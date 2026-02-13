@@ -11,10 +11,6 @@
 //! - Bounded samples make skip/partial behavior observable without log spam.
 //! - Reasons are part of the public surface; changing them is a semver-ish event.
 
-#![allow(dead_code)]
-
-use core::fmt;
-
 // -----------------------------
 // Reasons (stable taxonomy)
 // -----------------------------
@@ -239,17 +235,6 @@ pub enum SampleKind {
     ArchivePartial = 1,
     EntrySkipped = 2,
     EntryPartial = 3,
-}
-
-impl SampleKind {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::ArchiveSkipped => "archive_skipped",
-            Self::ArchivePartial => "archive_partial",
-            Self::EntrySkipped => "entry_skipped",
-            Self::EntryPartial => "entry_partial",
-        }
-    }
 }
 
 /// Maximum samples retained in an [`ArchiveSampleRing`].
@@ -579,47 +564,6 @@ impl ArchiveStats {
         }
 
         self.samples.merge_from(&other.samples);
-    }
-
-    /// Render a compact reason table for diagnostics/debug output.
-    pub fn fmt_reason_table(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "archive_skip_reasons:")?;
-        for r in ARCHIVE_SKIP_REASONS.iter() {
-            let n = self.archive_skip_reasons[r.as_usize()];
-            if n != 0 {
-                writeln!(f, "  {}={}", r.name(), n)?;
-            }
-        }
-
-        writeln!(f, "entry_skip_reasons:")?;
-        for r in ENTRY_SKIP_REASONS.iter() {
-            let n = self.entry_skip_reasons[r.as_usize()];
-            if n != 0 {
-                writeln!(f, "  {}={}", r.name(), n)?;
-            }
-        }
-
-        writeln!(f, "partial_reasons:")?;
-        for r in PARTIAL_REASONS.iter() {
-            let n = self.partial_reasons[r.as_usize()];
-            if n != 0 {
-                writeln!(f, "  {}={}", r.name(), n)?;
-            }
-        }
-        if self.paths_truncated != 0 {
-            writeln!(f, "path_truncated={}", self.paths_truncated)?;
-        }
-        if self.paths_had_traversal != 0 {
-            writeln!(f, "had_traversal={}", self.paths_had_traversal)?;
-        }
-        if self.paths_component_cap_exceeded != 0 {
-            writeln!(
-                f,
-                "component_cap_exceeded={}",
-                self.paths_component_cap_exceeded
-            )?;
-        }
-        Ok(())
     }
 }
 

@@ -3752,7 +3752,6 @@ struct TokenCase {
 #[cfg(feature = "stdx-proptest")]
 #[derive(Clone, Debug)]
 struct InputCase {
-    #[allow(dead_code)] // Retained for Debug output in test failures.
     rule_name: &'static str,
     buf: Vec<u8>,
 }
@@ -4615,6 +4614,7 @@ mod engine_proptests {
         #[test]
         fn prop_engine_matches_reference(case in input_case_strategy()) {
             let engine = demo_engine();
+            let _ = case.rule_name;
             let rules = demo_rules();
 
             let findings = scan_chunk_findings(&engine, &case.buf);
@@ -4631,6 +4631,7 @@ mod engine_proptests {
         #[test]
         fn prop_chunked_matches_full(case in input_case_strategy(), chunk_size in 1usize..256) {
             let engine = demo_engine();
+            let _ = case.rule_name;
             let mut scratch = engine.new_scratch();
             let full = engine.scan_chunk_records(&case.buf, FileId(0), 0, &mut scratch);
             let chunked = scan_in_chunks(&engine, &case.buf, chunk_size);
@@ -4659,6 +4660,7 @@ mod engine_proptests {
             seed in any::<u64>(),
         ) {
             let engine = correctness_engine();
+            let _ = case.rule_name;
             let oracle = scan_one_chunk_records(&engine, &case.buf);
 
             // A small set of "interesting" sizes that tends to shake out edge cases.
@@ -5605,6 +5607,8 @@ mod proptests {
             let engine = demo_engine();
             let mut scratch = engine.new_scratch();
             let mut out = Vec::new();
+            let _ = case_a.rule_name;
+            let _ = case_b.rule_name;
 
             engine.scan_chunk_into(&case_a.buf, FileId(0), 0, &mut scratch);
             engine.drain_findings_materialized(&mut scratch, &mut out);

@@ -145,10 +145,6 @@ impl Default for EngineTuning {
 pub struct ScanScratch {
     /// Findings accumulated during the current scan.
     findings: Vec<FindingRec>,
-
-    /// Internal scratch for the mock engine (would be pattern state in real engine).
-    #[allow(dead_code)]
-    internal: Vec<u8>,
 }
 
 impl ScanScratch {
@@ -156,7 +152,6 @@ impl ScanScratch {
     pub fn new(findings_cap: usize) -> Self {
         Self {
             findings: Vec::with_capacity(findings_cap),
-            internal: Vec::new(),
         }
     }
 

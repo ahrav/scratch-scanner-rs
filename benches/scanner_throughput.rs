@@ -178,8 +178,6 @@ impl XorShift64 {
 /// increases, revealing the cost model of the scanner's post-filter validation path.
 struct Workload {
     name: &'static str,
-    #[allow(dead_code)]
-    description: &'static str,
     data: Vec<u8>,
 }
 
@@ -954,37 +952,37 @@ fn bench_workload_comparison(c: &mut Criterion) {
     let workloads = [
         Workload {
             name: "random_bytes",
-            description: "Pure random - no hits expected",
+            // Pure random - no hits expected
             data: gen_random_bytes(PRIMARY_SIZE, 0x1111),
         },
         Workload {
             name: "clean_ascii",
-            description: "Clean ASCII text - minimal hits",
+            // Clean ASCII text - minimal hits
             data: gen_clean_ascii(PRIMARY_SIZE, 0x2222),
         },
         Workload {
             name: "sparse_anchors",
-            description: "Anchor hits every 16KB, no regex match",
+            // Anchor hits every 16KB, no regex match
             data: gen_sparse_anchor_hits(PRIMARY_SIZE, 0x3333, 16 * 1024),
         },
         Workload {
             name: "moderate_secrets",
-            description: "AWS keys every 16KB",
+            // AWS keys every 16KB
             data: gen_aws_key_hits(PRIMARY_SIZE, 0x4444, 16 * 1024),
         },
         Workload {
             name: "base64_noise",
-            description: "Base64 content, no secrets",
+            // Base64 content, no secrets
             data: gen_base64_noise(PRIMARY_SIZE, 0x5555),
         },
         Workload {
             name: "base64_secrets",
-            description: "Base64 with secrets every 16KB",
+            // Base64 with secrets every 16KB
             data: gen_base64_with_secrets(PRIMARY_SIZE, 0x6666, 16 * 1024),
         },
         Workload {
             name: "mixed_realistic",
-            description: "Simulated code repository content",
+            // Simulated code repository content
             data: gen_mixed_realistic(PRIMARY_SIZE, 0x7777),
         },
     ];

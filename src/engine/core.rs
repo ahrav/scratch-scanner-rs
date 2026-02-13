@@ -1365,11 +1365,18 @@ impl Engine {
             // scan_rules_on_buffer will be fast (zero touched_pairs = no regex work).
         }
 
-        // ── Step F: HIT PATH — selective reset, set one-shot flag ───────
+        // ── Step F: reset for scan loop, set one-shot prefilter flag ─────
         scratch.root_prefilter_saw_utf16 = saw_utf16;
         scratch.root_prefilter_done = true;
         let ((), _reset_nanos) = perf::time(|| {
-            scratch.reset_for_scan_after_prefilter(self);
+            // If prefilter found no rule hits, there is no accumulator state
+            // to preserve (transform-only path), so use the full reset.
+            // Otherwise preserve touched prefilter accumulators for the rule loop.
+            if scratch.touched_pairs.is_empty() {
+                scratch.reset_for_scan(self);
+            } else {
+                scratch.reset_for_scan_after_prefilter(self);
+            }
         });
         perf::record_scan_reset(_reset_nanos);
 
@@ -1898,7 +1905,7 @@ impl Engine {
     ///
     /// # Panics
     /// Panics if `idx >= self.transforms.len()`.
-    #[allow(dead_code)] // Used by sim_scanner for finding provenance tracking
+    #[cfg(feature = "sim-harness")]
     pub(crate) fn transform_id(&self, idx: usize) -> TransformId {
         self.transforms[idx].id
     }
@@ -2366,185 +2373,9 @@ pub fn bench_hash128(bytes: &[u8]) -> u128 {
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
 
 #[cfg(test)]
-mod url_gate_tests {
-    use super::*;
-
-    /// Build a 256-bit anchor byte set containing exactly the given bytes.
-    fn make_anchor_set(bytes: &[u8]) -> [u64; 4] {
-        let mut set = [0u64; 4];
-        for &b in bytes {
-            set[(b >> 6) as usize] |= 1u64 << (b & 63);
-        }
-        set
-    }
-
-    // Boundary coverage for `%XX` handling in the standalone gate helper.
-
-    #[test]
-    fn gate_triplet_at_end_of_buffer() {
-        // %20 decodes to 0x20 (space). Anchor set contains space.
-        let set = make_anchor_set(b" ");
-        // Buffer is exactly the 3-byte triplet — nothing before or after.
-        assert!(
-            url_percent_gate_check(&set, false, b"%20"),
-            "gate must detect %XX triplet at the very end of the buffer"
-        );
-    }
-
-    #[test]
-    fn gate_triplet_at_end_after_plain_bytes() {
-        let set = make_anchor_set(b"k");
-        // 0x6B == 'k'
-        assert!(
-            url_percent_gate_check(&set, false, b"hello%6B"),
-            "gate must detect %XX triplet at end preceded by plain text"
-        );
-    }
-
-    #[test]
-    fn gate_triplet_not_at_boundary_still_works() {
-        // Sanity: triplet NOT at the boundary should still work.
-        let set = make_anchor_set(b" ");
-        assert!(url_percent_gate_check(&set, false, b"%20xyz"));
-    }
-
-    #[test]
-    fn gate_no_anchor_bytes_returns_false() {
-        let set = make_anchor_set(b"A");
-        // %20 decodes to space, which is NOT in the anchor set.
-        assert!(!url_percent_gate_check(&set, false, b"%20"));
-    }
-
-    #[test]
-    fn gate_plus_to_space_without_percent_triplet() {
-        let set = make_anchor_set(b" ");
-        assert!(
-            url_percent_gate_check(&set, true, b"TOK+ABCD"),
-            "plus-to-space must pass even when no %XX escapes are present"
-        );
-        assert!(
-            !url_percent_gate_check(&set, false, b"TOK+ABCD"),
-            "without plus-to-space, '+' should not affect the gate"
-        );
-    }
-
-    #[test]
-    fn gate_empty_anchor_set_returns_true() {
-        let empty = [0u64; 4];
-        assert!(
-            url_percent_gate_check(&empty, false, b"anything"),
-            "empty anchor set is conservative — always returns true"
-        );
-    }
-
-    // ---- decode_hex_pair coverage ----
-
-    #[test]
-    fn hex_pair_valid_digits() {
-        assert_eq!(decode_hex_pair(b'0', b'0'), Some(0x00));
-        assert_eq!(decode_hex_pair(b'F', b'F'), Some(0xFF));
-        assert_eq!(decode_hex_pair(b'f', b'f'), Some(0xFF));
-        assert_eq!(decode_hex_pair(b'4', b'1'), Some(0x41)); // 'A'
-        assert_eq!(decode_hex_pair(b'6', b'B'), Some(0x6B)); // 'k'
-    }
-
-    #[test]
-    fn hex_pair_mixed_case() {
-        assert_eq!(decode_hex_pair(b'a', b'B'), Some(0xAB));
-        assert_eq!(decode_hex_pair(b'C', b'd'), Some(0xCD));
-    }
-
-    #[test]
-    fn hex_pair_invalid_hi() {
-        assert_eq!(decode_hex_pair(b'G', b'0'), None);
-        assert_eq!(decode_hex_pair(b'/', b'0'), None); // just below '0'
-        assert_eq!(decode_hex_pair(b':', b'0'), None); // just above '9'
-    }
-
-    #[test]
-    fn hex_pair_invalid_lo() {
-        assert_eq!(decode_hex_pair(b'0', b'g'), None);
-        assert_eq!(decode_hex_pair(b'0', b' '), None);
-    }
-
-    // ---- gate edge cases ----
-
-    #[test]
-    fn gate_truncated_triplet_at_end() {
-        let set = make_anchor_set(b" ");
-        // Buffer ends with `%2` — not enough bytes to form a triplet.
-        // Conservatively returns true (the truncated escape might decode to
-        // an anchor byte with more data).
-        assert!(url_percent_gate_check(&set, false, b"hello%2"));
-    }
-
-    #[test]
-    fn gate_percent_with_invalid_hex() {
-        let set = make_anchor_set(&[0x00]); // any byte would match 0x00
-                                            // `%ZZ` is not valid hex — should skip, not panic.
-        assert!(!url_percent_gate_check(&set, false, b"%ZZ"));
-    }
-
-    #[test]
-    fn gate_empty_buffer() {
-        let set = make_anchor_set(b"A");
-        assert!(!url_percent_gate_check(&set, false, b""));
-    }
-}
+#[path = "core_url_gate_tests.rs"]
+mod url_gate_tests;
 
 #[cfg(all(test, feature = "bench"))]
-mod bench_wrapper_tests {
-    use super::*;
-
-    #[test]
-    fn entropy_wrapper_reuses_table_for_same_max_len() {
-        let input = b"entropy-data";
-        let _ = bench_shannon_entropy(input, 64);
-
-        let ptr_before = BENCH_ENTROPY_STATE.with(|state| {
-            let state = state.borrow();
-            assert_eq!(state.max_len, 64);
-            state.log2_table.as_ptr()
-        });
-
-        let _ = bench_entropy_gate_passes(3.0, 1, 64, input);
-
-        let ptr_after = BENCH_ENTROPY_STATE.with(|state| {
-            let state = state.borrow();
-            assert_eq!(state.max_len, 64);
-            state.log2_table.as_ptr()
-        });
-
-        assert_eq!(ptr_before, ptr_after);
-    }
-
-    #[test]
-    fn merge_wrapper_keeps_capacity_for_smaller_followup_inputs() {
-        let large: Vec<(u32, u32)> = (0..64).map(|i| (i * 4, i * 4 + 2)).collect();
-        let small: Vec<(u32, u32)> = (0..4).map(|i| (i * 10, i * 10 + 1)).collect();
-
-        let _ = bench_merge_ranges(&large, 0);
-        let cap_after_large = BENCH_MERGE_STATE.with(|state| state.borrow().ranges.capacity());
-        assert!(cap_after_large >= large.len());
-
-        let _ = bench_merge_ranges(&small, 0);
-        let cap_after_small = BENCH_MERGE_STATE.with(|state| state.borrow().ranges.capacity());
-        assert_eq!(cap_after_small, cap_after_large);
-    }
-
-    #[test]
-    fn utf16_wrapper_reuses_capacity_for_same_max_out() {
-        let input = [b'A', 0, b'B', 0];
-
-        let _ = bench_decode_utf16le(&input, 8);
-        let cap_before = BENCH_UTF16_STATE.with(|state| state.borrow().out.capacity());
-
-        let _ = bench_decode_utf16le(&input, 8);
-        let cap_after_same = BENCH_UTF16_STATE.with(|state| state.borrow().out.capacity());
-        assert_eq!(cap_after_same, cap_before);
-
-        let _ = bench_decode_utf16le(&input, 16);
-        let cap_after_growth = BENCH_UTF16_STATE.with(|state| state.borrow().out.capacity());
-        assert!(cap_after_growth >= 16);
-    }
-}
+#[path = "core_bench_wrapper_tests.rs"]
+mod bench_wrapper_tests;

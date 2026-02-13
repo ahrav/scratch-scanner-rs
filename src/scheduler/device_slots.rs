@@ -382,7 +382,7 @@ impl DeviceSlots {
         let budget = self.get_or_create_budget(device);
 
         budget.try_acquire(1).map(|permit| DeviceSlotPermit {
-            inner: permit,
+            _inner: permit,
             device,
         })
     }
@@ -403,7 +403,7 @@ impl DeviceSlots {
         let budget = self.get_or_create_budget(device);
 
         DeviceSlotPermit {
-            inner: budget.acquire(1),
+            _inner: budget.acquire(1),
             device,
         }
     }
@@ -471,8 +471,7 @@ impl DeviceSlots {
 #[derive(Debug)]
 #[must_use = "DeviceSlotPermit releases on drop; not holding it defeats fairness"]
 pub struct DeviceSlotPermit {
-    #[allow(dead_code)] // Used by upcoming remote scanning pipeline
-    inner: CountPermit,
+    _inner: CountPermit,
     device: DeviceId,
 }
 

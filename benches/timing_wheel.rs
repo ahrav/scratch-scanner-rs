@@ -117,7 +117,6 @@ fn bench_bitset_find_next_set_cyclic(c: &mut Criterion) {
 // ============================================================================
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 struct Payload {
     hi_end: u64,
     id: u32,
@@ -150,7 +149,10 @@ fn bench_timing_wheel_push(c: &mut Criterion) {
                     }
                     // Drain all to reset
                     now += horizon + 1;
-                    tw.advance_and_drain(now, |_| {});
+                    tw.advance_and_drain(now, |payload| {
+                        black_box(payload.hi_end);
+                        black_box(payload.id);
+                    });
                 })
             }
             "g8_medium" => {
@@ -168,7 +170,10 @@ fn bench_timing_wheel_push(c: &mut Criterion) {
                         );
                     }
                     now += horizon + 1;
-                    tw.advance_and_drain(now, |_| {});
+                    tw.advance_and_drain(now, |payload| {
+                        black_box(payload.hi_end);
+                        black_box(payload.id);
+                    });
                 })
             }
             "g64_large" => {
@@ -186,7 +191,10 @@ fn bench_timing_wheel_push(c: &mut Criterion) {
                         );
                     }
                     now += horizon + 1;
-                    tw.advance_and_drain(now, |_| {});
+                    tw.advance_and_drain(now, |payload| {
+                        black_box(payload.hi_end);
+                        black_box(payload.id);
+                    });
                 })
             }
             _ => unreachable!(),
@@ -225,7 +233,9 @@ fn bench_timing_wheel_advance_drain(c: &mut Criterion) {
 
                 // Drain all at once
                 let mut count = 0usize;
-                tw.advance_and_drain(black_box((buckets_to_drain * 8) as u64), |_| {
+                tw.advance_and_drain(black_box((buckets_to_drain * 8) as u64), |payload| {
+                    black_box(payload.hi_end);
+                    black_box(payload.id);
                     count += 1;
                 });
                 black_box(count)
@@ -265,12 +275,18 @@ fn bench_timing_wheel_mixed_workload(c: &mut Criterion) {
 
                 // Advance time by a small amount
                 now += 8;
-                tw.advance_and_drain(black_box(now), |_| {});
+                tw.advance_and_drain(black_box(now), |payload| {
+                    black_box(payload.hi_end);
+                    black_box(payload.id);
+                });
             }
 
             // Final drain
             now += horizon + 1;
-            tw.advance_and_drain(now, |_| {});
+            tw.advance_and_drain(now, |payload| {
+                black_box(payload.hi_end);
+                black_box(payload.id);
+            });
         })
     });
 
@@ -297,7 +313,9 @@ fn bench_timing_wheel_mixed_workload(c: &mut Criterion) {
             // Single big drain
             now += horizon + 1;
             let mut drained = 0usize;
-            tw.advance_and_drain(black_box(now), |_| {
+            tw.advance_and_drain(black_box(now), |payload| {
+                black_box(payload.hi_end);
+                black_box(payload.id);
                 drained += 1;
             });
             black_box(drained)
@@ -367,7 +385,10 @@ fn bench_timing_wheel_granularity_comparison(c: &mut Criterion) {
                 );
             }
             now += horizon + 1;
-            tw.advance_and_drain(now, |_| {});
+            tw.advance_and_drain(now, |payload| {
+                black_box(payload.hi_end);
+                black_box(payload.id);
+            });
         })
     });
 
@@ -387,7 +408,10 @@ fn bench_timing_wheel_granularity_comparison(c: &mut Criterion) {
                 );
             }
             now += horizon + 1;
-            tw.advance_and_drain(now, |_| {});
+            tw.advance_and_drain(now, |payload| {
+                black_box(payload.hi_end);
+                black_box(payload.id);
+            });
         })
     });
 
@@ -407,7 +431,10 @@ fn bench_timing_wheel_granularity_comparison(c: &mut Criterion) {
                 );
             }
             now += horizon + 1;
-            tw.advance_and_drain(now, |_| {});
+            tw.advance_and_drain(now, |payload| {
+                black_box(payload.hi_end);
+                black_box(payload.id);
+            });
         })
     });
 

@@ -130,8 +130,7 @@ pub struct ObjectCtx {
     pub descriptor: ObjectDescriptor,
     /// Frontier permit - released when ObjectCtx drops.
     /// Intentionally not read; it's an RAII sentinel.
-    #[allow(dead_code)]
-    permit: ObjectPermit,
+    _permit: ObjectPermit,
     /// File ID for scan engine
     pub file_id: FileId,
 }
@@ -144,7 +143,7 @@ impl ObjectCtx {
     pub fn new(descriptor: ObjectDescriptor, permit: ObjectPermit, file_id: FileId) -> Self {
         Self {
             descriptor,
-            permit,
+            _permit: permit,
             file_id,
         }
     }

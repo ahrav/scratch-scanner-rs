@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Small, self-contained data structures used across the project.
 //!
 //! # Scope

@@ -134,21 +134,20 @@ enum SpillGrant {
     /// Spilling is unlimited (no slots configured in pool).
     Unlimited,
     /// Spilling is permitted via a counted slot.
-    #[allow(dead_code)] // Used by upcoming remote scanning pipeline
-    Limited(CountPermit),
+    Limited { _permit: CountPermit },
 }
 
 impl SpillGrant {
     /// Whether spilling is allowed (either unlimited or slot acquired).
     #[inline]
     fn is_allowed(&self) -> bool {
-        matches!(self, SpillGrant::Unlimited | SpillGrant::Limited(_))
+        matches!(self, SpillGrant::Unlimited | SpillGrant::Limited { .. })
     }
 
     /// Whether spilling is governed by a counted slot.
     #[inline]
     fn is_limited(&self) -> bool {
-        matches!(self, SpillGrant::Limited(_))
+        matches!(self, SpillGrant::Limited { .. })
     }
 }
 
@@ -301,7 +300,7 @@ impl GlobalResourcePool {
             match &self.spill_slots {
                 Some(budget) => {
                     match budget.try_acquire(1) {
-                        Some(permit) => SpillGrant::Limited(permit),
+                        Some(permit) => SpillGrant::Limited { _permit: permit },
                         None => {
                             // Rollback steps 1 and 2
                             if delta_cache_amount > 0 {

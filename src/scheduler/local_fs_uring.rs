@@ -778,7 +778,6 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
 
 /// Aggregate stats from a single archive worker thread, merged into
 /// [`MetricsSnapshot`] after the worker joins.
-#[allow(dead_code)]
 struct ArchiveWorkerStats {
     bytes_scanned: u64,
     chunks_scanned: u64,
@@ -921,7 +920,6 @@ fn archive_worker_loop<E: ScanEngine>(
 
 /// Aggregate stats from a single extraction worker thread, merged into
 /// [`MetricsSnapshot`] after the worker joins.
-#[allow(dead_code)]
 struct ExtractWorkerStats {
     bytes_scanned: u64,
     chunks_scanned: u64,
@@ -1105,10 +1103,8 @@ enum Op {
 /// early would be use-after-free.
 struct OpenOp {
     file_slot: usize,
-    #[allow(dead_code)]
-    path: CString,
-    #[allow(dead_code)]
-    open_how: Option<Box<types::OpenHow>>,
+    _path: CString,
+    _open_how: Option<Box<types::OpenHow>>,
 }
 
 /// State for an in-flight statx op.
@@ -1771,8 +1767,8 @@ fn io_worker_loop<E: ScanEngine>(
 
                 ops[op_slot] = Some(Op::Open(OpenOp {
                     file_slot,
-                    path: path_cstr,
-                    open_how,
+                    _path: path_cstr,
+                    _open_how: open_how,
                 }));
 
                 in_flight_ops += 1;

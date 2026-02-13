@@ -148,7 +148,7 @@ pub(crate) trait IdleHooks {
 /// - `shared_state_*` operations follow the combined `(count<<1)|accepting` layout.
 /// - `pop_local` is LIFO; `steal_from_victim` is FIFO for stolen tasks.
 /// - `record_panic` must signal shutdown and wake sleeping workers.
-#[allow(dead_code)] // Used by upcoming remote scanning pipeline
+#[allow(dead_code)] // Trait surface reserves hooks for alternate schedulers.
 pub(crate) trait WorkerCtxLike<T, S> {
     fn worker_id(&self) -> usize;
     fn worker_count(&self) -> usize;
@@ -203,13 +203,6 @@ pub(crate) fn close_gate(state: &AtomicUsize) -> usize {
 #[inline(always)]
 pub(crate) fn increment_count(state: &AtomicUsize) -> usize {
     state.fetch_add(COUNT_UNIT, Ordering::AcqRel)
-}
-
-/// Decrement the in-flight count in the combined state word.
-#[allow(dead_code)] // Used by upcoming remote scanning pipeline
-#[inline(always)]
-pub(crate) fn decrement_count(state: &AtomicUsize) -> usize {
-    state.fetch_sub(COUNT_UNIT, Ordering::AcqRel)
 }
 
 /// Try to pop a task: local first, then injector, then steal.

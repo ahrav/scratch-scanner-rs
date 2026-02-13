@@ -737,18 +737,11 @@ fn format_simple_baseline_ext(b: &BenchBaselineExt) -> String {
 /// Contains all metrics needed to reconstruct a synthetic `BenchReport`
 /// for comparison against a current run.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct ParsedBaseline {
-    name: String,
     throughput_mibs: f64,
     p50_ns: u64,
-    p95_ns: u64,
-    p99_ns: u64,
     peak_rss_bytes: u64,
     cpu_utilization: f64,
-    iters: usize,
-    timestamp: String,
-    git_commit: Option<String>,
     config_fingerprint: Option<String>,
 }
 
@@ -811,8 +804,6 @@ fn parse_simple_baseline(content: &str) -> Option<ParsedBaseline> {
     let mut peak_rss_bytes = 0u64;
     let mut cpu_utilization = 0.0;
     let mut iters = 0usize;
-    let mut timestamp = String::new();
-    let mut git_commit = None;
     let mut config_fingerprint = None;
 
     for line in content.lines() {
@@ -826,13 +817,7 @@ fn parse_simple_baseline(content: &str) -> Option<ParsedBaseline> {
                 "peak_rss_bytes" => peak_rss_bytes = val.trim().parse().unwrap_or(0),
                 "cpu_utilization" => cpu_utilization = val.trim().parse().unwrap_or(0.0),
                 "iters" => iters = val.trim().parse().unwrap_or(0),
-                "timestamp" => timestamp = val.trim().to_string(),
-                "git_commit" => {
-                    let v = val.trim();
-                    if v != "unknown" {
-                        git_commit = Some(v.to_string());
-                    }
-                }
+                "timestamp" | "git_commit" => {}
                 "config" => {
                     config_fingerprint = Some(val.trim().to_string());
                 }
@@ -857,16 +842,10 @@ fn parse_simple_baseline(content: &str) -> Option<ParsedBaseline> {
     }
 
     Some(ParsedBaseline {
-        name,
         throughput_mibs,
         p50_ns,
-        p95_ns,
-        p99_ns,
         peak_rss_bytes,
         cpu_utilization,
-        iters,
-        timestamp,
-        git_commit,
         config_fingerprint,
     })
 }
