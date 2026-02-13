@@ -245,16 +245,13 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     }
 }
 
+const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
+
 #[inline(always)]
 fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = match nyb {
-            0..=9 => b'0' + nyb,
-            _ => b'a' + (nyb - 10),
-        };
+    for i in 0..16 {
+        out16[i] = HEX_LOWER[((x >> ((15 - i) * 4)) & 0xF) as usize];
     }
 }
 

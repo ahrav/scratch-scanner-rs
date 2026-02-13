@@ -579,11 +579,19 @@ fn tar_pad(size: u64) -> u64 {
 
 #[inline(always)]
 fn is_zero_block(b: &[u8; TAR_BLOCK_LEN]) -> bool {
-    // Constant-time-ish scan, cheap enough (512 bytes).
-    for &x in b.iter() {
-        if x != 0 {
+    let ptr = b.as_ptr();
+    let mut i = 0usize;
+    while i < TAR_BLOCK_LEN {
+        let mut acc: u64 = 0;
+        let mut j = 0;
+        while j < 64 && i + j < TAR_BLOCK_LEN {
+            acc |= unsafe { (ptr.add(i + j) as *const u64).read_unaligned() };
+            j += 8;
+        }
+        if acc != 0 {
             return false;
         }
+        i += 64;
     }
     true
 }
@@ -642,8 +650,7 @@ fn parse_tar_size_octal(field: &[u8]) -> Option<u64> {
     }
     let mut v: u64 = 0;
     for &d in &field[i..end] {
-        v = v.checked_mul(8)?;
-        v = v.checked_add((d - b'0') as u64)?;
+        v = v.wrapping_mul(8).wrapping_add((d - b'0') as u64);
     }
     Some(v)
 }

@@ -173,6 +173,10 @@ name = "hit_pool"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "archive_throughput"
+harness = false
+
 [profile.dev]
 opt-level = 1
 

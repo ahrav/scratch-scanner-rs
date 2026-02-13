@@ -474,22 +474,19 @@ fn is_printable_ascii(b: u8) -> bool {
     (0x20..=0x7e).contains(&b)
 }
 
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
+
 #[inline(always)]
 fn hex_upper(n: u8) -> u8 {
     debug_assert!(n < 16);
-    match n {
-        0..=9 => b'0' + n,
-        _ => b'A' + (n - 10),
-    }
+    HEX_UPPER[n as usize]
 }
 
 #[inline(always)]
 fn hex_lower(n: u8) -> u8 {
     debug_assert!(n < 16);
-    match n {
-        0..=9 => b'0' + n,
-        _ => b'a' + (n - 10),
-    }
+    HEX_LOWER[n as usize]
 }
 
 pub(crate) fn apply_hash_suffix_truncation(out: &mut Vec<u8>, hash: u64, max_len: usize) {
@@ -545,10 +542,8 @@ fn emit_truncated_with_hash_suffix(out: &mut Vec<u8>, base: &[u8], hash: u64, ma
 
 fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = hex_lower(nyb);
+    for i in 0..16 {
+        out16[i] = HEX_LOWER[((x >> ((15 - i) * 4)) & 0xF) as usize];
     }
 }
 
