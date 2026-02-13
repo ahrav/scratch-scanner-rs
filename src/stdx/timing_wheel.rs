@@ -909,6 +909,14 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
         drained
     }
 
+    /// Convenience wrapper: drains expired entries into a caller-supplied `Vec`.
+    ///
+    /// Returns the number of items appended.
+    #[inline]
+    pub fn advance_and_drain_into(&mut self, now_offset: u64, out: &mut Vec<T>) -> usize {
+        self.advance_and_drain(now_offset, |item| out.push(item))
+    }
+
     #[inline(always)]
     fn alloc_node(&mut self, val: T) -> Option<u32> {
         let idx = self.free_head;

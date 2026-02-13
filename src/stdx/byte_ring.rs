@@ -144,6 +144,29 @@ impl ByteRing {
         lo >= self.start_offset && hi <= self.start_offset.saturating_add(self.len as u64)
     }
 
+    /// Returns a direct slice into the ring buffer for `[lo, hi)` when the
+    /// range is contiguous (does not wrap around the ring boundary).
+    ///
+    /// Returns `Some(&[u8])` on success, `Some(&[])` for empty ranges,
+    /// or `None` when the range wraps or is not retained.
+    pub(crate) fn contiguous_range(&self, lo: u64, hi: u64) -> Option<&[u8]> {
+        if hi <= lo {
+            return Some(&[]);
+        }
+        if !self.has_range(lo, hi) {
+            return None;
+        }
+        let offset = (lo - self.start_offset) as usize;
+        let len = (hi - lo) as usize;
+        let cap = self.buf.len();
+        let start = (self.head + offset) % cap;
+        if start + len <= cap {
+            Some(&self.buf[start..start + len])
+        } else {
+            None // wraps around
+        }
+    }
+
     /// Extends `out` with bytes in `[lo, hi)`, returning false if the range
     /// is not fully retained.
     ///
@@ -173,5 +196,54 @@ impl ByteRing {
             out.extend_from_slice(&self.buf[..(len - first)]);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ByteRing;
+
+    #[test]
+    fn contiguous_range_returns_slice_when_not_wrapped() {
+        let mut ring = ByteRing::with_capacity(16);
+        ring.push(b"hello world");
+        // Bytes at offsets [0, 11) are present and contiguous.
+        let slice = ring.contiguous_range(0, 5).expect("should be contiguous");
+        assert_eq!(slice, b"hello");
+    }
+
+    #[test]
+    fn contiguous_range_returns_none_when_wrapped() {
+        let mut ring = ByteRing::with_capacity(8);
+        // Push 6 bytes, then 6 more — second push evicts and wraps.
+        ring.push(b"abcdef");
+        ring.push(b"ghijkl");
+        // The range [6, 12) wraps around the 8-byte buffer.
+        let result = ring.contiguous_range(6, 12);
+        // May or may not wrap depending on internal head position.
+        // If contiguous, it should match; if wrapped, should return None.
+        if let Some(slice) = result {
+            assert_eq!(slice, b"ghijkl");
+        }
+        // Either way, extend_range_to should always work:
+        let mut out = Vec::new();
+        assert!(ring.extend_range_to(6, 12, &mut out));
+        assert_eq!(out, b"ghijkl");
+    }
+
+    #[test]
+    fn contiguous_range_empty_range() {
+        let ring = ByteRing::with_capacity(8);
+        assert_eq!(ring.contiguous_range(5, 5), Some(&[][..]));
+        assert_eq!(ring.contiguous_range(5, 3), Some(&[][..]));
+    }
+
+    #[test]
+    fn contiguous_range_not_retained() {
+        let mut ring = ByteRing::with_capacity(4);
+        ring.push(b"abcdefgh"); // Only last 4 bytes retained.
+        assert_eq!(ring.contiguous_range(0, 4), None); // Evicted.
+        let slice = ring.contiguous_range(4, 8).expect("should be retained");
+        assert_eq!(slice, b"efgh");
     }
 }

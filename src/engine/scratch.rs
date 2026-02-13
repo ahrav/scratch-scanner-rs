@@ -505,6 +505,12 @@ pub struct ScanScratch {
     pub(super) decode_ring: ByteRing,
     /// Temporary buffer for materializing decoded windows from the ring.
     pub(super) window_bytes: Vec<u8>,
+    /// Reusable batch buffer for collecting drained pending windows.
+    ///
+    /// Used by `decode_stream_and_scan` to collect expired windows from the
+    /// timing wheel before processing them, avoiding the need for raw-pointer
+    /// aliasing during the drain callback.
+    pub(super) drain_batch: Vec<PendingWindow>,
     /// Pending window timing wheel (exact, G=1) keyed by `hi` for decoded stream verification.
     pub(super) pending_windows: TimingWheel<PendingWindow, 1>,
     /// Max window horizon used to size the timing wheel (max window radius + stream chunk).
@@ -701,6 +707,7 @@ impl ScanScratch {
             } else {
                 Vec::new()
             },
+            drain_batch: Vec::new(),
             pending_windows: if has_active_transforms {
                 TimingWheel::new(pending_window_horizon_bytes, pending_window_cap)
             } else {
@@ -848,6 +855,7 @@ impl ScanScratch {
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
         self.window_bytes.clear();
+        self.drain_batch.clear();
         self.pending_windows.reset();
         self.vs_stream_matches.clear();
         self.pending_spans.clear();
@@ -911,6 +919,7 @@ impl ScanScratch {
         self.work_items_enqueued = 0;
         self.decode_ring.reset();
         self.window_bytes.clear();
+        self.drain_batch.clear();
         self.pending_windows.reset();
         self.vs_stream_matches.clear();
         self.pending_spans.clear();
