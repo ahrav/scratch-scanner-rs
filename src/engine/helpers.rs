@@ -236,6 +236,8 @@ pub(super) fn shannon_entropy_bits_per_byte(
     // branch predictor handles this well, and we avoid the per-byte branch
     // that the previous "touched list" approach required in the hot histogram loop.
     for i in 0..256 {
+        // SAFETY: loop bounds guarantee `i` is always in 0..256, which matches
+        // the exact length of `counts`.
         let c = unsafe { *scratch.counts.get_unchecked(i) } as usize;
         if c > 0 {
             sum_c_log2_c += (c as f32) * log2_lookup(log2_table, c);
@@ -379,11 +381,64 @@ pub(super) fn decode_utf16be_to_buf(
     decode_utf16_to_buf(input, max_out, false, out)
 }
 
+/// Reads one UTF-16 code unit from `input` at byte offset `off`.
+#[inline(always)]
+fn read_utf16_code_unit(input: &[u8], off: usize, le: bool) -> u16 {
+    // SAFETY: caller guarantees `off + 1 < input.len()`.
+    let b0 = unsafe { *input.get_unchecked(off) };
+    // SAFETY: caller guarantees `off + 1 < input.len()`.
+    let b1 = unsafe { *input.get_unchecked(off + 1) };
+    if le {
+        u16::from_le_bytes([b0, b1])
+    } else {
+        u16::from_be_bytes([b0, b1])
+    }
+}
+
+/// Decodes one Unicode scalar value at UTF-16 code-unit index `i`.
+///
+/// Returns `(char, advance_units)` where `advance_units` is 1 for BMP or
+/// replacement characters and 2 for valid surrogate pairs.
+#[inline(always)]
+fn decode_utf16_scalar_at(input: &[u8], i: usize, n: usize, le: bool) -> (char, usize) {
+    debug_assert!(i < n, "caller must provide in-bounds UTF-16 index");
+    let off = i * 2;
+    let u = read_utf16_code_unit(input, off, le);
+
+    if (0xD800..=0xDBFF).contains(&u) {
+        // High surrogate — consume a pair only when followed by a valid low surrogate.
+        if i + 1 < n {
+            let off2 = (i + 1) * 2;
+            // SAFETY: `i + 1 < n` and `n = input.len() / 2` imply
+            // `off2 + 1 = 2*(i+1)+1 < 2*n <= input.len()`.
+            let u2 = read_utf16_code_unit(input, off2, le);
+            if (0xDC00..=0xDFFF).contains(&u2) {
+                let high = (u - 0xD800) as u32;
+                let low = (u2 - 0xDC00) as u32;
+                let code = 0x10000 + ((high << 10) | low);
+                // SAFETY: code is constructed from a valid surrogate pair.
+                return (unsafe { char::from_u32_unchecked(code) }, 2);
+            }
+        }
+        return ('\u{FFFD}', 1);
+    }
+
+    if (0xDC00..=0xDFFF).contains(&u) {
+        // Lone low surrogate.
+        ('\u{FFFD}', 1)
+    } else {
+        // SAFETY: non-surrogate BMP code units are valid scalar values.
+        (unsafe { char::from_u32_unchecked(u as u32) }, 1)
+    }
+}
+
 /// Maps a decoded UTF-8 offset back to the raw UTF-16 byte offset.
 ///
 /// Returns the raw byte offset (half-open) such that decoding `input[0..offset]`
-/// would produce at least `decoded_offset` UTF-8 bytes. If `decoded_offset`
-/// exceeds the decoded length, returns the largest even byte offset.
+/// would produce at least `decoded_offset` UTF-8 bytes. The returned offset is
+/// always aligned to complete UTF-16 scalar decoding steps (it never points
+/// into the middle of a surrogate pair). If `decoded_offset` exceeds the
+/// decoded length, returns the largest even byte offset.
 pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
     if decoded_offset == 0 {
         return 0;
@@ -393,51 +448,11 @@ pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: 
     let mut i = 0usize;
 
     while i < n {
-        // Invariant: i < n, so 2*i+1 < input.len(). Since input.len() >= 2*n
-        // (integer division) and i < n, both 2*i and 2*i+1 are in bounds.
-        let off = i * 2;
-        let b0 = unsafe { *input.get_unchecked(off) };
-        let b1 = unsafe { *input.get_unchecked(off + 1) };
-        let u = if le {
-            u16::from_le_bytes([b0, b1])
-        } else {
-            u16::from_be_bytes([b0, b1])
-        };
+        let (ch, advance) = decode_utf16_scalar_at(input, i, n, le);
 
-        let (ch, advance) = if (0xD800..=0xDBFF).contains(&u) {
-            if i + 1 < n {
-                let off2 = (i + 1) * 2;
-                let b2 = unsafe { *input.get_unchecked(off2) };
-                let b3 = unsafe { *input.get_unchecked(off2 + 1) };
-                let u2 = if le {
-                    u16::from_le_bytes([b2, b3])
-                } else {
-                    u16::from_be_bytes([b2, b3])
-                };
-                if (0xDC00..=0xDFFF).contains(&u2) {
-                    let high = (u - 0xD800) as u32;
-                    let low = (u2 - 0xDC00) as u32;
-                    let code = 0x10000 + ((high << 10) | low);
-                    // SAFETY: code is a valid Unicode scalar (supplementary plane,
-                    // constructed from a valid surrogate pair).
-                    let ch = unsafe { char::from_u32_unchecked(code) };
-                    (ch, 2usize)
-                } else {
-                    ('\u{FFFD}', 1usize)
-                }
-            } else {
-                ('\u{FFFD}', 1usize)
-            }
-        } else if (0xDC00..=0xDFFF).contains(&u) {
-            ('\u{FFFD}', 1usize)
-        } else {
-            // SAFETY: u is not a surrogate, so it's a valid Unicode scalar value.
-            (unsafe { char::from_u32_unchecked(u as u32) }, 1usize)
-        };
-
-        // decoded and i cannot overflow: decoded <= input.len() (each char
-        // produces at most 4 UTF-8 bytes from 2 input bytes) and i <= n <= input.len()/2.
-        decoded += ch.len_utf8();
+        // `decoded` is monotonically increasing; saturating add keeps behavior
+        // defined even for pathological inputs near `usize::MAX`.
+        decoded = decoded.saturating_add(ch.len_utf8());
         i += advance;
         if decoded >= decoded_offset {
             return i * 2;
@@ -470,44 +485,14 @@ fn decode_utf16_to_buf(
     // Manual decode loop — avoids std::char::decode_utf16 iterator/Result overhead.
     let mut i = 0usize;
     while i < n {
-        let off = i * 2;
-        let b0 = input[off];
-        let b1 = input[off + 1];
-        let u = if le {
-            u16::from_le_bytes([b0, b1])
-        } else {
-            u16::from_be_bytes([b0, b1])
-        };
-
-        let (ch, advance) = if (0xD800..=0xDBFF).contains(&u) {
-            // High surrogate — look for trailing low surrogate.
-            if i + 1 < n {
-                let off2 = (i + 1) * 2;
-                let u2 = if le {
-                    u16::from_le_bytes([input[off2], input[off2 + 1]])
-                } else {
-                    u16::from_be_bytes([input[off2], input[off2 + 1]])
-                };
-                if (0xDC00..=0xDFFF).contains(&u2) {
-                    let code = (0x10000 + (((u - 0xD800) as u32) << 10)) | ((u2 - 0xDC00) as u32);
-                    // SAFETY: code is a valid Unicode scalar (supplementary plane).
-                    (unsafe { char::from_u32_unchecked(code) }, 2)
-                } else {
-                    ('\u{FFFD}', 1)
-                }
-            } else {
-                ('\u{FFFD}', 1)
-            }
-        } else if (0xDC00..=0xDFFF).contains(&u) {
-            ('\u{FFFD}', 1)
-        } else {
-            // SAFETY: u is not a surrogate, so it's a valid Unicode scalar value.
-            (unsafe { char::from_u32_unchecked(u as u32) }, 1)
-        };
+        let (ch, advance) = decode_utf16_scalar_at(input, i, n, le);
 
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
         if out.len() + s.len() > max_out {
+            return Err(Utf16DecodeError::OutputTooLarge);
+        }
+        if out.len() + s.len() > out.capacity() {
             return Err(Utf16DecodeError::OutputTooLarge);
         }
         out.extend_from_slice(s.as_bytes());
@@ -520,6 +505,9 @@ fn decode_utf16_to_buf(
 // Hashing (decoded buffer dedupe)
 // --------------------------
 
+/// Zero key for AEGIS-128L MAC, stored in `.rodata` to avoid per-call stack init.
+const ZERO_KEY: [u8; 16] = [0u8; 16];
+
 /// Collision-resistant 128-bit hash using AEGIS-128L MAC.
 ///
 /// Design intent:
@@ -531,9 +519,6 @@ fn decode_utf16_to_buf(
 /// a deterministic 128-bit tag that behaves like a PRF. This is not a general-
 /// purpose cryptographic hash, but it is collision-resistant enough for
 /// in-process deduplication and avoids an extra dependency.
-/// Zero key for AEGIS-128L MAC, stored in `.rodata` to avoid per-call stack init.
-const ZERO_KEY: [u8; 16] = [0u8; 16];
-
 pub(super) fn hash128(bytes: &[u8]) -> u128 {
     use aegis::aegis128l::Aegis128LMac;
     let mut mac = Aegis128LMac::<16>::new(&ZERO_KEY);
@@ -672,4 +657,107 @@ pub(super) fn extract_secret_span_locs(
 
     let (start, end) = locs.get(0).expect("group 0 always exists");
     (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scratch_memory::ScratchVec;
+
+    fn expected_map_utf16_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
+        if decoded_offset == 0 {
+            return 0;
+        }
+
+        let n = input.len() / 2;
+        let mut decoded = 0usize;
+        let mut i = 0usize;
+
+        while i < n {
+            let off = i * 2;
+            let u = if le {
+                u16::from_le_bytes([input[off], input[off + 1]])
+            } else {
+                u16::from_be_bytes([input[off], input[off + 1]])
+            };
+
+            let (utf8_len, advance) = if (0xD800..=0xDBFF).contains(&u) {
+                if i + 1 < n {
+                    let off2 = (i + 1) * 2;
+                    let u2 = if le {
+                        u16::from_le_bytes([input[off2], input[off2 + 1]])
+                    } else {
+                        u16::from_be_bytes([input[off2], input[off2 + 1]])
+                    };
+                    if (0xDC00..=0xDFFF).contains(&u2) {
+                        (4usize, 2usize)
+                    } else {
+                        (3usize, 1usize)
+                    }
+                } else {
+                    (3usize, 1usize)
+                }
+            } else if (0xDC00..=0xDFFF).contains(&u) {
+                (3usize, 1usize)
+            } else {
+                let ch = char::from_u32(u as u32).expect("non-surrogate BMP scalar");
+                (ch.len_utf8(), 1usize)
+            };
+
+            decoded = decoded.saturating_add(utf8_len);
+            i += advance;
+            if decoded >= decoded_offset {
+                return i * 2;
+            }
+        }
+
+        n * 2
+    }
+
+    #[test]
+    fn decode_utf16_to_buf_errors_when_capacity_is_too_small() {
+        // "AB" in UTF-16LE.
+        let input = [b'A', 0, b'B', 0];
+        let mut out = ScratchVec::with_capacity(1).expect("scratch alloc");
+
+        let err = decode_utf16le_to_buf(&input, 8, &mut out)
+            .expect_err("decode should map capacity overflow to Utf16DecodeError::OutputTooLarge");
+        assert!(matches!(err, Utf16DecodeError::OutputTooLarge));
+    }
+
+    #[test]
+    fn decode_utf16_to_buf_succeeds_when_capacity_is_sufficient() {
+        // "AB" in UTF-16LE.
+        let input = [b'A', 0, b'B', 0];
+        let mut out = ScratchVec::with_capacity(2).expect("scratch alloc");
+
+        decode_utf16le_to_buf(&input, 8, &mut out).expect("decode should succeed");
+        assert_eq!(out.as_slice(), b"AB");
+    }
+
+    #[test]
+    fn map_utf16_decoded_offset_matches_bruteforce_utf16le() {
+        // "A" + U+10000 surrogate pair + lone low surrogate + "z".
+        let input = [0x41, 0x00, 0x00, 0xD8, 0x00, 0xDC, 0x00, 0xDC, 0x7A, 0x00];
+        let full = decode_utf16le_to_vec(&input, usize::MAX).expect("decode");
+
+        for decoded_offset in 0..=(full.len() + 3) {
+            let mapped = map_utf16_decoded_offset(&input, decoded_offset, true);
+            let expected = expected_map_utf16_offset(&input, decoded_offset, true);
+            assert_eq!(mapped, expected, "decoded_offset={decoded_offset}");
+        }
+    }
+
+    #[test]
+    fn map_utf16_decoded_offset_matches_bruteforce_utf16be() {
+        // Same scalar sequence as LE test but in BE encoding.
+        let input = [0x00, 0x41, 0xD8, 0x00, 0xDC, 0x00, 0xDC, 0x00, 0x00, 0x7A];
+        let full = decode_utf16be_to_vec(&input, usize::MAX).expect("decode");
+
+        for decoded_offset in 0..=(full.len() + 3) {
+            let mapped = map_utf16_decoded_offset(&input, decoded_offset, false);
+            let expected = expected_map_utf16_offset(&input, decoded_offset, false);
+            assert_eq!(mapped, expected, "decoded_offset={decoded_offset}");
+        }
+    }
 }
