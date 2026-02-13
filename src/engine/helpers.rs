@@ -43,28 +43,32 @@ use memchr::memmem;
 /// # Complexity
 /// - O(n) time, O(1) extra space.
 pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap: u32) {
-    if ranges.len() <= 1 {
+    let len = ranges.len();
+    if len <= 1 {
         return;
     }
 
+    let s = ranges.as_mut_slice();
     let mut write = 0usize;
-    let mut cur = ranges[0];
-    let len = ranges.len();
+    let mut cur = s[0];
 
     for i in 1..len {
-        let r = ranges[i];
+        // SAFETY: i < len and len == s.len().
+        let r = unsafe { *s.get_unchecked(i) };
         debug_assert!(r.start >= cur.start);
         if r.start <= cur.end.saturating_add(gap) {
             cur.end = cur.end.max(r.end);
             // Preserve the earliest anchor hint when merging.
             cur.anchor_hint = cur.anchor_hint.min(r.anchor_hint);
         } else {
-            ranges[write] = cur;
+            // SAFETY: write < i < len, so write is in bounds.
+            unsafe { *s.get_unchecked_mut(write) = cur };
             write += 1;
             cur = r;
         }
     }
-    ranges[write] = cur;
+    // SAFETY: write <= len - 1 < len, so write is in bounds.
+    unsafe { *s.get_unchecked_mut(write) = cur };
     write += 1;
     ranges.truncate(write);
 }
@@ -133,12 +137,13 @@ pub(super) fn coalesce_under_pressure_sorted(
 /// # Behavior
 /// - Returns false when `needles` contains no patterns.
 pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
-    let count = needles.offsets.len().saturating_sub(1);
-    for i in 0..count {
-        let start = needles.offsets[i] as usize;
-        let end = needles.offsets[i + 1] as usize;
+    for pair in needles.offsets.windows(2) {
+        let start = pair[0] as usize;
+        let end = pair[1] as usize;
         debug_assert!(end <= needles.bytes.len());
-        if memmem::find(hay, &needles.bytes[start..end]).is_some() {
+        // SAFETY: PackedPatterns invariant guarantees offsets index into bytes.
+        let needle = unsafe { needles.bytes.get_unchecked(start..end) };
+        if memmem::find(hay, needle).is_some() {
             return true;
         }
     }
@@ -155,12 +160,13 @@ pub(super) fn contains_any_memmem(hay: &[u8], needles: &PackedPatterns) -> bool 
 /// # Behavior
 /// - Returns true when `needles` contains no patterns.
 pub(super) fn contains_all_memmem(hay: &[u8], needles: &PackedPatterns) -> bool {
-    let count = needles.offsets.len().saturating_sub(1);
-    for i in 0..count {
-        let start = needles.offsets[i] as usize;
-        let end = needles.offsets[i + 1] as usize;
+    for pair in needles.offsets.windows(2) {
+        let start = pair[0] as usize;
+        let end = pair[1] as usize;
         debug_assert!(end <= needles.bytes.len());
-        if memmem::find(hay, &needles.bytes[start..end]).is_none() {
+        // SAFETY: PackedPatterns invariant guarantees offsets index into bytes.
+        let needle = unsafe { needles.bytes.get_unchecked(start..end) };
+        if memmem::find(hay, needle).is_none() {
             return false;
         }
     }
@@ -203,7 +209,7 @@ fn log2_lookup(table: &[f32], n: usize) -> f32 {
 /// # Returns
 /// - 0.0 for empty input.
 #[inline]
-fn shannon_entropy_bits_per_byte(
+pub(super) fn shannon_entropy_bits_per_byte(
     bytes: &[u8],
     scratch: &mut EntropyScratch,
     log2_table: &[f32],
@@ -213,19 +219,11 @@ fn shannon_entropy_bits_per_byte(
         return 0.0;
     }
 
-    // Build a histogram using a "touched list" so reset cost is proportional
-    // to the number of distinct byte values, not 256.
+    // Branchless histogram: unconditionally increment the bin for each byte.
+    // No "first touch" tracking — the reset zeroes all 256 bins via memset.
     for &b in bytes {
-        let idx = b as usize;
-        let c = scratch.counts[idx];
-        if c == 0 {
-            let used_len = scratch.used_len as usize;
-            if used_len < scratch.used.len() {
-                scratch.used[used_len] = b;
-                scratch.used_len = (used_len + 1) as u16;
-            }
-        }
-        scratch.counts[idx] = c + 1;
+        // SAFETY: b is u8, so b as usize is in 0..256; counts has exactly 256 entries.
+        unsafe { *scratch.counts.get_unchecked_mut(b as usize) += 1 };
     }
 
     // Shannon entropy: H = log2(n) - (1/n) * sum(c_i * log2(c_i))
@@ -233,11 +231,15 @@ fn shannon_entropy_bits_per_byte(
     let log2_n = log2_lookup(log2_table, n);
     let mut sum_c_log2_c = 0.0f32;
 
-    let used_len = scratch.used_len as usize;
-    for i in 0..used_len {
-        let idx = scratch.used[i] as usize;
-        let c = scratch.counts[idx] as usize;
-        sum_c_log2_c += (c as f32) * log2_lookup(log2_table, c);
+    // Scan all 256 bins. For random data most bins are nonzero (predictable);
+    // for short inputs most bins are zero (also predictable). Either way the
+    // branch predictor handles this well, and we avoid the per-byte branch
+    // that the previous "touched list" approach required in the hot histogram loop.
+    for i in 0..256 {
+        let c = unsafe { *scratch.counts.get_unchecked(i) } as usize;
+        if c > 0 {
+            sum_c_log2_c += (c as f32) * log2_lookup(log2_table, c);
+        }
     }
 
     scratch.reset();
@@ -391,8 +393,11 @@ pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: 
     let mut i = 0usize;
 
     while i < n {
-        let b0 = input[2 * i];
-        let b1 = input[2 * i + 1];
+        // Invariant: i < n, so 2*i+1 < input.len(). Since input.len() >= 2*n
+        // (integer division) and i < n, both 2*i and 2*i+1 are in bounds.
+        let off = i * 2;
+        let b0 = unsafe { *input.get_unchecked(off) };
+        let b1 = unsafe { *input.get_unchecked(off + 1) };
         let u = if le {
             u16::from_le_bytes([b0, b1])
         } else {
@@ -401,8 +406,9 @@ pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: 
 
         let (ch, advance) = if (0xD800..=0xDBFF).contains(&u) {
             if i + 1 < n {
-                let b2 = input[2 * (i + 1)];
-                let b3 = input[2 * (i + 1) + 1];
+                let off2 = (i + 1) * 2;
+                let b2 = unsafe { *input.get_unchecked(off2) };
+                let b3 = unsafe { *input.get_unchecked(off2 + 1) };
                 let u2 = if le {
                     u16::from_le_bytes([b2, b3])
                 } else {
@@ -412,28 +418,33 @@ pub(super) fn map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: 
                     let high = (u - 0xD800) as u32;
                     let low = (u2 - 0xDC00) as u32;
                     let code = 0x10000 + ((high << 10) | low);
-                    let ch = std::char::from_u32(code).unwrap_or('\u{FFFD}');
-                    (ch, 2)
+                    // SAFETY: code is a valid Unicode scalar (supplementary plane,
+                    // constructed from a valid surrogate pair).
+                    let ch = unsafe { char::from_u32_unchecked(code) };
+                    (ch, 2usize)
                 } else {
-                    ('\u{FFFD}', 1)
+                    ('\u{FFFD}', 1usize)
                 }
             } else {
-                ('\u{FFFD}', 1)
+                ('\u{FFFD}', 1usize)
             }
         } else if (0xDC00..=0xDFFF).contains(&u) {
-            ('\u{FFFD}', 1)
+            ('\u{FFFD}', 1usize)
         } else {
-            (std::char::from_u32(u as u32).unwrap_or('\u{FFFD}'), 1)
+            // SAFETY: u is not a surrogate, so it's a valid Unicode scalar value.
+            (unsafe { char::from_u32_unchecked(u as u32) }, 1usize)
         };
 
-        decoded = decoded.saturating_add(ch.len_utf8());
-        i = i.saturating_add(advance);
+        // decoded and i cannot overflow: decoded <= input.len() (each char
+        // produces at most 4 UTF-8 bytes from 2 input bytes) and i <= n <= input.len()/2.
+        decoded += ch.len_utf8();
+        i += advance;
         if decoded >= decoded_offset {
-            return i.saturating_mul(2);
+            return i * 2;
         }
     }
 
-    n.saturating_mul(2)
+    n * 2
 }
 
 /// Decodes UTF-16 into a scratch buffer, using replacement characters for
@@ -454,29 +465,53 @@ fn decode_utf16_to_buf(
 ) -> Result<(), Utf16DecodeError> {
     // Ignore a trailing odd byte; it cannot form a full UTF-16 code unit.
     let n = input.len() / 2;
-    let iter = (0..n).map(|i| {
-        let b0 = input[2 * i];
-        let b1 = input[2 * i + 1];
-        if le {
+    out.clear();
+
+    // Manual decode loop — avoids std::char::decode_utf16 iterator/Result overhead.
+    let mut i = 0usize;
+    while i < n {
+        let off = i * 2;
+        let b0 = input[off];
+        let b1 = input[off + 1];
+        let u = if le {
             u16::from_le_bytes([b0, b1])
         } else {
             u16::from_be_bytes([b0, b1])
-        }
-    });
+        };
 
-    out.clear();
-    for r in std::char::decode_utf16(iter) {
-        let ch = r.unwrap_or('\u{FFFD}');
+        let (ch, advance) = if (0xD800..=0xDBFF).contains(&u) {
+            // High surrogate — look for trailing low surrogate.
+            if i + 1 < n {
+                let off2 = (i + 1) * 2;
+                let u2 = if le {
+                    u16::from_le_bytes([input[off2], input[off2 + 1]])
+                } else {
+                    u16::from_be_bytes([input[off2], input[off2 + 1]])
+                };
+                if (0xDC00..=0xDFFF).contains(&u2) {
+                    let code = 0x10000 + (((u - 0xD800) as u32) << 10) | ((u2 - 0xDC00) as u32);
+                    // SAFETY: code is a valid Unicode scalar (supplementary plane).
+                    (unsafe { char::from_u32_unchecked(code) }, 2)
+                } else {
+                    ('\u{FFFD}', 1)
+                }
+            } else {
+                ('\u{FFFD}', 1)
+            }
+        } else if (0xDC00..=0xDFFF).contains(&u) {
+            ('\u{FFFD}', 1)
+        } else {
+            // SAFETY: u is not a surrogate, so it's a valid Unicode scalar value.
+            (unsafe { char::from_u32_unchecked(u as u32) }, 1)
+        };
+
         let mut buf = [0u8; 4];
         let s = ch.encode_utf8(&mut buf);
         if out.len() + s.len() > max_out {
             return Err(Utf16DecodeError::OutputTooLarge);
         }
-        // Check capacity before extending to avoid panic.
-        if out.len() + s.len() > out.capacity() {
-            return Err(Utf16DecodeError::OutputTooLarge);
-        }
         out.extend_from_slice(s.as_bytes());
+        i += advance;
     }
     Ok(())
 }
@@ -496,10 +531,12 @@ fn decode_utf16_to_buf(
 /// a deterministic 128-bit tag that behaves like a PRF. This is not a general-
 /// purpose cryptographic hash, but it is collision-resistant enough for
 /// in-process deduplication and avoids an extra dependency.
+/// Zero key for AEGIS-128L MAC, stored in `.rodata` to avoid per-call stack init.
+const ZERO_KEY: [u8; 16] = [0u8; 16];
+
 pub(super) fn hash128(bytes: &[u8]) -> u128 {
     use aegis::aegis128l::Aegis128LMac;
-    let key = [0u8; 16];
-    let mut mac = Aegis128LMac::<16>::new(&key);
+    let mut mac = Aegis128LMac::<16>::new(&ZERO_KEY);
     mac.update(bytes);
     u128::from_le_bytes(mac.finalize())
 }
@@ -617,8 +654,15 @@ pub(super) fn extract_secret_span_locs(
         }
     }
 
-    // Scan groups 1..N for the first non-empty capture.
-    for gi in 1..locs.len() {
+    // Fast path: group 1 (covers >90% of rules).
+    if let Some((start, end)) = locs.get(1) {
+        if start < end {
+            return (start, end);
+        }
+    }
+
+    // Slow path: scan groups 2..N for the first non-empty capture.
+    for gi in 2..locs.len() {
         if let Some((start, end)) = locs.get(gi) {
             if start < end {
                 return (start, end);

@@ -2049,6 +2049,97 @@ pub fn bench_contains_any_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> b
     super::helpers::contains_any_memmem(hay, &needles.patterns)
 }
 
+/// Benchmark helper that calls the ALL-of memmem gate used in scan paths.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_contains_all_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> bool {
+    super::helpers::contains_all_memmem(hay, &needles.patterns)
+}
+
+/// Benchmark helper for `entropy_gate_passes`.
+#[cfg(feature = "bench")]
+pub fn bench_entropy_gate_passes(
+    min_bits: f32,
+    min_len: usize,
+    max_len: usize,
+    bytes: &[u8],
+) -> bool {
+    let spec = super::rule_repr::EntropyCompiled {
+        min_bits_per_byte: min_bits,
+        min_len,
+        max_len,
+    };
+    let log2_table = super::helpers::build_log2_table(max_len);
+    let mut scratch = super::scratch::EntropyScratch::new();
+    super::helpers::entropy_gate_passes(&spec, bytes, &mut scratch, &log2_table)
+}
+
+/// Benchmark helper for `shannon_entropy_bits_per_byte`.
+#[cfg(feature = "bench")]
+pub fn bench_shannon_entropy(bytes: &[u8], max_len: usize) -> f32 {
+    let log2_table = super::helpers::build_log2_table(max_len);
+    let mut scratch = super::scratch::EntropyScratch::new();
+    super::helpers::shannon_entropy_bits_per_byte(bytes, &mut scratch, &log2_table)
+}
+
+/// Benchmark wrapper for `merge_ranges_with_gap_sorted`.
+///
+/// Accepts a slice of `(start, end)` tuples and a gap, returns the number
+/// of merged ranges.
+#[cfg(feature = "bench")]
+pub fn bench_merge_ranges(ranges: &[(u32, u32)], gap: u32) -> usize {
+    use crate::scratch_memory::ScratchVec;
+    let mut sv = ScratchVec::with_capacity(ranges.len()).expect("bench merge_ranges alloc");
+    for &(s, e) in ranges {
+        sv.push(super::hit_pool::SpanU32 {
+            start: s,
+            end: e,
+            anchor_hint: s,
+        });
+    }
+    super::helpers::merge_ranges_with_gap_sorted(&mut sv, gap);
+    sv.len()
+}
+
+/// Benchmark wrapper for `decode_utf16le_to_buf`.
+#[cfg(feature = "bench")]
+pub fn bench_decode_utf16le(input: &[u8], max_out: usize) -> usize {
+    let mut out =
+        crate::scratch_memory::ScratchVec::with_capacity(max_out).expect("bench utf16 alloc");
+    let _ = super::helpers::decode_utf16le_to_buf(input, max_out, &mut out);
+    out.len()
+}
+
+/// Benchmark wrapper for `decode_utf16be_to_buf`.
+#[cfg(feature = "bench")]
+pub fn bench_decode_utf16be(input: &[u8], max_out: usize) -> usize {
+    let mut out =
+        crate::scratch_memory::ScratchVec::with_capacity(max_out).expect("bench utf16 alloc");
+    let _ = super::helpers::decode_utf16be_to_buf(input, max_out, &mut out);
+    out.len()
+}
+
+/// Benchmark wrapper for `map_utf16_decoded_offset`.
+#[cfg(feature = "bench")]
+pub fn bench_map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
+    super::helpers::map_utf16_decoded_offset(input, decoded_offset, le)
+}
+
+/// Benchmark wrapper for `extract_secret_span_locs`.
+#[cfg(feature = "bench")]
+pub fn bench_extract_secret_span_locs(
+    locs: &regex::bytes::CaptureLocations,
+    secret_group: Option<u16>,
+) -> (usize, usize) {
+    super::helpers::extract_secret_span_locs(locs, secret_group)
+}
+
+/// Benchmark wrapper for `hash128`.
+#[cfg(feature = "bench")]
+pub fn bench_hash128(bytes: &[u8]) -> u128 {
+    super::helpers::hash128(bytes)
+}
+
 #[cfg(feature = "bench")]
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
 
