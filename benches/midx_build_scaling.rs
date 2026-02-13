@@ -22,7 +22,6 @@ const FANOUT_ENTRIES: usize = 256;
 const FANOUT_SIZE: usize = FANOUT_ENTRIES * 4;
 
 struct MidxFixture {
-    #[allow(dead_code)]
     temp: TempDir,
     repo: GitRepoPaths,
     limits: MidxBuildLimits,
@@ -168,6 +167,7 @@ fn bench_scale_objects(c: &mut Criterion) {
 
     for (pack_count, objects_per_pack) in [(8usize, 8_192usize), (8, 16_384), (8, 32_768)] {
         let fixture = build_fixture(pack_count, objects_per_pack);
+        let _ = fixture.temp.path();
         let total_objects = fixture.total_objects;
         let label = format!("packs{pack_count}_objects{total_objects}");
         group.throughput(Throughput::Elements(total_objects as u64));
@@ -201,6 +201,7 @@ fn bench_scale_pack_fan_in(c: &mut Criterion) {
     for pack_count in [2usize, 4, 8, 16] {
         let objects_per_pack = TOTAL_OBJECTS / pack_count;
         let fixture = build_fixture(pack_count, objects_per_pack);
+        let _ = fixture.temp.path();
         let label = format!("packs{pack_count}_objects{}", fixture.total_objects);
         group.throughput(Throughput::Elements(fixture.total_objects as u64));
         group.bench_with_input(

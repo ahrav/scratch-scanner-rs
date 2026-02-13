@@ -778,12 +778,10 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
 
 /// Aggregate stats from a single archive worker thread, merged into
 /// [`MetricsSnapshot`] after the worker joins.
-#[allow(dead_code)]
 struct ArchiveWorkerStats {
     bytes_scanned: u64,
     chunks_scanned: u64,
     findings_emitted: u64,
-    archives_processed: u64,
     archives_open_failed: u64,
     archives_scan_errors: u64,
     archive_stats: ArchiveStats,
@@ -814,7 +812,6 @@ fn archive_worker_loop<E: ScanEngine>(
     let mut total_bytes = 0u64;
     let mut total_chunks = 0u64;
     let mut total_findings = 0u64;
-    let mut archives_processed = 0u64;
 
     let mut archives_open_failed = 0u64;
     let mut archives_scan_errors = 0u64;
@@ -898,7 +895,6 @@ fn archive_worker_loop<E: ScanEngine>(
         total_bytes += sink.bytes_scanned;
         total_chunks += sink.chunks_scanned;
         total_findings += sink.findings_emitted;
-        archives_processed += 1;
 
         // Token drop releases the CountPermit, unblocking discovery.
         drop(work.token);
@@ -908,7 +904,6 @@ fn archive_worker_loop<E: ScanEngine>(
         bytes_scanned: total_bytes,
         chunks_scanned: total_chunks,
         findings_emitted: total_findings,
-        archives_processed,
         archives_open_failed,
         archives_scan_errors,
         archive_stats,
@@ -921,7 +916,6 @@ fn archive_worker_loop<E: ScanEngine>(
 
 /// Aggregate stats from a single extraction worker thread, merged into
 /// [`MetricsSnapshot`] after the worker joins.
-#[allow(dead_code)]
 struct ExtractWorkerStats {
     bytes_scanned: u64,
     chunks_scanned: u64,
@@ -929,7 +923,6 @@ struct ExtractWorkerStats {
     findings_dropped: u64,
     files_extracted: u64,
     io_errors: u64,
-    extract_failures: u64,
 }
 
 /// Per-extraction-worker loop: drains [`ExtractWork`] from the channel,
@@ -963,7 +956,6 @@ fn extract_worker_loop<E: ScanEngine>(
     let mut total_dropped = 0u64;
     let mut files_extracted = 0u64;
     let mut io_errors = 0u64;
-    let mut extract_failures = 0u64;
 
     for work in rx {
         let display = &*work.token.display;
@@ -985,7 +977,6 @@ fn extract_worker_loop<E: ScanEngine>(
         let result = extract_content(work.fmt, &input_buf, &mut output_buf, &mut extract_scratch);
 
         if result != ExtractResult::Ok || output_buf.is_empty() {
-            extract_failures += 1;
             continue;
         }
 
@@ -1027,7 +1018,6 @@ fn extract_worker_loop<E: ScanEngine>(
         findings_dropped: total_dropped,
         files_extracted,
         io_errors,
-        extract_failures,
     }
 }
 
@@ -1105,10 +1095,8 @@ enum Op {
 /// early would be use-after-free.
 struct OpenOp {
     file_slot: usize,
-    #[allow(dead_code)]
-    path: CString,
-    #[allow(dead_code)]
-    open_how: Option<Box<types::OpenHow>>,
+    _path: CString,
+    _open_how: Option<Box<types::OpenHow>>,
 }
 
 /// State for an in-flight statx op.
@@ -1771,8 +1759,8 @@ fn io_worker_loop<E: ScanEngine>(
 
                 ops[op_slot] = Some(Op::Open(OpenOp {
                     file_slot,
-                    path: path_cstr,
-                    open_how,
+                    _path: path_cstr,
+                    _open_how: open_how,
                 }));
 
                 in_flight_ops += 1;

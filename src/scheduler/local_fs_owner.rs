@@ -315,14 +315,6 @@ struct FileTask {
     file_id: FileId,
     /// Path to open.
     path: PathBuf,
-    /// File size hint from discovery (not used in processing).
-    ///
-    /// May be 0 if discovery skipped metadata for performance.
-    ///
-    /// Processing uses `file.metadata().len()` for snapshot-at-open semantics.
-    /// Kept for logging/debugging the discovery phase.
-    #[allow(dead_code)]
-    size: u64,
     /// In-flight permit (released when task completes).
     _permit: super::count_budget::CountPermit,
 }
@@ -3221,7 +3213,6 @@ where
         let task = FileTask {
             file_id,
             path: file.path,
-            size: file.size,
             _permit: permit,
         };
 

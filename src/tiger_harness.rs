@@ -366,8 +366,6 @@ mod regressions {
     pub(crate) struct RegressionCase {
         pub(crate) path: PathBuf,
         pub(crate) label: Option<String>,
-        #[allow(dead_code)] // Retained for Debug output and regression triage.
-        pub(crate) seed: u64,
         pub(crate) plan: ChunkPlan,
         pub(crate) input: Vec<u8>,
     }
@@ -461,7 +459,6 @@ mod regressions {
             Ok(RegressionCase {
                 path,
                 label: self.label,
-                seed: self.seed,
                 plan,
                 input,
             })

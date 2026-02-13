@@ -73,12 +73,6 @@ impl PaddedAtomicU64 {
         self.0.load(order)
     }
 
-    #[allow(dead_code)] // Used by upcoming remote scanning pipeline
-    #[inline]
-    fn store(&self, val: u64, order: Ordering) {
-        self.0.store(val, order)
-    }
-
     #[inline]
     fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
         self.0.fetch_add(val, order)
