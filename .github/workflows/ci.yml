@@ -249,7 +249,10 @@ jobs:
             --skip scheduler::engine_impl \
             --skip scheduler::parallel_scan \
             --skip rules::yaml \
-            --skip archive::
+            --skip archive::scan \
+            --skip archive::formats::gzip \
+            --skip archive::formats::zip::tests::long_name \
+            --skip archive::formats::zip::tests::in_memory
 
   kani:
     name: Kani Verification (Scheduled)

@@ -938,4 +938,96 @@ mod tests {
         assert_entry(std::io::Cursor::new(bytes.clone()), &cfg);
         assert_entry(std::io::Cursor::new(bytes_arc), &cfg);
     }
+
+    // ── set_len Miri-targeted tests ───────────────────────────────────
+    //
+    // These exercise the `Vec::set_len` + immediate fill pattern used in
+    // `parse_local_file_header` without any FFI (no flate2 / zlib-ng),
+    // so they run cleanly under Miri with strict-provenance checking.
+
+    /// Validates the normal path: `set_len(n)` followed by immediate fill.
+    /// This mirrors the pattern at line 502-505 where `set_len(store_len)`
+    /// is immediately followed by `read_name_exact(store_len)`.
+    #[test]
+    fn name_buf_set_len_and_fill() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        // Mimic parse_local_file_header: clear, set_len, fill.
+        buf.clear();
+        let store_len = 32usize.min(cap);
+        unsafe {
+            buf.set_len(store_len);
+        }
+        // Immediately fill (simulates `read_name_exact`).
+        buf[..store_len].copy_from_slice(&[0xAA; 32]);
+
+        assert_eq!(buf.len(), 32);
+        assert!(buf.iter().all(|&b| b == 0xAA));
+    }
+
+    /// Validates the error path: `set_len(n)` followed by a failed read,
+    /// then `clear()` on the next call. The uninitialized bytes between
+    /// `set_len` and `clear` must never be read.
+    #[test]
+    fn name_buf_error_path_clears_without_reading_uninit() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        buf.clear();
+        let store_len = 32usize.min(cap);
+        unsafe {
+            buf.set_len(store_len);
+        }
+        // Simulate `read_name_exact` returning Err — the `?` propagates
+        // upward. On the next call, `parse_local_file_header` starts with
+        // `self.name_buf.clear()`. We must NOT read the uninit bytes.
+
+        // clear() just sets len=0 — no read of uninit memory.
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), cap);
+
+        // After clear, the buffer is safe to reuse with a new set_len+fill.
+        unsafe {
+            buf.set_len(16);
+        }
+        buf[..16].copy_from_slice(&[0xBB; 16]);
+        assert_eq!(buf.len(), 16);
+        assert!(buf.iter().all(|&b| b == 0xBB));
+    }
+
+    /// Validates set_len with store_len == 0 (no unsafe needed).
+    #[test]
+    fn name_buf_zero_len_skips_set_len() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        buf.clear();
+        let store_len = 0usize;
+        // The code guards: `if store_len > 0 { unsafe { set_len(...) } }`
+        // so store_len == 0 never enters the unsafe block.
+        if store_len > 0 {
+            unsafe {
+                buf.set_len(store_len);
+            }
+        }
+        assert_eq!(buf.len(), 0);
+    }
+
+    /// Validates set_len at exact capacity boundary.
+    #[test]
+    fn name_buf_set_len_at_capacity() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        buf.clear();
+        let store_len = cap; // store_len == capacity
+        unsafe {
+            buf.set_len(store_len);
+        }
+        buf[..store_len].fill(0xCC);
+        assert_eq!(buf.len(), cap);
+        assert!(buf.iter().all(|&b| b == 0xCC));
+    }
 }

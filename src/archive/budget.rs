@@ -1,17 +1,51 @@
 //! Deterministic budget tracking for archive expansion/scanning.
 //!
+//! Prevents resource exhaustion from zip bombs and deeply nested archives by
+//! enforcing hard caps on entry counts, decompressed output, metadata, nesting
+//! depth, and inflation ratio.  Budgets are purely deterministic — no wall-clock
+//! timeouts — so identical inputs always produce identical outcomes.
+//!
+//! # Budget Hierarchy
+//!
+//! Three nested scopes, each with independent caps:
+//!
+//! ```text
+//! Root (per-source-file)
+//!  └─ Archive (per-container: zip, tar, tar.gz, …)
+//!      └─ Entry (per-file inside the container)
+//! ```
+//!
+//! When charging decompressed output the tightest remaining allowance across
+//! all three scopes wins, and the corresponding [`BudgetHit`] variant is
+//! returned so callers can decide whether to skip just the entry, mark the
+//! archive partial, or stop the entire root.
+//!
+//! # Caller Protocol
+//!
+//! ```text
+//! new(cfg) / reset()
+//!   enter_archive()          ← push a frame, enforce depth cap
+//!     note_entry() / begin_entry()   ← count + optionally open entry scope
+//!       charge_metadata(n)
+//!       charge_compressed_in(n)
+//!       charge_decompressed_out(n) / charge_discarded_out(n)
+//!     end_entry(scanned)     ← close entry scope
+//!   exit_archive()           ← pop frame
+//! ```
+//!
+//! `enter_archive`/`exit_archive` and `begin_entry`/`end_entry` must be
+//! balanced.  Calling charge methods without an active frame is safe (returns
+//! a clamp-to-zero result).
+//!
 //! # Invariants
+//!
 //! - Budgets are enforced by counts/bytes only (no wall-clock time).
 //! - All accounting is saturating; overflows are treated as budget hits.
-//! - Callers must enter/exit archive frames correctly.
-//! - If no archive frame is active, charge methods clamp to 0 and remaining allowance is 0.
-//!
-//! # Algorithm
-//! - Track a fixed-size stack of archive frames plus a root-wide output counter.
-//! - Charge metadata, compressed input, and decompressed output deterministically.
-//! - Return a `Clamp { allowed, hit }` result to let callers stop cleanly.
+//! - If no archive frame is active, charge methods clamp to 0 and remaining
+//!   allowance is 0.
 //!
 //! # Design Notes
+//!
 //! - This module does **not** perform I/O or decompression.
 //! - Per-entry vs per-archive limits are separated to avoid ambiguity.
 //! - The frame stack is preallocated to `max_archive_depth` and never grows
@@ -20,6 +54,10 @@
 use super::{ArchiveConfig, ArchiveSkipReason, EntrySkipReason, PartialReason};
 
 /// Classification of a budget limit hit.
+///
+/// Variants are ordered by blast radius — `SkipEntry` affects only the
+/// current file inside the archive, while `StopRoot` halts all archive
+/// processing for the entire source file.
 ///
 /// Callers should map this to either an entry skip, an archive skip, or a
 /// partial outcome depending on the current scan progress.
@@ -31,14 +69,15 @@ pub enum BudgetHit {
     SkipArchive(ArchiveSkipReason),
     /// Stop scanning this archive, but report as "partial".
     PartialArchive(PartialReason),
-    /// Stop scanning further archive output for this root (report as partial at the root/archive level).
+    /// Stop scanning further archive output for this root (report as partial at the root level).
     StopRoot(PartialReason),
 }
 
 /// Result of charging a quantity where partial progress is meaningful (bytes).
 ///
-/// `Clamp` indicates the caller must scan/emits only the prefix length `allowed`
-/// and then stop, using `hit` to report the reason.
+/// `Clamp` indicates the caller must scan/emit only the first `allowed` bytes
+/// and then stop, using `hit` to report the reason.  `allowed` may be zero,
+/// meaning no bytes should be processed at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChargeResult {
     /// Full requested amount is allowed and was charged.
@@ -78,16 +117,26 @@ pub struct ArchiveBudgets {
 /// and keeps the struct at 40 bytes with `#[repr(C)]`.
 const ENTRY_NOT_OPEN: u64 = u64::MAX;
 
+/// Per-archive accounting frame pushed/popped by `enter_archive`/`exit_archive`.
+///
+/// Tracks entry counts, byte counters, and per-entry state for a single level
+/// of archive nesting.  `#[repr(C)]` with a compile-time size assertion keeps
+/// the layout predictable and padding-free (40 bytes).
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct ArchiveFrame {
+    /// Total entry records observed (headers, metadata records, regular files).
     entries_seen: u32,
+    /// Entries for which at least one payload byte was scanned/emitted.
     entries_scanned: u32,
+    /// Cumulative metadata bytes charged (central directory, tar headers, etc.).
     metadata_bytes: u64,
+    /// Cumulative compressed input bytes consumed (for inflation ratio tracking).
     compressed_in: u64,
+    /// Cumulative decompressed output bytes produced across all entries.
     decompressed_out: u64,
-    /// Decompressed bytes produced for the current entry.
-    /// `ENTRY_NOT_OPEN` (u64::MAX) means no entry is open.
+    /// Decompressed bytes produced for the *current* entry.
+    /// [`ENTRY_NOT_OPEN`] (`u64::MAX`) means no entry scope is active.
     entry_decompressed_out: u64,
 }
 
@@ -171,15 +220,29 @@ impl ArchiveBudgets {
         self.root_decompressed_out
     }
 
+    /// Return a mutable reference to the topmost archive frame.
+    ///
+    /// # Safety
+    ///
+    /// `self.depth` is always in `0..=self.max_depth`, and `self.frames` is
+    /// preallocated to exactly `self.max_depth` elements.  Every caller checks
+    /// `has_active_frame()` (i.e. `depth > 0`) before reaching this method, so
+    /// `depth - 1` is always a valid index.  The `debug_assert` catches
+    /// violations in test builds.
     #[inline(always)]
     fn cur_mut(&mut self) -> &mut ArchiveFrame {
         debug_assert!(self.depth > 0, "enter_archive must be called first");
+        // SAFETY: depth ∈ 1..=max_depth and frames.len() == max_depth.
         unsafe { self.frames.get_unchecked_mut(self.depth - 1) }
     }
 
+    /// Return a shared reference to the topmost archive frame.
+    ///
+    /// See [`Self::cur_mut`] for the safety argument.
     #[inline(always)]
     fn cur(&self) -> &ArchiveFrame {
         debug_assert!(self.depth > 0, "enter_archive must be called first");
+        // SAFETY: same as cur_mut.
         unsafe { self.frames.get_unchecked(self.depth - 1) }
     }
 
@@ -195,6 +258,9 @@ impl ArchiveBudgets {
     }
 
     /// Exit current archive scope (pops a frame).
+    ///
+    /// No-ops at depth 0 so that error-recovery paths can call this
+    /// unconditionally without tracking whether `enter_archive` succeeded.
     pub fn exit_archive(&mut self) {
         if self.depth > 0 {
             self.depth -= 1;
@@ -235,9 +301,10 @@ impl ArchiveBudgets {
         f.entry_decompressed_out = 0;
     }
 
-    /// Begin processing a new entry (enforces entry count cap).
+    /// Convenience: [`note_entry`](Self::note_entry) + [`begin_entry_scan`](Self::begin_entry_scan).
     ///
-    /// Callers should call `end_entry(scanned)` once done.
+    /// Use this for regular file entries where you intend to read payload bytes.
+    /// Callers must call [`end_entry`](Self::end_entry) once done.
     pub fn begin_entry(&mut self) -> Result<(), BudgetHit> {
         self.note_entry()?;
         self.begin_entry_scan();
@@ -330,17 +397,19 @@ impl ArchiveBudgets {
         };
         let entry_open = entry_out != ENTRY_NOT_OPEN;
 
+        // Compute remaining headroom under each independent cap.
+        // The tightest (smallest) wins and determines `allowed`.
         let rem_entry = if entry_open {
             remaining(max_entry, entry_out)
         } else {
-            u64::MAX
+            u64::MAX // no entry scope → entry cap does not apply
         };
         let rem_arch = remaining(max_archive, arch_out);
         let rem_root = remaining(max_root, root_out);
         let rem_ratio = if max_ratio > 0 && comp_in > 0 {
             remaining(comp_in.saturating_mul(max_ratio as u64), arch_out)
         } else {
-            u64::MAX
+            u64::MAX // ratio disabled or no compressed input observed yet
         };
 
         let min_rem = rem_entry.min(rem_arch).min(rem_root).min(rem_ratio);
@@ -359,6 +428,12 @@ impl ArchiveBudgets {
             return ChargeResult::Ok;
         }
 
+        // Identify which cap was the binding constraint.
+        //
+        // `progressed` distinguishes "we scanned nothing from this archive"
+        // (→ SkipArchive, the archive is treated as if it was never opened)
+        // from "we scanned some entries/bytes" (→ PartialArchive, results so
+        // far are still reported to the caller).
         let progressed = arch_out > 0 || entries_scanned > 0;
         let hit = if allowed == rem_entry {
             BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
@@ -377,6 +452,7 @@ impl ArchiveBudgets {
                 BudgetHit::SkipArchive(ArchiveSkipReason::InflationRatioExceeded)
             }
         } else {
+            // Defensive fallback — should not be reachable when caps are finite.
             BudgetHit::PartialArchive(PartialReason::ArchiveOutputBudgetExceeded)
         };
 
@@ -519,6 +595,10 @@ impl ArchiveBudgets {
         rem
     }
 
+    /// Return the appropriate [`BudgetHit`] for a metadata budget overrun.
+    ///
+    /// If no payload data has been scanned yet the archive can be skipped
+    /// entirely; otherwise it is reported as partial.
     fn metadata_budget_hit_kind(&self) -> BudgetHit {
         let f = self.cur();
         if f.decompressed_out == 0 && f.entries_scanned == 0 {
@@ -534,6 +614,11 @@ fn remaining(cap: u64, used: u64) -> u64 {
     cap.saturating_sub(used)
 }
 
+/// Charge `bytes` against `counter` up to `cap`, returning [`ChargeResult::Ok`]
+/// when the full amount fits or [`ChargeResult::Clamp`] with the allowed prefix.
+///
+/// This is the shared primitive behind [`ArchiveBudgets::charge_metadata`] and
+/// similar single-counter charge paths.
 #[inline]
 fn charge_u64_with_cap(counter: &mut u64, bytes: u64, cap: u64, hit: BudgetHit) -> ChargeResult {
     if bytes == 0 {
@@ -733,5 +818,64 @@ mod tests {
         // No compressed bytes observed yet; probe should cap to ratio (2).
         let rem = b.remaining_decompressed_allowance_with_ratio_probe(true);
         assert_eq!(rem, 2);
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::archive::ArchiveConfig;
+
+    /// Prove that `depth - 1` is always a valid index into `frames` whenever
+    /// `has_active_frame()` returns true, for any sequence of enter/exit ops.
+    ///
+    /// This is the safety invariant relied on by `cur()` and `cur_mut()`.
+    /// The proof bounds `max_archive_depth` to 3 (the production default)
+    /// and explores 6 symbolic operations to keep the state space tractable.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn verify_budget_cur_bounds() {
+        let depth: u16 = kani::any();
+        kani::assume(depth >= 1 && depth <= 4);
+
+        let cfg = ArchiveConfig {
+            max_archive_depth: depth,
+            ..ArchiveConfig::default()
+        };
+        let mut b = ArchiveBudgets::new(&cfg);
+
+        kani::assert(
+            b.frames.len() == depth as usize,
+            "frames must be preallocated to max_depth",
+        );
+
+        // Perform a symbolic sequence of enter/exit operations.
+        // 6 ops with max_depth ≤ 4 exercises all reachable depth transitions.
+        let mut i = 0u32;
+        while i < 6 {
+            let enter: bool = kani::any();
+            if enter {
+                let _ = b.enter_archive();
+            } else {
+                b.exit_archive();
+            }
+
+            // Core invariant: whenever depth > 0, depth - 1 is in bounds.
+            if b.has_active_frame() {
+                kani::assert(b.depth >= 1, "has_active_frame implies depth >= 1");
+                kani::assert(
+                    b.depth - 1 < b.frames.len(),
+                    "depth - 1 must be a valid frame index",
+                );
+            }
+
+            // Secondary invariant: depth never exceeds max_depth.
+            kani::assert(
+                b.depth <= depth as usize,
+                "depth must never exceed max_depth",
+            );
+
+            i += 1;
+        }
     }
 }

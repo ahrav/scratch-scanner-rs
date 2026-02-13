@@ -3,12 +3,79 @@
 //! # Scope
 //! - Streaming archive parsing (gzip/tar/tar.gz/zip) with deterministic budgets.
 //! - Virtual path construction + path budget enforcement.
-//! - Entry scanning is delegated to an `ArchiveEntrySink` to avoid coupling
+//! - Entry scanning is delegated to an [`ArchiveEntrySink`] to avoid coupling
 //!   to the pipeline or simulation harness.
 //!
-//! # Design Notes
+//! # Entry points
+//!
+//! | Function | Format | Access pattern |
+//! |---|---|---|
+//! | [`scan_gzip_stream`] | `.gz` | Sequential (`Read`) |
+//! | [`scan_tar_stream`] | `.tar` (plain or wrapped) | Sequential (`TarRead`) |
+//! | [`scan_targz_stream`] | `.tar.gz` | Sequential (`Read`) |
+//! | [`scan_zip_source`] | `.zip` | Random access (`ZipSource`) |
+//!
+//! # Sliding-window read loop
+//!
+//! Every entry payload is read using the same pattern (shared across gzip,
+//! tar, and zip code paths):
+//!
+//! ```text
+//! stream_buf layout on each iteration:
+//!
+//!   |<-- carry (overlap) -->|<--- new read (up to chunk_size) --->|
+//!   ^                       ^
+//!   buf[0]                  buf[carry]
+//!
+//! carry = overlap.min(bytes_emitted_so_far)
+//! ```
+//!
+//! Before each read, the last `carry` bytes of the previous chunk are
+//! copied to the front of `stream_buf` so that downstream pattern matchers
+//! see a sliding window with `overlap` bytes of look-behind context.
+//! Budget checks happen *after* the read returns: bytes beyond the budget
+//! are truncated (`allowed < n`) and the loop exits.
+//!
+//! # Budget lifecycle
+//!
+//! Each scan function follows the same budget protocol (see [`ArchiveBudgets`]):
+//!
+//! ```text
+//! reset() → enter_archive()
+//!   ├─ begin_entry() / begin_entry_scan()
+//!   │   ├─ charge_compressed_in()   (raw bytes consumed)
+//!   │   ├─ charge_decompressed_out() (payload bytes emitted)
+//!   │   └─ end_entry(scanned)
+//!   ├─ … (repeat per entry)
+//!   └─ exit_archive()
+//! ```
+//!
+//! Budget violations never panic: they return a [`BudgetHit`] that maps
+//! deterministically to [`ArchiveEnd::Partial`] or [`ArchiveEnd::Skipped`].
+//!
+//! # Locator suffixes
+//!
+//! Each virtual path is suffixed with a fixed-length *locator* so that
+//! downstream consumers can re-seek to the exact entry within the archive:
+//!
+//! ```text
+//! @t<16-hex-digits>   tar entry (header block index)
+//! @z<16-hex-digits>   zip entry (local file header offset, when valid)
+//! @c<16-hex-digits>   zip entry (CDFH offset, when LFH offset is invalid)
+//! ```
+//!
+//! # Nested archive handling
+//!
+//! Tar entries whose names match a known archive extension (`.gz`, `.tar`,
+//! `.tar.gz`) are recursively descended up to `max_archive_depth`. Zip
+//! entries inside a tar stream cannot be recursed (no random access) and
+//! are handled according to [`UnsupportedPolicy`](crate::archive::UnsupportedPolicy).
+//! Recursion uses `split_first_mut` to peel per-depth scratch slices
+//! without allocation.
+//!
+//! # Design notes
 //! - No OS dependencies: callers provide `Read`/`Read+Seek` sources.
-//! - All hot-path buffers live in `ArchiveScratch` and are reused.
+//! - All hot-path buffers live in [`ArchiveScratch`] and are reused.
 //! - Callers control chunk overlap semantics via the sink.
 
 use std::io::Read;
@@ -24,7 +91,13 @@ use crate::archive::{
     DEFAULT_MAX_COMPONENTS,
 };
 
+/// Length of a locator suffix: `@` + kind byte + 16 hex digits.
 const LOCATOR_LEN: usize = 18;
+
+/// Upper bound on a single `read()` call into `stream_buf`.
+///
+/// Keeps per-iteration work bounded even when `chunk_size` is very large,
+/// so that budget checks and sink delivery happen at a reasonable cadence.
 const ARCHIVE_STREAM_READ_MAX: usize = 256 * 1024;
 
 /// Outcome for a single archive scan.
@@ -67,11 +140,20 @@ pub struct EntryChunk<'a> {
     pub new_bytes_len: usize,
 }
 
-/// Sink interface used by the archive core to scan entry data.
+/// Sink interface used by the archive core to deliver entry data.
 ///
-/// Call order is: `on_entry_start`, zero or more `on_entry_chunk` calls,
-/// then `on_entry_end`. Implementations must tolerate empty entries.
-/// Returning an error aborts the scan and is propagated to the caller.
+/// # Call sequence
+///
+/// For every entry (including those truncated by a budget hit):
+///
+/// 1. Exactly one [`on_entry_start`](Self::on_entry_start) call.
+/// 2. Zero or more [`on_entry_chunk`](Self::on_entry_chunk) calls (zero for
+///    empty entries or entries skipped immediately after start).
+/// 3. Exactly one [`on_entry_end`](Self::on_entry_end) call — **always**
+///    delivered, even when the entry was partially scanned.
+///
+/// Returning an `Err` from any callback aborts the scan immediately; the
+/// error propagates to the caller as the outer `Result::Err`.
 pub trait ArchiveEntrySink {
     type Error;
 
@@ -85,6 +167,19 @@ pub trait ArchiveEntrySink {
 /// Buffers are preallocated to avoid per-entry allocations. This type is not
 /// thread-safe and is intended to be reused across scans by a single worker.
 /// `chunk_size` and `overlap` must match the engine/pipeline settings.
+///
+/// # Per-depth vectors
+///
+/// `vpaths`, `path_budget_used`, and `tar_cursors` are each sized to
+/// `max_archive_depth + 2`. During recursive tar descent, each nesting
+/// level peels its own element via `split_first_mut` so that the child
+/// scan operates on the tail slice without any allocation.
+///
+/// # `stream_buf` layout
+///
+/// `stream_buf` is `chunk_size + overlap` bytes. On each read iteration
+/// the last `overlap` bytes from the previous chunk are copied to the
+/// front, then up to `chunk_size` new bytes are read after them.
 pub struct ArchiveScratch<Z: ZipSource> {
     canon: EntryPathCanonicalizer,
     vpaths: Vec<VirtualPathBuilder>,
@@ -151,17 +246,26 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
         }
     }
 
+    /// Returns `true` if a policy (e.g. `FailRun`) has requested that the
+    /// entire scanning run be aborted, not just the current archive.
     #[inline]
     pub fn abort_run(&self) -> bool {
         self.abort_run
     }
 
+    /// Resets the run-abort flag so the scratch can be reused for the next run.
     #[inline]
     pub fn clear_abort(&mut self) {
         self.abort_run = false;
     }
 }
 
+/// Borrow-split view over [`ArchiveScratch`] plus the caller's sink and stats.
+///
+/// Constructing this from `ArchiveScratch` via [`ArchiveScanCtx::new`]
+/// splits the scratch into independent mutable borrows so that the scan
+/// functions can pass subsets to child contexts (recursive nesting) without
+/// violating Rust's aliasing rules.
 struct ArchiveScanCtx<'a, S, Z: ZipSource> {
     sink: &'a mut S,
     stats: &'a mut ArchiveStats,
@@ -209,6 +313,11 @@ impl<'a, S, Z: ZipSource> ArchiveScanCtx<'a, S, Z> {
     }
 }
 
+/// Convert an archive-level skip reason into a partial reason for entry-level
+/// reporting. The catch-all maps to `MalformedZip` because the remaining
+/// `ArchiveSkipReason` variants (e.g. `IoError`, `EncryptedArchive`) only
+/// arise before any entries are scanned, and reaching this fallback implies
+/// a zip-specific structural issue.
 #[inline(always)]
 fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
     match reason {
@@ -225,6 +334,8 @@ fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
     }
 }
 
+/// Map any [`BudgetHit`] variant to the [`PartialReason`] that should be
+/// recorded on the current entry.
 #[inline(always)]
 fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
     match hit {
@@ -235,6 +346,8 @@ fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
     }
 }
 
+/// Map a [`BudgetHit`] to the top-level [`ArchiveEnd`] outcome for the
+/// current archive.
 #[inline(always)]
 fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     match hit {
@@ -247,6 +360,9 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
 
 const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
 
+/// Write `x` as exactly 16 lowercase hex digits into `out16`.
+///
+/// `out16` **must** be exactly 16 bytes; this is checked by debug assert.
 #[inline(always)]
 fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     debug_assert_eq!(out16.len(), 16);
@@ -255,6 +371,10 @@ fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     }
 }
 
+/// Format a locator suffix into `out`: `@<kind><16-hex-digits>`.
+///
+/// `kind` is one of `b't'` (tar header block index), `b'z'` (zip LFH
+/// offset), or `b'c'` (zip CDFH offset). Returns the full 18-byte slice.
 #[inline]
 fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out[0] = b'@';
@@ -263,6 +383,9 @@ fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out
 }
 
+/// Charge `bytes` against the decompressed-output budget as *discarded*
+/// (read but not delivered to the sink). Returns `Err` if a budget limit
+/// is hit.
 #[inline(always)]
 fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<(), PartialReason> {
     if bytes == 0 {
@@ -274,6 +397,12 @@ fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<()
     }
 }
 
+/// Drain `remaining` bytes from `input` without delivering them to the sink.
+///
+/// Used after a budget-capped or nested-archive entry to advance the tar
+/// stream past the unconsumed payload. Each drained chunk is charged against
+/// the budget as discarded output; a budget hit aborts the drain early with
+/// the corresponding [`PartialReason`].
 fn discard_remaining_payload(
     input: &mut dyn TarRead,
     budgets: &mut ArchiveBudgets,
@@ -296,10 +425,20 @@ fn discard_remaining_payload(
     Ok(())
 }
 
-/// Scan a gzip stream as a single virtual entry (root scan).
+/// Scan a gzip stream as a single virtual entry (root-level entry point).
 ///
-/// The sink sees exactly one entry (`<gunzip>` when the gzip name is missing).
-/// Budgets are reset and charged against the archive limits in `archive`.
+/// The sink sees exactly one entry whose display name is the embedded gzip
+/// filename, or `<gunzip>` when the gzip header has no `FNAME` field.
+///
+/// Budgets are reset at the start and balanced (`enter_archive` /
+/// `exit_archive`) around the scan. The gzip header buffer is borrowed
+/// from `scratch` for the duration and restored before returning.
+///
+/// # Errors
+///
+/// Sink errors (`S::Error`) are propagated immediately. I/O and budget
+/// failures are represented as [`ArchiveEnd::Partial`] or
+/// [`ArchiveEnd::Skipped`] in the `Ok` variant.
 pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     reader: R,
     root_display: &[u8],
@@ -365,6 +504,9 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         return Ok(budget_hit_to_archive_end(hit));
     }
 
+    // Temporarily take ownership of entry_display_buf so we can borrow its
+    // contents as `display` while still passing `&mut scan` into the inner
+    // function. The buffer is restored immediately after the call.
     let display_buf = std::mem::take(scan.entry_display_buf);
     let display = display_buf.as_slice();
     let outcome = scan_gzip_entry_stream(&mut scan, &mut gz, display, chunk_size);
@@ -377,6 +519,16 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
+/// Inner read loop for a single gzip entry.
+///
+/// Implements the sliding-window pattern described in the module docs:
+/// reads up to `chunk_size` decompressed bytes per iteration, charges
+/// budgets, and delivers each window (including the overlap prefix from
+/// the prior chunk) to the sink. Always delivers `on_entry_end`, even on
+/// truncation.
+///
+/// An entry that yields zero decompressed bytes is treated as corrupt
+/// (`GzipCorrupt`), unless a budget limit was already hit first.
 fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     scan: &mut ArchiveScanCtx<'_, S, Z>,
     gz: &mut GzipStream<R>,
@@ -503,8 +655,18 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
 /// Scan a tar stream (plain or gzip-wrapped) as sequential entries.
 ///
-/// `ratio_active` controls whether inflation-ratio accounting is enforced for
-/// entry payload reads (true for gzip-wrapped tar streams).
+/// `ratio_active` controls whether inflation-ratio accounting is enforced
+/// for entry payload reads (set `true` when the tar stream is wrapped in
+/// gzip — the ratio tracks compressed-to-decompressed amplification).
+///
+/// Nesting starts at depth 1 (the root archive). Nested archives
+/// discovered inside tar entries are recursed via an internal helper
+/// (`scan_tar_stream_nested`).
+///
+/// # Errors
+///
+/// Sink errors propagate immediately. Budget and I/O failures map to
+/// [`ArchiveEnd::Partial`] / [`ArchiveEnd::Skipped`].
 #[allow(clippy::too_many_arguments)]
 pub fn scan_tar_stream<R: TarRead, S: ArchiveEntrySink, Z: ZipSource>(
     input: &mut R,
@@ -527,6 +689,30 @@ pub fn scan_tar_stream<R: TarRead, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
+/// Recursive inner loop for tar entry iteration.
+///
+/// For each tar entry this function:
+/// 1. Reads the header via [`TarCursor::next_entry`] and builds a
+///    canonicalized virtual path with a `@t` locator suffix.
+/// 2. Skips non-regular entries (directories, symlinks, etc.).
+/// 3. Checks whether the entry name matches a known archive extension.
+///    If so — and the depth limit has not been reached — the entry is
+///    recursively descended as a nested archive (gzip, tar, or tar.gz).
+///    Zip entries inside tar cannot be descended (no random access) and
+///    fall through to raw-byte scanning unless the policy aborts.
+/// 4. Otherwise, runs the sliding-window read loop to deliver payload
+///    chunks to the sink.
+///
+/// After each entry's payload (whether scanned or nested), any unconsumed
+/// bytes are drained via [`discard_remaining_payload`] and tar padding is
+/// consumed to keep the stream aligned for the next header.
+///
+/// # Scratch peeling
+///
+/// The function peels the first element from `scan.vpaths`,
+/// `scan.path_budget_used`, and `scan.tar_cursors` for the current depth
+/// and passes the remaining tail slices to child contexts. This avoids
+/// allocation and ensures each nesting level has its own independent state.
 fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
     scan: &mut ArchiveScanCtx<'_, S, Z>,
     input: &mut dyn TarRead,
@@ -1066,9 +1252,23 @@ pub fn scan_targz_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
 /// Scan a zip source with random access.
 ///
-/// The source must support `Read + Seek` and be cloneable for payload reads.
-/// Entry names are canonicalized and combined with locator suffixes to form
-/// virtual paths before delivery to the sink.
+/// The source must implement [`ZipSource`] (typically `Read + Seek + Clone`)
+/// to allow seeking to individual local file headers for payload reads.
+///
+/// Entry names are canonicalized, combined with a locator suffix (`@z` for
+/// valid LFH offsets, `@c` otherwise), and delivered to the sink. Entries
+/// that are directories, encrypted, or use an unsupported compression
+/// method are skipped or cause an early return depending on the configured
+/// [`EncryptedPolicy`](crate::archive::EncryptedPolicy) /
+/// [`UnsupportedPolicy`](crate::archive::UnsupportedPolicy).
+///
+/// Unlike the tar scanners, zip scanning does **not** recurse into nested
+/// archives — each entry is always scanned as raw bytes.
+///
+/// # Errors
+///
+/// Sink errors propagate immediately. Budget and I/O failures map to
+/// [`ArchiveEnd`] variants in the `Ok` path.
 pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
     source: Z,
     root_display: &[u8],

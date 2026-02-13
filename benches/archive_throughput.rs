@@ -1,7 +1,17 @@
-//! Archive scanning throughput benchmark.
+//! Archive scanning throughput benchmarks.
 //!
-//! Measures decompressed bytes/sec through the archive scan pipeline with a
-//! no-op sink, isolating scan+budget overhead from engine/detection costs.
+//! Measures decompressed bytes/sec through the archive scan pipeline using a
+//! no-op sink, isolating scan + budget-charging overhead from engine/detection
+//! costs. Two benchmark groups target different bottlenecks:
+//!
+//! - **`targz_scan`** — end-to-end throughput across a matrix of entry counts
+//!   and sizes, revealing per-entry overhead vs. bulk-copy throughput.
+//! - **`budget_overhead`** — worst-case per-entry cost with 10 000 × 64 B
+//!   entries, where header parsing and budget charging dominate wall time.
+//!
+//! All archives are built deterministically in-memory (xorshift64 PRNG, fixed
+//! seed) so results are reproducible across runs without touching the
+//! filesystem.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::io::{self, Cursor, Read, Write};
@@ -11,10 +21,11 @@ use scanner_rs::archive::{
     EntryChunk, EntryMeta,
 };
 
-// ---------------------------------------------------------------------------
-// No-op sink: discards all chunks (isolates scan+budget overhead)
-// ---------------------------------------------------------------------------
-
+/// Discards all entry data, accumulating only a byte count.
+///
+/// Used to isolate scan-loop and budget-charging overhead from any
+/// engine/detection cost. The `total_bytes` counter lets the benchmark
+/// verify that the expected payload volume was delivered.
 struct NullSink {
     total_bytes: u64,
 }
@@ -42,10 +53,11 @@ impl ArchiveEntrySink for NullSink {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic PRNG for reproducible test data
-// ---------------------------------------------------------------------------
-
+/// Xorshift64 PRNG for reproducible, dependency-free random payloads.
+///
+/// The (13, 7, 17) shift triple is Marsaglia's original xorshift64 variant.
+/// We only need non-compressible fill data — statistical quality beyond that
+/// is irrelevant, so a fast, simple generator suffices.
 struct XorShift64 {
     state: u64,
 }
@@ -79,10 +91,26 @@ impl XorShift64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tar.gz archive builder (deterministic, in-memory)
-// ---------------------------------------------------------------------------
-
+/// Build a POSIX (ustar) tar header for a regular file.
+///
+/// Constructs a 512-byte header block in-place following the POSIX.1-1988
+/// ustar layout. Field offsets (see IEEE Std 1003.1-1988 §10.1.1):
+///
+/// | Offset | Len | Field       |
+/// |--------|-----|-------------|
+/// |   0    | 100 | name        |
+/// | 100    |   8 | mode        |
+/// | 108    |   8 | uid         |
+/// | 116    |   8 | gid         |
+/// | 124    |  12 | size (octal)|
+/// | 136    |  12 | mtime       |
+/// | 148    |   8 | checksum    |
+/// | 156    |   1 | typeflag    |
+/// | 257    |   6 | magic       |
+/// | 263    |   2 | version     |
+///
+/// The checksum is computed as the unsigned sum of all 512 bytes with the
+/// checksum field itself treated as ASCII spaces (the initial fill value).
 fn build_tar_header(name: &[u8], size: u64) -> [u8; 512] {
     let mut hdr = [0u8; 512];
 
@@ -130,6 +158,8 @@ fn build_tar_header(name: &[u8], size: u64) -> [u8; 512] {
     hdr
 }
 
+/// Bytes of zero-padding needed after `size` bytes to reach a 512-byte
+/// boundary (tar records are always block-aligned).
 fn tar_pad(size: u64) -> usize {
     let rem = size % 512;
     if rem == 0 {
@@ -139,7 +169,11 @@ fn tar_pad(size: u64) -> usize {
     }
 }
 
-/// Build a deterministic tar archive in memory.
+/// Build a deterministic, uncompressed tar archive in memory.
+///
+/// Each entry is: 512-byte header ‖ payload ‖ zero-pad to 512-byte boundary.
+/// The archive terminates with two 512-byte zero blocks (1024 bytes) per the
+/// tar end-of-archive marker convention.
 fn build_tar(entry_count: usize, entry_size: usize, seed: u64) -> Vec<u8> {
     let mut rng = XorShift64::new(seed);
     let mut tar = Vec::with_capacity(entry_count * (512 + entry_size + 512));
@@ -186,10 +220,9 @@ fn expected_decompressed(entry_count: usize, entry_size: usize) -> u64 {
     (entry_count as u64) * (entry_size as u64)
 }
 
-// ---------------------------------------------------------------------------
-// ZipSource stub for ArchiveScratch (not used but required by generics)
-// ---------------------------------------------------------------------------
-
+/// Zero-length, no-op [`ZipSource`] satisfying the generic parameter of
+/// [`ArchiveScratch`]. These benchmarks only exercise tar.gz paths, so the
+/// zip source is never read — but the type parameter must be filled.
 #[derive(Clone)]
 struct NullZipSource;
 
@@ -214,13 +247,19 @@ impl scanner_rs::archive::formats::ZipSource for NullZipSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark groups
-// ---------------------------------------------------------------------------
-
+/// Throughput sweep across entry count × entry size.
+///
+/// The matrix is chosen to tease apart two cost centres:
+///
+/// - **Small entries (1 KB)**: per-entry overhead dominates — header parsing,
+///   budget charging, sink callbacks.
+/// - **Large entries (64 KB, 1 MB)**: bulk memcpy / decompression throughput
+///   dominates; per-entry costs are amortized.
+///
+/// Criterion reports `Throughput::Bytes` as *decompressed* payload bytes/sec,
+/// so gzip decompression cost is included but tar metadata is not.
 fn bench_targz_throughput(c: &mut Criterion) {
     let configs: &[(usize, usize, &str)] = &[
-        // (entry_count, entry_size, label)
         (100, 1024, "100x1KB"),
         (100, 64 * 1024, "100x64KB"),
         (10, 1024 * 1024, "10x1MB"),
@@ -240,6 +279,8 @@ fn bench_targz_throughput(c: &mut Criterion) {
         ..ArchiveConfig::default()
     };
 
+    // 256 KB chunk size mirrors the production default; overlap=0 because
+    // there is no pattern-matching engine that needs cross-chunk context.
     let chunk_size = 256 * 1024;
     let overlap = 0;
 
@@ -251,6 +292,9 @@ fn bench_targz_throughput(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(decompressed_total));
         group.bench_with_input(BenchmarkId::new("throughput", label), &targz, |b, targz| {
+            // Scratch and sink are allocated once outside the hot loop so
+            // the measured time reflects steady-state reuse, not first-call
+            // allocation.
             let mut scratch: ArchiveScratch<NullZipSource> =
                 ArchiveScratch::new(&archive_cfg, chunk_size, overlap);
             let mut sink = NullSink::new();
@@ -277,8 +321,13 @@ fn bench_targz_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Worst-case per-entry budget-charging overhead.
+///
+/// 10 000 entries × 64 B each: the payload is negligible so nearly all time
+/// is spent in header parsing, budget checks, and sink dispatch.  This is the
+/// scenario where branchless budget arithmetic matters most — a branch
+/// misprediction per entry at this scale is visible in wall-clock time.
 fn bench_budget_overhead(c: &mut Criterion) {
-    // Isolate budget charging overhead with many small entries
     let archive_cfg = ArchiveConfig {
         enabled: true,
         max_archive_depth: 4,
