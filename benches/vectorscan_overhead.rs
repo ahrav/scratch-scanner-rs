@@ -190,6 +190,9 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
     let mut db: *mut vs::hs_database_t = std::ptr::null_mut();
     let mut compile_err: *mut vs::hs_compile_error_t = std::ptr::null_mut();
 
+    // SAFETY: FFI call to Vectorscan. All pointer arguments are valid: `patterns`,
+    // `flags`, and `ids` are stack-allocated arrays with matching length (1).
+    // `db` and `compile_err` are valid out-pointers. Return code is checked below.
     let rc = unsafe {
         vs::hs_compile_multi(
             patterns.as_ptr(),
@@ -205,6 +208,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
     assert_eq!(rc, vs::HS_SUCCESS as i32, "hs_compile_multi failed");
 
     let mut scratch: *mut vs::hs_scratch_t = std::ptr::null_mut();
+    // SAFETY: `db` is a valid compiled database (compilation succeeded above).
+    // `scratch` is a valid out-pointer.
     let rc = unsafe { vs::hs_alloc_scratch(db, &mut scratch) };
     assert_eq!(rc, vs::HS_SUCCESS as i32, "hs_alloc_scratch failed");
 
@@ -218,6 +223,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
         _flags: std::ffi::c_uint,
         ctx: *mut std::ffi::c_void,
     ) -> std::ffi::c_int {
+        // SAFETY: The caller (Vectorscan) passes back the `ctx` pointer we provided
+        // to `hs_scan`, which is a valid `*mut u64` pointing to a local variable.
         unsafe {
             let count = ctx as *mut u64;
             *count += 1;
@@ -229,6 +236,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
         let mut count: u64 = 0;
         b.iter(|| {
             count = 0;
+            // SAFETY: `db` and `scratch` are valid (allocated above). `ascii` is a
+            // valid byte slice. `count` is a valid `u64` passed as the callback context.
             let rc = unsafe {
                 vs::hs_scan(
                     db,
@@ -249,6 +258,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
         let mut count: u64 = 0;
         b.iter(|| {
             count = 0;
+            // SAFETY: `db` and `scratch` are valid (allocated above). `random` is a
+            // valid byte slice. `count` is a valid `u64` passed as the callback context.
             let rc = unsafe {
                 vs::hs_scan(
                     db,
@@ -275,6 +286,9 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
     let ids_multi: Vec<u32> = (0..10).collect();
 
     let mut db_multi: *mut vs::hs_database_t = std::ptr::null_mut();
+    // SAFETY: FFI call to Vectorscan. All pointer arrays (`pattern_ptrs`, `flags_multi`,
+    // `ids_multi`) have matching length (10). `db_multi` and `compile_err` are valid
+    // out-pointers. The `CString` values in `patterns_multi` remain alive.
     let rc = unsafe {
         vs::hs_compile_multi(
             pattern_ptrs.as_ptr(),
@@ -290,6 +304,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
     assert_eq!(rc, vs::HS_SUCCESS as i32);
 
     let mut scratch_multi: *mut vs::hs_scratch_t = std::ptr::null_mut();
+    // SAFETY: `db_multi` is a valid compiled database (compilation succeeded above).
+    // `scratch_multi` is a valid out-pointer.
     let rc = unsafe { vs::hs_alloc_scratch(db_multi, &mut scratch_multi) };
     assert_eq!(rc, vs::HS_SUCCESS as i32);
 
@@ -297,6 +313,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
         let mut count: u64 = 0;
         b.iter(|| {
             count = 0;
+            // SAFETY: `db_multi` and `scratch_multi` are valid (allocated above).
+            // `ascii` is a valid byte slice. `count` is a valid `u64` callback context.
             let rc = unsafe {
                 vs::hs_scan(
                     db_multi,
@@ -314,6 +332,8 @@ fn bench_raw_vectorscan(c: &mut Criterion) {
     });
 
     // Cleanup
+    // SAFETY: All four pointers were successfully allocated earlier in this function
+    // and have not been freed yet. Scratch is freed before its associated database.
     unsafe {
         vs::hs_free_scratch(scratch);
         vs::hs_free_scratch(scratch_multi);

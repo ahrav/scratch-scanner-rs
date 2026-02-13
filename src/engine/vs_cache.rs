@@ -387,6 +387,8 @@ pub fn fuzz_try_load(dir: &std::path::Path, data: &[u8]) -> bool {
     };
     match cache.try_load(key) {
         Some(db) => {
+            // SAFETY: `db` was returned by `hs_deserialize_database` inside
+            // `try_load` and is non-null; freed exactly once here.
             unsafe { vs::hs_free_database(db) };
             true
         }
@@ -402,6 +404,10 @@ mod tests {
 
     fn test_platform() -> vs::hs_platform_info_t {
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `platform` is a zeroed, properly aligned `MaybeUninit`;
+        // `hs_populate_platform` writes valid data into the pointer.
+        // `assume_init` is sound because the struct was zero-initialized
+        // and `hs_populate_platform` fills all fields.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
             platform.assume_init()
@@ -515,6 +521,9 @@ mod tests {
         let platform = test_platform();
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut err: *mut vs::hs_compile_error_t = ptr::null_mut();
+        // SAFETY: All pointer arrays (`expr_ptrs`, `flags`, `ids`) have exactly
+        // `1` element matching the `elements` count. `platform`, `db`, and `err`
+        // are valid, properly aligned out-pointers.
         let rc = unsafe {
             vs::hs_compile_multi(
                 expr_ptrs.as_ptr(),
@@ -546,6 +555,8 @@ mod tests {
         assert!(loaded.is_some(), "expected cache hit after store");
 
         // Clean up both DBs.
+        // SAFETY: `db` was allocated by `hs_compile_multi` and `loaded_db` by
+        // `hs_deserialize_database`; both are non-null and freed exactly once.
         unsafe {
             vs::hs_free_database(db);
             if let Some(loaded_db) = loaded {
@@ -564,6 +575,8 @@ mod tests {
         let key = "test-corrupt-mac";
 
         cache.try_store(key, db as *const vs::hs_database_t);
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
 
         // Corrupt the last byte (MAC tag).
@@ -587,6 +600,8 @@ mod tests {
         let key = "test-truncated";
 
         cache.try_store(key, db as *const vs::hs_database_t);
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
 
         // Truncate the file.
@@ -608,6 +623,8 @@ mod tests {
         let key = "test-right-key";
 
         cache.try_store(key, db as *const vs::hs_database_t);
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
 
         // Rename the file to a different key name.
@@ -729,6 +746,8 @@ mod tests {
         let key = "test-bad-magic";
 
         cache.try_store(key, db as *const vs::hs_database_t);
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
 
         let path = dir.path().join(format!("{key}.hsdb"));
@@ -750,6 +769,8 @@ mod tests {
         let key = "test-bad-payload-len";
 
         cache.try_store(key, db as *const vs::hs_database_t);
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
 
         let path = dir.path().join(format!("{key}.hsdb"));
@@ -782,6 +803,8 @@ mod tests {
         let after = std::fs::read(&path).unwrap();
         assert_eq!(original, after, "second store should not modify the file");
 
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
     }
 
@@ -795,6 +818,8 @@ mod tests {
         let key = "test-corrupt-keyhash";
 
         cache.try_store(key, db as *const vs::hs_database_t);
+        // SAFETY: `db` was allocated by `hs_compile_multi` in `compile_trivial_db`
+        // and is non-null; freed exactly once here.
         unsafe { vs::hs_free_database(db) };
 
         let path = dir.path().join(format!("{key}.hsdb"));
@@ -858,6 +883,10 @@ mod prop_tests {
 
     fn test_platform() -> vs::hs_platform_info_t {
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `platform` is a zeroed, properly aligned `MaybeUninit`;
+        // `hs_populate_platform` writes valid data into the pointer.
+        // `assume_init` is sound because the struct was zero-initialized
+        // and `hs_populate_platform` fills all fields.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
             platform.assume_init()

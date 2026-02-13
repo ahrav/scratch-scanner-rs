@@ -486,18 +486,21 @@ impl HitAccPool {
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn is_coalesced(&self, pair: usize) -> bool {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, so `pair_meta.add(pair)` is in-bounds.
         unsafe { (*self.pair_meta.add(pair)).coalesced != 0 }
     }
 
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn pair_len(&self, pair: usize) -> u32 {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, so `pair_meta.add(pair)` is in-bounds.
         unsafe { (*self.pair_meta.add(pair)).len as u32 }
     }
 
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn coalesced_span(&self, pair: usize) -> SpanU32 {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, so `coalesced.add(pair)` is in-bounds.
         unsafe { *self.coalesced.add(pair) }
     }
 
@@ -505,6 +508,7 @@ impl HitAccPool {
     pub(super) fn window_at(&self, pair: usize, idx: usize) -> SpanU32 {
         let base = pair * self.max_hits as usize;
         debug_assert!(base + idx < (self.pair_count as usize) * (self.max_hits as usize));
+        // SAFETY: `base + idx` is within the allocated window buffer as asserted above.
         unsafe { *self.windows.add(base + idx) }
     }
 }
@@ -810,6 +814,8 @@ mod tests {
 
         for (pair, span) in ops {
             pool_safe.push_span(pair, span, &mut touched_safe);
+            // SAFETY: `pair` values are all < `pair_count` (4), `touched_hot` has
+            // capacity for `pair_count` entries, and we have exclusive access.
             unsafe {
                 pool_hot.push_span_unchecked_hot(pair, span, &mut touched_hot);
             }

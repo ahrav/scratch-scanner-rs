@@ -569,6 +569,7 @@ mod tests {
         assert_eq!(n, 3);
 
         for (i, slot) in out[..3].iter().enumerate() {
+            // SAFETY: `try_pop_batch` returned 3, so `out[0..3]` are fully initialized.
             let val = unsafe { slot.assume_init() };
             assert_eq!(val, i as u64);
         }

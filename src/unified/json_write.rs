@@ -1124,7 +1124,8 @@ mod tests {
                 let s = String::from_utf8(bytes).unwrap_or_else(|_| {
                     let mut bytes = vec![b'a'; 32];
                     bytes[pos] = esc;
-                    // Control chars are valid UTF-8, quote/backslash are ASCII.
+                    // SAFETY: Every byte is either `b'a'` (ASCII) or `esc` which is a
+                    // control char or ASCII punctuation — all valid single-byte UTF-8.
                     unsafe { String::from_utf8_unchecked(bytes) }
                 });
                 buf_new.clear();
