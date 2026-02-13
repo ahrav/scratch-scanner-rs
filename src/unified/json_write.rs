@@ -101,10 +101,12 @@ pub fn write_oid_hex(oid: &OidBytes, buf: &mut Vec<u8>) {
     }
 }
 
-/// Count the number of decimal digits in a u64.
+/// Count the number of decimal digits in a `u64`.
 ///
-/// Uses cascading comparisons against powers of 10, which compiles to a
-/// branch-free sequence on most architectures.
+/// Uses a CLZ (count-leading-zeros) based approximation of log10, then
+/// corrects the estimate with a single comparison against the exact
+/// power-of-10 boundary. The approximation `(63 - clz) * 77 >> 8`
+/// can be off by at most 1, so one branch handles both cases.
 #[inline(always)]
 fn digit_count(n: u64) -> usize {
     // Powers of 10 for each digit count threshold.
@@ -182,9 +184,18 @@ pub fn write_u64(n: u64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&tmp[..digits]);
 }
 
-/// Write an f64 with 2 decimal places.
+/// Write an `f64` as decimal with exactly 2 fractional digits.
 ///
-/// Handles NaN/Inf as `0.00` to avoid invalid JSON.
+/// The fractional part is obtained via `round((abs - trunc) * 100)`.
+/// When rounding pushes the fraction to 100 (e.g. `1.995` → frac 100),
+/// the integer part is incremented and the fraction reset to 0, so the
+/// output is always well-formed (`"2.00"`, not `"1.100"`).
+///
+/// NaN and infinity are written as `0.00` to keep the output valid JSON.
+///
+/// **Caveat:** values whose absolute magnitude exceeds `u64::MAX`
+/// (~1.8 × 10¹⁹) silently truncate on the `as u64` cast. This is
+/// acceptable for the entropy and timing values this module produces.
 #[inline(always)]
 pub fn write_f64(n: f64, buf: &mut Vec<u8>) {
     if n.is_nan() || n.is_infinite() {
@@ -251,8 +262,15 @@ fn write_json_str_scalar(s: &str, buf: &mut Vec<u8>) {
 
 /// Scalar JSON byte-slice escaping.
 ///
-/// Walks bytes left-to-right, escaping control/special characters and
-/// attempting UTF-8 validation for high bytes.
+/// Walks bytes left-to-right with three cases per byte:
+///
+/// - **ASCII special / control** (`"`, `\`, `0x00..=0x1f`) — JSON-escape.
+/// - **ASCII printable** (`0x20..=0x7e`) — pass through verbatim.
+/// - **High byte** (`0x80..=0xff`) — run `from_utf8` on the *entire*
+///   remainder to decide how much is valid UTF-8. If the valid prefix is
+///   non-empty, delegate it to [`write_json_str`] (which may use SIMD),
+///   then advance `i` past the valid prefix and continue. If the byte at
+///   `i` itself is invalid, escape it as `\u00XX` and advance by one.
 fn write_json_bytes_scalar(bytes: &[u8], buf: &mut Vec<u8>) {
     let mut i = 0;
     while i < bytes.len() {
@@ -307,6 +325,15 @@ fn write_json_bytes_scalar(bytes: &[u8], buf: &mut Vec<u8>) {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
+    //! NEON (128-bit SIMD) fast path for JSON string escaping on AArch64.
+    //!
+    //! Each function loads 16 bytes at a time via `vld1q_u8`, classifies all
+    //! lanes in parallel with [`is_all_safe_neon`], and either bulk-copies
+    //! the chunk or bails to the scalar path for the remainder. The bail-out
+    //! delegates the *entire* tail (not just 16 bytes) so that
+    //! `write_json_bytes_scalar` can run its UTF-8 validation without
+    //! splitting a multi-byte codepoint.
+
     use std::arch::aarch64::*;
 
     /// Check whether all 16 bytes in `chunk` are "safe" for JSON output:
@@ -416,6 +443,13 @@ mod neon {
 
 #[cfg(target_arch = "x86_64")]
 mod sse2 {
+    //! SSE2 (128-bit SIMD) fast path for JSON string escaping on x86_64.
+    //!
+    //! Mirrors the NEON module: 16-byte `_mm_loadu_si128` loads, parallel
+    //! classification via [`is_all_safe_sse2`], bulk copy or bail to scalar.
+    //! SSE2 is baseline on all x86_64 targets, so no runtime feature check
+    //! is needed.
+
     use std::arch::x86_64::*;
 
     /// Check whether all 16 bytes in `chunk` are "safe" for JSON output:

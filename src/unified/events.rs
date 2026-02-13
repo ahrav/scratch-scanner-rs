@@ -14,9 +14,11 @@
 //!
 //! # Performance
 //!
-//! Formatting happens into a caller-provided `Vec<u8>` buffer (typically
-//! from per-worker scratch). The mutex is held only for the `write_all`
-//! call, not during formatting.
+//! Each [`EventSink::emit`] call formats into a thread-local scratch
+//! buffer ([`with_format_buf`]) and then copies the finished bytes into
+//! the sink under a mutex. The mutex is held only for the `write_all`
+//! call, not during formatting, so contention scales with write latency
+//! rather than encoding cost.
 
 use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -28,6 +30,9 @@ use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
 
 thread_local! {
+    /// Per-thread scratch buffer for formatting events before writing to
+    /// the sink. 512 bytes covers a typical finding + newline without
+    /// reallocation; the buffer grows if needed and is reused across calls.
     static EMIT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
 }
 
@@ -66,9 +71,13 @@ where
 /// All variants borrow where possible to avoid allocation on the hot path.
 /// The [`EventSink`] implementation is responsible for serialization.
 pub enum ScanEvent<'a> {
+    /// A secret or credential match. Wire format type: `"finding"`.
     Finding(FindingEvent<'a>),
+    /// Periodic scan progress checkpoint. Wire format type: `"progress"`.
     Progress(ProgressEvent),
+    /// Final scan summary emitted once at completion. Wire format type: `"summary"`.
     Summary(SummaryEvent),
+    /// Debug or performance diagnostic. Wire format type: `"diagnostic"`.
     Diagnostic(DiagnosticEvent<'a>),
     /// Commit metadata emitted exactly once per referenced commit.
     ///
@@ -226,7 +235,11 @@ pub trait EventEncoder: Send + Sync {
 // JSONL encoder
 // ============================================================================
 
-/// JSONL encoder: one JSON object per line, no serde.
+/// JSONL encoder: one JSON object per line, without serde.
+///
+/// Encodes directly into a `Vec<u8>` via hand-rolled `extend_from_slice`
+/// calls, avoiding the allocation and type-erasure overhead of `serde_json`.
+/// This is the hot path for all structured output during scanning.
 pub struct JsonlEncoder;
 
 impl JsonlEncoder {
@@ -256,6 +269,10 @@ impl EventEncoder for JsonlEncoder {
 }
 
 /// Append a JSONL `finding` object to `buf` (no trailing newline).
+///
+/// Wire fields `commit_id` and `change_kind` are only emitted for
+/// [`SourceKind::Git`] findings (when the corresponding `Option` is `Some`).
+/// Filesystem findings omit them entirely to keep output compact.
 pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     // Pre-reserve: typical finding is ~128 bytes + path + rule name.
     buf.reserve(128 + f.object_path.len() + f.rule_name.len());
@@ -358,6 +375,11 @@ fn write_identity_field(name: &[u8], id: u32, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `commit_meta` object to `buf` (no trailing newline).
+///
+/// Identity fields (`author_name_id`, etc.) are omitted entirely when
+/// `identity` is `None`. When present, individual fields with value
+/// [`SENTINEL_ID`] are emitted as JSON `null` (not as the raw `u32::MAX`
+/// integer) to signal a parse failure to downstream consumers.
 pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"{\"type\":\"commit_meta\",\"commit_id\":");
     write_u64(m.commit_id as u64, buf);
