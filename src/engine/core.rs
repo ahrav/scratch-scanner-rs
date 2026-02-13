@@ -387,6 +387,11 @@ impl Engine {
             tuning.max_transform_depth.saturating_add(1) <= MAX_DECODE_STEPS,
             "max_transform_depth exceeds MAX_DECODE_STEPS"
         );
+        assert!(
+            rules.len() <= (1usize << 24),
+            "rule count {} exceeds 24-bit dedupe key budget",
+            rules.len()
+        );
         for r in &rules {
             r.assert_valid();
             if policy == AnchorPolicy::ManualOnly {
@@ -1135,16 +1140,8 @@ impl Engine {
         suppressed
     }
 
-    #[inline(always)]
-    pub(super) fn two_phase_gate(&self, idx: u32) -> Option<&TwoPhaseCompiled> {
-        if idx == NO_GATE {
-            None
-        } else {
-            Some(&self.two_phase_gates[idx as usize])
-        }
-    }
-
-    /// Resolves the offline structural validation gate for a rule.
+    /// Returns the `OfflineValidationSpec` for a gate pool index, or `None` if
+    /// the index is `NO_GATE`.
     ///
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
@@ -1154,6 +1151,15 @@ impl Engine {
             None
         } else {
             Some(self.offline_validation_gates[idx as usize])
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn two_phase_gate(&self, idx: u32) -> Option<&TwoPhaseCompiled> {
+        if idx == NO_GATE {
+            None
+        } else {
+            Some(&self.two_phase_gates[idx as usize])
         }
     }
 
@@ -2346,7 +2352,8 @@ pub fn bench_extract_secret_span_locs(
     locs: &regex::bytes::CaptureLocations,
     secret_group: Option<u16>,
 ) -> (usize, usize) {
-    super::helpers::extract_secret_span_locs(locs, secret_group)
+    let secret_group_raw = secret_group.unwrap_or_default();
+    super::helpers::extract_secret_span_locs_raw(locs, secret_group_raw, secret_group.is_some())
 }
 
 /// Benchmark wrapper for `hash128`.

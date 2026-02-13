@@ -330,6 +330,23 @@ pub(super) struct EntropyCompiled {
 /// bounded by the number of rules.
 pub(super) const NO_GATE: u32 = u32::MAX;
 
+const RULE_META_SECRET_GROUP_MASK: u32 = 0xFFFF;
+const RULE_META_NEEDS_ASSIGNMENT_SHAPE: u32 = 1 << 16;
+// Distinguishes `secret_group: None` from `secret_group: Some(u16::MAX)`.
+const RULE_META_HAS_SECRET_GROUP: u32 = 1 << 17;
+
+#[inline(always)]
+fn pack_rule_meta(secret_group: Option<u16>, needs_assignment_shape_check: bool) -> u32 {
+    let mut meta = 0;
+    if let Some(secret_group) = secret_group {
+        meta |= RULE_META_HAS_SECRET_GROUP | secret_group as u32;
+    }
+    if needs_assignment_shape_check {
+        meta |= RULE_META_NEEDS_ASSIGNMENT_SHAPE;
+    }
+    meta
+}
+
 /// Hot compiled rule representation used during scanning.
 ///
 /// This keeps precompiled regexes and optional gate pool indices to minimize
@@ -345,9 +362,10 @@ pub(super) const NO_GATE: u32 = u32::MAX;
 ///
 /// Fields are ordered by access frequency in the scan loop:
 ///
-/// 1. **Every candidate**: `re`, `must_contain`, `needs_assignment_shape_check`
+/// 1. **Every candidate**: `re`, `must_contain`, `rule_meta`
 ///    — touched for every merged window to decide if the regex runs.
-/// 2. **Post-match only**: `secret_group` — read only when the regex matches.
+/// 2. **Post-match only**: secret-group bits in `rule_meta` — read only when the
+///    regex matches.
 /// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
 ///    `entropy`, `local_context`, `two_phase`, `offline_validation` —
 ///    dereferenced through `Engine` pool accessors only when the
@@ -376,8 +394,11 @@ pub(super) const NO_GATE: u32 = u32::MAX;
 pub(super) struct RuleCompiled {
     pub(super) re: Regex,
     pub(super) must_contain: Option<&'static [u8]>,
-    pub(super) needs_assignment_shape_check: bool,
-    pub(super) secret_group: Option<u16>,
+    // Packed per-rule metadata:
+    // - bits 0..=15: secret_group (when bit 17 is set)
+    // - bit 16: needs_assignment_shape_check
+    // - bit 17: has_secret_group_override
+    pub(super) rule_meta: u32,
     // Gate pool indices — dereference through Engine pool vectors.
     // NO_GATE (u32::MAX) means the gate is absent for this rule.
     pub(super) confirm_all: u32,
@@ -387,6 +408,30 @@ pub(super) struct RuleCompiled {
     pub(super) local_context: u32,
     pub(super) two_phase: u32,
     pub(super) offline_validation: u32,
+}
+
+impl RuleCompiled {
+    #[inline(always)]
+    pub(super) fn needs_assignment_shape_check(&self) -> bool {
+        (self.rule_meta & RULE_META_NEEDS_ASSIGNMENT_SHAPE) != 0
+    }
+
+    #[inline(always)]
+    pub(super) fn secret_group_raw(&self) -> u16 {
+        (self.rule_meta & RULE_META_SECRET_GROUP_MASK) as u16
+    }
+
+    #[inline(always)]
+    pub(super) fn has_secret_group_override(&self) -> bool {
+        (self.rule_meta & RULE_META_HAS_SECRET_GROUP) != 0
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub(super) fn secret_group(&self) -> Option<u16> {
+        self.has_secret_group_override()
+            .then_some(self.secret_group_raw())
+    }
 }
 
 /// Cold rule metadata used outside the validation hot path.
@@ -401,6 +446,7 @@ pub(super) struct RuleCold {
 // Compile-time size guard: gate index is now a plain u32 (4 bytes) with
 // NO_GATE sentinel, down from 8-byte Option<u32> (no niche optimization).
 const _: () = assert!(std::mem::size_of::<u32>() == 4);
+const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 80);
 
 // --------------------------
 // Compile helpers
@@ -496,8 +542,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     let rule = RuleCompiled {
         re: spec.re.clone(),
         must_contain: spec.must_contain,
-        needs_assignment_shape_check,
-        secret_group: spec.secret_group,
+        rule_meta: pack_rule_meta(spec.secret_group, needs_assignment_shape_check),
         confirm_all: NO_GATE,
         keywords: NO_GATE,
         value_suppressors: NO_GATE,
@@ -732,5 +777,16 @@ mod tests {
 
         assert_eq!(rule.value_suppressors, NO_GATE);
         assert!(gates.value_suppressors.is_none());
+    }
+
+    #[test]
+    fn pack_rule_meta_distinguishes_none_from_explicit_max_secret_group() {
+        let none_meta = pack_rule_meta(None, false);
+        let explicit_max_meta = pack_rule_meta(Some(u16::MAX), false);
+
+        assert_ne!(
+            none_meta, explicit_max_meta,
+            "explicit secret_group=u16::MAX must not be conflated with None"
+        );
     }
 }

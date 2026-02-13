@@ -105,6 +105,8 @@ pub use demo::{
 #[cfg(feature = "tiger-harness")]
 pub use engine::fuzz_try_load;
 #[cfg(feature = "bench")]
+pub use engine::BenchHitAccPool;
+#[cfg(feature = "bench")]
 pub use engine::{
     bench_build_entropy_state, bench_build_merge_ranges_state, bench_build_utf16_decode_state,
     bench_contains_all_memmem, bench_contains_any_memmem, bench_decode_utf16be,

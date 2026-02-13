@@ -630,13 +630,17 @@ pub(super) fn extract_secret_span(
 ///
 /// Mirrors [`extract_secret_span`] but operates on `CaptureLocations` to avoid
 /// per-match allocations in hot paths.
+///
+/// `has_secret_group_override` is carried separately so all `u16` values
+/// (including `u16::MAX`) remain valid capture-group indices.
 #[inline]
-pub(super) fn extract_secret_span_locs(
+pub(super) fn extract_secret_span_locs_raw(
     locs: &regex::bytes::CaptureLocations,
-    secret_group: Option<u16>,
+    secret_group_raw: u16,
+    has_secret_group_override: bool,
 ) -> (usize, usize) {
-    if let Some(gi) = secret_group {
-        let group_idx = gi as usize;
+    if has_secret_group_override {
+        let group_idx = secret_group_raw as usize;
         if let Some((start, end)) = locs.get(group_idx) {
             if start < end {
                 return (start, end);
