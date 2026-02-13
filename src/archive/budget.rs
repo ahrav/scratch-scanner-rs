@@ -115,7 +115,18 @@ pub struct ArchiveBudgets {
 /// Sentinel value indicating no entry is currently open.
 /// Using a sentinel instead of a separate `bool` eliminates 7 bytes of padding
 /// and keeps the struct at 40 bytes with `#[repr(C)]`.
+///
+/// `u64::MAX` is safe as a sentinel because `entry_decompressed_out` is bounded
+/// by `max_uncompressed_bytes_per_entry`, which is clamped to at most
+/// `ENTRY_NOT_OPEN - 1` in [`ArchiveBudgets::new`].  Saturating addition in the
+/// charge path therefore cannot reach the sentinel value.
 const ENTRY_NOT_OPEN: u64 = u64::MAX;
+
+/// Returns `true` when an entry is currently open (being scanned).
+#[inline(always)]
+fn entry_is_open(frame: &ArchiveFrame) -> bool {
+    frame.entry_decompressed_out != ENTRY_NOT_OPEN
+}
 
 /// Per-archive accounting frame pushed/popped by `enter_archive`/`exit_archive`.
 ///
@@ -173,7 +184,9 @@ impl ArchiveBudgets {
         Self {
             max_depth: cfg.max_archive_depth,
             max_entries_per_archive: cfg.max_entries_per_archive,
-            max_uncompressed_bytes_per_entry: cfg.max_uncompressed_bytes_per_entry,
+            max_uncompressed_bytes_per_entry: cfg
+                .max_uncompressed_bytes_per_entry
+                .min(ENTRY_NOT_OPEN - 1),
             max_total_uncompressed_bytes_per_archive: cfg.max_total_uncompressed_bytes_per_archive,
             max_total_uncompressed_bytes_per_root: cfg.max_total_uncompressed_bytes_per_root,
             max_archive_metadata_bytes: cfg.max_archive_metadata_bytes,
@@ -417,8 +430,12 @@ impl ArchiveBudgets {
 
         if allowed > 0 {
             let f = self.cur_mut();
-            if f.entry_decompressed_out != ENTRY_NOT_OPEN {
+            if entry_is_open(f) {
                 f.entry_decompressed_out = f.entry_decompressed_out.saturating_add(allowed);
+                debug_assert_ne!(
+                    f.entry_decompressed_out, ENTRY_NOT_OPEN,
+                    "BUG: entry byte counter saturated to sentinel"
+                );
             }
             f.decompressed_out = f.decompressed_out.saturating_add(allowed);
             self.root_decompressed_out = self.root_decompressed_out.saturating_add(allowed);
@@ -429,6 +446,13 @@ impl ArchiveBudgets {
         }
 
         // Identify which cap was the binding constraint.
+        //
+        // Priority order (first match wins):
+        //   1. entry   — per-entry output cap
+        //   2. archive — per-archive output cap
+        //   3. root    — root-level (cross-archive) output cap
+        //   4. ratio   — inflation ratio cap
+        //   5. fallback — defensive (should be unreachable when caps are finite)
         //
         // `progressed` distinguishes "we scanned nothing from this archive"
         // (→ SkipArchive, the archive is treated as if it was never opened)
@@ -453,6 +477,12 @@ impl ArchiveBudgets {
             }
         } else {
             // Defensive fallback — should not be reachable when caps are finite.
+            debug_assert!(
+                false,
+                "unreachable: allowed={allowed} must equal one of \
+                 rem_entry={rem_entry}, rem_arch={rem_arch}, \
+                 rem_root={rem_root}, rem_ratio={rem_ratio}"
+            );
             BudgetHit::PartialArchive(PartialReason::ArchiveOutputBudgetExceeded)
         };
 
@@ -524,6 +554,11 @@ impl ArchiveBudgets {
                 BudgetHit::SkipArchive(ArchiveSkipReason::InflationRatioExceeded)
             }
         } else {
+            debug_assert!(
+                false,
+                "unreachable: allowed={allowed} must equal one of \
+                 rem_arch={rem_arch}, rem_root={rem_root}, rem_ratio={rem_ratio}"
+            );
             BudgetHit::PartialArchive(PartialReason::ArchiveOutputBudgetExceeded)
         };
 
@@ -570,7 +605,7 @@ impl ArchiveBudgets {
         );
         rem = rem.min(rem_arch);
 
-        if f.entry_decompressed_out != ENTRY_NOT_OPEN {
+        if entry_is_open(f) {
             let rem_entry = remaining(
                 self.max_uncompressed_bytes_per_entry,
                 f.entry_decompressed_out,
@@ -819,6 +854,116 @@ mod tests {
         let rem = b.remaining_decompressed_allowance_with_ratio_probe(true);
         assert_eq!(rem, 2);
     }
+
+    /// When entry and archive caps are tied, the entry cap wins (SkipEntry,
+    /// not PartialArchive).  This locks in the priority ordering of the
+    /// branchless hit-identification chain.
+    #[test]
+    fn tied_entry_and_archive_caps_prefer_skip_entry() {
+        let mut c = cfg();
+        // Set entry cap == archive cap so they exhaust simultaneously.
+        c.max_uncompressed_bytes_per_entry = 10;
+        c.max_total_uncompressed_bytes_per_archive = 10;
+        c.max_total_uncompressed_bytes_per_root = 1000;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+        b.begin_entry().unwrap();
+
+        // Charge exactly up to the shared cap.
+        assert_eq!(b.charge_decompressed_out(10), ChargeResult::Ok);
+
+        // Next byte hits both caps; entry should win.
+        let r = b.charge_decompressed_out(1);
+        assert_eq!(
+            r,
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+    }
+
+    /// `charge_discarded_out` intentionally bypasses the per-entry cap.
+    /// After the entry cap is exhausted via `charge_decompressed_out`, discarded
+    /// bytes should still be accepted up to the archive/root caps.
+    #[test]
+    fn discarded_out_bypasses_entry_cap() {
+        let mut c = cfg();
+        c.max_uncompressed_bytes_per_entry = 5;
+        c.max_total_uncompressed_bytes_per_archive = 100;
+        c.max_total_uncompressed_bytes_per_root = 1000;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+        b.begin_entry().unwrap();
+
+        // Exhaust the per-entry cap.
+        assert_eq!(b.charge_decompressed_out(5), ChargeResult::Ok);
+        assert_eq!(
+            b.charge_decompressed_out(1),
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+
+        // Discarded bytes should still succeed (entry cap does not apply).
+        assert_eq!(b.charge_discarded_out(10), ChargeResult::Ok);
+    }
+
+    /// Entry counters reset correctly across open/close/reopen cycles.
+    /// The second entry gets its full per-entry budget regardless of what
+    /// the first entry consumed.
+    #[test]
+    fn entry_lifecycle_reopen_resets_counter() {
+        let mut c = cfg();
+        c.max_uncompressed_bytes_per_entry = 10;
+        c.max_total_uncompressed_bytes_per_archive = 100;
+        c.max_total_uncompressed_bytes_per_root = 1000;
+        c.max_entries_per_archive = 10;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+
+        // First entry: consume full per-entry budget.
+        b.begin_entry().unwrap();
+        assert_eq!(b.charge_decompressed_out(10), ChargeResult::Ok);
+        assert_eq!(
+            b.charge_decompressed_out(1),
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+        b.end_entry(true);
+
+        // Second entry: should get a fresh per-entry budget of 10.
+        b.begin_entry().unwrap();
+        assert_eq!(b.charge_decompressed_out(10), ChargeResult::Ok);
+        assert_eq!(
+            b.charge_decompressed_out(1),
+            ChargeResult::Clamp {
+                allowed: 0,
+                hit: BudgetHit::SkipEntry(EntrySkipReason::EntryOutputBudgetExceeded)
+            }
+        );
+        b.end_entry(true);
+    }
+
+    /// The constructor clamps `max_uncompressed_bytes_per_entry` to
+    /// `ENTRY_NOT_OPEN - 1`, preventing the sentinel collision where
+    /// `saturating_add` could reach `u64::MAX`.
+    #[test]
+    fn sentinel_collision_prevented_by_constructor_clamp() {
+        let mut c = cfg();
+        c.max_uncompressed_bytes_per_entry = u64::MAX;
+        c.max_total_uncompressed_bytes_per_archive = u64::MAX;
+        c.max_total_uncompressed_bytes_per_root = u64::MAX;
+
+        let b = ArchiveBudgets::new(&c);
+        assert_eq!(b.max_uncompressed_bytes_per_entry, ENTRY_NOT_OPEN - 1);
+    }
 }
 
 #[cfg(kani)]
@@ -835,7 +980,7 @@ mod kani_proofs {
     #[kani::proof]
     #[kani::unwind(8)]
     fn verify_budget_cur_bounds() {
-        let depth: u16 = kani::any();
+        let depth: u8 = kani::any();
         kani::assume(depth >= 1 && depth <= 4);
 
         let cfg = ArchiveConfig {

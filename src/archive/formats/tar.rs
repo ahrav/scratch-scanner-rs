@@ -30,9 +30,8 @@
 //!   gzip-decoded streams, or in-memory cursors uniformly.
 
 use crate::archive::formats::GzipStream;
-use crate::archive::{
-    ArchiveBudgets, ArchiveConfig, ArchiveSkipReason, BudgetHit, ChargeResult, PartialReason,
-};
+use crate::archive::util;
+use crate::archive::{ArchiveBudgets, ArchiveConfig, ChargeResult, PartialReason};
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -303,7 +302,10 @@ impl TarCursor {
         loop {
             // Charge 1 header block before we read it (prevents overshoot).
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_metadata(TAR_BLOCK_LEN as u64) {
-                return Ok(TarNext::Stop(map_budget_hit_to_partial(hit)));
+                return Ok(TarNext::Stop(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedTar,
+                )));
             }
 
             // Read header block.
@@ -327,7 +329,10 @@ impl TarCursor {
 
             // Count this record.
             if let Err(hit) = budgets.note_entry() {
-                return Ok(TarNext::Stop(map_budget_hit_to_partial(hit)));
+                return Ok(TarNext::Stop(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedTar,
+                )));
             }
 
             let typeflag = self.hdr[156];
@@ -455,14 +460,20 @@ impl TarCursor {
             if let ChargeResult::Clamp { allowed, hit } = budgets.charge_metadata(step as u64) {
                 let allowed_usize = allowed as usize;
                 if allowed_usize == 0 {
-                    return Ok(Err(map_budget_hit_to_partial(hit)));
+                    return Ok(Err(util::budget_hit_to_partial(
+                        hit,
+                        PartialReason::MalformedTar,
+                    )));
                 }
-                read_exact_n(input, &mut self.discard[..allowed_usize])?;
+                util::read_exact_n(input, &mut self.discard[..allowed_usize], "tar")?;
                 budgets.charge_compressed_in(input.take_compressed_delta());
-                return Ok(Err(map_budget_hit_to_partial(hit)));
+                return Ok(Err(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedTar,
+                )));
             }
 
-            read_exact_n(input, &mut self.discard[..step])?;
+            util::read_exact_n(input, &mut self.discard[..step], "tar")?;
             budgets.charge_compressed_in(input.take_compressed_delta());
             n -= step as u64;
         }
@@ -490,15 +501,21 @@ impl TarCursor {
             if let ChargeResult::Clamp { allowed, hit } = budgets.charge_metadata(step as u64) {
                 let a = allowed as usize;
                 if a == 0 {
-                    return Ok(Err(map_budget_hit_to_partial(hit)));
+                    return Ok(Err(util::budget_hit_to_partial(
+                        hit,
+                        PartialReason::MalformedTar,
+                    )));
                 }
-                read_exact_n(input, &mut self.discard[..a])?;
+                util::read_exact_n(input, &mut self.discard[..a], "tar")?;
                 budgets.charge_compressed_in(input.take_compressed_delta());
                 append_longname_bytes(&mut self.gnu_longname, &self.discard[..a], cap);
-                return Ok(Err(map_budget_hit_to_partial(hit)));
+                return Ok(Err(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedTar,
+                )));
             }
 
-            read_exact_n(input, &mut self.discard[..step])?;
+            util::read_exact_n(input, &mut self.discard[..step], "tar")?;
             budgets.charge_compressed_in(input.take_compressed_delta());
             append_longname_bytes(&mut self.gnu_longname, &self.discard[..step], cap);
             remaining -= step as u64;
@@ -547,9 +564,12 @@ impl TarCursor {
             if let ChargeResult::Clamp { allowed, hit } = budgets.charge_metadata(step as u64) {
                 let a = allowed as usize;
                 if a == 0 {
-                    return Ok(Err(map_budget_hit_to_partial(hit)));
+                    return Ok(Err(util::budget_hit_to_partial(
+                        hit,
+                        PartialReason::MalformedTar,
+                    )));
                 }
-                read_exact_n(input, &mut self.discard[..a])?;
+                util::read_exact_n(input, &mut self.discard[..a], "tar")?;
                 budgets.charge_compressed_in(input.take_compressed_delta());
                 consume_pax_bytes(
                     &mut self.pax_carry,
@@ -560,10 +580,13 @@ impl TarCursor {
                     target,
                     cap,
                 );
-                return Ok(Err(map_budget_hit_to_partial(hit)));
+                return Ok(Err(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedTar,
+                )));
             }
 
-            read_exact_n(input, &mut self.discard[..step])?;
+            util::read_exact_n(input, &mut self.discard[..step], "tar")?;
             budgets.charge_compressed_in(input.take_compressed_delta());
             consume_pax_bytes(
                 &mut self.pax_carry,
@@ -596,29 +619,6 @@ enum PaxTarget {
     Global,
 }
 
-/// Translate a [`BudgetHit`] into the [`PartialReason`] variant used by
-/// the tar layer. Unknown `SkipArchive` variants fall through to
-/// `MalformedTar` as a conservative default.
-#[inline(always)]
-fn map_budget_hit_to_partial(hit: BudgetHit) -> PartialReason {
-    match hit {
-        BudgetHit::PartialArchive(r) => r,
-        BudgetHit::StopRoot(r) => r,
-        BudgetHit::SkipArchive(r) => match r {
-            ArchiveSkipReason::MetadataBudgetExceeded => PartialReason::MetadataBudgetExceeded,
-            ArchiveSkipReason::PathBudgetExceeded => PartialReason::PathBudgetExceeded,
-            ArchiveSkipReason::EntryCountExceeded => PartialReason::EntryCountExceeded,
-            ArchiveSkipReason::ArchiveOutputBudgetExceeded => {
-                PartialReason::ArchiveOutputBudgetExceeded
-            }
-            ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
-            ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
-            _ => PartialReason::MalformedTar,
-        },
-        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
-    }
-}
-
 /// Padding bytes needed after `size` payload bytes to reach the next 512-byte
 /// block boundary. Returns 0 when `size` is already block-aligned.
 #[inline(always)]
@@ -631,22 +631,18 @@ fn tar_pad(size: u64) -> u64 {
     }
 }
 
-/// Check whether an entire 512-byte block is zero using word-wide OR
-/// accumulation in 64-byte chunks for early exit.
+/// Check whether a 512-byte tar block is entirely zeroed.
 ///
-/// # Safety (internal)
-/// Uses `ptr::read_unaligned` on `u64` within the bounds of the fixed-size
-/// `[u8; 512]` array. The pointer arithmetic stays in bounds because:
-/// - `i` advances in steps of 64, `j` in steps of 8, so `i + j` ≤ 504.
-/// - `ptr.add(504)` reads bytes `[504..512)` — the last 8 bytes of the block.
-///   Alignment is irrelevant (`read_unaligned`).
+/// Uses word-wide (`u64`) unaligned reads with early exit on the first
+/// non-zero 64-byte group. This is faster than `iter().all(|&b| b == 0)`
+/// because it processes 8 bytes per load and can bail out early.
 ///
-/// # Safe alternative considered
-/// `*b == [0u8; 512]` compiles to a `memcmp` call (~10 inline instructions vs
-/// ~76 for this implementation). Benchmarked on Apple M-series: +1.5% time on
-/// `targz_scan/1000x64KB`, +2.4% on `budget_overhead/10000x64B`. The function
-/// call overhead outweighs the I-cache benefit since most invocations hit
-/// non-zero headers and early-exit after the first 64-byte chunk.
+/// # Safety invariant
+///
+/// All pointer offsets stay within the `[u8; TAR_BLOCK_LEN]` array:
+/// `TAR_BLOCK_LEN` (512) is divisible by 64 (outer stride) and by 8
+/// (`size_of::<u64>()`), so `i + j ≤ 504 < 512` for all iterations.
+/// This is formally verified by the Kani proof `verify_is_zero_block_bounds`.
 #[inline(always)]
 fn is_zero_block(b: &[u8; TAR_BLOCK_LEN]) -> bool {
     let ptr = b.as_ptr();
@@ -655,7 +651,7 @@ fn is_zero_block(b: &[u8; TAR_BLOCK_LEN]) -> bool {
         let mut acc: u64 = 0;
         let mut j = 0;
         while j < 64 && i + j < TAR_BLOCK_LEN {
-            acc |= unsafe { (ptr.add(i + j) as *const u64).read_unaligned() };
+            acc |= unsafe { ptr.add(i + j).cast::<u64>().read_unaligned() };
             j += 8;
         }
         if acc != 0 {
@@ -937,22 +933,6 @@ fn read_exact_or_eof<R: Read + ?Sized>(r: &mut R, dst: &mut [u8]) -> io::Result<
         off += n;
     }
     Ok(true)
-}
-
-/// Fill `dst` completely or return `Err(UnexpectedEof)`.
-fn read_exact_n<R: Read + ?Sized>(r: &mut R, dst: &mut [u8]) -> io::Result<()> {
-    let mut off = 0;
-    while off < dst.len() {
-        let n = read_some(r, &mut dst[off..])?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "tar truncated",
-            ));
-        }
-        off += n;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

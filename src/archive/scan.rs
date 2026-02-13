@@ -85,6 +85,7 @@ use crate::archive::formats::zip::LimitedRead;
 use crate::archive::formats::{GzipStream, TarCursor, TarNext, TarRead, ZipCursor, ZipEntryMeta};
 use crate::archive::formats::{ZipNext, ZipOpen, ZipSource};
 use crate::archive::path::apply_hash_suffix_truncation;
+use crate::archive::util;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, ArchiveStats, BudgetHit,
     ChargeResult, EntryPathCanonicalizer, EntrySkipReason, PartialReason, VirtualPathBuilder,
@@ -203,6 +204,14 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
     /// `chunk_size` is the non-overlap payload size; `overlap` is carried
     /// forward between chunks to preserve windowed scanning.
     pub fn new(archive: &ArchiveConfig, chunk_size: usize, overlap: usize) -> Self {
+        debug_assert!(chunk_size > 0, "chunk_size must be positive");
+        debug_assert!(
+            overlap <= chunk_size,
+            "overlap ({overlap}) must not exceed chunk_size ({chunk_size})"
+        );
+        // +2: one slot for the root level (not counted in `max_archive_depth`),
+        // plus one for a gzip sub-entry within the root tar (gzip wraps the stream
+        // but occupies a depth slot for its own vpath/cursor).
         let depth_cap = archive.max_archive_depth as usize + 2;
         let mut vpaths = Vec::with_capacity(depth_cap);
         for _ in 0..depth_cap {
@@ -267,22 +276,27 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
 /// functions can pass subsets to child contexts (recursive nesting) without
 /// violating Rust's aliasing rules.
 struct ArchiveScanCtx<'a, S, Z: ZipSource> {
+    // ── Per-depth fields (peeled via `split_first_mut` during recursion) ──
+    vpaths: &'a mut [VirtualPathBuilder],
+    path_budget_used: &'a mut [usize],
+    tar_cursors: &'a mut [TarCursor],
+
+    // ── Shared mutable state ─────────────────────────────────────────────
     sink: &'a mut S,
     stats: &'a mut ArchiveStats,
     budgets: &'a mut ArchiveBudgets,
     canon: &'a mut EntryPathCanonicalizer,
-    vpaths: &'a mut [VirtualPathBuilder],
-    path_budget_used: &'a mut [usize],
-    tar_cursors: &'a mut [TarCursor],
     zip_cursor: &'a mut ZipCursor<Z>,
     entry_display_buf: &'a mut Vec<u8>,
     gzip_header_buf: &'a mut Vec<u8>,
     gzip_name_buf: &'a mut Vec<u8>,
     stream_buf: &'a mut Vec<u8>,
+    abort_run: &'a mut bool,
+
+    // ── Immutable config ─────────────────────────────────────────────────
     archive: &'a ArchiveConfig,
     chunk_size: usize,
     overlap: usize,
-    abort_run: &'a mut bool,
 }
 
 impl<'a, S, Z: ZipSource> ArchiveScanCtx<'a, S, Z> {
@@ -313,39 +327,6 @@ impl<'a, S, Z: ZipSource> ArchiveScanCtx<'a, S, Z> {
     }
 }
 
-/// Convert an archive-level skip reason into a partial reason for entry-level
-/// reporting. The catch-all maps to `MalformedZip` because the remaining
-/// `ArchiveSkipReason` variants (e.g. `IoError`, `EncryptedArchive`) only
-/// arise before any entries are scanned, and reaching this fallback implies
-/// a zip-specific structural issue.
-#[inline(always)]
-fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
-    match reason {
-        ArchiveSkipReason::MetadataBudgetExceeded => PartialReason::MetadataBudgetExceeded,
-        ArchiveSkipReason::PathBudgetExceeded => PartialReason::PathBudgetExceeded,
-        ArchiveSkipReason::EntryCountExceeded => PartialReason::EntryCountExceeded,
-        ArchiveSkipReason::ArchiveOutputBudgetExceeded => {
-            PartialReason::ArchiveOutputBudgetExceeded
-        }
-        ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
-        ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
-        ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-        _ => PartialReason::MalformedZip,
-    }
-}
-
-/// Map any [`BudgetHit`] variant to the [`PartialReason`] that should be
-/// recorded on the current entry.
-#[inline(always)]
-fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
-    match hit {
-        BudgetHit::PartialArchive(r) => r,
-        BudgetHit::StopRoot(r) => r,
-        BudgetHit::SkipArchive(r) => map_archive_skip_to_partial(r),
-        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
-    }
-}
-
 /// Map a [`BudgetHit`] to the top-level [`ArchiveEnd`] outcome for the
 /// current archive.
 #[inline(always)]
@@ -358,19 +339,6 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     }
 }
 
-const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
-
-/// Write `x` as exactly 16 lowercase hex digits into `out16`.
-///
-/// `out16` **must** be exactly 16 bytes; this is checked by debug assert.
-#[inline(always)]
-fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for i in 0..16 {
-        out16[i] = HEX_LOWER[((x >> ((15 - i) * 4)) & 0xF) as usize];
-    }
-}
-
 /// Format a locator suffix into `out`: `@<kind><16-hex-digits>`.
 ///
 /// `kind` is one of `b't'` (tar header block index), `b'z'` (zip LFH
@@ -379,7 +347,7 @@ fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
 fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out[0] = b'@';
     out[1] = kind;
-    write_u64_hex_lower(value, &mut out[2..]);
+    util::write_u64_hex_lower(value, &mut out[2..]);
     out
 }
 
@@ -393,7 +361,10 @@ fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<()
     }
     match budgets.charge_discarded_out(bytes) {
         ChargeResult::Ok => Ok(()),
-        ChargeResult::Clamp { hit, .. } => Err(budget_hit_to_partial_reason(hit)),
+        ChargeResult::Clamp { hit, .. } => Err(util::budget_hit_to_partial(
+            hit,
+            PartialReason::MalformedTar,
+        )),
     }
 }
 
@@ -566,7 +537,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
         if allowance == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -579,7 +550,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
         if read_max == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -604,7 +575,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
         let mut allowed = n as u64;
         if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
-            let r = budget_hit_to_partial_reason(hit);
+            let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
             entry_partial_reason = Some(r);
@@ -726,6 +697,15 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
     let max_len = scan.archive.max_virtual_path_len_per_entry;
     let max_depth = scan.archive.max_archive_depth;
 
+    debug_assert!(!scan.vpaths.is_empty(), "vpaths exhausted at depth {depth}");
+    debug_assert!(
+        !scan.path_budget_used.is_empty(),
+        "path_budget_used exhausted at depth {depth}"
+    );
+    debug_assert!(
+        !scan.tar_cursors.is_empty(),
+        "tar_cursors exhausted at depth {depth}"
+    );
     let (cur_vpath, rest_vpaths) = scan
         .vpaths
         .split_first_mut()
@@ -877,6 +857,14 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                         let nested_outcome = match kind {
                             ArchiveKind::Gzip => {
+                                debug_assert!(
+                                    !rest_vpaths.is_empty(),
+                                    "vpaths exhausted for nested archive at depth {depth}"
+                                );
+                                debug_assert!(
+                                    !rest_path_used.is_empty(),
+                                    "path_budget_used exhausted for nested archive at depth {depth}"
+                                );
                                 let (gunzip_vpath, vpaths_tail) = rest_vpaths
                                     .split_first_mut()
                                     .expect("vpath scratch exhausted");
@@ -1028,7 +1016,10 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                         let mut entry_partial_reason = match nested_outcome.0 {
                             ArchiveEnd::Partial(r) => Some(r),
-                            ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
+                            ArchiveEnd::Skipped(r) => Some(util::budget_hit_to_partial(
+                                BudgetHit::SkipArchive(r),
+                                PartialReason::MalformedTar,
+                            )),
                             ArchiveEnd::Scanned => None,
                         };
 
@@ -1046,7 +1037,10 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                         let stop_reason = match nested_outcome.0 {
                             ArchiveEnd::Partial(r) => Some(r),
-                            ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
+                            ArchiveEnd::Skipped(r) => Some(util::budget_hit_to_partial(
+                                BudgetHit::SkipArchive(r),
+                                PartialReason::MalformedTar,
+                            )),
                             ArchiveEnd::Scanned => None,
                         };
                         if let Some(r) = stop_reason {
@@ -1121,7 +1115,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
             let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -1135,7 +1129,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -1164,7 +1158,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
             if let ChargeResult::Clamp { allowed: a, hit } =
                 budgets.charge_decompressed_out(allowed)
             {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                 allowed = a;
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -1519,7 +1513,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -1533,7 +1527,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -1566,7 +1560,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if let ChargeResult::Clamp { allowed: a, hit } =
                 scratch.budgets.charge_decompressed_out(allowed)
             {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                 allowed = a;
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -1611,3 +1605,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
     scratch.budgets.exit_archive();
     Ok(outcome)
 }
+
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod tests;

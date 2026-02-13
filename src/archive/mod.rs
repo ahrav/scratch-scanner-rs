@@ -16,6 +16,7 @@ pub mod formats;
 pub mod outcome;
 pub mod path;
 pub mod scan;
+pub(crate) mod util;
 
 pub use budget::{ArchiveBudgets, BudgetHit, ChargeResult};
 pub use config::{ArchiveConfig, ArchiveConfigError, EncryptedPolicy, UnsupportedPolicy};

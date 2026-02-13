@@ -37,6 +37,8 @@
 //! - Both public types reuse an internal `Vec<u8>` buffer and are intended to
 //!   be allocated once per worker thread for steady-state zero allocation.
 
+use crate::archive::util;
+
 /// Default maximum number of path components allowed during canonicalization.
 pub const DEFAULT_MAX_COMPONENTS: usize = 256;
 
@@ -252,7 +254,7 @@ impl EntryPathCanonicalizer {
 
         // If empty after canonicalization, emit placeholder.
         if self.comps.is_empty() {
-            let h = fnv1a64(EMPTY_PLACEHOLDER);
+            let h = util::fnv1a64(EMPTY_PLACEHOLDER);
             emit_truncated_with_hash_suffix(&mut self.out, EMPTY_PLACEHOLDER, h, max_len);
             return CanonicalPath {
                 bytes: &self.out,
@@ -264,7 +266,7 @@ impl EntryPathCanonicalizer {
         }
 
         // Emit full display bytes up to max_len, but compute hash over full (unbounded) display bytes.
-        let mut hash = fnv1a64_init();
+        let mut hash = util::fnv1a64_init();
         let mut full_len = 0usize;
 
         for (idx, (s, e)) in self.comps.iter().copied().enumerate() {
@@ -355,7 +357,7 @@ impl VirtualPathBuilder {
         );
         self.out.clear();
 
-        let mut hash = fnv1a64_init();
+        let mut hash = util::fnv1a64_init();
         let mut full_len = 0usize;
 
         for &b in parent {
@@ -426,7 +428,7 @@ impl VirtualPathBuilder {
         }
 
         let base_limit = max_len - suffix_len;
-        let mut hash = fnv1a64_init();
+        let mut hash = util::fnv1a64_init();
         let mut full_len = 0usize;
 
         for &b in parent {
@@ -466,41 +468,16 @@ fn is_sep(b: u8) -> bool {
     b == b'/' || b == b'\\'
 }
 
-// --- FNV-1a (64-bit) ---
-//
-// A simple, non-cryptographic hash used solely to distinguish truncated paths.
-// Chosen over SipHash/AHash because:
-//   - No seed or state -- fully deterministic across runs and platforms.
-//   - Byte-at-a-time interface fits the streaming emit loop with zero overhead.
-//   - Collision resistance is not a security requirement here.
-
-#[inline(always)]
-fn fnv1a64_init() -> u64 {
-    14695981039346656037u64 // FNV offset basis
-}
-
-#[inline(always)]
-fn fnv1a64_update(mut h: u64, b: u8) -> u64 {
-    h ^= b as u64;
-    h = h.wrapping_mul(1099511628211u64); // FNV prime
-    h
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = fnv1a64_init();
-    for &b in bytes {
-        h = fnv1a64_update(h, b);
-    }
-    h
-}
+// FNV-1a helpers are in `crate::archive::util`. The separator-normalizing
+// variant below is path-specific (normalizes `\` → `/` before hashing).
 
 // Hash raw bytes with `\` normalized to `/`.  Used for the component-cap-exceeded
 // placeholder so that `a\b\c` and `a/b/c` hash identically.
 fn fnv1a64_raw_with_sep_norm(raw: &[u8]) -> u64 {
-    let mut h = fnv1a64_init();
+    let mut h = util::fnv1a64_init();
     for &b in raw {
         let bb = if b == b'\\' { b'/' } else { b };
-        h = fnv1a64_update(h, bb);
+        h = util::fnv1a64_update(h, bb);
     }
     h
 }
@@ -511,7 +488,7 @@ fn fnv1a64_raw_with_sep_norm(raw: &[u8]) -> u64 {
 // the stored prefix bounded -- the key trick behind the truncation scheme.
 #[inline(always)]
 fn emit_one(out: &mut Vec<u8>, hash: &mut u64, full_len: &mut usize, b: u8, max_len: usize) {
-    *hash = fnv1a64_update(*hash, b);
+    *hash = util::fnv1a64_update(*hash, b);
     *full_len = full_len.saturating_add(1);
     if out.len() < max_len {
         out.push(b);
@@ -544,7 +521,6 @@ fn is_printable_ascii(b: u8) -> bool {
 }
 
 const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
-const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
 
 #[inline(always)]
 fn hex_upper(n: u8) -> u8 {
@@ -574,7 +550,7 @@ pub(crate) fn apply_hash_suffix_truncation(out: &mut Vec<u8>, hash: u64, max_len
     let mut suffix = [0u8; TRUNC_SUFFIX_LEN];
     suffix[0] = b'~';
     suffix[1] = b'#';
-    write_u64_hex_lower(hash, &mut suffix[2..18]);
+    util::write_u64_hex_lower(hash, &mut suffix[2..18]);
 
     if max_len <= TRUNC_SUFFIX_LEN {
         out.clear();
@@ -614,13 +590,6 @@ fn emit_truncated_with_hash_suffix(out: &mut Vec<u8>, base: &[u8], hash: u64, ma
         return; // Base fits -- no truncation needed.
     }
     apply_hash_suffix_truncation(out, hash, max_len);
-}
-
-fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for i in 0..16 {
-        out16[i] = HEX_LOWER[((x >> ((15 - i) * 4)) & 0xF) as usize];
-    }
 }
 
 #[cfg(test)]
@@ -704,5 +673,80 @@ mod tests {
         let r = c.canonicalize(raw, DEFAULT_MAX_COMPONENTS, 128);
         assert!(r.bytes.len() <= 8);
         assert!(r.truncated);
+    }
+
+    // ── Gap 7: Percent-escape boundary truncation ──────────────────────
+
+    #[test]
+    fn hash_suffix_trunc_cut_on_percent_removes_lone_percent() {
+        // Build output where cut falls exactly on '%'.
+        // TRUNC_SUFFIX_LEN = 18. With max_len=20, prefix_len=2.
+        // If prefix is "X%", the '%' at the boundary should be removed.
+        let mut out = b"X%".to_vec();
+        let hash = 0x1234_5678_ABCD_EF00u64;
+        apply_hash_suffix_truncation(&mut out, hash, 20);
+        // The '%' should be removed: output = "X" + suffix (18 bytes) = 19 bytes.
+        assert!(out.len() <= 20);
+        assert!(!out[..out.len().saturating_sub(18)].ends_with(b"%"));
+        assert!(out.windows(2).any(|w| w == b"~#"));
+    }
+
+    #[test]
+    fn hash_suffix_trunc_cut_on_first_hex_removes_partial_escape() {
+        // Prefix is "X%2" → "%2" should be removed (split escape).
+        let mut out = b"X%2".to_vec();
+        let hash = 0x1234_5678_ABCD_EF01u64;
+        // max_len = 21 → prefix_len = 3. Out has 3 bytes, cut is at 3.
+        // But out ends with "%2" (2-byte partial), which the backup should remove.
+        apply_hash_suffix_truncation(&mut out, hash, 21);
+        assert!(out.len() <= 21);
+        // The "%2" should be removed from the prefix.
+        let prefix_end = out.len().saturating_sub(18);
+        let prefix = &out[..prefix_end];
+        assert!(
+            !prefix.ends_with(b"%2"),
+            "partial escape '%2' should have been removed"
+        );
+    }
+
+    #[test]
+    fn hash_suffix_trunc_complete_escape_preserved() {
+        // Prefix is "X%25" → complete escape, no backup needed.
+        let mut out = b"X%25".to_vec();
+        let hash = 0x1234_5678_ABCD_EF02u64;
+        // max_len = 22 → prefix_len = 4. Out has 4 bytes, all good.
+        apply_hash_suffix_truncation(&mut out, hash, 22);
+        assert!(out.len() <= 22);
+        let prefix_end = out.len().saturating_sub(18);
+        let prefix = &out[..prefix_end];
+        // Complete escape "%25" should be preserved (not backed up).
+        assert_eq!(prefix, b"X%25");
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_equals_suffix_len() {
+        // max_len == TRUNC_SUFFIX_LEN (18) → output is just the suffix.
+        let mut out = b"some long prefix data".to_vec();
+        let hash = 0xAAAA_BBBB_CCCC_DDDDu64;
+        apply_hash_suffix_truncation(&mut out, hash, TRUNC_SUFFIX_LEN);
+        assert_eq!(out.len(), TRUNC_SUFFIX_LEN);
+        assert!(out.starts_with(b"~#"));
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_zero() {
+        let mut out = b"some data".to_vec();
+        apply_hash_suffix_truncation(&mut out, 0, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_less_than_suffix() {
+        // max_len < TRUNC_SUFFIX_LEN → output is truncated suffix.
+        let mut out = b"data".to_vec();
+        let hash = 0x1111_2222_3333_4444u64;
+        apply_hash_suffix_truncation(&mut out, hash, 5);
+        assert_eq!(out.len(), 5);
+        assert!(out.starts_with(b"~#"));
     }
 }
