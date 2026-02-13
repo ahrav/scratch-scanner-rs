@@ -497,6 +497,7 @@ impl Engine {
             // and the slice never escapes this function.
             let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
             let rule = &self.rules_hot[win.rule_id as usize];
+            let gates = self.resolve_gates(rule);
             match win.variant {
                 Variant::Raw => {
                     self.run_rule_on_raw_window_into(
@@ -511,6 +512,7 @@ impl Engine {
                         scratch,
                         found_any,
                         win.anchor_hint,
+                        &gates,
                     );
                 }
                 Variant::Utf16Le | Variant::Utf16Be => {
@@ -527,6 +529,7 @@ impl Engine {
                         scratch,
                         found_any,
                         win.anchor_hint,
+                        &gates,
                     );
                 }
             }
@@ -1404,6 +1407,7 @@ impl Engine {
                                 continue;
                             }
                             let rule = &self.rules_hot[rid];
+                            let gates = self.resolve_gates(rule);
 
                             scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
                             if scratch.windows.is_empty() {
@@ -1483,6 +1487,7 @@ impl Engine {
                                         scratch,
                                         &mut found_any,
                                         span.anchor_hint as u64,
+                                        &gates,
                                     );
                                 }
                             } else {
@@ -1504,6 +1509,7 @@ impl Engine {
                                         scratch,
                                         &mut found_any,
                                         span.anchor_hint as u64,
+                                        &gates,
                                     );
                                 }
                             }

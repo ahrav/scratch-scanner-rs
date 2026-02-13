@@ -676,4 +676,26 @@ mod tests {
     fn rejects_max_hits_exceeding_u16() {
         assert!(HitAccPool::new(1, u16::MAX as usize + 1).is_err());
     }
+
+    #[test]
+    fn new_rejects_max_hits_u32_overflow() {
+        match HitAccPool::new(1, (u32::MAX as usize) + 1) {
+            Ok(_) => panic!("max_hits values above u32::MAX must be rejected"),
+            Err(err) => assert!(
+                err.contains("max_hits exceeds u32::MAX"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn new_rejects_pair_count_u32_overflow() {
+        match HitAccPool::new((u32::MAX as usize) + 1, 2) {
+            Ok(_) => panic!("pair_count values above u32::MAX must be rejected"),
+            Err(err) => assert!(
+                err.contains("pair_count exceeds u32::MAX"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
 }

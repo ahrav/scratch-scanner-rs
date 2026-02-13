@@ -46,12 +46,13 @@ use super::Engine;
 /// Packed dedup key for finding deduplication.
 ///
 /// Uses `#[repr(C)]` with `bytemuck::Pod` to guarantee a fixed 32-byte layout
-/// with no padding. This lets `hash128` process the key in a single 32-byte
-/// absorption step with no trailing partial-block handling, which is
-/// measurably faster than the previous 33-byte packed layout.
+/// aligned to the AEGIS-128L absorption rate (32 bytes = 2 × 128-bit AES
+/// blocks) with no padding. This lets `hash128` process the key in a single
+/// absorption step with no trailing partial-block handling, which is measurably
+/// faster than the previous 33-byte packed layout.
 ///
 /// The variant discriminator is packed into the high byte of
-/// `rule_id_with_variant` since actual rule counts are well below 2^24.
+/// `rule_id_with_variant`. This requires `rule_id <= DEDUP_RULE_ID_MAX`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DedupKey {
@@ -66,8 +67,22 @@ struct DedupKey {
 
 const _: () = assert!(std::mem::size_of::<DedupKey>() == 32);
 
-/// BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret
-/// value. 32 bytes = 256 bits, matching BLAKE3's default output length.
+/// Number of low bits reserved for rule IDs in `DedupKey::rule_id_with_variant`.
+const DEDUP_RULE_ID_BITS: u32 = 24;
+/// Maximum rule id that can be packed with an 8-bit variant discriminator.
+pub(super) const DEDUP_RULE_ID_MAX: u32 = (1u32 << DEDUP_RULE_ID_BITS) - 1;
+
+#[inline(always)]
+fn pack_rule_id_with_variant(rule_id: u32, variant_disc: u8) -> u32 {
+    assert!(
+        rule_id <= DEDUP_RULE_ID_MAX,
+        "rule_id exceeds 24-bit dedup budget"
+    );
+    rule_id | (u32::from(variant_disc) << DEDUP_RULE_ID_BITS)
+}
+
+/// BLAKE3 digest of the raw secret bytes extracted after gate validation.
+/// 32 bytes = 256 bits, matching BLAKE3's default output length.
 ///
 /// Used for cross-chunk and cross-run deduplication: two findings with the
 /// same `NormHash` are considered the same secret regardless of surrounding
@@ -90,20 +105,16 @@ const FINDING_DEDUPE_MULTIPLIER: usize = 32;
 /// after the gate check.
 ///
 /// # Invariants
-/// - `used_len <= 256`.
-/// - `used[0..used_len]` tracks which counters were incremented since
-///   the last reset.
-/// - **All counters outside the `used` set must be zero.** Violating this
-///   produces silently wrong entropy calculations because leftover counts
-///   inflate the histogram.
+/// - **All counters must be zero before and after each entropy check.**
+///   The histogram loop increments bins and the reset zeroes the entire
+///   array via `memset`. This trades O(256) reset cost for a branchless
+///   histogram loop (no per-byte "first touch" tracking), which is a net
+///   win since the histogram loop runs N times (N = input length) while
+///   the reset runs once.
 #[derive(Clone, Copy)]
 pub(super) struct EntropyScratch {
     /// Byte-frequency histogram (256 bins, one per byte value).
     pub(super) counts: [u32; 256],
-    /// Indices of non-zero bins, enabling O(distinct) reset instead of O(256).
-    pub(super) used: [u8; 256],
-    /// Number of valid entries in `used[0..used_len]`.
-    pub(super) used_len: u16,
 }
 
 /// Context for mapping decoded spans back to root (encoded) coordinates.
@@ -307,27 +318,22 @@ impl RootSpanMapCtx {
 unsafe impl Send for RootSpanMapCtx {}
 
 impl EntropyScratch {
-    /// Returns a zeroed histogram with no tracked byte values.
+    /// Returns a zeroed histogram.
     pub(super) fn new() -> Self {
         Self {
             counts: [0u32; 256],
-            used: [0u8; 256],
-            used_len: 0,
         }
     }
 
-    /// Resets only the histogram bins that were incremented since the last reset.
+    /// Zeroes all 256 histogram bins.
     ///
-    /// This is O(distinct byte values seen) rather than O(256), which matters
-    /// when entropy checks are frequent but candidate matches are short.
+    /// This is O(256) via `memset`, which on modern ARM (stp loop) is very
+    /// fast — typically 2-3 ns for 1 KiB. The constant cost eliminates the
+    /// per-byte branch that the previous "touched list" approach required
+    /// in the histogram loop.
     #[inline]
     pub(super) fn reset(&mut self) {
-        let used_len = self.used_len as usize;
-        for i in 0..used_len {
-            let b = self.used[i] as usize;
-            self.counts[b] = 0;
-        }
-        self.used_len = 0;
+        self.counts = [0u32; 256];
     }
 }
 
@@ -484,7 +490,7 @@ pub struct ScanScratch {
     /// or transform re-scans produce identical matches. The set is reset on file
     /// boundary transitions (new file or `base_offset == 0`).
     ///
-    /// Key composition (32 bytes = 2 AES blocks → 128-bit hash):
+    /// Key composition (32 bytes = one AEGIS-128L absorption block → 128-bit hash):
     /// - `file_id` (4 bytes) — scoped to current file
     /// - `rule_id | variant_disc << 24` (4 bytes) — rule + UTF-16 endianness discriminator
     /// - `span_start`, `span_end` (8 bytes) — root-level span (zeroed for mapped transforms)
@@ -1502,6 +1508,9 @@ impl ScanScratch {
     /// └────────┴──────────────────────┴────────────┴──────────┴─────────────────┴───────────────┘
     /// ```
     ///
+    /// `rule_id_with_variant` packs a 24-bit rule id plus an 8-bit variant
+    /// discriminator. Rule ids above `DEDUP_RULE_ID_MAX` are rejected.
+    ///
     /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
     /// are zeroed only when a precise root-span mapping is available. When
     /// mapping is unavailable (nested transforms with length-changing parents),
@@ -1575,7 +1584,7 @@ impl ScanScratch {
             0
         };
 
-        // Build a 32-byte dedup key (single AES absorption) and hash to 128 bits.
+        // Build a 32-byte dedup key (one AEGIS-128L absorption block) and hash to 128 bits.
         debug_assert!(
             rec.rule_id < (1 << 24),
             "rule_id {:#x} overflows the 24-bit field; upper byte reserved for variant_disc",
@@ -1583,7 +1592,7 @@ impl ScanScratch {
         );
         let key = DedupKey {
             file_id: rec.file_id.0,
-            rule_id_with_variant: rec.rule_id | (u32::from(variant_disc) << 24),
+            rule_id_with_variant: pack_rule_id_with_variant(rec.rule_id, variant_disc),
             span_start,
             span_end,
             root_hint_start: rec.root_hint_start,
