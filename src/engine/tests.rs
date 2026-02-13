@@ -5662,8 +5662,8 @@ mod proptests {
                 }
             }
 
-            let acc_coalesced = if acc.coalesced_set()[pair] != 0 {
-                Some(acc.coalesced()[pair])
+            let acc_coalesced = if acc.is_coalesced(pair) {
+                Some(acc.coalesced_span(pair))
             } else {
                 None
             };
@@ -5671,14 +5671,13 @@ mod proptests {
             match (acc_coalesced, ref_coalesced) {
                 (Some(actual), Some(expected)) => {
                     prop_assert_eq!(actual, expected);
-                    prop_assert_eq!(acc.lens()[pair], 0);
+                    prop_assert_eq!(acc.pair_len(pair), 0);
                 }
                 (None, None) => {
-                    let len = acc.lens()[pair] as usize;
+                    let len = acc.pair_len(pair) as usize;
                     prop_assert_eq!(len, ref_windows.len());
-                    let base = pair * max_hits;
                     for (i, expected) in ref_windows.iter().enumerate() {
-                        prop_assert_eq!(acc.windows()[base + i], *expected);
+                        prop_assert_eq!(acc.window_at(pair, i), *expected);
                     }
                 }
                 _ => {
