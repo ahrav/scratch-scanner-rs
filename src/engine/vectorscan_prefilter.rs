@@ -185,6 +185,8 @@ unsafe impl Sync for VsGateDb {}
 
 impl Drop for VsStreamDb {
     fn drop(&mut self) {
+        // SAFETY: `self.db` was allocated by `hs_compile_multi` (or deserialized)
+        // and is only freed once here; the null check guards against double-free.
         unsafe {
             if !self.db.is_null() {
                 vs::hs_free_database(self.db);
@@ -195,6 +197,8 @@ impl Drop for VsStreamDb {
 
 impl Drop for VsGateDb {
     fn drop(&mut self) {
+        // SAFETY: `self.db` was allocated by `hs_compile_multi` (or deserialized)
+        // and is only freed once here; the null check guards against double-free.
         unsafe {
             if !self.db.is_null() {
                 vs::hs_free_database(self.db);
@@ -209,6 +213,8 @@ unsafe impl Sync for VsPrefilterDb {}
 
 impl Drop for VsPrefilterDb {
     fn drop(&mut self) {
+        // SAFETY: `self.db` was allocated by `hs_compile_multi` (or deserialized)
+        // and is only freed once here; the null check guards against double-free.
         unsafe {
             if !self.db.is_null() {
                 vs::hs_free_database(self.db);
@@ -318,9 +324,13 @@ impl VsStreamDb {
         // is still a valid `hs_platform_info_t` (Vectorscan treats zero fields as
         // "use defaults"), so `assume_init` is sound in both cases.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `platform` is a valid `MaybeUninit` pointer; `hs_populate_platform`
+        // writes through it and does not retain the pointer after returning.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
+        // SAFETY: `hs_platform_info_t` is a plain-data struct; zeroed memory is a valid
+        // representation, and `hs_populate_platform` (or the zeroed fallback) initializes it.
         let platform = unsafe { platform.assume_init() };
 
         let cache = VsDbCache::new();
@@ -341,6 +351,9 @@ impl VsStreamDb {
 
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+        // SAFETY: all pointer arrays (`expr_ptrs`, `flags`, `ids`) are valid for
+        // `expr_ptrs.len()` elements and live for the duration of the call; `db`
+        // and `compile_err` are valid out-pointers written by the FFI function.
         let rc = unsafe {
             vs::hs_compile_multi(
                 expr_ptrs.as_ptr(),
@@ -355,6 +368,8 @@ impl VsStreamDb {
         };
 
         if rc != vs::HS_SUCCESS as c_int {
+            // SAFETY: `compile_err` was written by `hs_compile_multi` on failure;
+            // the pointer and its `message` field are valid until `hs_free_compile_error`.
             let msg = unsafe {
                 if compile_err.is_null() {
                     "hs_compile_multi failed (no error message)".to_string()
@@ -383,6 +398,8 @@ impl VsStreamDb {
     /// Allocates a new scratch space bound to this database.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled database; `scratch` is a valid
+        // out-pointer. `hs_alloc_scratch` allocates or grows the scratch space.
         let rc =
             unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
         if rc != vs::HS_SUCCESS as c_int {
@@ -413,6 +430,8 @@ impl VsStreamDb {
     /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled stream-mode database; `stream`
+        // is a valid out-pointer written by the FFI function.
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
         if rc != vs::HS_SUCCESS as c_int {
             return Err(format!("hs_open_stream failed: rc={rc}"));
@@ -1201,6 +1220,8 @@ impl VsAnchorDb {
         };
 
         if rc != vs::HS_SUCCESS as c_int {
+            // SAFETY: `compile_err` was populated by `hs_compile_multi`; if non-null it
+            // points to a valid `hs_compile_error_t` that we read and then free.
             let msg = unsafe {
                 if compile_err.is_null() {
                     "hs_compile_multi failed (no error message)".to_string()
@@ -1234,6 +1255,8 @@ impl VsAnchorDb {
     /// Allocates a new scratch space bound to this anchor database.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled Vectorscan database; `scratch` is
+        // a valid out-pointer. Vectorscan allocates scratch internally.
         let rc =
             unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
         if rc != vs::HS_SUCCESS as c_int {
@@ -1279,6 +1302,10 @@ impl VsAnchorDb {
             saw_utf16: false,
         };
 
+        // SAFETY: `self.db` is a valid compiled database; `hay` is a live slice with
+        // length `len_u32`; `vs_scratch` is allocated for this database; `ctx` is a
+        // valid `VsAnchorMatchCtx` that outlives the scan. The callback
+        // `vs_anchor_on_match` upholds the FFI contract (no panics, no unwind).
         let rc = unsafe {
             vs::hs_scan(
                 self.db,
@@ -1339,6 +1366,8 @@ impl VsUtf16StreamDb {
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
+        // SAFETY: `hs_populate_platform` wrote all fields; the zeroed base
+        // ensures any untouched padding is deterministic.
         let platform = unsafe { platform.assume_init() };
 
         let cache = VsDbCache::new();
@@ -1362,6 +1391,9 @@ impl VsUtf16StreamDb {
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
 
+        // SAFETY: All pointer arrays (`expr_ptrs`, `ids`) are valid, non-null,
+        // and contain `expr_ptrs.len()` elements. `db` and `compile_err` are valid
+        // out-pointers. The platform struct is fully initialized.
         let rc = unsafe {
             vs::hs_compile_multi(
                 expr_ptrs.as_ptr(),
@@ -1376,6 +1408,8 @@ impl VsUtf16StreamDb {
         };
 
         if rc != vs::HS_SUCCESS as c_int {
+            // SAFETY: `compile_err` was populated by `hs_compile_multi`; if non-null it
+            // points to a valid `hs_compile_error_t` that we read and then free.
             let msg = unsafe {
                 if compile_err.is_null() {
                     "hs_compile_multi failed (no error message)".to_string()
@@ -1409,6 +1443,8 @@ impl VsUtf16StreamDb {
     /// Allocates a new scratch space bound to this UTF-16 stream database.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled Vectorscan database; `scratch` is
+        // a valid out-pointer. Vectorscan allocates scratch internally.
         let rc =
             unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
         if rc != vs::HS_SUCCESS as c_int {
@@ -1451,6 +1487,8 @@ impl VsUtf16StreamDb {
     /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled stream-mode database; `stream` is a
+        // valid out-pointer. Vectorscan allocates the stream state internally.
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
         if rc != vs::HS_SUCCESS as c_int {
             return Err(format!("hs_open_stream failed: rc={rc}"));
@@ -1476,6 +1514,9 @@ impl VsUtf16StreamDb {
             .len()
             .try_into()
             .map_err(|_| format!("buffer too large for hs_scan_stream: {} bytes", chunk.len()))?;
+        // SAFETY: `stream` is a valid open stream for this database; `chunk` is a
+        // live slice with length `len_u32`; `scratch` is allocated for this database.
+        // The caller guarantees `ctx` remains valid for the duration of the call.
         let rc = unsafe {
             vs::hs_scan_stream(
                 stream.stream,
@@ -1507,6 +1548,9 @@ impl VsUtf16StreamDb {
         on_event: vs::match_event_handler,
         ctx: *mut c_void,
     ) -> Result<(), String> {
+        // SAFETY: `stream` is a valid open stream; `scratch` is allocated for
+        // this database. The caller guarantees `ctx` remains valid for the call.
+        // Ownership of `stream` is consumed (freed by Vectorscan).
         let rc = unsafe { vs::hs_close_stream(stream.stream, scratch.scratch, on_event, ctx) };
         if rc == vs::HS_SUCCESS as c_int {
             Ok(())
@@ -1563,6 +1607,8 @@ impl VsGateDb {
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
+        // SAFETY: `hs_populate_platform` wrote all fields; the zeroed base
+        // ensures any untouched padding is deterministic.
         let platform = unsafe { platform.assume_init() };
 
         let cache = VsDbCache::new();
@@ -1580,6 +1626,9 @@ impl VsGateDb {
 
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+        // SAFETY: All pointer arrays (`expr_ptrs`, `flags`, `ids`) are valid,
+        // non-null, and contain `expr_ptrs.len()` elements. `db` and `compile_err`
+        // are valid out-pointers. The platform struct is fully initialized.
         let rc = unsafe {
             vs::hs_compile_multi(
                 expr_ptrs.as_ptr(),
@@ -1594,6 +1643,8 @@ impl VsGateDb {
         };
 
         if rc != vs::HS_SUCCESS as c_int {
+            // SAFETY: `compile_err` was populated by `hs_compile_multi`; if non-null it
+            // points to a valid `hs_compile_error_t` that we read and then free.
             let msg = unsafe {
                 if compile_err.is_null() {
                     "hs_compile_multi failed (no error message)".to_string()
@@ -1622,6 +1673,8 @@ impl VsGateDb {
     /// Allocates a new scratch space bound to this database.
     pub(crate) fn alloc_scratch(&self) -> Result<VsScratch, String> {
         let mut scratch: *mut vs::hs_scratch_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled Vectorscan database; `scratch` is
+        // a valid out-pointer. Vectorscan allocates scratch internally.
         let rc =
             unsafe { vs::hs_alloc_scratch(self.db, &mut scratch as *mut *mut vs::hs_scratch_t) };
         if rc != vs::HS_SUCCESS as c_int {
@@ -1646,6 +1699,8 @@ impl VsGateDb {
     /// See [`VsStream`] for lifecycle details.
     pub(crate) fn open_stream(&self) -> Result<VsStream, String> {
         let mut stream: *mut vs::hs_stream_t = ptr::null_mut();
+        // SAFETY: `self.db` is a valid compiled stream-mode database; `stream` is a
+        // valid out-pointer. Vectorscan allocates the stream state internally.
         let rc = unsafe { vs::hs_open_stream(self.db, 0, &mut stream) };
         if rc != vs::HS_SUCCESS as c_int {
             return Err(format!("hs_open_stream failed: rc={rc}"));
@@ -1670,6 +1725,9 @@ impl VsGateDb {
             .len()
             .try_into()
             .map_err(|_| format!("buffer too large for hs_scan_stream: {} bytes", data.len()))?;
+        // SAFETY: `stream` is a valid open stream for this database; `data` is a
+        // live slice with length `len_u32`; `scratch` is allocated for this database.
+        // The caller guarantees `ctx` remains valid for the duration of the call.
         let rc = unsafe {
             vs::hs_scan_stream(
                 stream.stream,
@@ -1696,6 +1754,9 @@ impl VsGateDb {
         on_event: vs::match_event_handler,
         ctx: *mut c_void,
     ) -> Result<(), String> {
+        // SAFETY: `stream` is a valid open stream; `scratch` is allocated for
+        // this database. The caller guarantees `ctx` remains valid for the call.
+        // Ownership of `stream` is consumed (freed by Vectorscan).
         let rc = unsafe { vs::hs_close_stream(stream.stream, scratch.scratch, on_event, ctx) };
         if rc == vs::HS_SUCCESS as c_int || rc == vs::HS_SCAN_TERMINATED as c_int {
             Ok(())
@@ -1707,6 +1768,8 @@ impl VsGateDb {
 
 impl Drop for VsScratch {
     fn drop(&mut self) {
+        // SAFETY: `self.scratch` was allocated by `hs_alloc_scratch` and is
+        // non-null (checked below). We have exclusive ownership via `&mut self`.
         unsafe {
             if !self.scratch.is_null() {
                 vs::hs_free_scratch(self.scratch);
@@ -1809,6 +1872,8 @@ impl VsPrefilterDb {
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
+        // SAFETY: `hs_populate_platform` wrote all fields; the zeroed base
+        // ensures any untouched padding is deterministic.
         let platform = unsafe { platform.assume_init() };
 
         let cache = VsDbCache::new();
@@ -1857,6 +1922,9 @@ impl VsPrefilterDb {
 
             let mut db: *mut vs::hs_database_t = ptr::null_mut();
             let mut compile_err: *mut vs::hs_compile_error_t = ptr::null_mut();
+            // SAFETY: All pointer arrays (`expr_ptrs`, `flags`, `ids`) are valid,
+            // non-null, and contain `expr_ptrs.len()` elements. `db` and `compile_err`
+            // are valid out-pointers. The platform struct is fully initialized.
             let rc = unsafe {
                 vs::hs_compile_multi(
                     expr_ptrs.as_ptr(),
@@ -1871,6 +1939,8 @@ impl VsPrefilterDb {
             };
 
             if rc != vs::HS_SUCCESS as c_int {
+                // SAFETY: `compile_err` was populated by `hs_compile_multi`; if non-null
+                // it points to a valid `hs_compile_error_t` that we read and then free.
                 let msg = unsafe {
                     if compile_err.is_null() {
                         "hs_compile_multi failed (no error message)".to_string()

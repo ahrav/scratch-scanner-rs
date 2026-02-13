@@ -340,6 +340,8 @@ impl HitAccPool {
         touched_pairs: &mut ScratchVec<u32>,
     ) {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, and `touched_pairs`
+        // is a valid scratch buffer pre-allocated for `pair_count` entries.
         unsafe { self.push_span_unchecked_hot(pair, span, touched_pairs) };
     }
 
@@ -357,12 +359,16 @@ impl HitAccPool {
         touched_pairs: &mut ScratchVec<u32>,
     ) {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: Caller guarantees `pair < pair_count` and `touched_pairs`
+        // has capacity for at least `pair_count` entries.
         unsafe {
             self.mark_touched_unchecked(pair, touched_pairs);
         }
 
         // Read len/coalesced as values so the mutable borrow of pair_meta
         // doesn't extend across coalesce_overflow.
+        // SAFETY: `pair < pair_count` (caller invariant), so `pair_meta.add(pair)`
+        // is within the allocation. The pointer is valid and properly aligned.
         let (len, coalesced) = unsafe {
             let m = &*self.pair_meta.add(pair);
             (m.len as usize, m.coalesced)
@@ -370,6 +376,7 @@ impl HitAccPool {
 
         if coalesced != 0 {
             // Expand coalesced window, preserving the earliest anchor hint.
+            // SAFETY: `pair < pair_count`, so `coalesced.add(pair)` is in-bounds.
             let c = unsafe { &mut *self.coalesced.add(pair) };
             c.start = c.start.min(span.start);
             c.end = c.end.max(span.end);
@@ -380,6 +387,9 @@ impl HitAccPool {
         let max_hits = self.max_hits as usize;
         if len < max_hits {
             let base = pair * max_hits;
+            // SAFETY: `pair < pair_count` and `len < max_hits`, so
+            // `base + len` is within the windows allocation. `pair_meta.add(pair)`
+            // is in-bounds for the same reason.
             unsafe {
                 *self.windows.add(base + len) = span;
                 (*self.pair_meta.add(pair)).len = (len + 1) as u16;

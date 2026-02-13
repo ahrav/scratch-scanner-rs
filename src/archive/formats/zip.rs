@@ -949,6 +949,7 @@ mod tests {
         // Mimic parse_local_file_header: clear, set_len, fill.
         buf.clear();
         let store_len = 32usize.min(cap);
+        // SAFETY: `store_len <= cap` and we immediately fill all bytes below.
         unsafe {
             buf.set_len(store_len);
         }

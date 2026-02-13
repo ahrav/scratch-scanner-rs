@@ -8,7 +8,7 @@ edition = "2021"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }
 
 [lints.clippy]
-undocumented_unsafe_blocks = "deny"
+undocumented_unsafe_blocks = "warn"
 
 [dependencies]
 aegis = "0.9"

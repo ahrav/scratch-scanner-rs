@@ -195,6 +195,9 @@ impl VsDbCache {
         // Deserialize the Vectorscan database.
         let payload = &bytes[HEADER_LEN..data_end];
         let mut db: *mut vs::hs_database_t = ptr::null_mut();
+        // SAFETY: `payload` is a valid byte slice from a MAC-verified file, and
+        // `db` is a properly aligned out-pointer. `hs_deserialize_database` only
+        // reads `payload.len()` bytes and writes a heap-allocated DB to `db`.
         let rc = unsafe {
             vs::hs_deserialize_database(
                 payload.as_ptr().cast::<c_char>(),
@@ -230,6 +233,9 @@ impl VsDbCache {
         // Serialize the database.
         let mut bytes_ptr: *mut c_char = ptr::null_mut();
         let mut bytes_len: usize = 0;
+        // SAFETY: `db` is a valid, compiled Vectorscan database pointer (caller
+        // obligation). `bytes_ptr` and `bytes_len` are valid out-pointers.
+        // `hs_serialize_database` allocates the output buffer internally.
         let rc = unsafe {
             vs::hs_serialize_database(
                 db,
@@ -239,11 +245,16 @@ impl VsDbCache {
         };
         if rc != vs::HS_SUCCESS as c_int || bytes_ptr.is_null() || bytes_len == 0 {
             if !bytes_ptr.is_null() {
+                // SAFETY: `bytes_ptr` was allocated by Vectorscan's allocator
+                // (libc malloc) and the null check above ensures it is valid.
                 unsafe { libc::free(bytes_ptr.cast()) };
             }
             return;
         }
 
+        // SAFETY: `hs_serialize_database` succeeded (rc == HS_SUCCESS), so
+        // `bytes_ptr` is non-null and points to `bytes_len` contiguous bytes
+        // allocated by libc malloc. The slice borrows the buffer until `free`.
         let payload = unsafe { std::slice::from_raw_parts(bytes_ptr.cast::<u8>(), bytes_len) };
 
         // Build the file contents: header || payload || mac.
@@ -256,6 +267,9 @@ impl VsDbCache {
         buf.extend_from_slice(&key_hash);
         buf.extend_from_slice(payload);
 
+        // SAFETY: `bytes_ptr` was allocated by Vectorscan (libc malloc), is
+        // non-null (checked after hs_serialize_database), and the `payload`
+        // slice derived from it is no longer referenced after this point.
         unsafe { libc::free(bytes_ptr.cast()) };
 
         // Compute MAC over header + payload (everything before the MAC slot).
