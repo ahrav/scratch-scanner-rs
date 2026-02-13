@@ -2058,28 +2058,91 @@ pub fn bench_contains_all_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> b
 
 /// Benchmark helper for `entropy_gate_passes`.
 #[cfg(feature = "bench")]
+pub struct BenchEntropyState {
+    max_len: usize,
+    log2_table: Vec<f32>,
+    scratch: super::scratch::EntropyScratch,
+}
+
+#[cfg(feature = "bench")]
+impl BenchEntropyState {
+    #[inline]
+    fn new(max_len: usize) -> Self {
+        Self {
+            max_len,
+            log2_table: super::helpers::build_log2_table(max_len),
+            scratch: super::scratch::EntropyScratch::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_max_len(&mut self, max_len: usize) {
+        if self.max_len != max_len {
+            self.max_len = max_len;
+            self.log2_table = super::helpers::build_log2_table(max_len);
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+thread_local! {
+    static BENCH_ENTROPY_STATE: std::cell::RefCell<BenchEntropyState> =
+        std::cell::RefCell::new(BenchEntropyState::new(0));
+}
+
+/// Build reusable benchmark entropy state so setup is outside timed iterations.
+#[cfg(feature = "bench")]
+pub fn bench_build_entropy_state(max_len: usize) -> BenchEntropyState {
+    BenchEntropyState::new(max_len)
+}
+
+/// Benchmark helper for `entropy_gate_passes` using reusable prebuilt state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_entropy_gate_passes_with_state(
+    min_bits: f32,
+    min_len: usize,
+    bytes: &[u8],
+    state: &mut BenchEntropyState,
+) -> bool {
+    let spec = super::rule_repr::EntropyCompiled {
+        min_bits_per_byte: min_bits,
+        min_len,
+        max_len: state.max_len,
+    };
+    super::helpers::entropy_gate_passes(&spec, bytes, &mut state.scratch, &state.log2_table)
+}
+
+/// Benchmark helper for `shannon_entropy_bits_per_byte` using reusable state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_shannon_entropy_with_state(bytes: &[u8], state: &mut BenchEntropyState) -> f32 {
+    super::helpers::shannon_entropy_bits_per_byte(bytes, &mut state.scratch, &state.log2_table)
+}
+
+/// Compatibility wrapper that reuses thread-local state across benchmark calls.
+#[cfg(feature = "bench")]
 pub fn bench_entropy_gate_passes(
     min_bits: f32,
     min_len: usize,
     max_len: usize,
     bytes: &[u8],
 ) -> bool {
-    let spec = super::rule_repr::EntropyCompiled {
-        min_bits_per_byte: min_bits,
-        min_len,
-        max_len,
-    };
-    let log2_table = super::helpers::build_log2_table(max_len);
-    let mut scratch = super::scratch::EntropyScratch::new();
-    super::helpers::entropy_gate_passes(&spec, bytes, &mut scratch, &log2_table)
+    BENCH_ENTROPY_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_len(max_len);
+        bench_entropy_gate_passes_with_state(min_bits, min_len, bytes, &mut state)
+    })
 }
 
-/// Benchmark helper for `shannon_entropy_bits_per_byte`.
+/// Compatibility wrapper that reuses thread-local state across benchmark calls.
 #[cfg(feature = "bench")]
 pub fn bench_shannon_entropy(bytes: &[u8], max_len: usize) -> f32 {
-    let log2_table = super::helpers::build_log2_table(max_len);
-    let mut scratch = super::scratch::EntropyScratch::new();
-    super::helpers::shannon_entropy_bits_per_byte(bytes, &mut scratch, &log2_table)
+    BENCH_ENTROPY_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_len(max_len);
+        bench_shannon_entropy_with_state(bytes, &mut state)
+    })
 }
 
 /// Benchmark wrapper for `merge_ranges_with_gap_sorted`.

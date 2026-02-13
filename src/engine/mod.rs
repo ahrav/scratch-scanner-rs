@@ -99,11 +99,12 @@ pub use core::{AnchorPlanStats, VectorscanStats};
 
 #[cfg(feature = "bench")]
 pub use core::{
-    bench_contains_all_memmem, bench_contains_any_memmem, bench_decode_utf16be,
-    bench_decode_utf16le, bench_entropy_gate_passes, bench_extract_secret_span_locs,
-    bench_find_spans_into, bench_hash128, bench_map_utf16_decoded_offset, bench_merge_ranges,
-    bench_pack_patterns_raw, bench_shannon_entropy, bench_stream_decode_base64,
-    bench_stream_decode_url, BenchPackedPatterns,
+    bench_build_entropy_state, bench_contains_all_memmem, bench_contains_any_memmem,
+    bench_decode_utf16be, bench_decode_utf16le, bench_entropy_gate_passes,
+    bench_entropy_gate_passes_with_state, bench_extract_secret_span_locs, bench_find_spans_into,
+    bench_hash128, bench_map_utf16_decoded_offset, bench_merge_ranges, bench_pack_patterns_raw,
+    bench_shannon_entropy, bench_shannon_entropy_with_state, bench_stream_decode_base64,
+    bench_stream_decode_url, BenchEntropyState, BenchPackedPatterns,
 };
 #[cfg(feature = "bench")]
 pub use offline_validate::{
