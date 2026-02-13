@@ -987,7 +987,25 @@ pub(super) fn base64_skip_chars(
         return Some(0);
     }
     let mut seen = 0usize;
-    for (i, &b) in encoded.iter().enumerate() {
+    let mut i = 0usize;
+
+    // Fast path: advance 4 bytes at a time while all are B64_CHAR and we
+    // haven't reached the target count yet.
+    while i + 4 <= encoded.len() && seen + 4 <= skip {
+        let f0 = BYTE_CLASS[encoded[i] as usize];
+        let f1 = BYTE_CLASS[encoded[i + 1] as usize];
+        let f2 = BYTE_CLASS[encoded[i + 2] as usize];
+        let f3 = BYTE_CLASS[encoded[i + 3] as usize];
+
+        if (f0 & f1 & f2 & f3 & B64_CHAR) == 0 {
+            break;
+        }
+        seen += 4;
+        i += 4;
+    }
+
+    // Slow path: handle whitespace, terminators, and approach target precisely.
+    for (j, &b) in encoded[i..].iter().enumerate() {
         if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
             continue;
         }
@@ -996,7 +1014,7 @@ pub(super) fn base64_skip_chars(
         }
         seen += 1;
         if seen == skip {
-            return Some(i + 1);
+            return Some(i + j + 1);
         }
     }
     None
@@ -1009,7 +1027,31 @@ pub(super) fn base64_skip_chars(
 /// span meets the `min_chars` threshold before attempting decode.
 pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
     let mut count = 0usize;
-    for &b in encoded {
+    let mut i = 0usize;
+
+    // Fast path: process 4 bytes at a time when all are B64_CHAR (no whitespace
+    // or invalid bytes). The AND of flags detects any non-B64 byte in a single
+    // comparison since whitespace flags don't include B64_CHAR.
+    while i + 4 <= encoded.len() {
+        let f0 = BYTE_CLASS[encoded[i] as usize];
+        let f1 = BYTE_CLASS[encoded[i + 1] as usize];
+        let f2 = BYTE_CLASS[encoded[i + 2] as usize];
+        let f3 = BYTE_CLASS[encoded[i + 3] as usize];
+
+        if (f0 & f1 & f2 & f3 & B64_CHAR) == 0 {
+            break;
+        }
+
+        count += 4
+            - (encoded[i] == b'=') as usize
+            - (encoded[i + 1] == b'=') as usize
+            - (encoded[i + 2] == b'=') as usize
+            - (encoded[i + 3] == b'=') as usize;
+        i += 4;
+    }
+
+    // Slow path: handle whitespace, non-B64 terminators, and the tail.
+    for &b in &encoded[i..] {
         if matches!(b, b'\n' | b'\r' | b'\t') || (allow_space_ws && b == b' ') {
             continue;
         }
@@ -1065,21 +1107,60 @@ fn stream_decode_base64(
 
     let mut out: [u8; STREAM_DECODE_CHUNK_BYTES] = [0; STREAM_DECODE_CHUNK_BYTES];
     let mut out_len = 0usize;
+    let max_fill = out.len() - 4; // headroom for a full quantum (3 bytes)
 
-    for &b in input {
-        // ignore whitespace broadly
+    let mut i = 0usize;
+    while i < input.len() {
+        // Fast path: when no partial quad is pending, batch-decode 4 bytes at a
+        // time using direct table lookups. The combined OR detects whitespace,
+        // padding, and invalid bytes in a single comparison — all map to values
+        // > 63 in B64_DECODE (B64_PAD=64, B64_INVALID=0xFF).
+        if qn == 0 && !seen_pad {
+            while i + 4 <= input.len() && out_len + 3 <= max_fill {
+                let a = B64_DECODE[input[i] as usize];
+                let b = B64_DECODE[input[i + 1] as usize];
+                let c = B64_DECODE[input[i + 2] as usize];
+                let d = B64_DECODE[input[i + 3] as usize];
+
+                if (a | b | c | d) > 63 {
+                    break;
+                }
+
+                out[out_len] = (a << 2) | (b >> 4);
+                out[out_len + 1] = ((b & 0x0F) << 4) | (c >> 2);
+                out[out_len + 2] = ((c & 0x03) << 6) | d;
+                out_len += 3;
+                i += 4;
+            }
+
+            // Flush if we filled up during the batch run.
+            if out_len >= max_fill {
+                match flush_buf(&mut out, &mut out_len, &mut on_bytes) {
+                    ControlFlow::Continue(()) => {}
+                    ControlFlow::Break(()) => return Ok(()),
+                }
+                continue;
+            }
+        }
+
+        if i >= input.len() {
+            break;
+        }
+
+        // Slow path: handle whitespace, padding, partial quads, and validation
+        // one byte at a time.
+        let b = input[i];
+        i += 1;
+
         if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
             continue;
         }
 
-        // Single-lookup decode via B64_DECODE table: 0-63 valid, B64_PAD (64) for '=',
-        // B64_INVALID (0xFF) for invalid bytes. Eliminates the match-per-byte overhead.
         let v = B64_DECODE[b as usize];
         if v == B64_INVALID {
             return Err(Base64DecodeError::InvalidByte);
         }
 
-        // Once padding is seen, only trailing whitespace is allowed.
         if seen_pad {
             return Err(Base64DecodeError::InvalidPadding);
         }
@@ -1130,8 +1211,7 @@ fn stream_decode_base64(
 
         qn = 0;
 
-        // Leave headroom so a full quantum (3 bytes) always fits.
-        if out_len >= out.len() - 4 {
+        if out_len >= max_fill {
             match flush_buf(&mut out, &mut out_len, &mut on_bytes) {
                 ControlFlow::Continue(()) => {}
                 ControlFlow::Break(()) => return Ok(()),
