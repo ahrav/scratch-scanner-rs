@@ -2025,3 +2025,141 @@ fn sniff_detected_zip_archive_emits_findings() {
         report.metrics.archive
     );
 }
+
+// ── Gap 8: FailRun policy propagation for unsupported_policy ───────
+
+#[test]
+fn tar_with_nested_zip_fail_run_aborts_scan() {
+    // A zip entry inside a tar can't be recursed (no random access).
+    // With unsupported_policy=FailRun, the entire run should be aborted
+    // and the plain file should NOT be scanned.
+    let tmp = TempDir::new().unwrap();
+    let tar_path = tmp.path().join("nested.tar");
+    let plain_path = tmp.path().join("plain.txt");
+
+    // Build a zip file to embed inside the tar.
+    let zip_bytes = build_zip_single_stored_entry("inner.txt", b"ZIP_CONTENT", false);
+    let tar_bytes = build_simple_tar_bytes(b"inner.zip", &zip_bytes);
+    fs::write(&tar_path, tar_bytes).unwrap();
+    fs::write(&plain_path, b"SECRET").unwrap();
+
+    let mut cfg = cfg_archives_enabled();
+    cfg.archive.unsupported_policy = UnsupportedPolicy::FailRun;
+
+    let (out, report) = run_scan(
+        vec![file_from_path(&tar_path), file_from_path(&plain_path)],
+        cfg,
+    );
+
+    // FailRun should abort the entire run: no findings from the plain file.
+    assert!(
+        out.trim().is_empty(),
+        "expected no findings with FailRun; got: {out}"
+    );
+
+    let idx = ArchiveSkipReason::NeedsRandomAccessNoSpill.as_usize();
+    assert_perf!(
+        report.metrics.archive.archive_skip_reasons[idx] > 0,
+        report.metrics.archive.archive_skip_reasons[idx] == 0,
+        "expected NeedsRandomAccessNoSpill skip reason: {:?}",
+        report.metrics.archive
+    );
+}
+
+#[test]
+fn zip_unsupported_compression_fail_run_aborts_scan() {
+    // A zip entry with an unsupported compression method + FailRun should abort.
+    let tmp = TempDir::new().unwrap();
+    let zip_path = tmp.path().join("unsupported.zip");
+    let plain_path = tmp.path().join("plain.txt");
+
+    let zip_bytes = build_zip_unsupported_compression("entry.txt", b"PAYLOAD");
+    fs::write(&zip_path, zip_bytes).unwrap();
+    fs::write(&plain_path, b"SECRET").unwrap();
+
+    let mut cfg = cfg_archives_enabled();
+    cfg.archive.unsupported_policy = UnsupportedPolicy::FailRun;
+
+    let (out, _report) = run_scan(
+        vec![file_from_path(&zip_path), file_from_path(&plain_path)],
+        cfg,
+    );
+
+    assert!(
+        out.trim().is_empty(),
+        "expected no findings with FailRun on unsupported compression; got: {out}"
+    );
+}
+
+/// Build a single-entry tar from raw name bytes and payload.
+fn build_simple_tar_bytes(name: &[u8], payload: &[u8]) -> Vec<u8> {
+    let name_str = std::str::from_utf8(name).unwrap_or("entry");
+    build_simple_tar(name_str, payload)
+}
+
+/// Build a zip file with a single entry using compression method 99 (unsupported).
+fn build_zip_unsupported_compression(name: &str, payload: &[u8]) -> Vec<u8> {
+    // We'll build a minimal zip by hand with method=99 (WinZip AES).
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len() as u16;
+    let payload_len = payload.len() as u32;
+
+    // Local file header.
+    let mut lfh = Vec::new();
+    lfh.extend_from_slice(&0x04034b50u32.to_le_bytes()); // LFH signature
+    lfh.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    lfh.extend_from_slice(&0u16.to_le_bytes()); // flags
+    lfh.extend_from_slice(&99u16.to_le_bytes()); // compression method (unsupported)
+    lfh.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    lfh.extend_from_slice(&0u16.to_le_bytes()); // mod date
+    lfh.extend_from_slice(&0u32.to_le_bytes()); // crc32
+    lfh.extend_from_slice(&payload_len.to_le_bytes()); // compressed size
+    lfh.extend_from_slice(&payload_len.to_le_bytes()); // uncompressed size
+    lfh.extend_from_slice(&name_len.to_le_bytes()); // name length
+    lfh.extend_from_slice(&0u16.to_le_bytes()); // extra field length
+    lfh.extend_from_slice(name_bytes);
+    let lfh_offset = 0u32;
+
+    // File data.
+    let mut out = lfh;
+    out.extend_from_slice(payload);
+
+    // Central directory file header.
+    let cdfh_offset = out.len() as u32;
+    let mut cdfh = Vec::new();
+    cdfh.extend_from_slice(&0x02014b50u32.to_le_bytes()); // CDFH signature
+    cdfh.extend_from_slice(&20u16.to_le_bytes()); // version made by
+    cdfh.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // flags
+    cdfh.extend_from_slice(&99u16.to_le_bytes()); // compression method
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // mod date
+    cdfh.extend_from_slice(&0u32.to_le_bytes()); // crc32
+    cdfh.extend_from_slice(&payload_len.to_le_bytes()); // compressed size
+    cdfh.extend_from_slice(&payload_len.to_le_bytes()); // uncompressed size
+    cdfh.extend_from_slice(&name_len.to_le_bytes()); // name length
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // extra field length
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+    cdfh.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+    cdfh.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+    cdfh.extend_from_slice(&lfh_offset.to_le_bytes()); // relative offset of LFH
+    cdfh.extend_from_slice(name_bytes);
+    out.extend_from_slice(&cdfh);
+
+    // End of central directory record.
+    let eocd_offset = out.len();
+    let cd_size = (eocd_offset as u32) - cdfh_offset;
+    let mut eocd = Vec::new();
+    eocd.extend_from_slice(&0x06054b50u32.to_le_bytes()); // EOCD signature
+    eocd.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    eocd.extend_from_slice(&0u16.to_le_bytes()); // disk with CD
+    eocd.extend_from_slice(&1u16.to_le_bytes()); // entries on this disk
+    eocd.extend_from_slice(&1u16.to_le_bytes()); // total entries
+    eocd.extend_from_slice(&cd_size.to_le_bytes()); // CD size
+    eocd.extend_from_slice(&cdfh_offset.to_le_bytes()); // CD offset
+    eocd.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    out.extend_from_slice(&eocd);
+
+    out
+}

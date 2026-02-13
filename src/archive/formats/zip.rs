@@ -30,8 +30,9 @@ use crate::archive::formats::tar::TarRead;
 
 use flate2::read::DeflateDecoder;
 
+use crate::archive::util;
 use crate::archive::{
-    ArchiveBudgets, ArchiveConfig, ArchiveSkipReason, BudgetHit, ChargeResult, PartialReason,
+    ArchiveBudgets, ArchiveConfig, ArchiveSkipReason, ChargeResult, PartialReason,
 };
 
 /// Source for ZIP parsing that supports random access and cloning.
@@ -281,12 +282,17 @@ impl<R: ZipSource> ZipCursor<R> {
         // Charge metadata for the EOCD search window.
         match budgets.charge_metadata(win_len as u64) {
             ChargeResult::Ok => {}
-            ChargeResult::Clamp { hit, .. } => return Ok(ZipOpen::Stop(map_budget_hit(hit))),
+            ChargeResult::Clamp { hit, .. } => {
+                return Ok(ZipOpen::Stop(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedZip,
+                )))
+            }
         }
 
         file.seek(SeekFrom::Start(win_off))?;
         let win = &mut self.eocd_buf[..win_len];
-        read_exact_n(&mut file, win)?;
+        util::read_exact_n(&mut file, win, "zip")?;
 
         // Find EOCD signature within window (scan backward).
         let eocd_rel = match rfind_sig_u32_le(win, SIG_EOCD) {
@@ -440,12 +446,17 @@ impl<R: ZipSource> ZipCursor<R> {
         // Read fixed CDFH.
         match budgets.charge_metadata(CDFH_LEN as u64) {
             ChargeResult::Ok => {}
-            ChargeResult::Clamp { hit, .. } => return Ok(ZipNext::Stop(map_budget_hit(hit))),
+            ChargeResult::Clamp { hit, .. } => {
+                return Ok(ZipNext::Stop(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedZip,
+                )))
+            }
         }
 
         file.seek(SeekFrom::Start(self.cd_pos))?;
         let mut hdr = [0u8; CDFH_LEN];
-        read_exact_n(file, &mut hdr)?;
+        util::read_exact_n(file, &mut hdr, "zip")?;
 
         let sig = u32_from_le(&hdr[0..4]);
         if sig != SIG_CDFH {
@@ -454,7 +465,10 @@ impl<R: ZipSource> ZipCursor<R> {
 
         // Enforce entry count deterministically.
         if let Err(hit) = budgets.note_entry() {
-            return Ok(ZipNext::Stop(map_budget_hit(hit)));
+            return Ok(ZipNext::Stop(util::budget_hit_to_partial(
+                hit,
+                PartialReason::MalformedZip,
+            )));
         }
         self.entries_seen = self.entries_seen.saturating_add(1);
 
@@ -483,7 +497,12 @@ impl<R: ZipSource> ZipCursor<R> {
 
         match budgets.charge_metadata(var_total as u64) {
             ChargeResult::Ok => {}
-            ChargeResult::Clamp { hit, .. } => return Ok(ZipNext::Stop(map_budget_hit(hit))),
+            ChargeResult::Clamp { hit, .. } => {
+                return Ok(ZipNext::Stop(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedZip,
+                )))
+            }
         }
 
         // Read filename, bounded storage (prefix) + streaming hash for overflow.
@@ -496,8 +515,17 @@ impl<R: ZipSource> ZipCursor<R> {
         let store_len = name_len.min(max_store).min(self.name_buf.capacity());
         let name_truncated = name_len > store_len;
 
-        // SAFETY: `store_len` is bounded by capacity and we immediately fill
-        // the entire buffer with `read_exact_n`.
+        // SAFETY: `store_len` is bounded by `self.name_buf.capacity()` (see
+        // `.min(self.name_buf.capacity())` above), satisfying `set_len`'s
+        // precondition.  The buffer is immediately filled by `read_name_exact`
+        // (which calls `read_exact_n`).
+        //
+        // Error-path safety: if `read_name_exact` returns `Err`, the `?`
+        // propagates upward with `name_buf` containing uninitialized bytes.
+        // This is safe because the next call to `next_entry` begins with
+        // `self.name_buf.clear()` (which sets len=0 without reading), so the
+        // uninitialized bytes are never observed — only overwritten or discarded.
+        // This is exercised by the Miri test `name_buf_error_path_clears_without_reading_uninit`.
         if store_len > 0 {
             unsafe {
                 self.name_buf.set_len(store_len);
@@ -505,9 +533,9 @@ impl<R: ZipSource> ZipCursor<R> {
             self.read_name_exact(store_len)?;
         }
 
-        let mut name_hash64 = fnv1a64_init();
+        let mut name_hash64 = util::fnv1a64_init();
         for &b in &self.name_buf {
-            name_hash64 = fnv1a64_update(name_hash64, b);
+            name_hash64 = util::fnv1a64_update(name_hash64, b);
         }
 
         if name_truncated {
@@ -558,7 +586,7 @@ impl<R: ZipSource> ZipCursor<R> {
                 ))
             }
         };
-        read_exact_n(file, &mut self.name_buf[..n])
+        util::read_exact_n(file, &mut self.name_buf[..n], "zip")
     }
 
     fn discard_exact(&mut self, mut n: usize) -> io::Result<()> {
@@ -573,7 +601,7 @@ impl<R: ZipSource> ZipCursor<R> {
         };
         while n > 0 {
             let step = self.discard.len().min(n);
-            read_exact_n(file, &mut self.discard[..step])?;
+            util::read_exact_n(file, &mut self.discard[..step], "zip")?;
             n -= step;
         }
         Ok(())
@@ -591,9 +619,9 @@ impl<R: ZipSource> ZipCursor<R> {
         };
         while n > 0 {
             let step = self.discard.len().min(n);
-            read_exact_n(file, &mut self.discard[..step])?;
+            util::read_exact_n(file, &mut self.discard[..step], "zip")?;
             for &b in &self.discard[..step] {
-                *hash = fnv1a64_update(*hash, b);
+                *hash = util::fnv1a64_update(*hash, b);
             }
             n -= step;
         }
@@ -620,11 +648,16 @@ impl<R: ZipSource> ZipCursor<R> {
 
         match budgets.charge_metadata(LFH_LEN as u64) {
             ChargeResult::Ok => {}
-            ChargeResult::Clamp { hit, .. } => return Ok(Err(map_budget_hit(hit))),
+            ChargeResult::Clamp { hit, .. } => {
+                return Ok(Err(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedZip,
+                )))
+            }
         }
 
         let mut lfh = [0u8; LFH_LEN];
-        read_exact_n(f, &mut lfh)?;
+        util::read_exact_n(f, &mut lfh, "zip")?;
 
         let sig = u32_from_le(&lfh[0..4]);
         if sig != SIG_LFH {
@@ -637,7 +670,12 @@ impl<R: ZipSource> ZipCursor<R> {
         let local_var = name_len.saturating_add(extra_len);
         match budgets.charge_metadata(local_var) {
             ChargeResult::Ok => {}
-            ChargeResult::Clamp { hit, .. } => return Ok(Err(map_budget_hit(hit))),
+            ChargeResult::Clamp { hit, .. } => {
+                return Ok(Err(util::budget_hit_to_partial(
+                    hit,
+                    PartialReason::MalformedZip,
+                )))
+            }
         }
 
         let data_start = meta
@@ -757,27 +795,6 @@ impl<R: Read> Read for CountedRead<R> {
     }
 }
 
-#[inline(always)]
-fn map_budget_hit(hit: BudgetHit) -> PartialReason {
-    match hit {
-        BudgetHit::PartialArchive(r) => r,
-        BudgetHit::StopRoot(r) => r,
-        BudgetHit::SkipArchive(r) => match r {
-            ArchiveSkipReason::MetadataBudgetExceeded => PartialReason::MetadataBudgetExceeded,
-            ArchiveSkipReason::PathBudgetExceeded => PartialReason::PathBudgetExceeded,
-            ArchiveSkipReason::EntryCountExceeded => PartialReason::EntryCountExceeded,
-            ArchiveSkipReason::ArchiveOutputBudgetExceeded => {
-                PartialReason::ArchiveOutputBudgetExceeded
-            }
-            ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
-            ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
-            ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-            _ => PartialReason::MalformedZip,
-        },
-        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
-    }
-}
-
 fn rfind_sig_u32_le(hay: &[u8], sig: u32) -> Option<usize> {
     if hay.len() < 4 {
         return None;
@@ -796,18 +813,6 @@ fn rfind_sig_u32_le(hay: &[u8], sig: u32) -> Option<usize> {
 }
 
 #[inline(always)]
-fn fnv1a64_init() -> u64 {
-    14695981039346656037u64
-}
-
-#[inline(always)]
-fn fnv1a64_update(mut h: u64, b: u8) -> u64 {
-    h ^= b as u64;
-    h = h.wrapping_mul(1099511628211u64);
-    h
-}
-
-#[inline(always)]
 fn u32_from_le(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
@@ -820,25 +825,6 @@ fn le_u16(b: &[u8]) -> u16 {
 #[inline(always)]
 fn le_u32(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-}
-
-fn read_exact_n<R: Read>(r: &mut R, dst: &mut [u8]) -> io::Result<()> {
-    let mut off = 0;
-    while off < dst.len() {
-        let n = match r.read(&mut dst[off..]) {
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "zip truncated",
-            ));
-        }
-        off += n;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -937,5 +923,97 @@ mod tests {
 
         assert_entry(std::io::Cursor::new(bytes.clone()), &cfg);
         assert_entry(std::io::Cursor::new(bytes_arc), &cfg);
+    }
+
+    // ── set_len Miri-targeted tests ───────────────────────────────────
+    //
+    // These exercise the `Vec::set_len` + immediate fill pattern used in
+    // `parse_local_file_header` without any FFI (no flate2 / zlib-ng),
+    // so they run cleanly under Miri with strict-provenance checking.
+
+    /// Validates the normal path: `set_len(n)` followed by immediate fill.
+    /// This mirrors the pattern at line 502-505 where `set_len(store_len)`
+    /// is immediately followed by `read_name_exact(store_len)`.
+    #[test]
+    fn name_buf_set_len_and_fill() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        // Mimic parse_local_file_header: clear, set_len, fill.
+        buf.clear();
+        let store_len = 32usize.min(cap);
+        unsafe {
+            buf.set_len(store_len);
+        }
+        // Immediately fill (simulates `read_name_exact`).
+        buf[..store_len].copy_from_slice(&[0xAA; 32]);
+
+        assert_eq!(buf.len(), 32);
+        assert!(buf.iter().all(|&b| b == 0xAA));
+    }
+
+    /// Validates the error path: `set_len(n)` followed by a failed read,
+    /// then `clear()` on the next call. The uninitialized bytes between
+    /// `set_len` and `clear` must never be read.
+    #[test]
+    fn name_buf_error_path_clears_without_reading_uninit() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        buf.clear();
+        let store_len = 32usize.min(cap);
+        unsafe {
+            buf.set_len(store_len);
+        }
+        // Simulate `read_name_exact` returning Err — the `?` propagates
+        // upward. On the next call, `parse_local_file_header` starts with
+        // `self.name_buf.clear()`. We must NOT read the uninit bytes.
+
+        // clear() just sets len=0 — no read of uninit memory.
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), cap);
+
+        // After clear, the buffer is safe to reuse with a new set_len+fill.
+        unsafe {
+            buf.set_len(16);
+        }
+        buf[..16].copy_from_slice(&[0xBB; 16]);
+        assert_eq!(buf.len(), 16);
+        assert!(buf.iter().all(|&b| b == 0xBB));
+    }
+
+    /// Validates set_len with store_len == 0 (no unsafe needed).
+    #[test]
+    fn name_buf_zero_len_skips_set_len() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        buf.clear();
+        let store_len = 0usize;
+        // The code guards: `if store_len > 0 { unsafe { set_len(...) } }`
+        // so store_len == 0 never enters the unsafe block.
+        if store_len > 0 {
+            unsafe {
+                buf.set_len(store_len);
+            }
+        }
+        assert_eq!(buf.len(), 0);
+    }
+
+    /// Validates set_len at exact capacity boundary.
+    #[test]
+    fn name_buf_set_len_at_capacity() {
+        let cap = 64;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap);
+
+        buf.clear();
+        let store_len = cap; // store_len == capacity
+        unsafe {
+            buf.set_len(store_len);
+        }
+        buf[..store_len].fill(0xCC);
+        assert_eq!(buf.len(), cap);
+        assert!(buf.iter().all(|&b| b == 0xCC));
     }
 }

@@ -1,19 +1,43 @@
 //! Deterministic virtual path construction for archive entries.
 //!
+//! Converts raw archive entry names (which may contain arbitrary bytes, `..`
+//! traversals, or Windows separators) into bounded, printable-ASCII display
+//! identifiers. These identifiers are used in logging and scan results -- they
+//! are **not** filesystem paths and are never used to open files.
+//!
+//! Two public types compose the full pipeline:
+//!
+//! - [`EntryPathCanonicalizer`] -- sanitizes a single entry name (resolve `.`/`..`,
+//!   escape non-printable bytes, enforce length + component caps).
+//! - [`VirtualPathBuilder`] -- joins `parent::entry` display bytes, optionally
+//!   with a suffix (e.g. a transaction-id tag), applying the same truncation scheme.
+//!
 //! # Invariants
-//! - Output bytes are printable ASCII; non-printables are percent-escaped.
+//! - Output bytes are printable ASCII (`0x20..=0x7E`); everything else is
+//!   percent-escaped as `%HH` (uppercase hex).
 //! - `..` traversal never escapes above the virtual root.
-//! - Output length is bounded by `max_len` with a stable hash suffix on truncation.
-//! - Component count is capped to avoid path explosion.
+//! - Output length is bounded by `max_len`. When truncated, a deterministic
+//!   `~#<16-hex-digit>` suffix (FNV-1a of the *full* untruncated output) replaces
+//!   the tail, so two different long paths never silently collide.
+//! - Component count is capped to avoid zip-bomb-style path explosion.
 //!
 //! # Algorithm
-//! - Normalize separators (`\\` → `/`) and split into components.
-//! - Drop `.`; clamp `..` while tracking traversal attempts.
-//! - Percent-escape unsafe bytes, then apply truncation with a hash suffix.
+//! 1. Normalize separators (`\` → `/`) and split into components.
+//! 2. Drop `.`; resolve `..` via a stack, clamping at root.
+//! 3. Emit escaped display bytes, streaming the FNV-1a hash over the full
+//!    (unbounded) output while storing only up to `max_len` bytes.
+//! 4. If the full output exceeded `max_len`, replace the stored tail with the
+//!    hash suffix, taking care not to split a `%HH` escape at the boundary.
 //!
 //! # Design Notes
 //! - Output is a **display identifier**, not a filesystem path.
-//! - ASCII output avoids terminal/control-byte issues in logs.
+//! - ASCII output avoids terminal / control-byte issues in logs.
+//! - FNV-1a is chosen for speed and simplicity -- collision resistance is not
+//!   a security goal here; the hash exists only to distinguish truncated paths.
+//! - Both public types reuse an internal `Vec<u8>` buffer and are intended to
+//!   be allocated once per worker thread for steady-state zero allocation.
+
+use crate::archive::util;
 
 /// Default maximum number of path components allowed during canonicalization.
 pub const DEFAULT_MAX_COMPONENTS: usize = 256;
@@ -29,9 +53,14 @@ const COMPONENT_CAP_PLACEHOLDER: &[u8] = b"<component-cap-exceeded>";
 
 /// Result of entry-path canonicalization.
 ///
-/// `bytes` is a slice into the canonicalizer's internal buffer and is valid
-/// until the next call that mutates the canonicalizer.
+/// Borrows the canonicalizer's internal buffer -- the slice is valid until
+/// the next call to [`EntryPathCanonicalizer::canonicalize`].
+///
+/// Callers typically inspect the flags to decide whether to log a warning
+/// (`had_traversal`, `component_cap_exceeded`) and use `bytes` as the
+/// display path in scan results.
 pub struct CanonicalPath<'a> {
+    /// Sanitized display bytes (printable ASCII, percent-escaped).
     pub bytes: &'a [u8],
     /// True if input attempted to traverse above root (`..` with empty stack).
     pub had_traversal: bool,
@@ -44,26 +73,37 @@ pub struct CanonicalPath<'a> {
 }
 
 /// Result of virtual path construction (`parent::entry`).
+///
+/// Borrows the builder's internal buffer -- the slice is valid until the
+/// next call to [`VirtualPathBuilder::build`] or [`VirtualPathBuilder::build_with_suffix`].
 pub struct VirtualPath<'a> {
+    /// The assembled display bytes (e.g. `/tmp/a.zip::dir/file.txt`).
     pub bytes: &'a [u8],
     pub truncated: bool,
     /// 64-bit deterministic hash of the full (untruncated) display bytes.
+    /// Returns 0 when the suffix alone exceeds `max_len` (no base bytes to hash).
     pub hash64: u64,
 }
 
-/// Canonicalizes archive entry names into stable display bytes.
+/// Canonicalizes archive entry names into bounded, printable-ASCII display bytes.
 ///
 /// # Guarantees
-/// - Returned slices are valid until the next call that mutates the canonicalizer.
-/// - Output length and component count are bounded by the provided limits.
+/// - Returned slices are valid until the next call to [`Self::canonicalize`].
+/// - Output length never exceeds `max_len`; component count never exceeds `max_components`.
+/// - Internal buffers never grow beyond the capacity set by [`Self::with_capacity`].
 ///
 /// # Performance
-/// - Intended to be reused (one per worker/reader) to avoid allocations.
+/// Intended to be allocated once per worker thread and reused across entries.
+/// After the first call, all operations are zero-allocation (the internal
+/// `Vec`s are cleared and refilled within their existing capacity).  Use
+/// [`Self::debug_assert_no_growth`] in tests to verify this invariant.
 #[derive(Default)]
 pub struct EntryPathCanonicalizer {
-    // Stack of component byte ranges referencing the raw input slice.
+    // Resolved component ranges `(start, end)` into the *raw input* slice.
+    // Stored as ranges rather than owned copies to avoid copying bytes during
+    // the resolve phase; the emit phase reads back from the raw slice.
     comps: Vec<(usize, usize)>,
-    // Output display bytes (ASCII).
+    // Output buffer for escaped display bytes (printable ASCII).
     out: Vec<u8>,
 
     // Debug-only capacity guards.
@@ -114,17 +154,27 @@ impl EntryPathCanonicalizer {
         }
     }
 
-    /// Canonicalize a raw archive entry path.
+    /// Canonicalize a raw archive entry path into bounded display bytes.
     ///
-    /// - Separators: `\` and `/` treated as `/`
-    /// - Drop empty and `.` components
-    /// - `..` pops a component; if empty, clamps and sets `had_traversal=true`
-    /// - Component cap exceeded => `component_cap_exceeded=true` and placeholder output
-    /// - Non-printable bytes (and `%`) are escaped as `%HH` (uppercase hex)
-    /// - If display exceeds `max_len`, truncates and appends `~#<16hex>` (may
-    ///   shorten by 1–2 bytes to avoid splitting a `%HH` escape)
-    /// - `max_len` and `max_components` are clamped to internal buffer capacity
-    ///   to avoid growth; size with `with_capacity` for larger limits
+    /// The method works in two phases:
+    ///
+    /// **Phase 1 -- Resolve:** Split the raw bytes on `/` and `\`, drop `.`,
+    /// resolve `..` via a stack (clamping at root), and enforce the component cap.
+    /// This phase stores `(start, end)` ranges into `raw` -- no bytes are copied.
+    ///
+    /// **Phase 2 -- Emit:** Walk the resolved ranges, percent-escape non-printable
+    /// bytes, and stream-hash the full (unbounded) output via FNV-1a.  Only the
+    /// first `max_len` bytes are stored; if the full output exceeded that limit,
+    /// the stored tail is replaced with `~#<16hex>` (the hash suffix).
+    ///
+    /// # Truncation boundary
+    /// The suffix replacement avoids splitting a `%HH` escape: if the cut falls
+    /// inside one, the prefix is shortened by 1-2 bytes so the escape stays intact.
+    ///
+    /// # Clamping
+    /// `max_len` and `max_components` are silently clamped to internal buffer
+    /// capacity to prevent growth. Use [`Self::with_capacity`] to size for
+    /// larger limits.
     pub fn canonicalize<'a>(
         &'a mut self,
         raw: &[u8],
@@ -204,7 +254,7 @@ impl EntryPathCanonicalizer {
 
         // If empty after canonicalization, emit placeholder.
         if self.comps.is_empty() {
-            let h = fnv1a64(EMPTY_PLACEHOLDER);
+            let h = util::fnv1a64(EMPTY_PLACEHOLDER);
             emit_truncated_with_hash_suffix(&mut self.out, EMPTY_PLACEHOLDER, h, max_len);
             return CanonicalPath {
                 bytes: &self.out,
@@ -216,7 +266,7 @@ impl EntryPathCanonicalizer {
         }
 
         // Emit full display bytes up to max_len, but compute hash over full (unbounded) display bytes.
-        let mut hash = fnv1a64_init();
+        let mut hash = util::fnv1a64_init();
         let mut full_len = 0usize;
 
         for (idx, (s, e)) in self.comps.iter().copied().enumerate() {
@@ -247,9 +297,15 @@ impl EntryPathCanonicalizer {
     }
 }
 
-/// Builds `parent::entry` display bytes with truncation + stable hash suffix.
+/// Joins a parent display path and an entry name with a `::` separator,
+/// producing bounded display bytes with the same truncation scheme as
+/// [`EntryPathCanonicalizer`].
 ///
-/// Reuse this per worker/reader to avoid allocations.
+/// The `::` separator is chosen to be visually distinct from filesystem
+/// separators (`/`, `\`) so nested archive paths read unambiguously in logs:
+/// `/tmp/outer.tar::inner.zip::dir/file.txt`.
+///
+/// Like `EntryPathCanonicalizer`, allocate once per worker thread and reuse.
 #[derive(Default)]
 pub struct VirtualPathBuilder {
     out: Vec<u8>,
@@ -264,6 +320,10 @@ impl VirtualPathBuilder {
         Self::default()
     }
 
+    /// Pre-size the internal buffer for steady-state zero growth.
+    ///
+    /// `max_len` should match the largest `max_len` argument you will pass
+    /// to [`Self::build`] or [`Self::build_with_suffix`].
     pub fn with_capacity(max_len: usize) -> Self {
         Self {
             out: Vec::with_capacity(max_len),
@@ -297,7 +357,7 @@ impl VirtualPathBuilder {
         );
         self.out.clear();
 
-        let mut hash = fnv1a64_init();
+        let mut hash = util::fnv1a64_init();
         let mut full_len = 0usize;
 
         for &b in parent {
@@ -368,7 +428,7 @@ impl VirtualPathBuilder {
         }
 
         let base_limit = max_len - suffix_len;
-        let mut hash = fnv1a64_init();
+        let mut hash = util::fnv1a64_init();
         let mut full_len = 0usize;
 
         for &b in parent {
@@ -408,41 +468,27 @@ fn is_sep(b: u8) -> bool {
     b == b'/' || b == b'\\'
 }
 
-// Deterministic 64-bit FNV-1a.
-#[inline(always)]
-fn fnv1a64_init() -> u64 {
-    14695981039346656037u64
-}
+// FNV-1a helpers are in `crate::archive::util`. The separator-normalizing
+// variant below is path-specific (normalizes `\` → `/` before hashing).
 
-#[inline(always)]
-fn fnv1a64_update(mut h: u64, b: u8) -> u64 {
-    h ^= b as u64;
-    h = h.wrapping_mul(1099511628211u64);
-    h
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h = fnv1a64_init();
-    for &b in bytes {
-        h = fnv1a64_update(h, b);
-    }
-    h
-}
-
-// Used only for the component-cap-exceeded placeholder: hash raw bytes with '\\' normalized to '/'.
+// Hash raw bytes with `\` normalized to `/`.  Used for the component-cap-exceeded
+// placeholder so that `a\b\c` and `a/b/c` hash identically.
 fn fnv1a64_raw_with_sep_norm(raw: &[u8]) -> u64 {
-    let mut h = fnv1a64_init();
+    let mut h = util::fnv1a64_init();
     for &b in raw {
         let bb = if b == b'\\' { b'/' } else { b };
-        h = fnv1a64_update(h, bb);
+        h = util::fnv1a64_update(h, bb);
     }
     h
 }
 
-// Emit one byte into out (stored only up to max_len), but always hash + count full_len.
+// Core emit primitive: unconditionally hashes `b` and increments `full_len`,
+// but only stores the byte in `out` while `out.len() < max_len`.  This lets
+// the caller compute the hash over the full (unbounded) output while keeping
+// the stored prefix bounded -- the key trick behind the truncation scheme.
 #[inline(always)]
 fn emit_one(out: &mut Vec<u8>, hash: &mut u64, full_len: &mut usize, b: u8, max_len: usize) {
-    *hash = fnv1a64_update(*hash, b);
+    *hash = util::fnv1a64_update(*hash, b);
     *full_len = full_len.saturating_add(1);
     if out.len() < max_len {
         out.push(b);
@@ -474,24 +520,26 @@ fn is_printable_ascii(b: u8) -> bool {
     (0x20..=0x7e).contains(&b)
 }
 
+const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
+
 #[inline(always)]
 fn hex_upper(n: u8) -> u8 {
     debug_assert!(n < 16);
-    match n {
-        0..=9 => b'0' + n,
-        _ => b'A' + (n - 10),
-    }
+    HEX_UPPER[n as usize]
 }
 
-#[inline(always)]
-fn hex_lower(n: u8) -> u8 {
-    debug_assert!(n < 16);
-    match n {
-        0..=9 => b'0' + n,
-        _ => b'a' + (n - 10),
-    }
-}
-
+/// Replace the tail of `out` with the deterministic hash suffix `~#<16hex>`.
+///
+/// `out` is assumed to already contain a prefix of the display bytes (up to
+/// `max_len` long). This function:
+///
+/// 1. Truncates `out` to `max_len - 18` bytes (room for `~#` + 16 hex digits).
+/// 2. Backs up 1-2 bytes if the cut would split a `%HH` percent-escape.
+/// 3. Appends the suffix.
+///
+/// Edge cases:
+/// - `max_len == 0` => `out` is cleared (no room for anything).
+/// - `max_len <= 18` => `out` is the suffix prefix alone (no display prefix).
 pub(crate) fn apply_hash_suffix_truncation(out: &mut Vec<u8>, hash: u64, max_len: usize) {
     if max_len == 0 {
         out.clear();
@@ -502,7 +550,7 @@ pub(crate) fn apply_hash_suffix_truncation(out: &mut Vec<u8>, hash: u64, max_len
     let mut suffix = [0u8; TRUNC_SUFFIX_LEN];
     suffix[0] = b'~';
     suffix[1] = b'#';
-    write_u64_hex_lower(hash, &mut suffix[2..18]);
+    util::write_u64_hex_lower(hash, &mut suffix[2..18]);
 
     if max_len <= TRUNC_SUFFIX_LEN {
         out.clear();
@@ -526,30 +574,22 @@ pub(crate) fn apply_hash_suffix_truncation(out: &mut Vec<u8>, hash: u64, max_len
     debug_assert!(out.len() <= max_len);
 }
 
+// Emit a literal `base` slice (no escaping) into `out`, applying hash-suffix
+// truncation only when `base` exceeds `max_len`.  When `base` fits, the output
+// is the full `base` unchanged -- the hash suffix is not appended because there
+// is no information loss to compensate for.
 fn emit_truncated_with_hash_suffix(out: &mut Vec<u8>, base: &[u8], hash: u64, max_len: usize) {
     out.clear();
     if max_len == 0 {
         return;
     }
-    // Emit base into out up to max_len (no escaping assumed here).
     let take = base.len().min(max_len);
     out.extend_from_slice(&base[..take]);
 
-    // If base doesn't fit, suffix truncation is not meaningful - keep prefix only.
     if base.len() <= max_len {
-        return;
+        return; // Base fits -- no truncation needed.
     }
-    // base longer than max - replace with hash suffix truncation.
     apply_hash_suffix_truncation(out, hash, max_len);
-}
-
-fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = hex_lower(nyb);
-    }
 }
 
 #[cfg(test)]
@@ -633,5 +673,80 @@ mod tests {
         let r = c.canonicalize(raw, DEFAULT_MAX_COMPONENTS, 128);
         assert!(r.bytes.len() <= 8);
         assert!(r.truncated);
+    }
+
+    // ── Gap 7: Percent-escape boundary truncation ──────────────────────
+
+    #[test]
+    fn hash_suffix_trunc_cut_on_percent_removes_lone_percent() {
+        // Build output where cut falls exactly on '%'.
+        // TRUNC_SUFFIX_LEN = 18. With max_len=20, prefix_len=2.
+        // If prefix is "X%", the '%' at the boundary should be removed.
+        let mut out = b"X%".to_vec();
+        let hash = 0x1234_5678_ABCD_EF00u64;
+        apply_hash_suffix_truncation(&mut out, hash, 20);
+        // The '%' should be removed: output = "X" + suffix (18 bytes) = 19 bytes.
+        assert!(out.len() <= 20);
+        assert!(!out[..out.len().saturating_sub(18)].ends_with(b"%"));
+        assert!(out.windows(2).any(|w| w == b"~#"));
+    }
+
+    #[test]
+    fn hash_suffix_trunc_cut_on_first_hex_removes_partial_escape() {
+        // Prefix is "X%2" → "%2" should be removed (split escape).
+        let mut out = b"X%2".to_vec();
+        let hash = 0x1234_5678_ABCD_EF01u64;
+        // max_len = 21 → prefix_len = 3. Out has 3 bytes, cut is at 3.
+        // But out ends with "%2" (2-byte partial), which the backup should remove.
+        apply_hash_suffix_truncation(&mut out, hash, 21);
+        assert!(out.len() <= 21);
+        // The "%2" should be removed from the prefix.
+        let prefix_end = out.len().saturating_sub(18);
+        let prefix = &out[..prefix_end];
+        assert!(
+            !prefix.ends_with(b"%2"),
+            "partial escape '%2' should have been removed"
+        );
+    }
+
+    #[test]
+    fn hash_suffix_trunc_complete_escape_preserved() {
+        // Prefix is "X%25" → complete escape, no backup needed.
+        let mut out = b"X%25".to_vec();
+        let hash = 0x1234_5678_ABCD_EF02u64;
+        // max_len = 22 → prefix_len = 4. Out has 4 bytes, all good.
+        apply_hash_suffix_truncation(&mut out, hash, 22);
+        assert!(out.len() <= 22);
+        let prefix_end = out.len().saturating_sub(18);
+        let prefix = &out[..prefix_end];
+        // Complete escape "%25" should be preserved (not backed up).
+        assert_eq!(prefix, b"X%25");
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_equals_suffix_len() {
+        // max_len == TRUNC_SUFFIX_LEN (18) → output is just the suffix.
+        let mut out = b"some long prefix data".to_vec();
+        let hash = 0xAAAA_BBBB_CCCC_DDDDu64;
+        apply_hash_suffix_truncation(&mut out, hash, TRUNC_SUFFIX_LEN);
+        assert_eq!(out.len(), TRUNC_SUFFIX_LEN);
+        assert!(out.starts_with(b"~#"));
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_zero() {
+        let mut out = b"some data".to_vec();
+        apply_hash_suffix_truncation(&mut out, 0, 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hash_suffix_trunc_max_len_less_than_suffix() {
+        // max_len < TRUNC_SUFFIX_LEN → output is truncated suffix.
+        let mut out = b"data".to_vec();
+        let hash = 0x1111_2222_3333_4444u64;
+        apply_hash_suffix_truncation(&mut out, hash, 5);
+        assert_eq!(out.len(), 5);
+        assert!(out.starts_with(b"~#"));
     }
 }
