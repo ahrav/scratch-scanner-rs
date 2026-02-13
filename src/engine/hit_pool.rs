@@ -165,10 +165,9 @@ pub(super) struct HitAccPool {
     touched_words: *mut u64,
 }
 
-/// # Safety
-/// All raw pointers in `HitAccPool` are exclusively owned heap allocations,
-/// never aliased, and only accessed through `&self` / `&mut self`. This is
-/// the same ownership model as `ScratchVec` which also implements `Send`.
+// SAFETY: All raw pointers in `HitAccPool` are exclusively owned heap allocations,
+// never aliased, and only accessed through `&self` / `&mut self`. This is
+// the same ownership model as `ScratchVec` which also implements `Send`.
 unsafe impl Send for HitAccPool {}
 
 impl Drop for HitAccPool {

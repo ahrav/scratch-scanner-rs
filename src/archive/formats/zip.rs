@@ -496,9 +496,9 @@ impl<R: ZipSource> ZipCursor<R> {
         let store_len = name_len.min(max_store).min(self.name_buf.capacity());
         let name_truncated = name_len > store_len;
 
-        // SAFETY: `store_len` is bounded by capacity and we immediately fill
-        // the entire buffer with `read_exact_n`.
         if store_len > 0 {
+            // SAFETY: `store_len <= capacity` (clamped above) and the buffer is
+            // immediately filled by `read_name_exact` on the next line.
             unsafe {
                 self.name_buf.set_len(store_len);
             }

@@ -175,12 +175,14 @@ pub(crate) struct VsGateDb {
 
 use super::vs_cache::{CacheKeyInput, VsDbCache};
 
-// Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsStreamDb {}
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Sync for VsStreamDb {}
 
-// Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsGateDb {}
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Sync for VsGateDb {}
 
 impl Drop for VsStreamDb {
@@ -207,8 +209,9 @@ impl Drop for VsGateDb {
     }
 }
 
-// Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsPrefilterDb {}
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Sync for VsPrefilterDb {}
 
 impl Drop for VsPrefilterDb {
@@ -678,9 +681,11 @@ unsafe fn push_stream_window_bounded(
 ) -> bool {
     debug_assert!(!pending_ptr.is_null());
     debug_assert!(!pending_len.is_null());
+    // SAFETY: Caller guarantees `pending_len` is a valid, aligned, dereferenceable pointer.
     let len = unsafe { *pending_len };
     if len >= max_pending || len >= pending_cap {
         if !overflowed.is_null() {
+            // SAFETY: Caller guarantees `overflowed` is valid when non-null.
             unsafe { *overflowed = 1 };
         }
         return false;
@@ -688,6 +693,8 @@ unsafe fn push_stream_window_bounded(
     // `len < max_pending` and `len < pending_cap` from the guard above,
     // so `len + 1 <= pending_cap <= u32::MAX` — no overflow.
     debug_assert!(len < u32::MAX, "pending_len would overflow u32");
+    // SAFETY: `len < pending_cap`, so `pending_ptr.add(len)` is within the
+    // allocation. `pending_len` is valid and writable (caller invariant).
     unsafe {
         pending_ptr.add(len as usize).write(win);
         *pending_len = len + 1;
@@ -713,6 +720,7 @@ unsafe extern "C" fn vs_on_stream_match(
         return 0;
     }
     let c = &mut *(ctx as *mut VsStreamMatchCtx);
+    // SAFETY: `c.overflowed` is a valid pointer when non-null (caller invariant).
     if !c.overflowed.is_null() && unsafe { *c.overflowed } != 0 {
         return 1;
     }
@@ -824,6 +832,7 @@ unsafe extern "C" fn vs_utf16_stream_on_match(
         return 0;
     }
     let c = &mut *(ctx as *mut VsUtf16StreamMatchCtx);
+    // SAFETY: `c.overflowed` is a valid pointer when non-null (caller invariant).
     if !c.overflowed.is_null() && unsafe { *c.overflowed } != 0 {
         return 1;
     }
@@ -1113,8 +1122,9 @@ pub(crate) struct VsUtf16StreamDb {
     pat_lens: Vec<u32>,
 }
 
-// Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsUtf16StreamDb {}
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Sync for VsUtf16StreamDb {}
 
 impl Drop for VsUtf16StreamDb {
@@ -1129,8 +1139,9 @@ impl Drop for VsUtf16StreamDb {
     }
 }
 
-// Safe because hs_database_t is immutable after compilation, and we require per-thread scratch.
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Send for VsAnchorDb {}
+// SAFETY: hs_database_t is immutable after compilation, and we require per-thread scratch.
 unsafe impl Sync for VsAnchorDb {}
 
 impl Drop for VsAnchorDb {
@@ -1377,8 +1388,10 @@ impl VsUtf16StreamDb {
             ids.push(id as c_uint);
         }
 
-        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `hs_populate_platform` writes CPU feature fields into the
+        // provided pointer. The `MaybeUninit` allocation is valid and
+        // properly aligned; see `VsStreamDb::try_new_stream` for rationale.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
@@ -1618,8 +1631,10 @@ impl VsGateDb {
             ids.push(id as c_uint);
         }
 
-        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `hs_populate_platform` writes CPU feature fields into the
+        // provided pointer. The `MaybeUninit` allocation is valid and
+        // properly aligned; see `VsStreamDb::try_new_stream` for rationale.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
@@ -1883,8 +1898,10 @@ impl VsPrefilterDb {
             None
         };
 
-        // SAFETY: see `VsStreamDb::try_new_stream` for the zeroed-platform rationale.
         let mut platform = MaybeUninit::<vs::hs_platform_info_t>::zeroed();
+        // SAFETY: `hs_populate_platform` writes CPU feature fields into the
+        // provided pointer. The `MaybeUninit` allocation is valid and
+        // properly aligned; see `VsStreamDb::try_new_stream` for rationale.
         unsafe {
             let _ = vs::hs_populate_platform(platform.as_mut_ptr());
         }
@@ -2436,6 +2453,7 @@ unsafe extern "C" fn vs_on_match(
     // SAFETY: pat_offsets has length anchor_pat_count + 1 (ctx invariant),
     // and pid < anchor_pat_count, so pid and pid + 1 are in bounds.
     let off_start = unsafe { *c.anchor_pat_offsets.add(pid) } as usize;
+    // SAFETY: pid + 1 <= anchor_pat_count, so this offset is in bounds.
     let off_end = unsafe { *c.anchor_pat_offsets.add(pid + 1) } as usize;
 
     // SAFETY: `scratch` is valid for the duration of the scan and not used concurrently.
@@ -2491,6 +2509,7 @@ unsafe extern "C" fn vs_anchor_on_match(
     // SAFETY: pat_offsets has length pat_count + 1 (ctx invariant),
     // and pid < pat_count, so pid and pid + 1 are in bounds.
     let off_start = unsafe { *c.pat_offsets.add(pid) } as usize;
+    // SAFETY: pid + 1 <= pat_count, so this offset is in bounds.
     let off_end = unsafe { *c.pat_offsets.add(pid + 1) } as usize;
 
     // SAFETY: scratch is valid for the duration of the scan and not used concurrently.

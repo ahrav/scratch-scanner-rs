@@ -128,6 +128,7 @@ impl<T, const N: usize> SpscRing<T, N> {
 // disjoint slots. `UnsafeCell<[MaybeUninit<T>; N]>` is safe to share
 // because the atomic head/tail indices enforce the access discipline.
 unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
+// SAFETY: `SpscRing` owns its buffered items and is `Send` when `T: Send`.
 unsafe impl<T: Send, const N: usize> Send for SpscRing<T, N> {}
 
 impl<T, const N: usize> Drop for SpscRing<T, N> {
@@ -387,6 +388,7 @@ struct OwnedSpscInner<T, const N: usize> {
 
 // SAFETY: The ring pointer is valid and the SPSC protocol ensures safe access.
 unsafe impl<T: Send, const N: usize> Send for OwnedSpscInner<T, N> {}
+// SAFETY: The ring pointer is valid and the SPSC protocol ensures safe access.
 unsafe impl<T: Send, const N: usize> Sync for OwnedSpscInner<T, N> {}
 
 impl<T, const N: usize> Drop for OwnedSpscInner<T, N> {

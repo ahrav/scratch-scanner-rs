@@ -379,6 +379,9 @@ impl<'a, T> Drop for Drain<'a, T> {
     fn drop(&mut self) {
         // Drop any remaining elements that were not yielded.
         for i in self.idx..self.len {
+            // SAFETY: `self.ptr` points to a valid `ScratchVec` allocation with
+            // `self.len` initialized elements; indices `self.idx..self.len` have
+            // not been yielded and must be dropped exactly once.
             unsafe {
                 std::ptr::drop_in_place(self.ptr.as_ptr().add(i));
             }
