@@ -1423,6 +1423,13 @@ impl Engine {
             // (checked on line above). `work_head` only increments by 1
             // per iteration, and `work_q` only grows (push) during the
             // loop body, never shrinks.
+            //
+            // NOTE: As of 2025-02, LLVM elides the bounds check on safe
+            // indexing here (ccmp+b.hs pattern on AArch64). This unsafe
+            // produces identical ASM and exists as a regression guard to
+            // ensure the bounds check is never re-introduced by future
+            // code changes. If this policy is revisited, revert to safe
+            // indexing: `let item = scratch.work_q[scratch.work_head];`
             let item = unsafe { *scratch.work_q.get_unchecked(scratch.work_head) };
             scratch.work_head += 1;
 
