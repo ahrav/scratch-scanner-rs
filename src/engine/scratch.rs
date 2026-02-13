@@ -72,6 +72,16 @@ const DEDUP_RULE_ID_BITS: u32 = 24;
 /// Maximum rule id that can be packed with an 8-bit variant discriminator.
 pub(super) const DEDUP_RULE_ID_MAX: u32 = (1u32 << DEDUP_RULE_ID_BITS) - 1;
 
+/// Packs a rule ID and variant discriminator into a single `u32`.
+///
+/// The lower [`DEDUP_RULE_ID_BITS`] (24) bits hold the rule ID; the upper 8
+/// bits hold `variant_disc` (Raw=0, Utf16Le=1, Utf16Be=2). This packing
+/// ensures UTF-16 LE/BE findings that share the same span and root hint
+/// produce distinct dedup keys.
+///
+/// # Panics
+///
+/// Panics if `rule_id > DEDUP_RULE_ID_MAX` (2²⁴ − 1 = 16,777,215).
 #[inline(always)]
 fn pack_rule_id_with_variant(rule_id: u32, variant_disc: u8) -> u32 {
     assert!(
@@ -337,9 +347,14 @@ impl EntropyScratch {
     }
 }
 
-/// Zero-sized type that forces 64-byte alignment between the hot and cold
-/// regions of [`ScanScratch`], ensuring the cold region starts on a fresh
-/// cache line.
+/// Zero-sized alignment marker that forces a 64-byte cache-line boundary
+/// between the hot and cold regions of [`ScanScratch`].
+///
+/// Placed as a field inside a `#[repr(C)]` struct, this ensures the next
+/// field begins on a fresh cache line. The `[u8; 0]` body contributes no
+/// bytes to the struct size — only the `#[repr(align(64))]` attribute
+/// matters, which the compiler satisfies by inserting padding before this
+/// field (not after it) in the `#[repr(C)]` layout.
 #[repr(align(64))]
 struct CachelineBoundary {
     _pad: [u8; 0],
@@ -1375,7 +1390,18 @@ impl ScanScratch {
     /// `keep` receives the finding record plus its aligned drop boundary and must
     /// return `true` to keep the row. Returns the number of rows removed.
     ///
+    /// # Algorithm
+    ///
+    /// Two-pass compaction optimized for the common case where nothing is dropped:
+    ///
+    /// 1. **Scan pass** — linear scan to find the first dropped row. If none is
+    ///    found, returns 0 without touching any sidecar arrays (fast path).
+    /// 2. **Compact pass** — from the first drop index onward, copies surviving
+    ///    rows into the gap left by dropped rows across all three parallel arrays
+    ///    (`out`, `drop_hint_end`, `norm_hash`), then truncates.
+    ///
     /// # Contract for `keep`
+    ///
     /// `keep` may be called more than once for the same row when at least one
     /// row is dropped (first-pass detection + second-pass compaction). It must
     /// therefore be side-effect free and deterministic for a given input pair.

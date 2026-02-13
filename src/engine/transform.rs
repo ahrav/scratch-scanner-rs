@@ -95,6 +95,11 @@ const B64_CHAR: u8 = 1 << 1;
 const B64_WS: u8 = 1 << 2;
 const B64_WS_SPACE: u8 = 1 << 3;
 
+/// Builds the shared 256-byte classification table at compile time.
+///
+/// Each byte value is assigned a bitmask of flags so that both URL and base64
+/// scanners can classify any byte with a single indexed load and mask test.
+/// The flags are: `URLISH`, `B64_CHAR`, `B64_WS`, `B64_WS_SPACE`.
 const fn build_byte_class() -> [u8; 256] {
     let mut table = [0u8; 256];
     let mut i = 0;
@@ -167,9 +172,11 @@ const B64_INVALID: u8 = 0xFF;
 /// Sentinel value indicating padding ('=') in B64_DECODE table.
 const B64_PAD: u8 = 64;
 
-/// Lookup table for base64 decoding: 0-63 for valid chars, B64_PAD (64) for '=',
-/// B64_INVALID (0xFF) for invalid bytes.
-/// Accepts both standard (+/) and URL-safe (-_) alphabets.
+/// Builds the base64 decode lookup table at compile time.
+///
+/// Maps each byte to its 6-bit decoded value (0–63), `B64_PAD` (64) for `=`,
+/// or `B64_INVALID` (0xFF) for non-base64 bytes. Accepts both standard (`+/`)
+/// and URL-safe (`-_`) alphabets simultaneously.
 const fn build_b64_decode_table() -> [u8; 256] {
     let mut table = [B64_INVALID; 256];
     let mut i = 0u8;
@@ -1075,6 +1082,11 @@ pub(super) fn base64_char_count(encoded: &[u8], allow_space_ws: bool) -> usize {
 //     Returns (bytes_consumed_from_src, bytes_written_to_dst).
 //     Stops at the first chunk containing a non-base64 byte (whitespace,
 //     padding, or invalid).
+//
+// Contract: these functions decode only "clean" runs of base64 alphabet
+// chars (A-Z, a-z, 0-9, +, /, -, _). Whitespace, padding ('='), and
+// invalid bytes cause the loop to break, returning how far it got.
+// The scalar slow path in stream_decode_base64 handles the remainder.
 
 #[cfg(target_arch = "aarch64")]
 mod simd_b64 {
@@ -1364,6 +1376,10 @@ mod simd_b64 {
 // the fast-path in stream_decode_base64 uses the scalar 4-byte batch instead.
 
 /// Returns true if SIMD base64 decode is available at runtime.
+///
+/// On aarch64, NEON is architecturally guaranteed. On x86_64, SSSE3 is
+/// checked via `is_x86_feature_detected!`. On other architectures, returns
+/// false and the decoder falls through to the scalar 4-byte batch path.
 #[cfg(target_arch = "aarch64")]
 fn has_simd_b64() -> bool {
     true // NEON is always available on aarch64
@@ -1381,10 +1397,15 @@ fn has_simd_b64() -> bool {
 
 /// Streaming base64 decoder that accepts std + URL-safe alphabets.
 ///
-/// Whitespace is ignored. Padding is validated, but an unpadded tail
-/// (2 or 3 bytes in the final quantum) is accepted. Output is emitted in
-/// bounded chunks (stream decode buffer). The `on_bytes` callback may stop
-/// decoding early by returning `ControlFlow::Break(())` (treated as success).
+/// All ASCII whitespace (`' '`, `\n`, `\r`, `\t`) is unconditionally skipped
+/// during decode, regardless of the `base64_allow_space_ws` setting. That
+/// flag only controls whether spaces terminate *spans* during scanning; once
+/// a span reaches the decoder, spaces are always tolerated.
+///
+/// Padding is validated, but an unpadded tail (2 or 3 bytes in the final
+/// quantum) is accepted. Output is emitted in bounded chunks (stream decode
+/// buffer). The `on_bytes` callback may stop decoding early by returning
+/// `ControlFlow::Break(())` (treated as success).
 ///
 /// # Behavior
 /// - Once padding is seen, only trailing whitespace is allowed.
@@ -1611,7 +1632,12 @@ fn decode_base64_to_vec(input: &[u8], max_out: usize) -> Result<Vec<u8>, Base64T
 // Transform dispatch
 // --------------------------
 
-/// Quick prefilter to avoid running span scans when no trigger bytes are present.
+/// Quick prefilter: returns `false` when `buf` cannot possibly contain an
+/// encoded payload, allowing the caller to skip the more expensive span scan.
+///
+/// For URL-percent, checks for `%` (and `+` when `plus_to_space` is set).
+/// For base64, always returns `true` because the span finder itself is the
+/// real filter (the alphabet is too common for a single-byte prefilter).
 pub(super) fn transform_quick_trigger(tc: &TransformConfig, buf: &[u8]) -> bool {
     match tc.id {
         TransformId::UrlPercent => {
@@ -1650,6 +1676,11 @@ pub(super) fn find_spans_into(tc: &TransformConfig, buf: &[u8], out: &mut impl S
 }
 
 /// Dispatch to the appropriate streaming decoder, erasing the error type.
+///
+/// URL-percent decode is infallible (invalid escapes pass through); base64
+/// decode may fail on invalid bytes, bad padding, or a truncated final
+/// quantum. In either case, `on_bytes` may have been called with partial
+/// output before an error is returned.
 pub(super) fn stream_decode(
     tc: &TransformConfig,
     input: &[u8],

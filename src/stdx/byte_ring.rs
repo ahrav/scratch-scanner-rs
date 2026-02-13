@@ -8,6 +8,8 @@
 //!
 //! # Invariants
 //! - `len <= capacity` and `head < capacity`.
+//! - Capacity is always a power of two, so all index wrapping uses `& mask`
+//!   instead of modulo division (eliminates `divq` on the hot push path).
 //! - When `len > 0`, `start_offset` is the absolute offset of the byte at
 //!   `head`.
 //! - `end_offset == start_offset + len` (using saturating arithmetic on
@@ -88,7 +90,10 @@ impl ByteRing {
         }
     }
 
-    /// Clears all retained bytes and resets offsets.
+    /// Clears all retained bytes and resets `start_offset` to 0.
+    ///
+    /// After this call the ring is logically empty and will treat the next
+    /// `push` as the beginning of a new stream. Does not reallocate.
     pub(crate) fn reset(&mut self) {
         self.head = 0;
         self.len = 0;

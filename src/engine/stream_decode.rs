@@ -605,7 +605,21 @@ impl Engine {
                 .saturating_add(encoded.len() as u64);
         }
 
+        // ── Main decode loop ──────────────────────────────────────────────
+        //
+        // Each decoded chunk passes through these phases in order:
+        //
+        //   1. Budget enforcement (per-transform + global decode limits)
+        //   2. UTF-16 slab buffering (conditional; feeds block scanner later)
+        //   3. Accounting (local_out, total_decode_output_bytes, MAC update)
+        //   4. Ring buffer push + Vectorscan stream scan (raw anchors)
+        //   5. Gate DB scan (decoded-space anchor gating, if enabled)
+        //   6. UTF-16 stream activation / feeding (lazy on first NUL byte)
+        //   7. Vectorscan match → PendingWindow enqueue (timing wheel)
+        //   8. Timing wheel drain → process_window for expired windows
+        //   9. Span stream feeding (nested transform detection)
         let res = stream_decode(tc, encoded, |chunk| {
+            // ── Phase 1: Budget enforcement ──────────────────────────────
             if local_out.saturating_add(chunk.len()) > max_out {
                 truncated = true;
                 return ControlFlow::Break(());
@@ -619,6 +633,7 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
+            // ── Phase 2: UTF-16 slab buffering (conditional) ────────────
             if want_utf16_scan && !use_utf16_stream {
                 // We need the full decoded buffer to run the UTF-16 scanner later.
                 if scratch.slab.buf.len().saturating_add(chunk.len()) > scratch.slab.limit {
@@ -632,6 +647,7 @@ impl Engine {
                 }
             }
 
+            // ── Phase 3: Accounting ──────────────────────────────────────
             local_out = local_out.saturating_add(chunk.len());
             scratch.total_decode_output_bytes = scratch
                 .total_decode_output_bytes
@@ -640,6 +656,7 @@ impl Engine {
             mac.update(chunk);
             scratch.decode_ring.push(chunk);
 
+            // ── Phase 4: Vectorscan stream scan (raw anchors) ───────────
             if vs_stream
                 .scan_stream(
                     &mut stream,
@@ -654,6 +671,7 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
+            // ── Phase 5: Gate DB scan ─────────────────────────────────────
             if gate_db_active && gate_hit == 0 {
                 if let (Some(db), Some(gstream), Some(gscratch)) = (
                     self.vs_gate.as_ref(),
@@ -676,6 +694,7 @@ impl Engine {
                 }
             }
 
+            // ── Phase 6: UTF-16 stream activation / feeding ─────────────
             if use_utf16_stream {
                 if let Some(db) = self.vs_utf16_stream.as_ref() {
                     let mut scanned_chunk = false;
@@ -776,6 +795,7 @@ impl Engine {
                 }
             }
 
+            // ── Phase 7: Vectorscan match → PendingWindow enqueue ────────
             if !scratch.vs_stream_matches.is_empty() {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
                 let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
@@ -846,6 +866,8 @@ impl Engine {
 
             decoded_offset = decoded_offset.saturating_add(chunk.len() as u64);
 
+            // ── Phase 8: Timing wheel drain → window processing ─────────
+            //
             // Batch-drain expired windows: collect first, process second.
             // This avoids raw-pointer aliasing across the timing-wheel callback.
             let mut batch = std::mem::take(&mut scratch.drain_batch);
@@ -865,6 +887,7 @@ impl Engine {
                 return ControlFlow::Break(());
             }
 
+            // ── Phase 9: Span stream feeding (nested transforms) ────────
             let chunk_start = decoded_offset.saturating_sub(chunk.len() as u64);
             if depth < self.tuning.max_transform_depth {
                 // Streaming span detectors emit child decode spans as we go.
@@ -1011,6 +1034,12 @@ impl Engine {
             ControlFlow::Continue(())
         });
 
+        // ── Post-stream: close Vectorscan streams, return scratch ──────
+        //
+        // All stream resources must be returned to `scratch` on every exit
+        // path. The order below (main stream → gate → UTF-16) mirrors the
+        // allocation order for symmetry, though correctness doesn't depend
+        // on it.
         let _ = vs_stream.close_stream(
             stream,
             &mut vs_scratch,
@@ -1053,6 +1082,17 @@ impl Engine {
             scratch.vs_utf16_stream_scratch = Some(vs_utf16_scratch);
         }
 
+        // ── Post-stream: force_full checkpoint 1 ─────────────────────────
+        //
+        // `force_full` can be set during the decode loop (phase 7/8/9) when
+        // a window cap is exceeded, the ring cannot reconstruct a span, or
+        // the timing wheel overflows. This is the first of two rollback
+        // points — the second is after the post-stream match/span processing
+        // below (line ~1325). Both perform the identical rollback sequence:
+        // truncate slab, reset budgets, clear staging buffers, then delegate
+        // to `decode_span_fallback`. Two check points are needed because the
+        // post-stream match processing (close_stream flush + end-of-stream
+        // span finishers) can also set `force_full`.
         if force_full {
             #[cfg(feature = "stats")]
             self.vs_stats
@@ -1081,6 +1121,7 @@ impl Engine {
             return;
         }
 
+        // ── Post-stream: process close_stream flush matches + finish spans ─
         if res.is_ok() {
             if !scratch.vs_stream_matches.is_empty() {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
@@ -1277,6 +1318,11 @@ impl Engine {
             }
         }
 
+        // ── Post-stream: final timing wheel drain ─────────────────────────
+        //
+        // Flush all remaining pending windows (advance to u64::MAX). Windows
+        // whose `hi` exceeds the actual decoded length are clamped to
+        // `final_offset` so we don't read past the decoded data.
         if res.is_ok() && !force_full {
             let final_offset = decoded_offset;
             let mut batch = std::mem::take(&mut scratch.drain_batch);
@@ -1293,6 +1339,9 @@ impl Engine {
             scratch.drain_batch = batch;
         }
 
+        // ── Post-stream: force_full checkpoint 2 ─────────────────────────
+        // Same rollback as checkpoint 1 above; triggered by post-stream match
+        // processing or end-of-stream span finishers.
         if force_full {
             scratch.slab.buf.truncate(slab_start);
             scratch.total_decode_output_bytes = total_decode_start;
@@ -1316,6 +1365,7 @@ impl Engine {
             return;
         }
 
+        // ── Post-stream: decode error / truncation early-return ─────────
         if res.is_err() || truncated || local_out == 0 || local_out > max_out {
             #[cfg(feature = "b64-stats")]
             if is_b64_gate {
@@ -1334,6 +1384,13 @@ impl Engine {
             return;
         }
 
+        // ── Post-stream: UTF-16 block scan (fallback path) ──────────────
+        //
+        // Activated when: (a) UTF-16 scanning is enabled, (b) the streaming
+        // UTF-16 DB is unavailable (`!use_utf16_stream`), (c) a NUL byte was
+        // observed (NUL ⇒ possible UTF-16 content), and (d) we have decoded
+        // output. In this path the full decoded buffer was buffered in the
+        // slab during the decode loop (Phase 2) for a single-pass block scan.
         if want_utf16_scan && !use_utf16_stream && decoded_has_nul && decoded_full_len > 0 {
             if let Some(vs_utf16) = self.vs_utf16.as_ref() {
                 if let Some(mut vs_utf16_scratch) = scratch.vs_utf16_scratch.take() {
@@ -1585,14 +1642,22 @@ impl Engine {
                 .saturating_add(local_out as u64);
         }
 
+        // ── Post-stream: content-hash dedupe ─────────────────────────────
+        //
+        // Finalize the streamed AEGIS-128L MAC over all decoded chunks to get
+        // a 128-bit content fingerprint. If the same decoded content (at the
+        // same root position) was already scanned, skip — no new findings.
         let h = mix_root_hint_hash(u128::from_le_bytes(mac.finalize()), &root_hint);
         if !scratch.seen.insert(h) {
             scratch.slab.buf.truncate(slab_start);
             return;
         }
 
-        // Commit staged findings now that streaming succeeded and dedupe passed.
-        // `mem::take` + put-back avoids double-borrowing `scratch` while draining.
+        // ── Post-stream: commit staged findings ─────────────────────────
+        //
+        // All-or-nothing: staged findings are only promoted to `scratch.out`
+        // now that the stream completed, dedupe passed, and the gate was
+        // satisfied. `mem::take` + put-back avoids double-borrowing `scratch`.
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
         let mut tmp_norm_hash = std::mem::take(&mut scratch.tmp_norm_hash);
@@ -1609,7 +1674,8 @@ impl Engine {
         scratch.tmp_drop_hint_end = tmp_drop_hint_end;
         scratch.tmp_norm_hash = tmp_norm_hash;
 
-        // Promote deferred child spans into the work queue.
+        // ── Post-stream: promote deferred child spans ───────────────────
+        //
         // Deferred because `IfNoFindingsInThisBuffer` transforms must see the
         // final `found_any` state before deciding whether to enqueue.
         let found_any_in_buf = found_any;

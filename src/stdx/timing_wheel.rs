@@ -209,6 +209,9 @@ pub struct Bitset2 {
 }
 
 impl Bitset2 {
+    /// Creates an empty bitset that can track `bits` individual flags.
+    ///
+    /// Both levels are zeroed; `any()` returns false until `set` is called.
     pub fn new(bits: usize) -> Self {
         let l0_words = bits.div_ceil(64);
         let l1_bits = l0_words;
@@ -362,6 +365,9 @@ impl Bitset2 {
     }
 }
 
+/// Returns a bitmask that keeps only the valid bits in the final `u64` word
+/// of a bitset with `bits` total bits. If `bits` is a multiple of 64, returns
+/// `u64::MAX` (all bits valid).
 #[inline(always)]
 fn mask_last(bits: usize) -> u64 {
     let rem = bits & 63;
@@ -395,6 +401,8 @@ fn ceil_div_u64(x: u64, d: u64) -> u64 {
     q + (r != 0) as u64
 }
 
+/// Thin wrapper around `usize::next_power_of_two` for naming clarity at
+/// call sites. Panics on overflow (same as the std method).
 #[inline(always)]
 fn next_pow2_usize(x: usize) -> usize {
     x.next_power_of_two()
@@ -592,6 +600,10 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
     }
 
     /// Reset to the initial empty state without reallocating.
+    ///
+    /// All pending items are drained (callbacks discarded), the cursor rewinds
+    /// to bucket key 0, and the full node pool is returned to the free list.
+    /// After this call the wheel accepts items starting from `hi_end = 0` again.
     pub fn reset(&mut self) {
         if self.len != 0 || self.occ.any() {
             self.advance_and_drain(u64::MAX, |_| {});
@@ -917,6 +929,8 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
         self.advance_and_drain(now_offset, |item| out.push(item))
     }
 
+    /// Pops a node from the free list, writes `val` into it, and returns its
+    /// index. Returns `None` when the pool is exhausted.
     #[inline(always)]
     fn alloc_node(&mut self, val: T) -> Option<u32> {
         let idx = self.free_head;
@@ -929,6 +943,10 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
         Some(idx)
     }
 
+    /// Returns node `idx` to the free list (LIFO push onto `free_head`).
+    ///
+    /// The caller must ensure `idx` is currently allocated (not already free).
+    /// The payload at `idx` is not dropped (`T: Copy`); it becomes stale.
     #[inline(always)]
     fn free_node(&mut self, idx: u32) {
         debug_assert!((idx as usize) < self.cap, "free_node index out of bounds");
