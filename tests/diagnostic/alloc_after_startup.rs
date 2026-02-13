@@ -132,6 +132,39 @@ fn write_sample_file(dir: &TempDir, name: &str, bytes: &[u8]) -> io::Result<Path
     Ok(path)
 }
 
+#[cfg(feature = "bench")]
+#[test]
+#[ignore]
+fn entropy_bench_helper_avoids_allocations_after_warmup() {
+    let bytes = b"AKIAIOSFODNN7EXAMPLE";
+    let min_bits = 3.0;
+    let min_len = 16;
+    let max_len = 4096;
+
+    for _ in 0..5 {
+        let _ = scanner_rs::bench_entropy_gate_passes(min_bits, min_len, max_len, bytes);
+    }
+
+    reset_counts();
+    let _ = scanner_rs::bench_entropy_gate_passes(min_bits, min_len, max_len, bytes);
+    let counts = snapshot_counts();
+
+    eprintln!(
+        "bench_entropy_gate_passes allocs: calls={} bytes={} reallocs={} realloc_bytes={} deallocs={}",
+        counts.alloc_calls,
+        counts.alloc_bytes,
+        counts.realloc_calls,
+        counts.realloc_bytes,
+        counts.dealloc_calls
+    );
+
+    assert!(
+        counts.total_alloc_calls() == 0,
+        "expected no allocations in warmed benchmark helper, got {} alloc/realloc calls",
+        counts.total_alloc_calls()
+    );
+}
+
 #[test]
 #[ignore]
 fn allocs_after_startup_in_engine_scan_chunk() {

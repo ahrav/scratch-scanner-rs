@@ -74,7 +74,7 @@ use super::rule_repr::{
     RuleCompiled, Target, TwoPhaseCompiled, Variant, NO_GATE,
 };
 use super::safelist::SafelistFilter;
-use super::scratch::{RootSpanMapCtx, ScanScratch};
+use super::scratch::{RootSpanMapCtx, ScanScratch, DEDUP_RULE_ID_MAX};
 use super::transform::{
     base64_char_count, base64_skip_chars, find_spans_into, transform_quick_trigger,
     STREAM_DECODE_CHUNK_BYTES,
@@ -239,11 +239,11 @@ pub struct Engine {
     /// per-scan scratch sizing derives from these values.
     pub(crate) tuning: Tuning,
 
-    /// Gate pools — indexed by `Option<u32>` gate IDs stored in [`RuleCompiled`].
+    /// Gate pools — indexed by `u32` IDs stored in [`RuleCompiled`], with
+    /// [`NO_GATE`] (`u32::MAX`) as the absent sentinel.
     ///
-    /// Each rule holds an `Option<u32>` index into the relevant pool. This
-    /// indirection keeps `RuleCompiled` small (no inline allocations) while
-    /// allowing gate data to be shared or deduplicated in the future.
+    /// This indirection keeps `RuleCompiled` small (no inline allocations)
+    /// while allowing gate data to be shared or deduplicated in the future.
     pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
     pub(super) keyword_gates: Vec<KeywordsCompiled>,
     /// Value-level suppression patterns checked against extracted secret bytes.
@@ -415,32 +415,32 @@ impl Engine {
         for spec in rules.iter() {
             let (mut rule, gates) = compile_rule(spec);
             if let Some(tp) = gates.two_phase {
-                debug_assert!(two_phase_gates.len() < NO_GATE as usize);
+                assert!(two_phase_gates.len() < NO_GATE as usize);
                 rule.two_phase = two_phase_gates.len() as u32;
                 two_phase_gates.push(tp);
             }
             if let Some(kw) = gates.keywords {
-                debug_assert!(keyword_gates.len() < NO_GATE as usize);
+                assert!(keyword_gates.len() < NO_GATE as usize);
                 rule.keywords = keyword_gates.len() as u32;
                 keyword_gates.push(kw);
             }
             if let Some(suppressors) = gates.value_suppressors {
-                debug_assert!(value_suppressor_gates.len() < NO_GATE as usize);
+                assert!(value_suppressor_gates.len() < NO_GATE as usize);
                 rule.value_suppressors = value_suppressor_gates.len() as u32;
                 value_suppressor_gates.push(suppressors);
             }
             if let Some(ent) = gates.entropy {
-                debug_assert!(entropy_gates.len() < NO_GATE as usize);
+                assert!(entropy_gates.len() < NO_GATE as usize);
                 rule.entropy = entropy_gates.len() as u32;
                 entropy_gates.push(ent);
             }
             if let Some(ctx) = gates.local_context {
-                debug_assert!(local_context_gates.len() < NO_GATE as usize);
+                assert!(local_context_gates.len() < NO_GATE as usize);
                 rule.local_context = local_context_gates.len() as u32;
                 local_context_gates.push(ctx);
             }
             if let Some(ov) = gates.offline_validation {
-                debug_assert!(offline_validation_gates.len() < NO_GATE as usize);
+                assert!(offline_validation_gates.len() < NO_GATE as usize);
                 rule.offline_validation = offline_validation_gates.len() as u32;
                 offline_validation_gates.push(ov);
             }
@@ -513,7 +513,11 @@ impl Engine {
         );
 
         for (rid, r) in rules.iter().enumerate() {
-            assert!(rid <= u32::MAX as usize);
+            assert!(
+                rid <= DEDUP_RULE_ID_MAX as usize,
+                "rule index exceeds dedup key capacity ({})",
+                DEDUP_RULE_ID_MAX
+            );
             let rid_u32 = rid as u32;
             let mut manual_used = false;
             let mut add_manual =
@@ -584,7 +588,7 @@ impl Engine {
                         confirm_all.retain(|c| c.as_slice() != needle);
                     }
                     if let Some(compiled) = compile_confirm_all(confirm_all) {
-                        debug_assert!(confirm_all_gates.len() < NO_GATE as usize);
+                        assert!(confirm_all_gates.len() < NO_GATE as usize);
                         rules_compiled[rid].confirm_all = confirm_all_gates.len() as u32;
                         confirm_all_gates.push(compiled);
                     }
@@ -1137,6 +1141,19 @@ impl Engine {
             None
         } else {
             Some(&self.two_phase_gates[idx as usize])
+        }
+    }
+
+    /// Resolves the offline structural validation gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
+    #[inline(always)]
+    pub(super) fn offline_validation_gate(&self, idx: u32) -> Option<OfflineValidationSpec> {
+        if idx == NO_GATE {
+            None
+        } else {
+            Some(self.offline_validation_gates[idx as usize])
         }
     }
 
@@ -2071,6 +2088,273 @@ pub fn bench_contains_any_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> b
     contains_any_memmem(hay, &needles.patterns)
 }
 
+/// Benchmark helper that calls the ALL-of memmem gate used in scan paths.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_contains_all_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> bool {
+    super::helpers::contains_all_memmem(hay, &needles.patterns)
+}
+
+/// Benchmark helper for `entropy_gate_passes`.
+#[cfg(feature = "bench")]
+pub struct BenchEntropyState {
+    max_len: usize,
+    log2_table: Vec<f32>,
+    scratch: super::scratch::EntropyScratch,
+}
+
+#[cfg(feature = "bench")]
+impl BenchEntropyState {
+    #[inline]
+    fn new(max_len: usize) -> Self {
+        Self {
+            max_len,
+            log2_table: super::helpers::build_log2_table(max_len),
+            scratch: super::scratch::EntropyScratch::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_max_len(&mut self, max_len: usize) {
+        if self.max_len != max_len {
+            self.max_len = max_len;
+            self.log2_table = super::helpers::build_log2_table(max_len);
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+thread_local! {
+    static BENCH_ENTROPY_STATE: std::cell::RefCell<BenchEntropyState> =
+        std::cell::RefCell::new(BenchEntropyState::new(0));
+}
+
+/// Build reusable benchmark entropy state so setup is outside timed iterations.
+#[cfg(feature = "bench")]
+pub fn bench_build_entropy_state(max_len: usize) -> BenchEntropyState {
+    BenchEntropyState::new(max_len)
+}
+
+/// Benchmark helper for `entropy_gate_passes` using reusable prebuilt state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_entropy_gate_passes_with_state(
+    min_bits: f32,
+    min_len: usize,
+    bytes: &[u8],
+    state: &mut BenchEntropyState,
+) -> bool {
+    let spec = super::rule_repr::EntropyCompiled {
+        min_bits_per_byte: min_bits,
+        min_len,
+        max_len: state.max_len,
+    };
+    super::helpers::entropy_gate_passes(&spec, bytes, &mut state.scratch, &state.log2_table)
+}
+
+/// Benchmark helper for `shannon_entropy_bits_per_byte` using reusable state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_shannon_entropy_with_state(bytes: &[u8], state: &mut BenchEntropyState) -> f32 {
+    super::helpers::shannon_entropy_bits_per_byte(bytes, &mut state.scratch, &state.log2_table)
+}
+
+/// Compatibility wrapper that reuses thread-local state across benchmark calls.
+#[cfg(feature = "bench")]
+pub fn bench_entropy_gate_passes(
+    min_bits: f32,
+    min_len: usize,
+    max_len: usize,
+    bytes: &[u8],
+) -> bool {
+    BENCH_ENTROPY_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_len(max_len);
+        bench_entropy_gate_passes_with_state(min_bits, min_len, bytes, &mut state)
+    })
+}
+
+/// Compatibility wrapper that reuses thread-local state across benchmark calls.
+#[cfg(feature = "bench")]
+pub fn bench_shannon_entropy(bytes: &[u8], max_len: usize) -> f32 {
+    BENCH_ENTROPY_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_len(max_len);
+        bench_shannon_entropy_with_state(bytes, &mut state)
+    })
+}
+
+/// Reusable benchmark state for `merge_ranges_with_gap_sorted`.
+#[cfg(feature = "bench")]
+pub struct BenchMergeRangesState {
+    ranges: crate::scratch_memory::ScratchVec<super::hit_pool::SpanU32>,
+}
+
+#[cfg(feature = "bench")]
+impl BenchMergeRangesState {
+    #[inline]
+    fn new(capacity: usize) -> Self {
+        Self {
+            ranges: crate::scratch_memory::ScratchVec::with_capacity(capacity)
+                .expect("bench merge_ranges alloc"),
+        }
+    }
+
+    #[inline]
+    fn ensure_capacity(&mut self, capacity: usize) {
+        if self.ranges.capacity() < capacity {
+            self.ranges = crate::scratch_memory::ScratchVec::with_capacity(capacity)
+                .expect("bench merge_ranges alloc");
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+thread_local! {
+    static BENCH_MERGE_STATE: std::cell::RefCell<BenchMergeRangesState> =
+        std::cell::RefCell::new(BenchMergeRangesState::new(0));
+}
+
+/// Build reusable merge-range benchmark state.
+#[cfg(feature = "bench")]
+pub fn bench_build_merge_ranges_state(capacity: usize) -> BenchMergeRangesState {
+    BenchMergeRangesState::new(capacity)
+}
+
+/// Load source ranges into reusable merge benchmark state.
+#[cfg(feature = "bench")]
+pub fn bench_merge_ranges_load(state: &mut BenchMergeRangesState, ranges: &[(u32, u32)]) {
+    state.ensure_capacity(ranges.len());
+    state.ranges.clear();
+    for &(s, e) in ranges {
+        state.ranges.push(super::hit_pool::SpanU32 {
+            start: s,
+            end: e,
+            anchor_hint: s,
+        });
+    }
+}
+
+/// Run `merge_ranges_with_gap_sorted` on already-loaded benchmark state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_merge_ranges_run(state: &mut BenchMergeRangesState, gap: u32) -> usize {
+    super::helpers::merge_ranges_with_gap_sorted(&mut state.ranges, gap);
+    state.ranges.len()
+}
+
+/// Benchmark wrapper for `merge_ranges_with_gap_sorted`.
+///
+/// Accepts a slice of `(start, end)` tuples and a gap, returns the number
+/// of merged ranges.
+#[cfg(feature = "bench")]
+pub fn bench_merge_ranges(ranges: &[(u32, u32)], gap: u32) -> usize {
+    BENCH_MERGE_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        bench_merge_ranges_load(&mut state, ranges);
+        bench_merge_ranges_run(&mut state, gap)
+    })
+}
+
+/// Reusable benchmark state for UTF-16 decode helpers.
+#[cfg(feature = "bench")]
+pub struct BenchUtf16DecodeState {
+    max_out: usize,
+    out: crate::scratch_memory::ScratchVec<u8>,
+}
+
+#[cfg(feature = "bench")]
+impl BenchUtf16DecodeState {
+    #[inline]
+    fn new(max_out: usize) -> Self {
+        Self {
+            max_out,
+            out: crate::scratch_memory::ScratchVec::with_capacity(max_out)
+                .expect("bench utf16 alloc"),
+        }
+    }
+
+    #[inline]
+    fn ensure_max_out(&mut self, max_out: usize) {
+        if self.max_out != max_out {
+            self.max_out = max_out;
+            if self.out.capacity() < max_out {
+                self.out = crate::scratch_memory::ScratchVec::with_capacity(max_out)
+                    .expect("bench utf16 alloc");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+thread_local! {
+    static BENCH_UTF16_STATE: std::cell::RefCell<BenchUtf16DecodeState> =
+        std::cell::RefCell::new(BenchUtf16DecodeState::new(0));
+}
+
+/// Build reusable UTF-16 decode benchmark state.
+#[cfg(feature = "bench")]
+pub fn bench_build_utf16_decode_state(max_out: usize) -> BenchUtf16DecodeState {
+    BenchUtf16DecodeState::new(max_out)
+}
+
+/// Benchmark helper for `decode_utf16le_to_buf` using reusable state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_decode_utf16le_with_state(input: &[u8], state: &mut BenchUtf16DecodeState) -> usize {
+    let _ = super::helpers::decode_utf16le_to_buf(input, state.max_out, &mut state.out);
+    state.out.len()
+}
+
+/// Benchmark helper for `decode_utf16be_to_buf` using reusable state.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_decode_utf16be_with_state(input: &[u8], state: &mut BenchUtf16DecodeState) -> usize {
+    let _ = super::helpers::decode_utf16be_to_buf(input, state.max_out, &mut state.out);
+    state.out.len()
+}
+
+/// Benchmark wrapper for `decode_utf16le_to_buf`.
+#[cfg(feature = "bench")]
+pub fn bench_decode_utf16le(input: &[u8], max_out: usize) -> usize {
+    BENCH_UTF16_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_out(max_out);
+        bench_decode_utf16le_with_state(input, &mut state)
+    })
+}
+
+/// Benchmark wrapper for `decode_utf16be_to_buf`.
+#[cfg(feature = "bench")]
+pub fn bench_decode_utf16be(input: &[u8], max_out: usize) -> usize {
+    BENCH_UTF16_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.ensure_max_out(max_out);
+        bench_decode_utf16be_with_state(input, &mut state)
+    })
+}
+
+/// Benchmark wrapper for `map_utf16_decoded_offset`.
+#[cfg(feature = "bench")]
+pub fn bench_map_utf16_decoded_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
+    super::helpers::map_utf16_decoded_offset(input, decoded_offset, le)
+}
+
+/// Benchmark wrapper for `extract_secret_span_locs`.
+#[cfg(feature = "bench")]
+pub fn bench_extract_secret_span_locs(
+    locs: &regex::bytes::CaptureLocations,
+    secret_group: Option<u16>,
+) -> (usize, usize) {
+    super::helpers::extract_secret_span_locs(locs, secret_group)
+}
+
+/// Benchmark wrapper for `hash128`.
+#[cfg(feature = "bench")]
+pub fn bench_hash128(bytes: &[u8]) -> u128 {
+    super::helpers::hash128(bytes)
+}
+
 #[cfg(feature = "bench")]
 pub use super::transform::{bench_stream_decode_base64, bench_stream_decode_url};
 
@@ -2198,5 +2482,62 @@ mod url_gate_tests {
     fn gate_empty_buffer() {
         let set = make_anchor_set(b"A");
         assert!(!url_percent_gate_check(&set, false, b""));
+    }
+}
+
+#[cfg(all(test, feature = "bench"))]
+mod bench_wrapper_tests {
+    use super::*;
+
+    #[test]
+    fn entropy_wrapper_reuses_table_for_same_max_len() {
+        let input = b"entropy-data";
+        let _ = bench_shannon_entropy(input, 64);
+
+        let ptr_before = BENCH_ENTROPY_STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.max_len, 64);
+            state.log2_table.as_ptr()
+        });
+
+        let _ = bench_entropy_gate_passes(3.0, 1, 64, input);
+
+        let ptr_after = BENCH_ENTROPY_STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.max_len, 64);
+            state.log2_table.as_ptr()
+        });
+
+        assert_eq!(ptr_before, ptr_after);
+    }
+
+    #[test]
+    fn merge_wrapper_keeps_capacity_for_smaller_followup_inputs() {
+        let large: Vec<(u32, u32)> = (0..64).map(|i| (i * 4, i * 4 + 2)).collect();
+        let small: Vec<(u32, u32)> = (0..4).map(|i| (i * 10, i * 10 + 1)).collect();
+
+        let _ = bench_merge_ranges(&large, 0);
+        let cap_after_large = BENCH_MERGE_STATE.with(|state| state.borrow().ranges.capacity());
+        assert!(cap_after_large >= large.len());
+
+        let _ = bench_merge_ranges(&small, 0);
+        let cap_after_small = BENCH_MERGE_STATE.with(|state| state.borrow().ranges.capacity());
+        assert_eq!(cap_after_small, cap_after_large);
+    }
+
+    #[test]
+    fn utf16_wrapper_reuses_capacity_for_same_max_out() {
+        let input = [b'A', 0, b'B', 0];
+
+        let _ = bench_decode_utf16le(&input, 8);
+        let cap_before = BENCH_UTF16_STATE.with(|state| state.borrow().out.capacity());
+
+        let _ = bench_decode_utf16le(&input, 8);
+        let cap_after_same = BENCH_UTF16_STATE.with(|state| state.borrow().out.capacity());
+        assert_eq!(cap_after_same, cap_before);
+
+        let _ = bench_decode_utf16le(&input, 16);
+        let cap_after_growth = BENCH_UTF16_STATE.with(|state| state.borrow().out.capacity());
+        assert!(cap_after_growth >= 16);
     }
 }

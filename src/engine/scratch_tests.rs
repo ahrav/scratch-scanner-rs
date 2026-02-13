@@ -1,6 +1,7 @@
 use super::{normalize_root_hint_end_for_dedup, CachelineBoundary, ScanScratch};
 use crate::api::{
-    FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning, STEP_ROOT,
+    DecodeStep, FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning,
+    Utf16Endianness, STEP_ROOT,
 };
 use crate::engine::Engine;
 use regex::bytes::Regex;
@@ -225,5 +226,247 @@ fn cross_chunk_dedupe_tracks_candidates_beyond_emit_cap() {
         scratch.pending_findings_len(),
         0,
         "cross-chunk duplicate should be suppressed even when first sighting exceeded emit cap"
+    );
+}
+
+#[test]
+#[should_panic(expected = "rule_id exceeds 24-bit dedup budget")]
+fn dedup_rejects_rule_ids_that_overlap_variant_bits() {
+    let engine = Engine::new(
+        vec![simple_rule(), simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 1024);
+
+    let utf16_le_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Utf16Window {
+            endianness: Utf16Endianness::Le,
+            parent_span: 0..4,
+        },
+    );
+
+    // These two records would alias in the packed dedup key if high rule-id bits
+    // were allowed to overlap the UTF-16 variant discriminator byte.
+    let root_overflow = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0x01_00_00_01,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: STEP_ROOT,
+    };
+    let utf16_le = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0x00_00_00_01,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: utf16_le_step,
+    };
+
+    scratch.push_finding_with_drop_hint(
+        root_overflow,
+        [0xA1; 32],
+        root_overflow.root_hint_end,
+        root_overflow.dedupe_with_span,
+    );
+    scratch.push_finding_with_drop_hint(
+        utf16_le,
+        [0xB2; 32],
+        utf16_le.root_hint_end,
+        utf16_le.dedupe_with_span,
+    );
+}
+
+#[test]
+fn same_scan_raw_duplicate_is_not_replaced_by_equal() {
+    // Two identical RAW findings in the same scan: the second is recognized as
+    // a same-scan duplicate. Because root_hint_end is equal, no replacement
+    // occurs — the original stays.
+    let engine = Engine::new(
+        vec![simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 1024);
+
+    let rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: STEP_ROOT,
+    };
+    let hash_a = [0xA1; 32];
+    let hash_b = [0xB2; 32];
+
+    scratch.push_finding_with_drop_hint(rec, hash_a, rec.root_hint_end, rec.dedupe_with_span);
+    scratch.push_finding_with_drop_hint(rec, hash_b, rec.root_hint_end, rec.dedupe_with_span);
+
+    assert_eq!(
+        scratch.pending_findings_len(),
+        1,
+        "duplicate should not create a second finding"
+    );
+
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        hashes[0], hash_a,
+        "original norm_hash should be preserved (no replacement)"
+    );
+}
+
+#[test]
+fn same_scan_transform_replaces_raw_finding() {
+    // A transform finding (step_id != STEP_ROOT) should replace a RAW finding
+    // (step_id == STEP_ROOT) when both produce the same DedupKey hash.
+    //
+    // DedupKey composition: (file_id, rule_id|variant_disc<<24, span_start,
+    // span_end, root_hint_start, root_hint_end).
+    //
+    // For STEP_ROOT findings, span is always included in the key (the
+    // `include_span || step_id == STEP_ROOT` guard). For non-root transform
+    // findings with include_span=false, span is zeroed to (0, 0). To make
+    // both keys hash identically, the RAW finding uses span=(0, 0) as well.
+    let engine = Engine::new(
+        vec![simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+
+    let raw_rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 0,
+        span_end: 0,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: false,
+        step_id: STEP_ROOT,
+    };
+    let raw_hash = [0xAA; 32];
+    scratch.push_finding_with_drop_hint(raw_rec, raw_hash, raw_rec.root_hint_end, false);
+
+    // Non-UTF16 transform: variant_disc=0, so rule_id_with_variant matches the
+    // RAW finding. include_span=false zeroes the span to (0, 0).
+    let transform_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..100,
+        },
+    );
+    let transform_rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 5,
+        span_end: 15,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: false,
+        step_id: transform_step,
+    };
+    let transform_hash = [0xBB; 32];
+    scratch.push_finding_with_drop_hint(
+        transform_rec,
+        transform_hash,
+        transform_rec.root_hint_end,
+        false,
+    );
+
+    assert_eq!(scratch.pending_findings_len(), 1);
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_ne!(
+        findings[0].step_id, STEP_ROOT,
+        "transform finding should have replaced the RAW finding"
+    );
+    assert_eq!(
+        hashes[0], transform_hash,
+        "norm_hash should be updated to the transform's hash"
+    );
+}
+
+#[test]
+fn same_scan_raw_does_not_replace_transform_finding() {
+    // The reverse: a RAW finding should NOT replace an existing transform finding.
+    // Same DedupKey alignment constraints as the test above — RAW span must be
+    // (0, 0) to match the transform's zeroed span in the dedup key.
+    let engine = Engine::new(
+        vec![simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 4096);
+
+    // Push a transform finding first.
+    let transform_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Transform {
+            transform_idx: 0,
+            parent_span: 0..100,
+        },
+    );
+    let transform_rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 5,
+        span_end: 15,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: false,
+        step_id: transform_step,
+    };
+    let transform_hash = [0xBB; 32];
+    scratch.push_finding_with_drop_hint(
+        transform_rec,
+        transform_hash,
+        transform_rec.root_hint_end,
+        false,
+    );
+
+    // Now push a RAW finding that hashes the same (span=0,0 to match zeroed
+    // transform span in DedupKey).
+    let raw_rec = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 0,
+        span_end: 0,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: false,
+        step_id: STEP_ROOT,
+    };
+    let raw_hash = [0xAA; 32];
+    scratch.push_finding_with_drop_hint(raw_rec, raw_hash, raw_rec.root_hint_end, false);
+
+    assert_eq!(scratch.pending_findings_len(), 1);
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_ne!(
+        findings[0].step_id, STEP_ROOT,
+        "transform finding should NOT be replaced by RAW"
+    );
+    assert_eq!(
+        hashes[0], transform_hash,
+        "original transform hash should be preserved"
     );
 }
