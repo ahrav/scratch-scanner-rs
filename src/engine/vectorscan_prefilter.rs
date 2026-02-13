@@ -1219,6 +1219,9 @@ impl VsAnchorDb {
             );
         }
 
+        // SAFETY: all pointer arrays (`expr_ptrs`, `ids`) are valid for
+        // `expr_ptrs.len()` elements and live for the duration of the call; `db`
+        // and `compile_err` are valid out-pointers written by the FFI function.
         let rc = unsafe {
             vs::hs_compile_multi(
                 expr_ptrs.as_ptr(),
@@ -2309,6 +2312,8 @@ unsafe fn enqueue_anchor_target_spans(
             "pair {pair} exceeds pool pair_count {}",
             scratch.hit_acc_pool.pair_count()
         );
+        // SAFETY: `pair` is in bounds (debug-asserted above); `scratch` has
+        // exclusive access for the duration of the scan.
         unsafe {
             scratch.hit_acc_pool.push_span_unchecked_hot(
                 pair,
@@ -2355,9 +2360,13 @@ unsafe extern "C" fn vs_on_match(
     ctx: *mut c_void,
 ) -> c_int {
     // Absolutely no panics across FFI.
+    // SAFETY: `ctx` is a valid, non-null pointer to `VsMatchCtx` passed by the
+    // caller of `hs_scan`. It is exclusively borrowed for the scan duration.
     let c = unsafe { &mut *(ctx as *mut VsMatchCtx) };
     if id < c.raw_rule_count {
         let raw_idx = id as usize;
+        // SAFETY: `raw_idx < raw_rule_count`, and `raw_meta` has `raw_rule_count`
+        // entries (ctx invariant).
         let meta = unsafe { *c.raw_meta.add(raw_idx) };
         let rid = meta.rule_id as usize;
 
@@ -2391,6 +2400,8 @@ unsafe extern "C" fn vs_on_match(
             "pair {pair} exceeds pool pair_count {}",
             scratch.hit_acc_pool.pair_count()
         );
+        // SAFETY: `pair` is in bounds (debug-asserted above); `scratch` has
+        // exclusive access for the duration of the scan.
         unsafe {
             scratch.hit_acc_pool.push_span_unchecked_hot(
                 pair,
