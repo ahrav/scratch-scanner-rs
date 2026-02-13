@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
+use std::ptr::{copy_nonoverlapping, NonNull};
 use std::rc::Rc;
 use std::slice;
 use std::sync::Arc;
@@ -440,21 +440,44 @@ impl Chunk {
     /// Full data slice, including the overlap prefix.
     ///
     /// The slice length is `len` and starts at `buf_offset` into the backing
-    /// buffer.
+    /// buffer. The implementation uses unchecked pointer arithmetic to avoid
+    /// hot-loop bounds checks, guarded by chunk construction invariants.
+    #[inline(always)]
     pub fn data(&self) -> &[u8] {
         let start = self.buf_offset as usize;
-        let end = start + self.len as usize;
-        &self.buf.as_slice()[start..end]
+        let len = self.len as usize;
+        debug_assert!(
+            start <= BUFFER_LEN_MAX && len <= BUFFER_LEN_MAX.saturating_sub(start),
+            "chunk data out of bounds"
+        );
+        // SAFETY:
+        // - `self.buf.ptr` points to a valid `BUFFER_LEN_MAX`-byte allocation.
+        // - `start + len <= BUFFER_LEN_MAX` is guaranteed by chunk invariants and
+        //   checked in debug builds above.
+        // - Returned slice is shared (`&[u8]`) and does not violate aliasing.
+        unsafe { slice::from_raw_parts(self.buf.ptr.as_ptr().add(start), len) }
     }
 
     /// Payload slice excluding the overlap prefix.
     ///
     /// The slice length is `len - prefix_len` and contains only newly read
-    /// bytes from the file.
+    /// bytes from the file. Like [`data`](Self::data), this uses unchecked
+    /// pointer arithmetic guarded by chunk invariants.
+    #[inline(always)]
     pub fn payload(&self) -> &[u8] {
-        let start = self.buf_offset as usize + self.prefix_len as usize;
-        let end = self.buf_offset as usize + self.len as usize;
-        &self.buf.as_slice()[start..end]
+        let start = self.buf_offset as usize;
+        let len = self.len as usize;
+        let prefix = self.prefix_len as usize;
+        debug_assert!(prefix <= len, "chunk payload prefix exceeds chunk length");
+        debug_assert!(
+            start <= BUFFER_LEN_MAX && len <= BUFFER_LEN_MAX.saturating_sub(start),
+            "chunk payload out of bounds"
+        );
+        // SAFETY:
+        // - `prefix <= len` by invariant and debug assertion above.
+        // - `start + len <= BUFFER_LEN_MAX` by chunk invariants.
+        // - Pointer arithmetic stays within the same allocation.
+        unsafe { slice::from_raw_parts(self.buf.ptr.as_ptr().add(start + prefix), len - prefix) }
     }
 }
 
@@ -652,25 +675,46 @@ pub fn read_file_chunks(
     let mut offset = 0u64;
 
     loop {
-        let mut handle = pool.acquire();
-        let buf = handle.as_mut_slice();
+        let handle = pool.acquire();
+        let buf_ptr = handle.ptr.as_ptr();
         debug_assert!(tail_len <= tail.len());
-        debug_assert!(buf.len() >= tail_len + chunk_size);
+        debug_assert!(tail_len + chunk_size <= BUFFER_LEN_MAX);
 
         if tail_len > 0 {
-            buf[..tail_len].copy_from_slice(&tail[..tail_len]);
+            // SAFETY:
+            // - `tail_len <= tail.len()` and `tail_len <= BUFFER_LEN_MAX`.
+            // - `buf_ptr` points to a valid `BUFFER_LEN_MAX`-byte allocation.
+            // - Source (`tail`) and destination (`buf`) do not overlap.
+            unsafe { copy_nonoverlapping(tail.as_ptr(), buf_ptr, tail_len) };
         }
 
-        let read = file.read(&mut buf[tail_len..tail_len + chunk_size])?;
+        let read_dst = unsafe {
+            // SAFETY:
+            // - `tail_len + chunk_size <= BUFFER_LEN_MAX` (asserted above).
+            // - `buf_ptr` is valid for `BUFFER_LEN_MAX` bytes.
+            // - `buf_ptr.add(tail_len)` stays within the allocation.
+            slice::from_raw_parts_mut(buf_ptr.add(tail_len), chunk_size)
+        };
+        let read = file.read(read_dst)?;
         if read == 0 {
             break;
         }
 
         let total_len = tail_len + read;
+        debug_assert!(total_len <= BUFFER_LEN_MAX);
         let base_offset = offset.saturating_sub(tail_len as u64);
         let next_tail_len = if overlap > 0 {
             let keep = overlap.min(total_len);
-            tail[..keep].copy_from_slice(&buf[total_len - keep..total_len]);
+            if keep > 0 {
+                // SAFETY:
+                // - `keep <= total_len <= BUFFER_LEN_MAX`.
+                // - `total_len - keep` stays in-bounds for `buf_ptr`.
+                // - `keep <= overlap <= tail.len()` ensures destination fits.
+                // - Source (`buf`) and destination (`tail`) do not overlap.
+                unsafe {
+                    copy_nonoverlapping(buf_ptr.add(total_len - keep), tail.as_mut_ptr(), keep);
+                }
+            }
             keep
         } else {
             0
@@ -810,7 +854,8 @@ impl ScannerRuntime {
             scratch.drop_prefix_findings(new_bytes_start);
 
             let pending = scratch.pending_findings_len();
-            if out.len().saturating_add(pending) > out.capacity() {
+            debug_assert!(out.len() <= out.capacity());
+            if pending > out.capacity() - out.len() {
                 overflow = true;
                 return ControlFlow::Break(());
             }
@@ -820,11 +865,17 @@ impl ScannerRuntime {
         })?;
 
         if overflow {
-            return Err(io::Error::from(io::ErrorKind::Other));
+            return Err(findings_capacity_error());
         }
 
         Ok(self.out.as_slice())
     }
+}
+
+#[cold]
+#[inline(never)]
+fn findings_capacity_error() -> io::Error {
+    io::Error::from(io::ErrorKind::Other)
 }
 
 #[cfg(test)]
@@ -963,6 +1014,167 @@ mod tests_buffer_pool {
         handle.clear();
         assert_eq!(handle.as_slice()[0], 0);
         assert_eq!(handle.as_slice()[BUFFER_LEN_MAX - 1], 0);
+    }
+}
+
+#[cfg(test)]
+mod tests_chunk_views {
+    use super::*;
+
+    fn make_chunk(buf_offset: usize, len: usize, prefix_len: usize) -> Chunk {
+        assert!(prefix_len <= len);
+        assert!(buf_offset + len <= BUFFER_LEN_MAX);
+        let pool = BufferPool::new(1);
+        let mut buf = pool.acquire();
+        for (idx, b) in buf.as_mut_slice()[..(buf_offset + len)]
+            .iter_mut()
+            .enumerate()
+        {
+            *b = (idx % 251) as u8;
+        }
+        Chunk {
+            file_id: FileId(7),
+            base_offset: 99,
+            len: len as u32,
+            prefix_len: prefix_len as u32,
+            buf,
+            buf_offset: buf_offset as u32,
+        }
+    }
+
+    #[test]
+    fn data_and_payload_match_safe_reference() {
+        let chunk = make_chunk(32, 80, 12);
+        let expected_data = &chunk.buf.as_slice()[32..112];
+        let expected_payload = &chunk.buf.as_slice()[44..112];
+        assert_eq!(chunk.data(), expected_data);
+        assert_eq!(chunk.payload(), expected_payload);
+    }
+
+    #[test]
+    fn payload_is_empty_when_prefix_equals_len() {
+        let chunk = make_chunk(16, 24, 24);
+        assert_eq!(chunk.payload().len(), 0);
+        assert_eq!(chunk.data().len(), 24);
+    }
+
+    #[test]
+    fn chunk_views_allow_upper_buffer_boundary() {
+        let buf_offset = BUFFER_LEN_MAX - 64;
+        let chunk = make_chunk(buf_offset, 64, 31);
+        let data = chunk.data();
+        let payload = chunk.payload();
+        assert_eq!(data.len(), 64);
+        assert_eq!(payload.len(), 33);
+        assert_eq!(payload[0], data[31]);
+        assert_eq!(payload[payload.len() - 1], data[data.len() - 1]);
+    }
+}
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod tests_runtime_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    const PROPTEST_CASES: u32 = 64;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
+        #[test]
+        fn chunk_data_payload_match_safe_model(
+            buf_offset in 0usize..BUFFER_LEN_MAX,
+            len in 0usize..4096,
+            prefix in 0usize..4096,
+        ) {
+            prop_assume!(buf_offset + len <= BUFFER_LEN_MAX);
+            prop_assume!(prefix <= len);
+
+            let pool = BufferPool::new(1);
+            let mut buf = pool.acquire();
+            for (idx, b) in buf.as_mut_slice()[..(buf_offset + len)].iter_mut().enumerate() {
+                *b = (idx % 251) as u8;
+            }
+
+            let chunk = Chunk {
+                file_id: FileId(1),
+                base_offset: 0,
+                len: len as u32,
+                prefix_len: prefix as u32,
+                buf,
+                buf_offset: buf_offset as u32,
+            };
+
+            let expected_data = &chunk.buf.as_slice()[buf_offset..buf_offset + len];
+            let expected_payload =
+                &chunk.buf.as_slice()[buf_offset + prefix..buf_offset + len];
+
+            prop_assert_eq!(chunk.data(), expected_data);
+            prop_assert_eq!(chunk.payload(), expected_payload);
+        }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_chunk_view_arithmetic_bounds() {
+        let buf_offset: u32 = kani::any();
+        let len: u32 = kani::any();
+        let prefix: u32 = kani::any();
+
+        kani::assume(prefix <= len);
+        kani::assume(buf_offset as usize <= BUFFER_LEN_MAX);
+        kani::assume(len as usize <= BUFFER_LEN_MAX);
+        kani::assume((buf_offset as usize) + (len as usize) <= BUFFER_LEN_MAX);
+
+        let start = buf_offset as usize;
+        let end = start + len as usize;
+        let payload_start = start + prefix as usize;
+
+        kani::assert(
+            payload_start <= end,
+            "payload start must not exceed chunk end",
+        );
+        kani::assert(
+            end <= BUFFER_LEN_MAX,
+            "chunk end must remain in backing buffer",
+        );
+    }
+
+    #[kani::proof]
+    fn verify_read_file_chunk_copy_windows_fit() {
+        let chunk_size: usize = kani::any();
+        let overlap: usize = kani::any();
+        let tail_len: usize = kani::any();
+        let read: usize = kani::any();
+
+        kani::assume(chunk_size > 0);
+        kani::assume(chunk_size <= BUFFER_LEN_MAX);
+        kani::assume(overlap <= BUFFER_LEN_MAX - chunk_size);
+        kani::assume(tail_len <= overlap);
+        kani::assume(read <= chunk_size);
+
+        let total_len = tail_len + read;
+        let keep = if overlap < total_len {
+            overlap
+        } else {
+            total_len
+        };
+
+        kani::assert(
+            total_len <= BUFFER_LEN_MAX,
+            "tail + read must stay in buffer",
+        );
+        kani::assert(keep <= total_len, "keep must not exceed total_len");
+        kani::assert(
+            total_len - keep <= BUFFER_LEN_MAX,
+            "tail copy start must stay in buffer",
+        );
     }
 }
 
