@@ -472,6 +472,10 @@ impl Engine {
 
         let mut local_out = 0usize;
         let mut truncated = false;
+        // Set to `true` when a Raw-variant match fires in the main prefilter
+        // stream (Phase 7). Used as fallback gate evidence when the dedicated
+        // gate DB is unavailable — the prefilter covers raw anchors but cannot
+        // see wide-encoded (UTF-16) content.
         let mut prefilter_gate_hit = false;
         let mut found_any = false;
 
@@ -504,6 +508,10 @@ impl Engine {
         // appended to the slab so the block scanner can run after streaming ends.
         let want_utf16_scan = self.tuning.scan_utf16_variants && self.has_utf16_anchors;
         let use_utf16_stream = want_utf16_scan && self.vs_utf16_stream.is_some();
+        // Slab range tracking for the UTF-16 block scan fallback. Only meaningful
+        // when `want_utf16_scan && !use_utf16_stream`: Phase 2 appends every
+        // decoded chunk to the slab so the single-pass block scanner can run
+        // after streaming ends.
         let decoded_full_start = slab_start;
         let mut decoded_full_len = 0usize;
         let mut decoded_has_nul = false;
@@ -538,9 +546,16 @@ impl Engine {
             // Try zero-copy path first: if the window is contiguous in the ring
             // buffer we can scan the slice directly without copying.
             let bytes: &[u8] = if let Some(slice) = scratch.decode_ring.contiguous_range(lo, hi) {
-                // SAFETY: The scan functions (`run_rule_on_raw_window_into`,
-                // `run_rule_on_utf16_window_into`) do not touch `decode_ring`;
-                // the slice is consumed before any ring mutation.
+                // SAFETY: `contiguous_range` borrows `decode_ring` immutably,
+                // but we need to pass `scratch` mutably to `run_rule_on_*`.
+                // This is sound because:
+                //   1. `run_rule_on_{raw,utf16}_window_into` never read or
+                //      write `decode_ring`.
+                //   2. The slice is consumed (pattern-matched) within this
+                //      `process_window` invocation and does not escape.
+                //   3. `decode_ring.push()` (which invalidates ring slices)
+                //      only runs in the main decode-loop body, which cannot
+                //      execute while `process_window` is on the stack.
                 unsafe { std::slice::from_raw_parts(slice.as_ptr(), slice.len()) }
             } else {
                 // Fall back to copying from the ring (or re-decoding).
@@ -561,8 +576,10 @@ impl Engine {
                     return;
                 }
                 let (ptr, len) = (scratch.window_bytes.as_ptr(), scratch.window_bytes.len());
-                // SAFETY: `window_bytes` is not mutated until after this
-                // slice is consumed; the pointer does not escape.
+                // SAFETY: `window_bytes` is not mutated until the next
+                // `process_window` call (which `clear()`s it at the top).
+                // The slice does not escape this arm; it is consumed by
+                // `run_rule_on_*` before this invocation returns.
                 unsafe { std::slice::from_raw_parts(ptr, len) }
             };
 
@@ -663,8 +680,12 @@ impl Engine {
         //
         // Avoids buffering the full decoded output just for deduplication:
         // each decoded chunk is fed to `mac.update()` and the final digest
-        // is checked against `scratch.seen`. A fixed zero key is acceptable
-        // because we need collision resistance, not authentication.
+        // is checked against `scratch.seen`. AEGIS-128L is chosen over
+        // SipHash (used by `hash128` in the full-buffer path) because it
+        // supports incremental `update()` calls — SipHash would require
+        // materializing the entire decoded output first, defeating the
+        // purpose of streaming. A fixed zero key is acceptable because we
+        // need collision resistance, not authentication.
         let key = [0u8; 16];
         let mut mac = aegis::aegis128l::Aegis128LMac::<16>::new(&key);
 
@@ -897,6 +918,9 @@ impl Engine {
                 let max_hits = self.tuning.max_windows_per_rule_variant as u32;
                 let mut vs_matches = std::mem::take(&mut scratch.vs_stream_matches);
                 for win in vs_matches.drain(..) {
+                    // `force_full` is set by the Vectorscan callback when a
+                    // match window exceeds representable bounds or the callback
+                    // detects an unrecoverable state (see `VsStreamWindow`).
                     if win.force_full {
                         force_full = true;
                         break;
@@ -1179,6 +1203,10 @@ impl Engine {
         if let Some(vs_utf16_scratch) = utf16_stream_scratch.take() {
             scratch.vs_utf16_stream_scratch = Some(vs_utf16_scratch);
         }
+        // `close_stream` flushes the Vectorscan automaton's internal state,
+        // which may emit additional matches not seen during the streaming loop.
+        // Propagate those matches into `vs_stream_matches` so the post-stream
+        // processing below can handle them.
         if vs_pending_len != 0 {
             // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
             unsafe {
@@ -1456,6 +1484,10 @@ impl Engine {
         }
 
         // ── Post-stream: decode error / truncation early-return ─────────
+        //
+        // `local_out > max_out` is a defensive guard — Phase 1 should prevent
+        // exceeding the budget, but we check here anyway to avoid propagating
+        // corrupted accounting into downstream dedup or findings.
         if res.is_err() || truncated || local_out == 0 || local_out > max_out {
             #[cfg(feature = "b64-stats")]
             if is_b64_gate {
