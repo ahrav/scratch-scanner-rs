@@ -142,7 +142,10 @@ impl PairMeta {
 pub(super) struct HitAccPool {
     max_hits: u32,
     pair_count: u32,
+    /// `ceil(pair_count / 64)` — number of `u64` words in the touched bitset.
     touched_word_count: u32,
+    /// Explicit padding so the pointer fields start at an 8-byte boundary,
+    /// keeping the struct layout predictable across platforms.
     _pad: u32,
     // Raw pointers to exclusively-owned heap allocations.
     // All arrays are fixed-size after construction.
@@ -169,6 +172,7 @@ impl Drop for HitAccPool {
         // (as_mut_ptr + mem::forget) with the exact capacity stored in the struct.
         // No other code has taken ownership of these allocations.
         unsafe {
+            // Cannot overflow: `new()` already validated via checked_mul.
             let total_windows = pair_count.saturating_mul(max_hits);
             drop(Vec::from_raw_parts(self.pair_meta, pair_count, pair_count));
             drop(Vec::from_raw_parts(
@@ -264,6 +268,9 @@ impl HitAccPool {
         self.max_hits
     }
 
+    /// Clear the touched-bit for each pair in `touched_pairs`.
+    ///
+    /// O(#touched), not O(pair_count), so reset cost is proportional to work done.
     #[inline(always)]
     pub(super) fn reset_touched(&mut self, touched_pairs: &[u32]) {
         let words = self.touched_words;
@@ -277,6 +284,7 @@ impl HitAccPool {
         }
     }
 
+    /// Record `pair` as touched (idempotent). First touch appends to `touched_pairs`.
     #[inline(always)]
     pub(super) fn mark_touched(&mut self, pair: usize, touched_pairs: &mut ScratchVec<u32>) {
         debug_assert!((pair as u32) < self.pair_count);
@@ -291,11 +299,11 @@ impl HitAccPool {
         }
     }
 
-    #[inline(always)]
     /// Record a hit window for `pair`, preserving order until capped.
     ///
     /// Once the per-pair cap is exceeded, all hits are coalesced into a single
     /// span that conservatively covers every hit seen so far.
+    #[inline(always)]
     pub(super) fn push_span(
         &mut self,
         pair: usize,
@@ -372,11 +380,11 @@ impl HitAccPool {
         meta.len = 0;
     }
 
-    #[inline(always)]
     /// Drain accumulated windows for `pair` into `out`.
     ///
     /// If the pair is coalesced, this returns a single span; otherwise, it
     /// returns the per-hit list in insertion order and resets the count.
+    #[inline(always)]
     pub(super) fn take_into(&mut self, pair: usize, out: &mut ScratchVec<SpanU32>) {
         debug_assert!((pair as u32) < self.pair_count);
         out.clear();
@@ -404,8 +412,8 @@ impl HitAccPool {
         meta.len = 0;
     }
 
-    #[inline(always)]
     /// Clears all accumulated state for `pair` without returning windows.
+    #[inline(always)]
     pub(super) fn reset_pair(&mut self, pair: usize) {
         debug_assert!((pair as u32) < self.pair_count);
         // SAFETY: pair < pair_count.
@@ -441,6 +449,10 @@ impl HitAccPool {
     }
 }
 
+/// Benchmark harness wrapping [`HitAccPool`] with co-allocated scratch buffers.
+///
+/// Bundles the pool, touched-pair tracker, and output buffer so that Criterion
+/// benchmarks can call `push` / `take` / `reset` without managing scratch state.
 #[cfg(feature = "bench")]
 pub struct BenchHitAccPool {
     pool: HitAccPool,
