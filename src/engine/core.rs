@@ -239,11 +239,12 @@ pub struct Engine {
     /// per-scan scratch sizing derives from these values.
     pub(crate) tuning: Tuning,
 
-    /// Gate pools — indexed by `Option<u32>` gate IDs stored in [`RuleCompiled`].
+    /// Gate pools — indexed by `u32` gate IDs stored in [`RuleCompiled`].
     ///
-    /// Each rule holds an `Option<u32>` index into the relevant pool. This
-    /// indirection keeps `RuleCompiled` small (no inline allocations) while
-    /// allowing gate data to be shared or deduplicated in the future.
+    /// Each rule holds a compact pool index, with [`NO_GATE`] as the sentinel
+    /// for "absent". This indirection keeps `RuleCompiled` small (no inline
+    /// allocations) while allowing gate data to be shared or deduplicated in
+    /// the future.
     pub(super) confirm_all_gates: Vec<ConfirmAllCompiled>,
     pub(super) keyword_gates: Vec<KeywordsCompiled>,
     /// Value-level suppression patterns checked against extracted secret bytes.
@@ -386,6 +387,11 @@ impl Engine {
         assert!(
             tuning.max_transform_depth.saturating_add(1) <= MAX_DECODE_STEPS,
             "max_transform_depth exceeds MAX_DECODE_STEPS"
+        );
+        assert!(
+            rules.len() <= (1usize << 24),
+            "rule count {} exceeds 24-bit dedupe key budget",
+            rules.len()
         );
         for r in &rules {
             r.assert_valid();
@@ -1129,6 +1135,20 @@ impl Engine {
             .is_match(&context_buf[start as usize..end as usize]);
         *last_decision = Some((start, end, suppressed));
         suppressed
+    }
+
+    /// Returns the `OfflineValidationSpec` for a gate pool index, or `None` if
+    /// the index is `NO_GATE`.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
+    #[inline(always)]
+    pub(super) fn offline_validation_gate(&self, idx: u32) -> Option<OfflineValidationSpec> {
+        if idx == NO_GATE {
+            None
+        } else {
+            Some(self.offline_validation_gates[idx as usize])
+        }
     }
 
     #[inline(always)]

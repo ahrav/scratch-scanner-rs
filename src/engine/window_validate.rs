@@ -73,10 +73,14 @@ use super::scratch::ScanScratch;
 /// every `run_rule_on_window` / `run_rule_on_utf16_window_aligned` call for
 /// the same rule.
 ///
-/// Without this struct, LLVM re-loads gate pool references after every
-/// `&mut ScanScratch` mutation because it cannot prove `&self` (Engine)
-/// fields are unaliased by the mutable scratch borrow. Hoisting the lookups
-/// here eliminates those redundant loads from the per-window inner loop.
+/// Without this struct, LLVM re-loads gate pool slices on every iteration of
+/// the per-window loop. The `&mut ScanScratch` borrow required by each
+/// `run_rule_on_window` call is opaque to LLVM: it cannot prove that the
+/// mutable scratch reference does not alias the `&self` (Engine) gate
+/// vectors, so it conservatively re-fetches their `(ptr, len)` pairs after
+/// every call. Copying the five references into a stack-local struct before
+/// the loop lets LLVM keep them in registers for the entire iteration.
+#[derive(Clone, Copy)]
 pub(super) struct ResolvedGates<'e> {
     pub(super) confirm_all: Option<&'e ConfirmAllCompiled>,
     pub(super) keywords: Option<&'e KeywordsCompiled>,
@@ -1353,11 +1357,10 @@ impl Engine {
         if parent_step_id != STEP_ROOT {
             return false;
         }
-        let gate_idx = rule.offline_validation;
-        if gate_idx == super::rule_repr::NO_GATE {
-            return false;
-        }
-        let spec = self.offline_validation_gates[gate_idx as usize];
+        let spec = match self.offline_validation_gate(rule.offline_validation) {
+            Some(s) => s,
+            None => return false,
+        };
         let verdict = super::offline_validate::validate(spec, secret_bytes);
         matches!(verdict, crate::api::OfflineVerdict::Invalid) && spec.suppresses_on_invalid()
     }

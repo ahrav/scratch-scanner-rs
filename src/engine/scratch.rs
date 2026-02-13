@@ -46,9 +46,9 @@ use super::Engine;
 /// Packed dedup key for finding deduplication.
 ///
 /// Uses `#[repr(C)]` with `bytemuck::Pod` to guarantee a fixed 32-byte layout
-/// (exactly two AES blocks) with no padding. This lets `hash128` process the
-/// key in exactly two AES rounds with no trailing partial-block handling,
-/// which is measurably faster than the previous 33-byte packed layout.
+/// with no padding. This lets `hash128` process the key in a single 32-byte
+/// absorption step with no trailing partial-block handling, which is
+/// measurably faster than the previous 33-byte packed layout.
 ///
 /// The variant discriminator is packed into the high byte of
 /// `rule_id_with_variant` since actual rule counts are well below 2^24.
@@ -1493,13 +1493,13 @@ impl ScanScratch {
     ///
     /// # Deduplication Strategy
     ///
-    /// Findings are keyed by a 33-byte composite:
+    /// Findings are keyed by a fixed 32-byte [`DedupKey`] composite:
     ///
     /// ```text
-    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┬─────────┐
-    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │ variant │
-    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │ 1B      │
-    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┴─────────┘
+    /// ┌────────┬──────────────────────┬────────────┬──────────┬─────────────────┬───────────────┐
+    /// │file_id │ rule_id_with_variant │ span_start │ span_end │ root_hint_start │ root_hint_end │
+    /// │ 4B     │ 4B (24b rule + 8b v) │ 4B         │ 4B       │ 8B              │ 8B            │
+    /// └────────┴──────────────────────┴────────────┴──────────┴─────────────────┴───────────────┘
     /// ```
     ///
     /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
@@ -1575,7 +1575,12 @@ impl ScanScratch {
             0
         };
 
-        // Build a 32-byte dedup key (exactly 2 AES blocks) and hash to 128 bits.
+        // Build a 32-byte dedup key (single AES absorption) and hash to 128 bits.
+        debug_assert!(
+            rec.rule_id < (1 << 24),
+            "rule_id {:#x} overflows the 24-bit field; upper byte reserved for variant_disc",
+            rec.rule_id,
+        );
         let key = DedupKey {
             file_id: rec.file_id.0,
             rule_id_with_variant: rec.rule_id | (u32::from(variant_disc) << 24),
