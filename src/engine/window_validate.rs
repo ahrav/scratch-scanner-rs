@@ -80,6 +80,7 @@ use super::scratch::ScanScratch;
 /// chains. Hoisting the lookups here keeps them in local variables that
 /// LLVM can hold in registers across the per-window inner loop. This also
 /// eliminates redundant `NO_GATE` sentinel checks and repeated pool indexing.
+#[derive(Clone, Copy)]
 pub(super) struct ResolvedGates<'e> {
     pub(super) confirm_all: Option<&'e ConfirmAllCompiled>,
     pub(super) keywords: Option<&'e KeywordsCompiled>,

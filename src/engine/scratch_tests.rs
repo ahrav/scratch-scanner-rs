@@ -230,7 +230,7 @@ fn cross_chunk_dedupe_tracks_candidates_beyond_emit_cap() {
 }
 
 #[test]
-#[should_panic(expected = "rule_id exceeds 24-bit dedup budget")]
+#[should_panic(expected = "overflows the 24-bit field")]
 fn dedup_rejects_rule_ids_that_overlap_variant_bits() {
     let engine = Engine::new(
         vec![simple_rule(), simple_rule()],
