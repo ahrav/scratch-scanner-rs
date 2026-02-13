@@ -489,7 +489,7 @@ fn decode_utf16_to_buf(
                     u16::from_be_bytes([input[off2], input[off2 + 1]])
                 };
                 if (0xDC00..=0xDFFF).contains(&u2) {
-                    let code = 0x10000 + (((u - 0xD800) as u32) << 10) | ((u2 - 0xDC00) as u32);
+                    let code = (0x10000 + (((u - 0xD800) as u32) << 10)) | ((u2 - 0xDC00) as u32);
                     // SAFETY: code is a valid Unicode scalar (supplementary plane).
                     (unsafe { char::from_u32_unchecked(code) }, 2)
                 } else {
