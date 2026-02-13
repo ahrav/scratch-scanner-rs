@@ -911,6 +911,11 @@ impl Engine {
 
             // ── Phase 7: Vectorscan match → PendingWindow enqueue ────────
             if vs_pending_len != 0 {
+                debug_assert!(
+                    (vs_pending_len as usize) <= scratch.vs_stream_matches.capacity(),
+                    "vs_pending_len ({vs_pending_len}) exceeds stream match capacity ({})",
+                    scratch.vs_stream_matches.capacity(),
+                );
                 // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
                 unsafe {
                     scratch.vs_stream_matches.set_len(vs_pending_len as usize);
@@ -1208,6 +1213,11 @@ impl Engine {
         // Propagate those matches into `vs_stream_matches` so the post-stream
         // processing below can handle them.
         if vs_pending_len != 0 {
+            debug_assert!(
+                (vs_pending_len as usize) <= scratch.vs_stream_matches.capacity(),
+                "vs_pending_len ({vs_pending_len}) exceeds stream match capacity ({})",
+                scratch.vs_stream_matches.capacity(),
+            );
             // SAFETY: callbacks cap vs_pending_len to stream_pending_cap.
             unsafe {
                 scratch.vs_stream_matches.set_len(vs_pending_len as usize);

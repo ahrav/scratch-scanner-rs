@@ -419,27 +419,95 @@ const FILETABLE_PATH_BYTES_PER_FILE_DEFAULT: usize = 256;
 /// - `base_offset` points to the first byte in `data()`
 pub struct Chunk {
     /// File identifier for this chunk.
-    pub file_id: FileId,
+    file_id: FileId,
     /// File offset where this chunk begins, including the overlap prefix.
-    pub base_offset: u64,
+    base_offset: u64,
     /// Total byte length of this chunk, including the overlap prefix.
-    pub len: u32,
+    len: u32,
     /// Number of prefix bytes copied from the previous chunk.
     ///
     /// Invariants: `prefix_len <= len` and `len - prefix_len` is the payload
     /// length for newly read bytes.
-    pub prefix_len: u32,
+    prefix_len: u32,
     /// Backing buffer for the chunk. Returned to the pool when dropped.
-    pub buf: BufferHandle,
+    buf: BufferHandle,
     /// Starting offset into `buf` where the chunk data begins.
     ///
     /// This is usually zero for buffered reads. For O_DIRECT reads with an
     /// aligned payload offset, it can be non-zero so the overlap prefix
     /// remains contiguous without scanning alignment padding.
-    pub buf_offset: u32,
+    buf_offset: u32,
 }
 
 impl Chunk {
+    /// Constructs a new `Chunk` after validating structural invariants.
+    ///
+    /// # Panics
+    /// Panics if `prefix_len > len` or `buf_offset + len > BUFFER_LEN_MAX`.
+    pub(crate) fn new(
+        file_id: FileId,
+        base_offset: u64,
+        len: u32,
+        prefix_len: u32,
+        buf: BufferHandle,
+        buf_offset: u32,
+    ) -> Self {
+        let start = buf_offset as usize;
+        let length = len as usize;
+        assert!(
+            prefix_len <= len,
+            "chunk prefix_len ({prefix_len}) exceeds len ({len})"
+        );
+        assert!(
+            start + length <= BUFFER_LEN_MAX,
+            "chunk buf_offset ({buf_offset}) + len ({len}) exceeds BUFFER_LEN_MAX ({BUFFER_LEN_MAX})"
+        );
+        Self {
+            file_id,
+            base_offset,
+            len,
+            prefix_len,
+            buf,
+            buf_offset,
+        }
+    }
+
+    /// File identifier for this chunk.
+    #[inline(always)]
+    pub fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    /// File offset where this chunk begins, including the overlap prefix.
+    #[inline(always)]
+    pub fn base_offset(&self) -> u64 {
+        self.base_offset
+    }
+
+    /// Total byte length of this chunk, including the overlap prefix.
+    #[inline(always)]
+    pub fn total_len(&self) -> u32 {
+        self.len
+    }
+
+    /// Number of prefix bytes copied from the previous chunk.
+    #[inline(always)]
+    pub fn prefix_len(&self) -> u32 {
+        self.prefix_len
+    }
+
+    /// Starting offset into the backing buffer where chunk data begins.
+    #[inline(always)]
+    pub fn buf_offset(&self) -> u32 {
+        self.buf_offset
+    }
+
+    /// Shared reference to the backing buffer handle.
+    #[inline(always)]
+    pub fn buf(&self) -> &BufferHandle {
+        &self.buf
+    }
+
     /// Full data slice, including the overlap prefix.
     ///
     /// The slice length is `len` and starts at `buf_offset` into the backing
@@ -727,14 +795,14 @@ pub fn read_file_chunks(
             0
         };
 
-        let chunk = Chunk {
+        let chunk = Chunk::new(
             file_id,
             base_offset,
-            len: total_len as u32,
-            prefix_len: tail_len as u32,
-            buf: handle,
-            buf_offset: 0,
-        };
+            total_len as u32,
+            tail_len as u32,
+            handle,
+            0,
+        );
 
         if let ControlFlow::Break(()) = emit(chunk) {
             break;
@@ -1034,31 +1102,30 @@ mod tests_chunk_views {
     use super::*;
 
     fn make_chunk(buf_offset: usize, len: usize, prefix_len: usize) -> Chunk {
-        assert!(prefix_len <= len);
-        assert!(buf_offset + len <= BUFFER_LEN_MAX);
         let pool = BufferPool::new(1);
         let mut buf = pool.acquire();
+        // Chunk::new validates prefix_len <= len and buf_offset + len <= BUFFER_LEN_MAX.
         for (idx, b) in buf.as_mut_slice()[..(buf_offset + len)]
             .iter_mut()
             .enumerate()
         {
             *b = (idx % 251) as u8;
         }
-        Chunk {
-            file_id: FileId(7),
-            base_offset: 99,
-            len: len as u32,
-            prefix_len: prefix_len as u32,
+        Chunk::new(
+            FileId(7),
+            99,
+            len as u32,
+            prefix_len as u32,
             buf,
-            buf_offset: buf_offset as u32,
-        }
+            buf_offset as u32,
+        )
     }
 
     #[test]
     fn data_and_payload_match_safe_reference() {
         let chunk = make_chunk(32, 80, 12);
-        let expected_data = &chunk.buf.as_slice()[32..112];
-        let expected_payload = &chunk.buf.as_slice()[44..112];
+        let expected_data = &chunk.buf().as_slice()[32..112];
+        let expected_payload = &chunk.buf().as_slice()[44..112];
         assert_eq!(chunk.data(), expected_data);
         assert_eq!(chunk.payload(), expected_payload);
     }
@@ -1080,6 +1147,23 @@ mod tests_chunk_views {
         assert_eq!(payload.len(), 33);
         assert_eq!(payload[0], data[31]);
         assert_eq!(payload[payload.len() - 1], data[data.len() - 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "buf_offset")]
+    fn rejects_chunk_exceeding_buffer_bounds() {
+        let pool = BufferPool::new(1);
+        let buf = pool.acquire();
+        // buf_offset + len overflows BUFFER_LEN_MAX → constructor panics.
+        Chunk::new(FileId(0), 0, (BUFFER_LEN_MAX as u32) + 1, 0, buf, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "prefix_len")]
+    fn rejects_chunk_prefix_exceeding_len() {
+        let pool = BufferPool::new(1);
+        let buf = pool.acquire();
+        Chunk::new(FileId(0), 0, 10, 11, buf, 0);
     }
 }
 
@@ -1110,18 +1194,18 @@ mod tests_runtime_proptests {
                 *b = (idx % 251) as u8;
             }
 
-            let chunk = Chunk {
-                file_id: FileId(1),
-                base_offset: 0,
-                len: len as u32,
-                prefix_len: prefix as u32,
+            let chunk = Chunk::new(
+                FileId(1),
+                0,
+                len as u32,
+                prefix as u32,
                 buf,
-                buf_offset: buf_offset as u32,
-            };
+                buf_offset as u32,
+            );
 
-            let expected_data = &chunk.buf.as_slice()[buf_offset..buf_offset + len];
+            let expected_data = &chunk.buf().as_slice()[buf_offset..buf_offset + len];
             let expected_payload =
-                &chunk.buf.as_slice()[buf_offset + prefix..buf_offset + len];
+                &chunk.buf().as_slice()[buf_offset + prefix..buf_offset + len];
 
             prop_assert_eq!(chunk.data(), expected_data);
             prop_assert_eq!(chunk.payload(), expected_payload);
