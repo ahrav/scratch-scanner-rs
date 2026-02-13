@@ -189,7 +189,10 @@ impl FileTable {
         }
     }
 
-    /// Fallible variant of `alloc_path_span` (Unix only).
+    /// Fallible variant of [`alloc_path_span`](Self::alloc_path_span) (Unix only).
+    ///
+    /// Returns `None` if the arena capacity or `u32` span limit would be
+    /// exceeded, instead of panicking.
     #[cfg(unix)]
     fn try_alloc_path_span(&mut self, bytes: &[u8]) -> Option<PathSpan> {
         let start = self.path_bytes.len();
@@ -486,6 +489,8 @@ pub const BUFFER_LEN_MAX: usize = 8 * 1024 * 1024;
 /// Alignment for pooled buffers (bytes).
 pub const BUFFER_ALIGN: usize = 4096;
 
+// Power-of-two sizes allow bitmask arithmetic in the node pool allocator.
+// Alignment ≤ 4096 ensures compatibility with page-aligned I/O (O_DIRECT).
 const _: () = {
     assert!(BUFFER_LEN_MAX > 0);
     assert!(BUFFER_LEN_MAX.is_power_of_two());
@@ -608,7 +613,9 @@ impl BufferHandle {
     ///
     /// The slice length is always `BUFFER_LEN_MAX`.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: `ptr` is uniquely borrowed via `&mut self` for this call.
+        // SAFETY: `ptr` points to a `BUFFER_LEN_MAX`-byte allocation owned by
+        // the pool. `&mut self` guarantees no other references to the buffer
+        // exist for the duration of the borrow.
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), BUFFER_LEN_MAX) }
     }
 
@@ -872,6 +879,11 @@ impl ScannerRuntime {
     }
 }
 
+/// Constructs the error returned when `scan_file_sync` exceeds its findings
+/// capacity.
+///
+/// Separated into a `#[cold]` function so the happy path in the scan loop
+/// stays small and branch-prediction-friendly.
 #[cold]
 #[inline(never)]
 fn findings_capacity_error() -> io::Error {
