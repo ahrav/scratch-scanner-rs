@@ -108,8 +108,11 @@ pub use engine::fuzz_try_load;
 pub use engine::BenchHitAccPool;
 #[cfg(feature = "bench")]
 pub use engine::{
-    bench_contains_any_memmem, bench_find_spans_into, bench_offline_validate_aws_access_key,
-    bench_offline_validate_sentry_org_token, bench_pack_patterns_raw, bench_stream_decode_base64,
+    bench_contains_all_memmem, bench_contains_any_memmem, bench_decode_utf16be,
+    bench_decode_utf16le, bench_entropy_gate_passes, bench_extract_secret_span_locs,
+    bench_find_spans_into, bench_hash128, bench_map_utf16_decoded_offset, bench_merge_ranges,
+    bench_offline_validate_aws_access_key, bench_offline_validate_sentry_org_token,
+    bench_pack_patterns_raw, bench_shannon_entropy, bench_stream_decode_base64,
     bench_stream_decode_url, BenchPackedPatterns,
 };
 #[cfg(feature = "stats")]
