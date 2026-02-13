@@ -183,6 +183,7 @@ harness = false
 [[bench]]
 name = "event_encoding"
 harness = false
+required-features = ["bench"]
 
 [profile.dev]
 opt-level = 1

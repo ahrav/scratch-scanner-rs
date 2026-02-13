@@ -31,8 +31,11 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use scanner_rs::git_scan::identity_intern::CommitIdentityIds;
 use scanner_rs::git_scan::object_id::OidBytes;
 use scanner_rs::unified::events::{
-    encode_commit_meta, encode_finding, CommitMetaEvent, EventEncoder, EventSink, FindingEvent,
-    JsonlEncoder, JsonlEventSink, ScanEvent,
+    CommitMetaEvent, EventEncoder, EventSink, FindingEvent, JsonlEncoder, JsonlEventSink, ScanEvent,
+};
+use scanner_rs::unified::harness_api::{
+    encode_commit_meta, encode_finding, write_f64, write_json_bytes, write_json_str, write_oid_hex,
+    write_u64,
 };
 use scanner_rs::unified::SourceKind;
 use std::io;
@@ -269,7 +272,6 @@ fn make_commit_meta_with_identity() -> CommitMetaEvent {
 /// not with the numeric value itself. The three cases (1-digit, 10-digit,
 /// 20-digit) confirm that per-digit cost is constant.
 fn bench_write_u64(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_u64;
     let mut group = c.benchmark_group("write_u64");
 
     for &(label, val) in &[
@@ -296,7 +298,6 @@ fn bench_write_u64(c: &mut Criterion) {
 /// SHA-256 case should be ~1.6× the SHA-1 cost, confirming linear scaling
 /// with no per-call overhead domination.
 fn bench_write_oid_hex(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_oid_hex;
     let mut group = c.benchmark_group("write_oid_hex");
 
     let sha1 = make_sha1_oid();
@@ -333,7 +334,6 @@ fn bench_write_oid_hex(c: &mut Criterion) {
 /// the escaped variant should be measurably slower but still sub-linear in
 /// escape count thanks to the 16-byte bulk scan.
 fn bench_write_json_str(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_json_str;
     let mut group = c.benchmark_group("write_json_str");
 
     // Sub-16-byte strings: always take the scalar path (below SIMD threshold).
@@ -399,7 +399,6 @@ fn bench_write_json_str(c: &mut Criterion) {
 /// must handle high bytes via Unicode escape (`\\u00XX`). The `with_0xff` variant
 /// confirms the scalar fallback cost is bounded.
 fn bench_write_json_bytes(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_json_bytes;
     let mut group = c.benchmark_group("write_json_bytes");
 
     let clean = make_clean_bytes(128);
@@ -434,7 +433,6 @@ fn bench_write_json_bytes(c: &mut Criterion) {
 /// This benchmark exists mainly as a regression guard — f64 fields are rare
 /// in scan events today but the primitive is shared infrastructure.
 fn bench_write_f64(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_f64;
     let mut group = c.benchmark_group("write_f64");
     group.throughput(Throughput::Elements(1));
     group.bench_function("81.23", |b| {

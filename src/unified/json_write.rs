@@ -46,8 +46,6 @@
 
 use crate::git_scan::object_id::OidBytes;
 
-use super::SourceKind;
-
 // ============================================================================
 // Lookup tables
 // ============================================================================
@@ -86,15 +84,6 @@ const HEX_PAIRS: [[u8; 2]; 256] = {
 // ============================================================================
 // Primitives
 // ============================================================================
-
-/// Write a [`SourceKind`] as its JSON string value (`fs` or `git`), without quotes.
-#[inline]
-pub(crate) fn write_source(kind: SourceKind, buf: &mut Vec<u8>) {
-    match kind {
-        SourceKind::Fs => buf.extend_from_slice(b"fs"),
-        SourceKind::Git => buf.extend_from_slice(b"git"),
-    }
-}
 
 /// Write an [`OidBytes`] as lowercase hex (without surrounding quotes).
 ///
