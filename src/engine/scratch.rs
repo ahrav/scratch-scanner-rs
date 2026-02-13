@@ -51,7 +51,7 @@ use super::Engine;
 /// which is measurably faster than the previous 33-byte packed layout.
 ///
 /// The variant discriminator is packed into the high byte of
-/// `rule_id_with_variant` since actual rule counts are well below 2^24.
+/// `rule_id_with_variant`. This requires `rule_id <= DEDUP_RULE_ID_MAX`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DedupKey {
@@ -65,6 +65,20 @@ struct DedupKey {
 }
 
 const _: () = assert!(std::mem::size_of::<DedupKey>() == 32);
+
+/// Number of low bits reserved for rule IDs in `DedupKey::rule_id_with_variant`.
+const DEDUP_RULE_ID_BITS: u32 = 24;
+/// Maximum rule id that can be packed with an 8-bit variant discriminator.
+pub(super) const DEDUP_RULE_ID_MAX: u32 = (1u32 << DEDUP_RULE_ID_BITS) - 1;
+
+#[inline(always)]
+fn pack_rule_id_with_variant(rule_id: u32, variant_disc: u8) -> u32 {
+    assert!(
+        rule_id <= DEDUP_RULE_ID_MAX,
+        "rule_id exceeds 24-bit dedup budget"
+    );
+    rule_id | (u32::from(variant_disc) << DEDUP_RULE_ID_BITS)
+}
 
 /// BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret
 /// value. 32 bytes = 256 bits, matching BLAKE3's default output length.
@@ -1484,14 +1498,17 @@ impl ScanScratch {
     ///
     /// # Deduplication Strategy
     ///
-    /// Findings are keyed by a 33-byte composite:
+    /// Findings are keyed by a 32-byte composite (`DedupKey`):
     ///
     /// ```text
-    /// ┌────────┬────────┬────────────┬──────────┬─────────────────┬───────────────┬─────────┐
-    /// │file_id │rule_id │ span_start │ span_end │ root_hint_start │ root_hint_end │ variant │
-    /// │ 4B     │ 4B     │ 4B         │ 4B       │ 8B              │ 8B            │ 1B      │
-    /// └────────┴────────┴────────────┴──────────┴─────────────────┴───────────────┴─────────┘
+    /// ┌────────┬──────────────────────┬────────────┬──────────┬─────────────────┬───────────────┐
+    /// │file_id │ rule_id_with_variant │ span_start │ span_end │ root_hint_start │ root_hint_end │
+    /// │ 4B     │ 4B                   │ 4B         │ 4B       │ 8B              │ 8B            │
+    /// └────────┴──────────────────────┴────────────┴──────────┴─────────────────┴───────────────┘
     /// ```
+    ///
+    /// `rule_id_with_variant` packs a 24-bit rule id plus an 8-bit variant
+    /// discriminator. Rule ids above `DEDUP_RULE_ID_MAX` are rejected.
     ///
     /// For transform-derived findings (`step_id != STEP_ROOT`), span coordinates
     /// are zeroed only when a precise root-span mapping is available. When
@@ -1569,7 +1586,7 @@ impl ScanScratch {
         // Build a 32-byte dedup key (exactly 2 AES blocks) and hash to 128 bits.
         let key = DedupKey {
             file_id: rec.file_id.0,
-            rule_id_with_variant: rec.rule_id | (u32::from(variant_disc) << 24),
+            rule_id_with_variant: pack_rule_id_with_variant(rec.rule_id, variant_disc),
             span_start,
             span_end,
             root_hint_start: rec.root_hint_start,

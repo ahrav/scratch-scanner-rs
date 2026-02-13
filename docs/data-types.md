@@ -191,7 +191,7 @@ classDiagram
 
     RuleSpec --> TwoPhaseSpec : optional
     RuleSpec --> OfflineValidationSpec : optional
-    RuleCompiled --> TwoPhaseCompiled : optional gate index
+    RuleCompiled --> TwoPhaseCompiled : optional gate index (`u32`; `NO_GATE` sentinel)
     TwoPhaseCompiled --> PackedPatterns : uses
 
     ScanScratch --> FindingRec : produces

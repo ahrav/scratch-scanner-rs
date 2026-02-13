@@ -1,6 +1,7 @@
 use super::{normalize_root_hint_end_for_dedup, CachelineBoundary, ScanScratch};
 use crate::api::{
-    FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning, STEP_ROOT,
+    DecodeStep, FileId, FindingRec, RuleSpec, StepId, TransformConfig, TransformId, Tuning,
+    Utf16Endianness, STEP_ROOT,
 };
 use crate::engine::Engine;
 use regex::bytes::Regex;
@@ -225,5 +226,61 @@ fn cross_chunk_dedupe_tracks_candidates_beyond_emit_cap() {
         scratch.pending_findings_len(),
         0,
         "cross-chunk duplicate should be suppressed even when first sighting exceeded emit cap"
+    );
+}
+
+#[test]
+#[should_panic(expected = "rule_id exceeds 24-bit dedup budget")]
+fn dedup_rejects_rule_ids_that_overlap_variant_bits() {
+    let engine = Engine::new(
+        vec![simple_rule(), simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 1024);
+
+    let utf16_le_step = scratch.step_arena.push(
+        STEP_ROOT,
+        DecodeStep::Utf16Window {
+            endianness: Utf16Endianness::Le,
+            parent_span: 0..4,
+        },
+    );
+
+    // These two records would alias in the packed dedup key if high rule-id bits
+    // were allowed to overlap the UTF-16 variant discriminator byte.
+    let root_overflow = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0x01_00_00_01,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: STEP_ROOT,
+    };
+    let utf16_le = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0x00_00_00_01,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: utf16_le_step,
+    };
+
+    scratch.push_finding_with_drop_hint(
+        root_overflow,
+        [0xA1; 32],
+        root_overflow.root_hint_end,
+        root_overflow.dedupe_with_span,
+    );
+    scratch.push_finding_with_drop_hint(
+        utf16_le,
+        [0xB2; 32],
+        utf16_le.root_hint_end,
+        utf16_le.dedupe_with_span,
     );
 }
