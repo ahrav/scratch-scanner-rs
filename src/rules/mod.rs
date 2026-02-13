@@ -8,8 +8,9 @@
 //!
 //! - Runtime file loading always returns structured `RulesError` values for
 //!   parse/validation failures.
-//! - Built-in rules are validated once at process startup and then cloned from
-//!   cache; invalid embedded YAML is treated as a programming error and panics.
+//! - Built-in rules are parsed/validated lazily on first use via `OnceLock`,
+//!   then cloned from cache; invalid embedded YAML is treated as a programming
+//!   error and panics.
 //! - Regex compilation uses progressive size tiers so one complex rule does not
 //!   require raising memory limits globally.
 
@@ -194,12 +195,30 @@ pub(crate) fn default_rules_path() -> Option<PathBuf> {
 /// The built-in rule set, embedded from `default_rules.yaml` at compile time.
 const BUILTIN_RULES_YAML: &str = include_str!("../../default_rules.yaml");
 
-/// Returns the built-in `default_rules.yaml` contents embedded at compile time.
+/// Deterministic hasher for rule-content provenance fingerprints.
 ///
-/// Used for provenance hashing/logging in startup paths that fall back to
-/// built-in rules.
-pub(crate) fn builtin_rules_yaml() -> &'static str {
-    BUILTIN_RULES_YAML
+/// Seeds are fixed to preserve existing startup hash behavior.
+const RULE_CONTENT_HASHER: ahash::RandomState = ahash::RandomState::with_seeds(
+    0x524C_5348_3031,
+    0xA341_6F5D_19B2_CC93,
+    0x9E37_79B9_7F4A_7C15,
+    0xD1B5_4A32_D192_ED03,
+);
+
+/// Hash arbitrary rule content bytes into a deterministic 64-bit fingerprint.
+///
+/// This is a non-cryptographic hash intended for provenance logs.
+#[inline]
+pub(crate) fn rules_content_hash64(bytes: &[u8]) -> u64 {
+    RULE_CONTENT_HASHER.hash_one(bytes)
+}
+
+/// Hash the built-in rule YAML into a deterministic 64-bit fingerprint.
+///
+/// Suitable for startup provenance logs when using the compile-time fallback.
+#[inline]
+pub(crate) fn builtin_rules_hash64() -> u64 {
+    rules_content_hash64(BUILTIN_RULES_YAML.as_bytes())
 }
 
 /// Parse and return the built-in rule set.
@@ -341,5 +360,27 @@ mod tests {
     #[test]
     fn build_regex_invalid_pattern() {
         assert!(build_regex(r"[unclosed").is_err());
+    }
+
+    #[test]
+    fn rules_content_hash64_is_stable_and_formats_as_u64_hex() {
+        let h1 = rules_content_hash64(b"rules: []\n");
+        let h2 = rules_content_hash64(b"rules: []\n");
+        let h3 = rules_content_hash64(b"rules:\n- name: x\n");
+        assert_eq!(h1, h2, "same bytes should hash identically");
+        assert_ne!(h1, h3, "different bytes should generally hash differently");
+        assert_eq!(
+            format!("{h1:016x}").len(),
+            16,
+            "u64 fingerprint should format as 16 hex chars"
+        );
+    }
+
+    #[test]
+    fn builtin_rules_hash64_matches_builtin_yaml_hash() {
+        assert_eq!(
+            builtin_rules_hash64(),
+            rules_content_hash64(BUILTIN_RULES_YAML.as_bytes())
+        );
     }
 }

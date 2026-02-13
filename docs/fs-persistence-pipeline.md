@@ -179,11 +179,8 @@ When `--persist-findings` is enabled for FS scans, the orchestrator wires
 
 #### Store Root Resolution
 
-The store root directory is resolved in this order:
-
-1. **`SCANNER_FS_LOG_DIR` env var** — used verbatim if set.
-2. **Sibling of scan root** — `<scan_root>/.scanner-store/` under the
-   scan target directory.
+The store root directory is currently fixed to a sibling of the scan root:
+`<scan_root>/.scanner-store/`.
 
 Example: scanning `/data/repos/myproject` creates
 `/data/repos/myproject/.scanner-store/findings.db`.
@@ -420,7 +417,6 @@ writes to `findings.db` under the store root.
 
 | Variable | Purpose |
 |----------|---------|
-| `SCANNER_FS_LOG_DIR` | Override the store root directory (takes precedence over the default sibling-of-scan-root path) |
 | `SCANNER_SECRET_KEY` | Stable secret key for BLAKE3-keyed identity hashes; if unset, an ephemeral key is generated (cross-run dedup disabled) |
 
 ### Wiring Path

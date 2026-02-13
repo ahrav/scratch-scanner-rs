@@ -242,8 +242,8 @@ Filesystem scans have a concrete persistence backend in
   redundant lookups for frequently seen rules.
 - Run status (`Complete`, `CompleteWithCoverageLimits`, `Incomplete`) is
   derived from `RunCounters` at `end_run()` time.
-- Store root is resolved from `SCANNER_FS_LOG_DIR` env var, or defaults to
-  `<scan_root>/.scanner-store/`.
+- Store root is currently `<scan_root>/.scanner-store/` when
+  `--persist-findings` is enabled.
 
 For the full schema documentation, query APIs, and configuration,
 see [fs-persistence-pipeline.md § SQLite Backend](fs-persistence-pipeline.md#sqlite-backend).
