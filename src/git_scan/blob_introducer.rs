@@ -42,7 +42,7 @@ use super::object_id::OidBytes;
 use super::object_store::{ObjectStore, ObjectStoreLayout, TreeBytes};
 use super::oid_index::OidIndex;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateCollector};
-use super::path_policy::{classify_path, is_excluded_path};
+use super::path_policy::{classify_path, PathClass};
 use super::repo_open::RepoJobState;
 use super::runner::GitScanConfig;
 use super::tree_candidate::{CandidateSink, ChangeKind};
@@ -724,7 +724,9 @@ impl BlobIntroducer {
                 EntryKind::RegularFile | EntryKind::ExecutableFile | EntryKind::Symlink => {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
-                    let excluded = is_excluded_path(path, self.path_policy_version);
+                    let class = classify_path(path);
+                    let excluded = matches!(self.path_policy_version, 2..)
+                        && class.contains(PathClass::BINARY);
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -754,7 +756,7 @@ impl BlobIntroducer {
                         self.path_builder.pop_leaf(leaf_start);
                         continue;
                     }
-                    let cand_flags = classify_path(path).bits();
+                    let cand_flags = class.bits();
                     let mode_u16 = mode as u16;
                     sink.emit(
                         oid,
@@ -1019,7 +1021,9 @@ impl<'a> BlobIntroWorker<'a> {
                 EntryKind::RegularFile | EntryKind::ExecutableFile | EntryKind::Symlink => {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
-                    let excluded = is_excluded_path(path, self.path_policy_version);
+                    let class = classify_path(path);
+                    let excluded = matches!(self.path_policy_version, 2..)
+                        && class.contains(PathClass::BINARY);
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -1050,7 +1054,7 @@ impl<'a> BlobIntroWorker<'a> {
                         self.path_builder.pop_leaf(leaf_start);
                         continue;
                     }
-                    let cand_flags = classify_path(path).bits();
+                    let cand_flags = class.bits();
                     let mode_u16 = mode as u16;
                     sink.emit(
                         oid,

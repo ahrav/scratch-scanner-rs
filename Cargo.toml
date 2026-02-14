@@ -194,6 +194,10 @@ harness = false
 name = "pack_inflate_perf"
 harness = false
 
+[[bench]]
+name = "hotspot_quick_wins"
+harness = false
+
 [profile.dev]
 opt-level = 1
 

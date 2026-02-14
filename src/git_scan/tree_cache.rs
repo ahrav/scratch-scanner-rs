@@ -276,12 +276,19 @@ fn round_down_power_of_two_u32(val: u32) -> u32 {
 }
 
 fn hash_oid(oid: &OidBytes) -> u64 {
-    // Use the first 8 bytes as a cheap, deterministic hash. This is
-    // sufficient for set selection; collisions are handled by the cache.
+    // SplitMix64 avalanche on the first 8 OID bytes. Sequential OIDs
+    // (common in packs) share long prefixes; without mixing they cluster
+    // into the same sets, degrading the 4-way associative cache to a
+    // single-set LRU. The finalizer is the same one used in
+    // `tree_delta_cache::hash_key`.
     let bytes = oid.as_slice();
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(buf)
+    let mut h = u64::from_le_bytes(buf);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h
 }
 
 #[cfg(test)]

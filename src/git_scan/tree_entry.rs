@@ -58,9 +58,8 @@
 //!
 //! # Performance
 //!
-//! Delimiter scanning uses `iter().position()` which the compiler optimizes
-//! well. For maximum performance with SIMD, add the `memchr` crate and swap
-//! the `memchr_*` helper functions.
+//! Delimiter scanning uses the `memchr` crate for SIMD-accelerated byte
+//! searching (NEON on aarch64, SSE2/AVX2 on x86-64).
 
 use super::errors::TreeDiffError;
 use super::object_id::OidBytes;
@@ -410,21 +409,21 @@ pub(crate) fn parse_entry(data: &[u8], oid_len: u8) -> Result<ParseOutcome, Tree
     }))
 }
 
-// Delimiter scanning helpers
+// Delimiter scanning helpers — SIMD-accelerated via the `memchr` crate.
 
 #[inline]
 fn memchr_space(haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == b' ')
+    ::memchr::memchr(b' ', haystack)
 }
 
 #[inline]
 fn memchr_nul(haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == 0)
+    ::memchr::memchr(b'\0', haystack)
 }
 
 #[inline]
 fn memchr_slash(haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == b'/')
+    ::memchr::memchr(b'/', haystack)
 }
 
 // Mode parsing and classification

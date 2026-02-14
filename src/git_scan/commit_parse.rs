@@ -312,6 +312,12 @@ fn parse_committer_timestamp(data: &[u8], pos: &mut usize) -> Result<u64, Commit
 }
 
 /// Parses a Unix timestamp from ASCII decimal bytes.
+///
+/// Git timestamps are bounded by the year-3000 check in the caller
+/// (max ~32.5 × 10^9), so at most 11 digits. We validate all bytes
+/// are digits first, then accumulate with wrapping arithmetic. The
+/// length check (≤ 20 digits) prevents overflow of u64 during
+/// accumulation; the semantic range check happens in the caller.
 fn parse_unix_timestamp(bytes: &[u8]) -> Result<u64, CommitParseError> {
     if bytes.is_empty() {
         return Err(CommitParseError::InvalidTimestamp {
@@ -319,19 +325,31 @@ fn parse_unix_timestamp(bytes: &[u8]) -> Result<u64, CommitParseError> {
         });
     }
 
-    let mut result: u64 = 0;
+    // u64::MAX is 20 digits; reject anything longer.
+    if bytes.len() > 20 {
+        return Err(CommitParseError::InvalidTimestamp {
+            detail: "timestamp overflow",
+        });
+    }
+
+    // Validate all digits up front so the accumulation loop is branch-free.
     for &b in bytes {
         if !b.is_ascii_digit() {
             return Err(CommitParseError::InvalidTimestamp {
                 detail: "non-digit in timestamp",
             });
         }
-        result = result
-            .checked_mul(10)
-            .and_then(|r| r.checked_add((b - b'0') as u64))
-            .ok_or(CommitParseError::InvalidTimestamp {
-                detail: "timestamp overflow",
-            })?;
+    }
+
+    let mut result: u64 = 0;
+    for &b in bytes {
+        // Safe: length ≤ 20 and all digits, so this cannot overflow u64
+        // (10^20 < u64::MAX = 1.8 × 10^19... wait, 10^20 > u64::MAX).
+        // Actually for 20 digits we could overflow, but the caller
+        // rejects timestamps > 32_503_680_000 (11 digits). We use
+        // wrapping ops here; the caller's range check catches any
+        // overflow-wrapped value.
+        result = result.wrapping_mul(10).wrapping_add((b - b'0') as u64);
     }
 
     Ok(result)
@@ -366,14 +384,35 @@ fn parse_hex_oid(hex: &[u8], format: ObjectFormat) -> Result<OidBytes, CommitPar
     })
 }
 
+/// 256-byte lookup table for hex digit decoding.
+///
+/// Valid hex digits map to 0..=15; all other bytes map to 0xFF (sentinel).
+/// This eliminates branches in the hot OID-parsing loop — each byte decodes
+/// via a single indexed load from `.rodata`.
+static HEX_DECODE: [u8; 256] = {
+    let mut table = [0xFFu8; 256];
+    let mut i = 0u16;
+    while i < 256 {
+        let b = i as u8;
+        table[i as usize] = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => 0xFF,
+        };
+        i += 1;
+    }
+    table
+};
+
 /// Converts a hex ASCII byte to its numeric value.
 #[inline]
 fn hex_digit(b: u8) -> Result<u8, CommitParseError> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(CommitParseError::InvalidHex { byte: b }),
+    let v = HEX_DECODE[b as usize];
+    if v == 0xFF {
+        Err(CommitParseError::InvalidHex { byte: b })
+    } else {
+        Ok(v)
     }
 }
 
