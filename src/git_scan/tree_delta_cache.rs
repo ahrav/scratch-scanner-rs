@@ -126,18 +126,32 @@ pub struct TreeDeltaCache {
 
 /// Handle to a pinned delta base stored in the cache.
 ///
-/// The handle keeps the slot pinned until drop so cached bytes are not
-/// overwritten while the caller is still borrowing them.
+/// While this handle exists the underlying slot is pinned (its pin count
+/// is > 0), preventing the CLOCK eviction algorithm from reclaiming the
+/// slot. Dropping the handle releases the pin.
 ///
-/// # Safety
-/// The handle must not outlive the cache that created it.
+/// In addition to the raw bytes, the handle carries the resolved
+/// [`ObjectKind`] and `chain_len` so the delta resolver does not need a
+/// second lookup.
+///
+/// # Lifetime constraint
+///
+/// The handle stores a raw pointer to the parent [`TreeDeltaCache`].
+/// Callers must ensure the cache is not dropped or moved while any handle
+/// is live.
 #[derive(Debug)]
 pub struct TreeDeltaCacheHandle {
+    /// Raw pointer back to the owning cache.
     cache: *const TreeDeltaCache,
+    /// Absolute slot index in `slots` (for pin-count bookkeeping).
     slot: usize,
+    /// Byte offset into `storage` where the payload begins.
     offset: usize,
+    /// Byte length of the cached payload.
     len: usize,
+    /// Resolved object kind of the base.
     kind: ObjectKind,
+    /// Delta chain length at the time of caching.
     chain_len: u8,
 }
 
