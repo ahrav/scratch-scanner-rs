@@ -421,65 +421,97 @@ impl<'a> PackFile<'a> {
     }
 }
 
-/// Inflate a zlib stream with a hard output cap.
+/// Inflate a zlib stream with a hard output cap, using a caller-provided
+/// `Decompress`. The decompressor is reset before use.
 ///
 /// Returns the number of input bytes consumed from `input`.
 ///
-/// The output buffer is cleared and pre-reserved to `max_out` before writing.
+/// Decompressed bytes are written directly into `out`'s spare capacity,
+/// avoiding an intermediate buffer copy.
 ///
 /// On error, `out` may contain a partial prefix; callers should discard it.
-/// This does not enforce that the stream ends exactly at the end of `input`;
-/// callers should use the returned byte count to advance within a pack.
-pub fn inflate_limited(
+pub fn inflate_limited_with(
+    de: &mut Decompress,
     input: &[u8],
     out: &mut Vec<u8>,
     max_out: usize,
 ) -> Result<usize, InflateError> {
     use flate2::{FlushDecompress, Status};
 
+    de.reset(true);
     out.clear();
     out.reserve(max_out);
 
-    with_inflate_scratch(|de, buf| {
-        let mut in_pos: usize = 0;
+    let mut in_pos: usize = 0;
 
-        loop {
-            let before_in = de.total_in() as usize;
-            let before_out = de.total_out() as usize;
+    loop {
+        let before_in = de.total_in() as usize;
+        let before_out = de.total_out() as usize;
 
-            let status = de
-                .decompress(&input[in_pos..], buf, FlushDecompress::None)
-                .map_err(|_| InflateError::Backend)?;
+        // Decompress directly into Vec spare capacity, capped so
+        // total output never exceeds max_out.
+        let remaining = max_out - out.len();
+        let spare = out.spare_capacity_mut();
+        let buf_len = spare.len().min(remaining);
+        // SAFETY: `MaybeUninit<u8>` has identical layout to `u8`.
+        // `buf_len <= spare.len()` so the pointer range is within the
+        // Vec's allocation. `decompress` writes only to positions it
+        // initializes.
+        let out_buf =
+            unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), buf_len) };
 
-            let consumed = de.total_in() as usize - before_in;
-            let produced = de.total_out() as usize - before_out;
-            in_pos += consumed;
+        let status = de
+            .decompress(&input[in_pos..], out_buf, FlushDecompress::None)
+            .map_err(|_| InflateError::Backend)?;
 
-            if produced != 0 {
-                if out.len() + produced > max_out {
-                    return Err(InflateError::LimitExceeded);
-                }
-                out.extend_from_slice(&buf[..produced]);
-            }
+        let consumed = de.total_in() as usize - before_in;
+        let produced = de.total_out() as usize - before_out;
+        in_pos += consumed;
 
-            match status {
-                Status::StreamEnd => return Ok(in_pos),
-                Status::Ok => {
-                    if consumed == 0 && produced == 0 {
-                        if in_pos >= input.len() {
-                            return Err(InflateError::TruncatedInput);
-                        }
-                        return Err(InflateError::Stalled);
-                    }
-                }
-                Status::BufError => {
+        if produced != 0 {
+            // SAFETY: `decompress` initialized exactly `produced` bytes
+            // starting at `out[out.len()..]`. `produced <= buf_len <=
+            // remaining = max_out - out.len()`, so the new length is
+            // at most `max_out`, which is within the reserved capacity.
+            unsafe { out.set_len(out.len() + produced) };
+        }
+
+        match status {
+            Status::StreamEnd => return Ok(in_pos),
+            Status::Ok => {
+                if consumed == 0 && produced == 0 {
                     if in_pos >= input.len() {
                         return Err(InflateError::TruncatedInput);
                     }
+                    return Err(InflateError::Stalled);
+                }
+                if out.len() >= max_out {
+                    return Err(InflateError::LimitExceeded);
+                }
+            }
+            Status::BufError => {
+                if out.len() >= max_out {
+                    return Err(InflateError::LimitExceeded);
+                }
+                if in_pos >= input.len() {
+                    return Err(InflateError::TruncatedInput);
                 }
             }
         }
-    })
+    }
+}
+
+/// Inflate a zlib stream with a hard output cap, using the thread-local
+/// `Decompress`.
+///
+/// Convenience wrapper around [`inflate_limited_with`] for callers that
+/// don't maintain their own decompressor.
+pub fn inflate_limited(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    max_out: usize,
+) -> Result<usize, InflateError> {
+    with_inflate_scratch(|de, _buf| inflate_limited_with(de, input, out, max_out))
 }
 
 /// Inflate a zlib stream into a caller-provided sink with an exact output size.
@@ -548,25 +580,31 @@ pub fn inflate_stream(
     })
 }
 
+/// Inflate a zlib stream expecting exactly `expected` output bytes, using a
+/// caller-provided `Decompress`.
+pub fn inflate_exact_with(
+    de: &mut Decompress,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    expected: usize,
+) -> Result<usize, InflateError> {
+    let consumed = inflate_limited_with(de, input, out, expected)?;
+    if out.len() != expected {
+        return Err(InflateError::TruncatedInput);
+    }
+    Ok(consumed)
+}
+
 /// Inflate a zlib stream expecting exactly `expected` output bytes.
 ///
-/// Returns the number of input bytes consumed from `input`.
-///
-/// The output buffer is cleared before writing. Callers should reserve at
-/// least `expected` capacity to satisfy debug assertions and avoid reallocations.
-///
-/// If the stream ends early or produces fewer bytes than expected, returns
-/// `TruncatedInput`.
+/// Convenience wrapper around [`inflate_exact_with`] using the thread-local
+/// `Decompress`.
 pub fn inflate_exact(
     input: &[u8],
     out: &mut Vec<u8>,
     expected: usize,
 ) -> Result<usize, InflateError> {
-    let consumed = inflate_limited(input, out, expected)?;
-    if out.len() != expected {
-        return Err(InflateError::TruncatedInput);
-    }
-    Ok(consumed)
+    with_inflate_scratch(|de, _buf| inflate_exact_with(de, input, out, expected))
 }
 
 /// Reads a Git delta varint (LEB128-like) as u64.

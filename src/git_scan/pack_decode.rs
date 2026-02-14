@@ -13,8 +13,13 @@
 
 use std::fmt;
 
-use super::pack_inflate::{inflate_exact, inflate_limited, EntryHeader, EntryKind, PackFile};
+use super::pack_inflate::{
+    inflate_exact, inflate_exact_with, inflate_limited, inflate_limited_with, EntryHeader,
+    EntryKind, PackFile,
+};
 use super::pack_inflate::{InflateError, PackParseError};
+
+use flate2::Decompress;
 
 /// Limits for pack object decoding.
 ///
@@ -132,15 +137,36 @@ pub fn entry_header_at(
     Ok(header)
 }
 
-/// Inflates the payload for an entry header.
-///
-/// For non-delta entries, this inflates exactly `header.size` bytes.
-/// For delta entries, this inflates the delta stream up to `max_delta_bytes`.
-///
-/// Returns the number of compressed bytes consumed from the pack slice.
-///
-/// # Errors
-/// - `PackDecodeError::Inflate` on zlib errors or limit overruns.
+/// Inflates the payload for an entry header using a caller-provided
+/// `Decompress`, bypassing TLS.
+pub fn inflate_entry_payload_with(
+    de: &mut Decompress,
+    pack: &PackFile<'_>,
+    header: &EntryHeader,
+    out: &mut Vec<u8>,
+    limits: &PackDecodeLimits,
+) -> Result<usize, PackDecodeError> {
+    match header.kind {
+        EntryKind::NonDelta { .. } => {
+            let expected = header.size as usize;
+            let consumed =
+                inflate_exact_with(de, pack.slice_from(header.data_start), out, expected)?;
+            Ok(consumed)
+        }
+        EntryKind::OfsDelta { .. } | EntryKind::RefDelta { .. } => {
+            let consumed = inflate_limited_with(
+                de,
+                pack.slice_from(header.data_start),
+                out,
+                limits.max_delta_bytes,
+            )?;
+            Ok(consumed)
+        }
+    }
+}
+
+/// Inflates the payload for an entry header using the thread-local
+/// `Decompress`.
 pub fn inflate_entry_payload(
     pack: &PackFile<'_>,
     header: &EntryHeader,
