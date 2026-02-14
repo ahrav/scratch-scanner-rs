@@ -227,9 +227,8 @@ pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub(crate) use runner::auto_pack_exec_workers_for_in_pack;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
-    GitScanMetricsSnapshot, GitScanMode, GitScanReport, GitScanResult, GitScanStageNanos,
-    PackMmapLimits, SkippedCandidate,
+    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError, GitScanMode,
+    GitScanReport, GitScanResult, GitScanStageNanos, PackMmapLimits, SkippedCandidate,
 };
 pub use work_items::WorkItems;
 

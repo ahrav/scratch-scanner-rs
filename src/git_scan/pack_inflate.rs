@@ -50,9 +50,15 @@ thread_local! {
 /// Runs an inflate operation using per-thread scratch buffers.
 ///
 /// This avoids per-call allocations by reusing a thread-local `Decompress`
-/// and output buffer. The scratch state is not re-entrant on the same
-/// thread; callers must not invoke inflate helpers recursively from within
-/// an `inflate_stream` callback.
+/// and output buffer.
+///
+/// # Panics
+///
+/// Panics if called reentrantly on the same thread (the `RefCell` borrow
+/// guard detects double-borrow). Callers must not invoke inflate helpers
+/// recursively from within an `inflate_stream` callback. The `_with`
+/// variants that accept a caller-owned `Decompress` bypass this TLS
+/// entirely and are safe for reentrant use.
 fn with_inflate_scratch<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Decompress, &mut [u8]) -> R,
@@ -454,10 +460,17 @@ pub fn inflate_limited_with(
         let remaining = max_out - out.len();
         let spare = out.spare_capacity_mut();
         let buf_len = spare.len().min(remaining);
-        // SAFETY: `MaybeUninit<u8>` has identical layout to `u8`.
-        // `buf_len <= spare.len()` so the pointer range is within the
-        // Vec's allocation. `decompress` writes only to positions it
-        // initializes.
+        // SAFETY:
+        // 1. Layout: `MaybeUninit<u8>` has identical layout to `u8` (guaranteed).
+        // 2. Bounds: `buf_len <= spare.len()`, so the pointer range is within
+        //    the Vec's allocation.
+        // 3. Write-only FFI: `decompress` is a zlib FFI wrapper that only
+        //    writes to the output buffer; it never reads uninitialized bytes.
+        // 4. Known deviation: creating `&mut [u8]` over uninit memory is
+        //    technically UB under Rust's reference validity model, but this
+        //    is a widely-used pattern predating `BorrowedBuf` stabilization.
+        //    Practical risk is zero because zlib `inflate` treats the buffer
+        //    as write-only.  Ref: rust-lang/unsafe-code-guidelines#77.
         let out_buf =
             unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), buf_len) };
 
@@ -471,10 +484,13 @@ pub fn inflate_limited_with(
 
         if produced != 0 {
             debug_assert!(out.len() + produced <= out.capacity());
-            // SAFETY: `decompress` initialized exactly `produced` bytes
-            // starting at `out[out.len()..]`. `produced <= buf_len <=
-            // remaining = max_out - out.len()`, so the new length is
-            // at most `max_out`, which is within the reserved capacity.
+            // SAFETY:
+            // 1. Initialization: `decompress` initialized exactly `produced`
+            //    bytes starting at `out[out.len()..]` (tracked by zlib's
+            //    internal counters, not by reading the buffer).
+            // 2. Bounds: `produced <= buf_len <= remaining = max_out - out.len()`,
+            //    so the new length is at most `max_out`, within reserved capacity.
+            // 3. No aliasing: `out` is the sole owner of its allocation.
             unsafe { out.set_len(out.len() + produced) };
         }
 
@@ -688,7 +704,7 @@ fn interpret_delta_body(
             if end > base.len() {
                 return Err(DeltaError::CopyOutOfRange);
             }
-            let out_end = out_len.saturating_add(size);
+            let out_end = out_len.checked_add(size).ok_or(DeltaError::OutputOverrun)?;
             if out_end > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
@@ -701,7 +717,7 @@ fn interpret_delta_body(
             if delta.len() - pos < size {
                 return Err(DeltaError::Truncated);
             }
-            let out_end = out_len.saturating_add(size);
+            let out_end = out_len.checked_add(size).ok_or(DeltaError::OutputOverrun)?;
             if out_end > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
@@ -761,9 +777,14 @@ pub fn apply_delta(
         let size = chunk.len();
         debug_assert!(written + size <= result_size);
 
-        // SAFETY: `interpret_delta_body` guarantees chunk source bounds and
-        // output bound checks; pointer stability invariant above guarantees
-        // destination validity for `written..written+size`.
+        // SAFETY:
+        // 1. Bounds: `interpret_delta_body` validates chunk source bounds and
+        //    enforces `written + size <= result_size` before emitting.
+        // 2. Pointer stability: `out_ptr` is valid because no Vec methods are
+        //    called between `as_mut_ptr()` and `set_len()` (see invariant above).
+        // 3. Destination: `written + size <= result_size <= capacity`.
+        // 4. No aliasing: chunks reference `base` or `delta` (both `&[u8]`),
+        //    disjoint from `out: &mut Vec<u8>` (enforced by borrow checker).
         unsafe {
             std::ptr::copy_nonoverlapping(chunk.as_ptr(), out_ptr.add(written), size);
         }
@@ -773,9 +794,11 @@ pub fn apply_delta(
 
     debug_assert_eq!(written, result_size);
 
-    // SAFETY: exactly `written == result_size` bytes initialized above,
-    // all within reserved capacity (`out.reserve(result_size)` guarantees
-    // `capacity >= result_size`).
+    // SAFETY:
+    // 1. Initialization: exactly `written == result_size` bytes written above
+    //    via `copy_nonoverlapping` from validated source slices.
+    // 2. Bounds: `written <= result_size <= capacity` (from `out.reserve`).
+    // 3. Pointer stability: no Vec methods called since `as_mut_ptr()`.
     unsafe { out.set_len(written) };
     Ok(())
 }
@@ -833,6 +856,11 @@ fn decode_copy_params(
     let mut cursor = start;
     let mut off: usize = 0;
     let mut size: usize = 0;
+    debug_assert!(
+        end <= delta.len(),
+        "decode_copy_params: end ({end}) > delta.len() ({len})",
+        len = delta.len()
+    );
     // SAFETY: `cursor` bounds are validated above by proving
     // `start <= cursor < end <= delta.len()` for every read in this block.
     unsafe {

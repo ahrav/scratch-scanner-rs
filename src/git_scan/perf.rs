@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Snapshot of Git scan performance counters.
+///
+/// When the `git-perf` feature is disabled this is a zero-sized unit struct
+/// so it adds no memory cost to `GitScanReport`.
+#[cfg(feature = "git-perf")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitPerfStats {
     /// Total bytes inflated from pack entries (uncompressed size).
@@ -114,6 +118,39 @@ pub struct GitPerfStats {
     /// Chunks where the hoisted prefilter bypassed reset+work-queue setup.
     pub scan_prefilter_bypass_count: u64,
 }
+
+/// Zero-sized stub when `git-perf` is disabled.
+#[cfg(not(feature = "git-perf"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GitPerfStats;
+
+/// Assigns a value to a perf-related struct field.
+///
+/// When `git-perf` is disabled the assignment is elided entirely.
+macro_rules! perf_set {
+    ($target:expr, $field:ident, $val:expr) => {
+        #[cfg(feature = "git-perf")]
+        {
+            $target.$field = $val;
+        }
+    };
+}
+pub(crate) use perf_set;
+
+/// Declares a `let` binding that only exists when `git-perf` is enabled.
+///
+/// Use for `Instant::now()` timers that feed into [`perf_set!`] calls.
+macro_rules! perf_let {
+    ($name:ident = $val:expr) => {
+        #[cfg(feature = "git-perf")]
+        let $name = $val;
+    };
+    (mut $name:ident = $val:expr) => {
+        #[cfg(feature = "git-perf")]
+        let mut $name = $val;
+    };
+}
+pub(crate) use perf_let;
 
 #[cfg(feature = "git-perf")]
 static PACK_INFLATE_BYTES: AtomicU64 = AtomicU64::new(0);

@@ -139,6 +139,68 @@ cargo test --features sim-harness --test simulation git_scan_random
 Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
 artifacts to `tests/failures/` for triage and minimization.
 
+## Performance Architecture
+
+### Delta Resolution
+
+Pack delta chains are resolved using a two-phase iterative approach rather
+than recursion. **Phase 1 (walk forward)** follows OFS delta base offsets
+through the chain, collecting a lightweight `TreeDeltaFrame` per hop without
+inflating any payloads. The walk terminates when a non-delta root object, a
+delta cache hit, or a cross-pack REF delta base is reached. **Phase 2
+(unwind backward)** iterates the frame stack in reverse, inflating each
+delta payload and applying it against the current base using a ping-pong
+buffer swap (`base_buf` and `result_buf` alternate roles via
+`std::mem::swap`). This eliminates the per-hop `Vec` allocations and
+unbounded stack growth that a recursive implementation would incur, and the
+chain depth is bounded by `MAX_DELTA_DEPTH` (64).
+
+### Spill Arena
+
+Tree payloads that exceed the in-memory cache capacity are written to a
+preallocated, memory-mapped spill file (`SpillArena`). The arena uses a
+dual-mapping strategy: a `MmapMut` writer for sequential appends and a
+shared read-only `Mmap` for zero-copy reads. An open-addressing hash table
+(`SpillIndex`) with linear probing provides O(1) lookups by OID, using a
+Murmur3 fmix64 finalizer on the first 8 OID bytes to distribute sequential
+OIDs evenly across slots. The index is best-effort: once all slots are
+occupied it disables itself and lookups fall back to pack/loose reads.
+
+### Pack Execution Strategy
+
+The runner selects one of three execution strategies based on worker count
+and plan structure (`select_pack_exec_strategy`):
+
+- **Serial** -- single-threaded execution, chosen when `workers <= 1`, no
+  plans exist, or total decode work falls below `MIN_TOTAL_NEED_FOR_PARALLEL`.
+- **PackParallel** -- one plan per worker with deterministic sequence
+  reassembly, chosen when the number of pack plans is at least the worker
+  count (i.e. enough independent packs to keep all workers busy).
+- **IntraPackSharded** -- large single-pack plans are split into
+  index-range shards, each executed by a separate worker. Shard counts are
+  chosen adaptively per plan using cost hints (forward and external delta
+  dependency counts) and a locality pressure estimator that measures
+  cross-shard dependency crossings.
+
+### Buffer Reuse
+
+Several buffer reuse patterns eliminate per-object allocation on hot paths:
+
+- **TreeDecodeBufs** -- persistent `inflate_buf`, `result_buf`, and
+  `base_buf` vectors plus a pooled `delta_stack` that are reused across
+  `read_pack_object` calls in the tree-loading `ObjectStore`. The
+  decompressor is reset between inflations; buffers retain their capacity
+  across calls.
+- **InflateScratch** -- a `thread_local!` struct that merges a `Decompress`
+  handle and a 64 KiB scratch buffer into a single TLS slot, halving the
+  borrow overhead compared to two separate thread-locals. The `_with`
+  inflate variants accept a caller-owned `Decompress` to bypass TLS
+  entirely on reentrant or hot paths.
+- **PackExecScratch** -- caller-owned decode scratch (`DecodeBufs` plus
+  hot delta-dep and candidate-range vectors) that is `prepare()`d once per
+  plan to reserve capacity and then reused across all offsets within a pack
+  execution pass, avoiding per-offset allocations on the decode hot path.
+
 ## Related Docs
 
 - `docs/architecture-overview.md`

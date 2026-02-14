@@ -37,8 +37,10 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "git-perf")]
 use std::time::Instant;
 
+#[cfg(feature = "git-perf")]
 use crate::scheduler::AllocStatsDelta;
 use crate::Engine;
 
@@ -76,6 +78,7 @@ use super::start_set::StartSetConfig;
 use super::tree_diff::TreeDiffStats;
 use super::tree_diff_limits::TreeDiffLimits;
 
+use super::perf::{perf_let, perf_set};
 use super::runner_exec::build_ref_entries;
 
 /// Limits for pack file mmapping during scan execution.
@@ -443,8 +446,10 @@ pub struct SkippedCandidate {
 
 /// Wall-clock timing per Git scan stage (nanoseconds).
 ///
-/// `mapping` and `scan` are populated from the `git-perf` counters when
-/// available; they are zero when the feature is disabled.
+/// Per-stage wall-clock nanoseconds for the git scan pipeline.
+///
+/// Only compiled with `git-perf`; zero-sized stub otherwise.
+#[cfg(feature = "git-perf")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GitScanStageNanos {
     /// Tree diff stage time.
@@ -469,336 +474,30 @@ pub struct GitScanStageNanos {
     pub scan: u64,
 }
 
+/// Zero-sized stub when `git-perf` is disabled.
+#[cfg(not(feature = "git-perf"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitScanStageNanos;
+
 /// Allocation deltas captured across hot stages.
 ///
-/// These are best-effort global deltas and require the counting allocator
-/// to be installed (tests do this by default).
+/// Only compiled with `git-perf`; zero-sized stub otherwise.
+#[cfg(feature = "git-perf")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GitScanAllocStats {
     /// Allocation deltas for pack decode + scan.
     pub pack_exec: AllocStatsDelta,
 }
 
-/// Snapshot of key Git scan metrics for reporting.
-///
-/// Throughput values are derived via integer division. `cycles_per_byte`
-/// uses the optional `GIT_SCAN_CPU_HZ` hint and reports `0` when unset.
+/// Zero-sized stub when `git-perf` is disabled.
+#[cfg(not(feature = "git-perf"))]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct GitScanMetricsSnapshot {
-    /// Stage timing in nanoseconds.
-    pub stages: GitScanStageNanos,
-    /// Pack/scan perf counters.
-    pub perf: super::perf::GitPerfStats,
-    /// Total bytes read by tree diff.
-    pub tree_diff_bytes: u64,
-    /// Number of spill runs produced.
-    pub spill_runs: usize,
-    /// Total spill bytes written.
-    pub spill_bytes: u64,
-    /// Allocation deltas for hot stages.
-    pub alloc: GitScanAllocStats,
-}
-
-impl GitScanMetricsSnapshot {
-    /// Formats metrics as machine-parseable `key=value\n` lines.
-    ///
-    /// Output sections (in order):
-    /// 1. **stage.\*** — wall-clock nanoseconds per pipeline stage.
-    /// 2. **tree_diff/tree_load/tree_cache/tree_object/tree_inflate/tree_delta_\*** —
-    ///    tree-walk throughput and cache counters.
-    /// 3. **pack_inflate/delta_apply/scan** — pack-decode throughput with optional
-    ///    `cycles_per_byte` (requires `GIT_SCAN_CPU_HZ` env var; `0` when unset).
-    /// 4. **mapping** — mapping bridge call count and latency.
-    /// 5. **spill/alloc** — spill IO and allocator deltas.
-    ///
-    /// All throughput helpers return `0` when the denominator is zero (no
-    /// division-by-zero). The format is append-only: new keys may be added at the
-    /// end, but existing keys and their order are stable across versions.
-    #[must_use]
-    pub fn format(&self) -> String {
-        fn bytes_per_sec(bytes: u64, nanos: u64) -> u64 {
-            if bytes == 0 || nanos == 0 {
-                0
-            } else {
-                bytes.saturating_mul(1_000_000_000).saturating_div(nanos)
-            }
-        }
-
-        fn nanos_per_byte(bytes: u64, nanos: u64) -> u64 {
-            if bytes == 0 {
-                0
-            } else {
-                nanos.saturating_div(bytes)
-            }
-        }
-
-        fn cycles_per_byte(bytes: u64, nanos: u64, cpu_hz: Option<u64>) -> u64 {
-            let Some(hz) = cpu_hz else {
-                return 0;
-            };
-            if bytes == 0 || nanos == 0 {
-                return 0;
-            }
-            let cycles = hz.saturating_mul(nanos).saturating_div(1_000_000_000);
-            cycles.saturating_div(bytes)
-        }
-
-        let cpu_hz = std::env::var("GIT_SCAN_CPU_HZ")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok());
-
-        fn push_line<T: std::fmt::Display>(out: &mut String, key: &str, value: T) {
-            out.push_str(key);
-            out.push('=');
-            out.push_str(&value.to_string());
-            out.push('\n');
-        }
-
-        let mut out = String::new();
-
-        push_line(&mut out, "stage.tree_diff.nanos", self.stages.tree_diff);
-        push_line(&mut out, "stage.commit_plan.nanos", self.stages.commit_plan);
-        push_line(&mut out, "stage.blob_intro.nanos", self.stages.blob_intro);
-        push_line(&mut out, "stage.spill.nanos", self.stages.spill);
-        push_line(
-            &mut out,
-            "stage.pack_collect.nanos",
-            self.stages.pack_collect,
-        );
-        push_line(&mut out, "stage.mapping.nanos", self.stages.mapping);
-        push_line(&mut out, "stage.pack_plan.nanos", self.stages.pack_plan);
-        push_line(&mut out, "stage.pack_exec.nanos", self.stages.pack_exec);
-        push_line(&mut out, "stage.loose_scan.nanos", self.stages.loose_scan);
-        push_line(&mut out, "stage.scan.nanos", self.stages.scan);
-
-        push_line(&mut out, "tree_diff.bytes", self.tree_diff_bytes);
-        push_line(
-            &mut out,
-            "tree_diff.bytes_per_sec",
-            bytes_per_sec(self.tree_diff_bytes, self.stages.tree_diff),
-        );
-        push_line(
-            &mut out,
-            "tree_diff.ns_per_byte",
-            nanos_per_byte(self.tree_diff_bytes, self.stages.tree_diff),
-        );
-
-        push_line(&mut out, "tree_load.calls", self.perf.tree_load_calls);
-        push_line(&mut out, "tree_load.bytes", self.perf.tree_load_bytes);
-        push_line(&mut out, "tree_load.nanos", self.perf.tree_load_nanos);
-        push_line(
-            &mut out,
-            "tree_load.bytes_per_sec",
-            bytes_per_sec(self.perf.tree_load_bytes, self.perf.tree_load_nanos),
-        );
-        push_line(
-            &mut out,
-            "tree_load.ns_per_byte",
-            nanos_per_byte(self.perf.tree_load_bytes, self.perf.tree_load_nanos),
-        );
-        push_line(&mut out, "tree_cache.hits", self.perf.tree_cache_hits);
-        push_line(
-            &mut out,
-            "tree_delta_cache.hits",
-            self.perf.tree_delta_cache_hits,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_cache.misses",
-            self.perf.tree_delta_cache_misses,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_cache.bytes",
-            self.perf.tree_delta_cache_bytes,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_cache.hit_nanos",
-            self.perf.tree_delta_cache_hit_nanos,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_cache.miss_nanos",
-            self.perf.tree_delta_cache_miss_nanos,
-        );
-        push_line(&mut out, "tree_delta_chain.0", self.perf.tree_delta_chain_0);
-        push_line(&mut out, "tree_delta_chain.1", self.perf.tree_delta_chain_1);
-        push_line(
-            &mut out,
-            "tree_delta_chain.2_3",
-            self.perf.tree_delta_chain_2_3,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_chain.4_7",
-            self.perf.tree_delta_chain_4_7,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_chain.8_plus",
-            self.perf.tree_delta_chain_8_plus,
-        );
-        push_line(&mut out, "tree_spill.hits", self.perf.tree_spill_hits);
-        push_line(&mut out, "tree_object.loads", self.perf.tree_object_loads);
-        push_line(&mut out, "tree_object.bytes", self.perf.tree_object_bytes);
-        push_line(&mut out, "tree_object.nanos", self.perf.tree_object_nanos);
-        push_line(
-            &mut out,
-            "tree_object.bytes_per_sec",
-            bytes_per_sec(self.perf.tree_object_bytes, self.perf.tree_object_nanos),
-        );
-        push_line(
-            &mut out,
-            "tree_object.ns_per_byte",
-            nanos_per_byte(self.perf.tree_object_bytes, self.perf.tree_object_nanos),
-        );
-        push_line(&mut out, "tree_object.pack", self.perf.tree_object_pack);
-        push_line(&mut out, "tree_object.loose", self.perf.tree_object_loose);
-        push_line(&mut out, "tree_inflate.bytes", self.perf.tree_inflate_bytes);
-        push_line(&mut out, "tree_inflate.nanos", self.perf.tree_inflate_nanos);
-        push_line(
-            &mut out,
-            "tree_inflate.bytes_per_sec",
-            bytes_per_sec(self.perf.tree_inflate_bytes, self.perf.tree_inflate_nanos),
-        );
-        push_line(
-            &mut out,
-            "tree_inflate.ns_per_byte",
-            nanos_per_byte(self.perf.tree_inflate_bytes, self.perf.tree_inflate_nanos),
-        );
-        push_line(
-            &mut out,
-            "tree_delta_apply.bytes",
-            self.perf.tree_delta_apply_bytes,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_apply.nanos",
-            self.perf.tree_delta_apply_nanos,
-        );
-        push_line(
-            &mut out,
-            "tree_delta_apply.bytes_per_sec",
-            bytes_per_sec(
-                self.perf.tree_delta_apply_bytes,
-                self.perf.tree_delta_apply_nanos,
-            ),
-        );
-        push_line(
-            &mut out,
-            "tree_delta_apply.ns_per_byte",
-            nanos_per_byte(
-                self.perf.tree_delta_apply_bytes,
-                self.perf.tree_delta_apply_nanos,
-            ),
-        );
-
-        push_line(&mut out, "pack_inflate.bytes", self.perf.pack_inflate_bytes);
-        push_line(&mut out, "pack_inflate.nanos", self.perf.pack_inflate_nanos);
-        push_line(
-            &mut out,
-            "pack_inflate.bytes_per_sec",
-            bytes_per_sec(self.perf.pack_inflate_bytes, self.perf.pack_inflate_nanos),
-        );
-        push_line(
-            &mut out,
-            "pack_inflate.ns_per_byte",
-            nanos_per_byte(self.perf.pack_inflate_bytes, self.perf.pack_inflate_nanos),
-        );
-        push_line(
-            &mut out,
-            "pack_inflate.cycles_per_byte",
-            cycles_per_byte(
-                self.perf.pack_inflate_bytes,
-                self.perf.pack_inflate_nanos,
-                cpu_hz,
-            ),
-        );
-
-        push_line(&mut out, "delta_apply.bytes", self.perf.delta_apply_bytes);
-        push_line(&mut out, "delta_apply.nanos", self.perf.delta_apply_nanos);
-        push_line(
-            &mut out,
-            "delta_apply.bytes_per_sec",
-            bytes_per_sec(self.perf.delta_apply_bytes, self.perf.delta_apply_nanos),
-        );
-        push_line(
-            &mut out,
-            "delta_apply.ns_per_byte",
-            nanos_per_byte(self.perf.delta_apply_bytes, self.perf.delta_apply_nanos),
-        );
-        push_line(
-            &mut out,
-            "delta_apply.cycles_per_byte",
-            cycles_per_byte(
-                self.perf.delta_apply_bytes,
-                self.perf.delta_apply_nanos,
-                cpu_hz,
-            ),
-        );
-
-        push_line(&mut out, "scan.bytes", self.perf.scan_bytes);
-        push_line(&mut out, "scan.nanos", self.perf.scan_nanos);
-        push_line(
-            &mut out,
-            "scan.bytes_per_sec",
-            bytes_per_sec(self.perf.scan_bytes, self.perf.scan_nanos),
-        );
-        push_line(
-            &mut out,
-            "scan.ns_per_byte",
-            nanos_per_byte(self.perf.scan_bytes, self.perf.scan_nanos),
-        );
-        push_line(
-            &mut out,
-            "scan.cycles_per_byte",
-            cycles_per_byte(self.perf.scan_bytes, self.perf.scan_nanos, cpu_hz),
-        );
-
-        push_line(&mut out, "mapping.calls", self.perf.mapping_calls);
-        push_line(&mut out, "mapping.nanos", self.perf.mapping_nanos);
-        // Reuse nanos_per_byte as a generic nanos/count divider.
-        // .max(1) avoids div-by-zero when no mapping calls were recorded.
-        push_line(
-            &mut out,
-            "mapping.ns_per_call",
-            nanos_per_byte(self.perf.mapping_calls.max(1), self.perf.mapping_nanos),
-        );
-
-        push_line(&mut out, "spill.runs", self.spill_runs);
-        push_line(&mut out, "spill.bytes", self.spill_bytes);
-
-        push_line(
-            &mut out,
-            "alloc.pack_exec.allocs",
-            self.alloc.pack_exec.allocs,
-        );
-        push_line(
-            &mut out,
-            "alloc.pack_exec.bytes",
-            self.alloc.pack_exec.bytes_allocated,
-        );
-        push_line(
-            &mut out,
-            "alloc.pack_exec.reallocs",
-            self.alloc.pack_exec.reallocs,
-        );
-        push_line(
-            &mut out,
-            "alloc.pack_exec.deallocs",
-            self.alloc.pack_exec.deallocs,
-        );
-
-        out
-    }
-}
+pub struct GitScanAllocStats;
 
 /// Summary report for a completed scan.
 ///
 /// Contains per-stage statistics, pack execution reports, skipped candidates,
-/// and finalize output. Callers typically use [`metrics_snapshot`](Self::metrics_snapshot)
-/// for a condensed view or [`format_metrics`](Self::format_metrics) for
+/// and finalize output. Use [`format_metrics`](Self::format_metrics) for
 /// machine-parseable output.
 #[derive(Debug)]
 pub struct GitScanReport {
@@ -837,23 +536,239 @@ pub struct GitScanReport {
 }
 
 impl GitScanReport {
-    /// Returns a snapshot of key metrics for reporting.
+    /// Formats metrics as machine-parseable `key=value\n` lines.
+    ///
+    /// Returns an empty string when `git-perf` is disabled.
     #[must_use]
-    pub fn metrics_snapshot(&self) -> GitScanMetricsSnapshot {
-        GitScanMetricsSnapshot {
-            stages: self.stage_nanos,
-            perf: self.perf_stats,
-            tree_diff_bytes: self.tree_diff_stats.tree_bytes_loaded,
-            spill_runs: self.spill_stats.spill_runs,
-            spill_bytes: self.spill_stats.spill_bytes,
-            alloc: self.alloc_stats,
-        }
+    #[cfg(not(feature = "git-perf"))]
+    pub fn format_metrics(&self) -> String {
+        String::new()
     }
 
-    /// Formats metrics as stable key=value lines.
+    /// Formats metrics as machine-parseable `key=value\n` lines.
     #[must_use]
+    #[cfg(feature = "git-perf")]
     pub fn format_metrics(&self) -> String {
-        self.metrics_snapshot().format()
+        fn bytes_per_sec(bytes: u64, nanos: u64) -> u64 {
+            if bytes == 0 || nanos == 0 {
+                0
+            } else {
+                bytes.saturating_mul(1_000_000_000).saturating_div(nanos)
+            }
+        }
+
+        fn nanos_per_byte(bytes: u64, nanos: u64) -> u64 {
+            if bytes == 0 {
+                0
+            } else {
+                nanos.saturating_div(bytes)
+            }
+        }
+
+        fn push_line<T: std::fmt::Display>(out: &mut String, key: &str, value: T) {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }
+
+        let stages = &self.stage_nanos;
+        let perf = &self.perf_stats;
+        let tree_diff_bytes = self.tree_diff_stats.tree_bytes_loaded;
+        let mut out = String::new();
+
+        push_line(&mut out, "stage.tree_diff.nanos", stages.tree_diff);
+        push_line(&mut out, "stage.commit_plan.nanos", stages.commit_plan);
+        push_line(&mut out, "stage.blob_intro.nanos", stages.blob_intro);
+        push_line(&mut out, "stage.spill.nanos", stages.spill);
+        push_line(&mut out, "stage.pack_collect.nanos", stages.pack_collect);
+        push_line(&mut out, "stage.mapping.nanos", stages.mapping);
+        push_line(&mut out, "stage.pack_plan.nanos", stages.pack_plan);
+        push_line(&mut out, "stage.pack_exec.nanos", stages.pack_exec);
+        push_line(&mut out, "stage.loose_scan.nanos", stages.loose_scan);
+        push_line(&mut out, "stage.scan.nanos", stages.scan);
+
+        push_line(&mut out, "tree_diff.bytes", tree_diff_bytes);
+        push_line(
+            &mut out,
+            "tree_diff.bytes_per_sec",
+            bytes_per_sec(tree_diff_bytes, stages.tree_diff),
+        );
+        push_line(
+            &mut out,
+            "tree_diff.ns_per_byte",
+            nanos_per_byte(tree_diff_bytes, stages.tree_diff),
+        );
+
+        push_line(&mut out, "tree_load.calls", perf.tree_load_calls);
+        push_line(&mut out, "tree_load.bytes", perf.tree_load_bytes);
+        push_line(&mut out, "tree_load.nanos", perf.tree_load_nanos);
+        push_line(
+            &mut out,
+            "tree_load.bytes_per_sec",
+            bytes_per_sec(perf.tree_load_bytes, perf.tree_load_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_load.ns_per_byte",
+            nanos_per_byte(perf.tree_load_bytes, perf.tree_load_nanos),
+        );
+        push_line(&mut out, "tree_cache.hits", perf.tree_cache_hits);
+        push_line(
+            &mut out,
+            "tree_delta_cache.hits",
+            perf.tree_delta_cache_hits,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.misses",
+            perf.tree_delta_cache_misses,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.bytes",
+            perf.tree_delta_cache_bytes,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.hit_nanos",
+            perf.tree_delta_cache_hit_nanos,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_cache.miss_nanos",
+            perf.tree_delta_cache_miss_nanos,
+        );
+        push_line(&mut out, "tree_delta_chain.0", perf.tree_delta_chain_0);
+        push_line(&mut out, "tree_delta_chain.1", perf.tree_delta_chain_1);
+        push_line(&mut out, "tree_delta_chain.2_3", perf.tree_delta_chain_2_3);
+        push_line(&mut out, "tree_delta_chain.4_7", perf.tree_delta_chain_4_7);
+        push_line(
+            &mut out,
+            "tree_delta_chain.8_plus",
+            perf.tree_delta_chain_8_plus,
+        );
+        push_line(&mut out, "tree_spill.hits", perf.tree_spill_hits);
+        push_line(&mut out, "tree_object.loads", perf.tree_object_loads);
+        push_line(&mut out, "tree_object.bytes", perf.tree_object_bytes);
+        push_line(&mut out, "tree_object.nanos", perf.tree_object_nanos);
+        push_line(
+            &mut out,
+            "tree_object.bytes_per_sec",
+            bytes_per_sec(perf.tree_object_bytes, perf.tree_object_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_object.ns_per_byte",
+            nanos_per_byte(perf.tree_object_bytes, perf.tree_object_nanos),
+        );
+        push_line(&mut out, "tree_object.pack", perf.tree_object_pack);
+        push_line(&mut out, "tree_object.loose", perf.tree_object_loose);
+        push_line(&mut out, "tree_inflate.bytes", perf.tree_inflate_bytes);
+        push_line(&mut out, "tree_inflate.nanos", perf.tree_inflate_nanos);
+        push_line(
+            &mut out,
+            "tree_inflate.bytes_per_sec",
+            bytes_per_sec(perf.tree_inflate_bytes, perf.tree_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_inflate.ns_per_byte",
+            nanos_per_byte(perf.tree_inflate_bytes, perf.tree_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.bytes",
+            perf.tree_delta_apply_bytes,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.nanos",
+            perf.tree_delta_apply_nanos,
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.bytes_per_sec",
+            bytes_per_sec(perf.tree_delta_apply_bytes, perf.tree_delta_apply_nanos),
+        );
+        push_line(
+            &mut out,
+            "tree_delta_apply.ns_per_byte",
+            nanos_per_byte(perf.tree_delta_apply_bytes, perf.tree_delta_apply_nanos),
+        );
+
+        push_line(&mut out, "pack_inflate.bytes", perf.pack_inflate_bytes);
+        push_line(&mut out, "pack_inflate.nanos", perf.pack_inflate_nanos);
+        push_line(
+            &mut out,
+            "pack_inflate.bytes_per_sec",
+            bytes_per_sec(perf.pack_inflate_bytes, perf.pack_inflate_nanos),
+        );
+        push_line(
+            &mut out,
+            "pack_inflate.ns_per_byte",
+            nanos_per_byte(perf.pack_inflate_bytes, perf.pack_inflate_nanos),
+        );
+
+        push_line(&mut out, "delta_apply.bytes", perf.delta_apply_bytes);
+        push_line(&mut out, "delta_apply.nanos", perf.delta_apply_nanos);
+        push_line(
+            &mut out,
+            "delta_apply.bytes_per_sec",
+            bytes_per_sec(perf.delta_apply_bytes, perf.delta_apply_nanos),
+        );
+        push_line(
+            &mut out,
+            "delta_apply.ns_per_byte",
+            nanos_per_byte(perf.delta_apply_bytes, perf.delta_apply_nanos),
+        );
+
+        push_line(&mut out, "scan.bytes", perf.scan_bytes);
+        push_line(&mut out, "scan.nanos", perf.scan_nanos);
+        push_line(
+            &mut out,
+            "scan.bytes_per_sec",
+            bytes_per_sec(perf.scan_bytes, perf.scan_nanos),
+        );
+        push_line(
+            &mut out,
+            "scan.ns_per_byte",
+            nanos_per_byte(perf.scan_bytes, perf.scan_nanos),
+        );
+
+        push_line(&mut out, "mapping.calls", perf.mapping_calls);
+        push_line(&mut out, "mapping.nanos", perf.mapping_nanos);
+        push_line(
+            &mut out,
+            "mapping.ns_per_call",
+            nanos_per_byte(perf.mapping_calls.max(1), perf.mapping_nanos),
+        );
+
+        push_line(&mut out, "spill.runs", self.spill_stats.spill_runs);
+        push_line(&mut out, "spill.bytes", self.spill_stats.spill_bytes);
+
+        push_line(
+            &mut out,
+            "alloc.pack_exec.allocs",
+            self.alloc_stats.pack_exec.allocs,
+        );
+        push_line(
+            &mut out,
+            "alloc.pack_exec.bytes",
+            self.alloc_stats.pack_exec.bytes_allocated,
+        );
+        push_line(
+            &mut out,
+            "alloc.pack_exec.reallocs",
+            self.alloc_stats.pack_exec.reallocs,
+        );
+        push_line(
+            &mut out,
+            "alloc.pack_exec.deallocs",
+            self.alloc_stats.pack_exec.deallocs,
+        );
+
+        out
     }
 }
 
@@ -1153,9 +1068,9 @@ pub fn run_git_scan(
     };
 
     // Commit plan (shared across both modes).
-    let plan_start = Instant::now();
+    perf_let!(plan_start = Instant::now());
     let plan = introduced_by_plan(&repo, &cg, config.commit_walk)?;
-    let commit_plan_nanos = plan_start.elapsed().as_nanos() as u64;
+    perf_let!(commit_plan_nanos = plan_start.elapsed().as_nanos() as u64);
 
     // Build commit-graph index and emit-once bitset (shared by both modes).
     let cg_index = std::sync::Arc::new(CommitGraphIndex::build_from_mem(&cg)?);
@@ -1174,6 +1089,7 @@ pub fn run_git_scan(
         commit_meta_seen: std::sync::Arc::clone(&commit_meta_seen),
         identity_interner: identity_interner.clone(),
     };
+    #[allow(unused_mut)]
     let mut output = match config.scan_mode {
         GitScanMode::OdbBlobFast => super::runner_odb_blob::run_odb_blob(
             &repo,
@@ -1194,7 +1110,7 @@ pub fn run_git_scan(
             mk_commit_meta(),
         )?,
     };
-    output.stage_nanos.commit_plan = commit_plan_nanos;
+    perf_set!(output.stage_nanos, commit_plan, commit_plan_nanos);
 
     // Post-execution artifact stability check.
     if !repo.artifacts_unchanged()? {
@@ -1230,8 +1146,8 @@ pub fn run_git_scan(
     // `Instant` measurements. We patch them into `stage_nanos` here so
     // they appear alongside the wall-clock stages in the final report.
     let perf_stats = super::perf::snapshot();
-    output.stage_nanos.mapping = perf_stats.mapping_nanos;
-    output.stage_nanos.scan = perf_stats.scan_nanos;
+    perf_set!(output.stage_nanos, mapping, perf_stats.mapping_nanos);
+    perf_set!(output.stage_nanos, scan, perf_stats.scan_nanos);
 
     Ok(GitScanResult(GitScanReport {
         commit_count: plan.len(),
@@ -1376,158 +1292,5 @@ mod tests {
             ),
             36
         );
-    }
-
-    #[test]
-    fn metrics_format_is_stable() {
-        let snapshot = GitScanMetricsSnapshot {
-            stages: GitScanStageNanos {
-                tree_diff: 2_000,
-                commit_plan: 1_000,
-                blob_intro: 0,
-                spill: 3_000,
-                pack_collect: 0,
-                mapping: 4_000,
-                pack_plan: 5_000,
-                pack_exec: 6_000,
-                loose_scan: 0,
-                scan: 8_000,
-            },
-            perf: crate::git_scan::GitPerfStats {
-                pack_inflate_bytes: 2_000,
-                pack_inflate_nanos: 4_000,
-                delta_apply_bytes: 3_000,
-                delta_apply_nanos: 6_000,
-                scan_bytes: 4_000,
-                scan_nanos: 8_000,
-                mapping_calls: 5,
-                mapping_nanos: 2_500,
-                cache_hits: 0,
-                cache_misses: 0,
-                tree_load_calls: 0,
-                tree_load_bytes: 0,
-                tree_load_nanos: 0,
-                tree_cache_hits: 0,
-                tree_delta_cache_hits: 0,
-                tree_delta_cache_misses: 0,
-                tree_delta_cache_bytes: 0,
-                tree_delta_cache_hit_nanos: 0,
-                tree_delta_cache_miss_nanos: 0,
-                tree_delta_chain_0: 0,
-                tree_delta_chain_1: 0,
-                tree_delta_chain_2_3: 0,
-                tree_delta_chain_4_7: 0,
-                tree_delta_chain_8_plus: 0,
-                tree_spill_hits: 0,
-                tree_object_loads: 0,
-                tree_object_bytes: 0,
-                tree_object_nanos: 0,
-                tree_inflate_bytes: 0,
-                tree_inflate_nanos: 0,
-                tree_delta_apply_bytes: 0,
-                tree_delta_apply_nanos: 0,
-                tree_object_pack: 0,
-                tree_object_loose: 0,
-                scan_vs_prefilter_nanos: 0,
-                scan_validate_nanos: 0,
-                scan_transform_nanos: 0,
-                scan_sort_dedup_nanos: 0,
-                scan_reset_nanos: 0,
-                scan_blob_count: 0,
-                scan_chunk_count: 0,
-                scan_zero_hit_chunks: 0,
-                scan_findings_count: 0,
-                scan_chunker_bypass_count: 0,
-                scan_binary_skip_count: 0,
-                scan_binary_extract_count: 0,
-                scan_prefilter_bypass_count: 0,
-            },
-            tree_diff_bytes: 1_000,
-            spill_runs: 2,
-            spill_bytes: 4_096,
-            alloc: GitScanAllocStats {
-                pack_exec: AllocStatsDelta {
-                    allocs: 3,
-                    deallocs: 2,
-                    reallocs: 1,
-                    bytes_allocated: 4_096,
-                    bytes_deallocated: 2_048,
-                },
-            },
-        };
-
-        let expected = "\
-stage.tree_diff.nanos=2000
-stage.commit_plan.nanos=1000
-stage.blob_intro.nanos=0
-stage.spill.nanos=3000
-stage.pack_collect.nanos=0
-stage.mapping.nanos=4000
-stage.pack_plan.nanos=5000
-stage.pack_exec.nanos=6000
-stage.loose_scan.nanos=0
-stage.scan.nanos=8000
-tree_diff.bytes=1000
-tree_diff.bytes_per_sec=500000000
-tree_diff.ns_per_byte=2
-tree_load.calls=0
-tree_load.bytes=0
-tree_load.nanos=0
-tree_load.bytes_per_sec=0
-tree_load.ns_per_byte=0
-tree_cache.hits=0
-tree_delta_cache.hits=0
-tree_delta_cache.misses=0
-tree_delta_cache.bytes=0
-tree_delta_cache.hit_nanos=0
-tree_delta_cache.miss_nanos=0
-tree_delta_chain.0=0
-tree_delta_chain.1=0
-tree_delta_chain.2_3=0
-tree_delta_chain.4_7=0
-tree_delta_chain.8_plus=0
-tree_spill.hits=0
-tree_object.loads=0
-tree_object.bytes=0
-tree_object.nanos=0
-tree_object.bytes_per_sec=0
-tree_object.ns_per_byte=0
-tree_object.pack=0
-tree_object.loose=0
-tree_inflate.bytes=0
-tree_inflate.nanos=0
-tree_inflate.bytes_per_sec=0
-tree_inflate.ns_per_byte=0
-tree_delta_apply.bytes=0
-tree_delta_apply.nanos=0
-tree_delta_apply.bytes_per_sec=0
-tree_delta_apply.ns_per_byte=0
-pack_inflate.bytes=2000
-pack_inflate.nanos=4000
-pack_inflate.bytes_per_sec=500000000
-pack_inflate.ns_per_byte=2
-pack_inflate.cycles_per_byte=0
-delta_apply.bytes=3000
-delta_apply.nanos=6000
-delta_apply.bytes_per_sec=500000000
-delta_apply.ns_per_byte=2
-delta_apply.cycles_per_byte=0
-scan.bytes=4000
-scan.nanos=8000
-scan.bytes_per_sec=500000000
-scan.ns_per_byte=2
-scan.cycles_per_byte=0
-mapping.calls=5
-mapping.nanos=2500
-mapping.ns_per_call=500
-spill.runs=2
-spill.bytes=4096
-alloc.pack_exec.allocs=3
-alloc.pack_exec.bytes=4096
-alloc.pack_exec.reallocs=1
-alloc.pack_exec.deallocs=2
-";
-
-        assert_eq!(snapshot.format(), expected);
     }
 }

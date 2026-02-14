@@ -33,6 +33,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "git-perf")]
 use crate::scheduler::{alloc_stats, AllocStats};
 use crate::Engine;
 
@@ -69,6 +70,7 @@ use super::runner_exec::{
     PackExecStrategy, SpillCandidateSink,
 };
 
+use super::perf::perf_set;
 use super::repo_open::RepoJobState;
 
 /// Runs the ODB-blob fast-path scan pipeline.
@@ -117,6 +119,7 @@ use super::repo_open::RepoJobState;
 /// Returns `GitScanError` on MIDX, pack plan, pack exec, or I/O failures.
 /// Returns `GitScanError::ConcurrentMaintenance` if artifacts change
 /// between planning start and execution start.
+#[cfg_attr(not(feature = "git-perf"), allow(unused_variables, unused_mut))]
 pub(super) fn run_odb_blob(
     repo: &RepoJobState,
     engine: Arc<Engine>,
@@ -209,7 +212,11 @@ pub(super) fn run_odb_blob(
                 mapping_cfg.max_loose_candidates,
             ) {
                 Ok(result) => {
-                    stage_nanos.blob_intro = intro_start.elapsed().as_nanos() as u64;
+                    perf_set!(
+                        stage_nanos,
+                        blob_intro,
+                        intro_start.elapsed().as_nanos() as u64
+                    );
                     let mapping_stats = MappingStats {
                         unique_blobs_in: result.packed.len().saturating_add(result.loose.len())
                             as u64,
@@ -274,10 +281,18 @@ pub(super) fn run_odb_blob(
                 &mut collector,
             ) {
                 Ok(stats) => {
-                    stage_nanos.blob_intro = intro_start.elapsed().as_nanos() as u64;
+                    perf_set!(
+                        stage_nanos,
+                        blob_intro,
+                        intro_start.elapsed().as_nanos() as u64
+                    );
                     let collect_start = Instant::now();
                     let (packed, loose, path_arena) = collector.finish();
-                    stage_nanos.pack_collect = collect_start.elapsed().as_nanos() as u64;
+                    perf_set!(
+                        stage_nanos,
+                        pack_collect,
+                        collect_start.elapsed().as_nanos() as u64
+                    );
                     let mapping_stats = MappingStats {
                         unique_blobs_in: packed.len().saturating_add(loose.len()) as u64,
                         packed_matched: packed.len() as u64,
@@ -366,9 +381,13 @@ pub(super) fn run_odb_blob(
     let path_arena = Arc::new(path_arena);
     let spill_dir = Arc::new(spill_dir);
 
+    #[cfg(feature = "git-perf")]
     let mut pack_exec_started = false;
+    #[cfg(feature = "git-perf")]
     let mut pack_exec_start = Instant::now();
+    #[cfg(feature = "git-perf")]
     let mut pack_exec_alloc_before = AllocStats::default();
+    #[cfg(feature = "git-perf")]
     let mut start_pack_exec = || {
         if !pack_exec_started {
             pack_exec_started = true;
@@ -405,9 +424,14 @@ pub(super) fn run_odb_blob(
             pack_plan_delta_deps_max = pack_plan_delta_deps_max.max(deps_len);
             plans.push(plan);
         }
-        stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
+        perf_set!(
+            stage_nanos,
+            pack_plan,
+            pack_plan_start.elapsed().as_nanos() as u64
+        );
 
         if !plans.is_empty() {
+            #[cfg(feature = "git-perf")]
             start_pack_exec();
             let strategy = select_pack_exec_strategy(pack_exec_workers, &plans);
             let scheduler_workers = match strategy {
@@ -450,6 +474,7 @@ pub(super) fn run_odb_blob(
         }
 
         if !loose.is_empty() {
+            #[cfg(feature = "git-perf")]
             start_pack_exec();
             let mut adapter = EngineAdapter::new_with_event_sink(
                 engine.as_ref(),
@@ -477,14 +502,23 @@ pub(super) fn run_odb_blob(
                 &mut external,
                 &mut skipped_candidates,
             )?;
-            stage_nanos.loose_scan = loose_start.elapsed().as_nanos() as u64;
+            perf_set!(
+                stage_nanos,
+                loose_scan,
+                loose_start.elapsed().as_nanos() as u64
+            );
             let loose_metrics = adapter.take_metrics();
             common_metrics.merge_from(&loose_metrics);
             append_scanned_blobs(&mut scanned, adapter.take_results());
         }
     } else {
-        stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
+        perf_set!(
+            stage_nanos,
+            pack_plan,
+            pack_plan_start.elapsed().as_nanos() as u64
+        );
         if !loose.is_empty() {
+            #[cfg(feature = "git-perf")]
             start_pack_exec();
             let mut adapter = EngineAdapter::new_with_event_sink(
                 engine.as_ref(),
@@ -512,13 +546,18 @@ pub(super) fn run_odb_blob(
                 &mut external,
                 &mut skipped_candidates,
             )?;
-            stage_nanos.loose_scan = loose_start.elapsed().as_nanos() as u64;
+            perf_set!(
+                stage_nanos,
+                loose_scan,
+                loose_start.elapsed().as_nanos() as u64
+            );
             let loose_metrics = adapter.take_metrics();
             common_metrics.merge_from(&loose_metrics);
             append_scanned_blobs(&mut scanned, adapter.take_results());
         }
     }
 
+    #[cfg(feature = "git-perf")]
     if pack_exec_started {
         stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
         let pack_exec_alloc_after = alloc_stats();
@@ -587,6 +626,7 @@ type IntroResult = (
 /// `stage_nanos.blob_intro` is set to the sum of the failed first attempt
 /// and the successful retry, so callers see the total wall-clock cost.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "git-perf"), allow(unused_variables, unused_mut))]
 fn run_serial_spill_retry(
     repo: &RepoJobState,
     config: &GitScanConfig,
@@ -617,7 +657,11 @@ fn run_serial_spill_retry(
     let mut sink = SpillCandidateSink::new(&mut spiller);
     let stats = introducer.introduce(object_store, cg_index, plan, oid_index, &mut sink)?;
     let retry_elapsed = retry_start.elapsed().as_nanos() as u64;
-    stage_nanos.blob_intro = first_elapsed.saturating_add(retry_elapsed);
+    perf_set!(
+        stage_nanos,
+        blob_intro,
+        first_elapsed.saturating_add(retry_elapsed)
+    );
 
     let spill_start = Instant::now();
     let mut bridge = MappingBridge::new(
@@ -629,7 +673,7 @@ fn run_serial_spill_retry(
         *mapping_cfg,
     );
     let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
-    stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
+    perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
     let packed = std::mem::take(&mut sink.packed);
     let loose = std::mem::take(&mut sink.loose);

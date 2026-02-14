@@ -48,9 +48,14 @@
 
 use std::io;
 use std::sync::Arc;
+
+#[cfg(feature = "git-perf")]
 use std::time::Instant;
 
+#[cfg(feature = "git-perf")]
 use crate::scheduler::{alloc_stats, AllocStats};
+
+use super::perf::{perf_let, perf_set};
 use crate::Engine;
 
 use super::commit_walk::{CommitGraph, ParentScratch, PlannedCommit};
@@ -122,6 +127,7 @@ use super::runner_exec::{
 /// - `GitScanError::ConcurrentMaintenance` if repository artifacts (pack
 ///   files, indices) changed between pack planning and pack execution,
 ///   indicating a concurrent `git gc` or `git repack`.
+#[cfg_attr(not(feature = "git-perf"), allow(unused_mut))]
 pub(super) fn run_diff_history(
     repo: &RepoJobState,
     engine: Arc<Engine>,
@@ -174,7 +180,7 @@ pub(super) fn run_diff_history(
     // directly into the spiller, bounding memory even for repositories with
     // millions of changed blobs.
     {
-        let diff_start = Instant::now();
+        perf_let!(diff_start = Instant::now());
         let mut sink = SpillCandidateSink::new(&mut spiller);
         for PlannedCommit { pos, snapshot_root } in plan {
             let commit_id = pos.0;
@@ -244,7 +250,11 @@ pub(super) fn run_diff_history(
                 }
             }
         }
-        stage_nanos.tree_diff = diff_start.elapsed().as_nanos() as u64;
+        perf_set!(
+            stage_nanos,
+            tree_diff,
+            diff_start.elapsed().as_nanos() as u64
+        );
     }
 
     // ── Stages 2–3: Spill/dedupe → mapping bridge ──────────────────────
@@ -254,7 +264,7 @@ pub(super) fn run_diff_history(
     // packed (with pack_id + offset) and loose (fan-out directory lookup).
     // The returned path arena owns all file-path bytes for the rest of the
     // pipeline.
-    let spill_start = Instant::now();
+    perf_let!(spill_start = Instant::now());
     let mut mapping_cfg = config.mapping;
     let default_mapping_cfg = MappingBridgeConfig::default();
     if mapping_cfg.max_packed_candidates >= default_mapping_cfg.max_packed_candidates {
@@ -272,12 +282,12 @@ pub(super) fn run_diff_history(
         mapping_cfg,
     );
     let spill_stats = spiller.finalize(seen_store, &mut bridge)?;
-    stage_nanos.spill = spill_start.elapsed().as_nanos() as u64;
+    perf_set!(stage_nanos, spill, spill_start.elapsed().as_nanos() as u64);
     let (mapping_stats, mut sink, mapping_arena) = bridge.finish()?;
     let mapping_arena = Arc::new(mapping_arena);
 
     // ── Stage 4: Pack planning ───────────────────────────────────────────
-    let pack_plan_start = Instant::now();
+    perf_let!(pack_plan_start = Instant::now());
     let pack_dirs = collect_pack_dirs(&repo.paths);
     let pack_names = list_pack_files(&pack_dirs)?;
     midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
@@ -303,7 +313,11 @@ pub(super) fn run_diff_history(
         plans.append(&mut pack_plans);
     }
     let (pack_plan_delta_deps_total, pack_plan_delta_deps_max) = summarize_pack_plan_deps(&plans);
-    stage_nanos.pack_plan = pack_plan_start.elapsed().as_nanos() as u64;
+    perf_set!(
+        stage_nanos,
+        pack_plan,
+        pack_plan_start.elapsed().as_nanos() as u64
+    );
 
     // Gate between planning and execution: if pack files or indices were
     // rewritten by a concurrent `git gc` / `git repack`, the offsets in our
@@ -341,7 +355,9 @@ pub(super) fn run_diff_history(
         finding_arena: Vec::new(),
     };
 
+    #[cfg(feature = "git-perf")]
     let pack_exec_start = Instant::now();
+    #[cfg(feature = "git-perf")]
     let pack_exec_alloc_before: AllocStats = alloc_stats();
     if !plans.is_empty() {
         let scheduler_workers = match pack_exec_strategy {
@@ -412,9 +428,16 @@ pub(super) fn run_diff_history(
         common_metrics.merge_from(&loose_metrics);
         append_scanned_blobs(&mut scanned, adapter.take_results());
     }
-    stage_nanos.pack_exec = pack_exec_start.elapsed().as_nanos() as u64;
-    let pack_exec_alloc_after = alloc_stats();
-    alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
+    perf_set!(
+        stage_nanos,
+        pack_exec,
+        pack_exec_start.elapsed().as_nanos() as u64
+    );
+    #[cfg(feature = "git-perf")]
+    {
+        let pack_exec_alloc_after = alloc_stats();
+        alloc_deltas.pack_exec = pack_exec_alloc_after.since(&pack_exec_alloc_before);
+    }
 
     Ok(ScanModeOutput {
         scanned,

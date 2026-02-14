@@ -642,3 +642,22 @@ fn estimate_locality_pressure_known_deps() {
         "all deps cross shard boundaries"
     );
 }
+
+#[test]
+fn scheduler_worker_runtime_field_order_borrowers_before_owners() {
+    // SchedulerPackWorkerRuntime relies on ManuallyDrop with field-order-dependent
+    // drop: borrowing fields (adapter, external) must precede owning fields
+    // (_engine, _midx_bytes) so the custom Drop impl drops borrowers first.
+    // This test catches accidental field reordering at compile/test time.
+    use std::mem::offset_of;
+    assert!(
+        offset_of!(SchedulerPackWorkerRuntime, adapter)
+            < offset_of!(SchedulerPackWorkerRuntime, _engine),
+        "adapter (borrower) must be declared before _engine (owner)"
+    );
+    assert!(
+        offset_of!(SchedulerPackWorkerRuntime, external)
+            < offset_of!(SchedulerPackWorkerRuntime, _midx_bytes),
+        "external (borrower) must be declared before _midx_bytes (owner)"
+    );
+}
