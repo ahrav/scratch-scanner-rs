@@ -67,8 +67,8 @@ use super::pack_inflate::{
     PackFile, PackHeader,
 };
 use super::perf;
-use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
+use super::repo_paths;
 use super::spill_arena::{SpillArena, SpillArenaError, SpillSlice};
 use super::tree_cache::{TreeCache, TreeCacheHandle};
 use super::tree_delta_cache::TreeDeltaCache;
@@ -304,6 +304,7 @@ struct TreeDecodeBufs {
     inflate_buf: Vec<u8>,
     result_buf: Vec<u8>,
     base_buf: Vec<u8>,
+    delta_stack_pool: Vec<Vec<TreeDeltaFrame>>,
 }
 
 impl std::fmt::Debug for TreeDecodeBufs {
@@ -312,6 +313,7 @@ impl std::fmt::Debug for TreeDecodeBufs {
             .field("inflate_buf.cap", &self.inflate_buf.capacity())
             .field("result_buf.cap", &self.result_buf.capacity())
             .field("base_buf.cap", &self.base_buf.capacity())
+            .field("delta_stack_pool.len", &self.delta_stack_pool.len())
             .finish()
     }
 }
@@ -323,7 +325,21 @@ impl TreeDecodeBufs {
             inflate_buf: Vec::new(),
             result_buf: Vec::new(),
             base_buf: Vec::new(),
+            delta_stack_pool: vec![Vec::new()],
         }
+    }
+
+    #[inline]
+    fn take_delta_stack(&mut self) -> Vec<TreeDeltaFrame> {
+        let mut stack = self.delta_stack_pool.pop().unwrap_or_default();
+        stack.clear();
+        stack
+    }
+
+    #[inline]
+    fn return_delta_stack(&mut self, mut stack: Vec<TreeDeltaFrame>) {
+        stack.clear();
+        self.delta_stack_pool.push(stack);
     }
 }
 
@@ -397,15 +413,17 @@ impl<'a> ObjectStoreLayout<'a> {
         repo: &RepoJobState,
         midx: MidxView<'a>,
     ) -> Result<Self, TreeDiffError> {
-        let pack_dirs = collect_pack_dirs(&repo.paths);
-        let pack_names = list_pack_files(&pack_dirs)?;
+        let pack_dirs = repo_paths::collect_pack_dirs(&repo.paths);
+        let pack_names = repo_paths::list_pack_files(&pack_dirs).map_err(store_error)?;
         // Ensure every on-disk pack file is represented in the MIDX so
         // pack lookups are complete across alternates.
         midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))
             .map_err(store_error)?;
 
-        let pack_paths = Arc::<[PathBuf]>::from(resolve_pack_paths(&midx, &pack_dirs)?);
-        let loose_dirs = Arc::<[PathBuf]>::from(collect_loose_dirs(&repo.paths));
+        let pack_paths = Arc::<[PathBuf]>::from(
+            repo_paths::resolve_pack_paths(&midx, &pack_dirs).map_err(store_error)?,
+        );
+        let loose_dirs = Arc::<[PathBuf]>::from(repo_paths::collect_loose_dirs(&repo.paths));
 
         Ok(Self {
             oid_len: repo.object_format.oid_len(),
@@ -616,7 +634,6 @@ impl<'a> ObjectStore<'a> {
     /// Scratch buffers in `decode_bufs` are reused across calls, eliminating
     /// per-hop `Vec::new()` / `Vec::with_capacity()` allocations that the
     /// previous recursive implementation performed.
-    #[allow(unused_assignments)] // base_kind/base_chain_len initializers
     fn read_pack_object(
         &mut self,
         pack_id: u16,
@@ -626,17 +643,41 @@ impl<'a> ObjectStore<'a> {
         depth: u8,
         root_oid: Option<OidBytes>,
     ) -> Result<DecodedTreeObject, TreeDiffError> {
+        let mut delta_stack = self.decode_bufs.take_delta_stack();
+        let result = self.read_pack_object_impl(
+            pack_id,
+            pack_bytes,
+            pack_header,
+            offset,
+            depth,
+            root_oid,
+            &mut delta_stack,
+        );
+        self.decode_bufs.return_delta_stack(delta_stack);
+        result
+    }
+
+    #[allow(unused_assignments)] // base_kind/base_chain_len initializers
+    #[allow(clippy::too_many_arguments)]
+    fn read_pack_object_impl(
+        &mut self,
+        pack_id: u16,
+        pack_bytes: &[u8],
+        pack_header: PackHeader,
+        offset: u64,
+        depth: u8,
+        root_oid: Option<OidBytes>,
+        delta_stack: &mut Vec<TreeDeltaFrame>,
+    ) -> Result<DecodedTreeObject, TreeDiffError> {
         let pack = PackFile::from_header(pack_bytes, pack_header);
         let max_object_bytes = self.max_object_bytes;
 
         // -- Phase 1: Walk forward through the delta chain -----------------
         //
-        // delta_stack is intentionally local (not in TreeDecodeBufs) because
-        // the REF delta path below may re-enter read_pack_object via
-        // load_object_with_depth. A shared delta_stack would be clobbered
-        // by the inner call. The per-call Vec::new() cost is acceptable
-        // since delta chains are bounded by MAX_DELTA_DEPTH (64 frames).
-        let mut delta_stack: Vec<TreeDeltaFrame> = Vec::new();
+        // `delta_stack` is leased from decode scratch by read_pack_object.
+        // Clear it defensively so stale frames cannot leak across calls.
+        // Recursive REF-delta calls lease independent stacks from the pool.
+        delta_stack.clear();
         let mut current_offset = offset;
         let mut remaining_depth = depth;
         let mut base_kind: ObjectKind = ObjectKind::Tree; // set below
@@ -890,7 +931,7 @@ impl<'a> ObjectStore<'a> {
         oid: &OidBytes,
     ) -> Result<Option<(ObjectKind, Vec<u8>)>, TreeDiffError> {
         // Loose objects are stored by hex fanout: <objects>/<2-hex>/<38-hex>.
-        let hex = oid_to_hex(oid);
+        let hex = repo_paths::oid_to_hex(oid);
         let (dir, file) = hex.split_at(2);
         let dir_name = String::from_utf8_lossy(dir);
         let file_name = String::from_utf8_lossy(file);
@@ -1103,114 +1144,6 @@ fn format_root_oid(root_oid: Option<OidBytes>) -> String {
     }
 }
 
-fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
-    dirs.push(paths.pack_dir.clone());
-    for alternate in &paths.alternate_object_dirs {
-        if alternate == &paths.objects_dir {
-            continue;
-        }
-        dirs.push(alternate.join("pack"));
-    }
-    dirs
-}
-
-fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
-    dirs.push(paths.objects_dir.clone());
-    for alternate in &paths.alternate_object_dirs {
-        if alternate == &paths.objects_dir {
-            continue;
-        }
-        dirs.push(alternate.clone());
-    }
-    dirs
-}
-
-fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, TreeDiffError> {
-    // Collect pack *names* (not full paths) so we can compare them to MIDX PNAM.
-    let mut names = Vec::new();
-
-    for dir in pack_dirs {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(TreeDiffError::ObjectStoreError {
-                    detail: format!("failed to read pack dir {}: {err}", dir.display()),
-                });
-            }
-        };
-
-        for entry in entries {
-            let entry = entry.map_err(|err| TreeDiffError::ObjectStoreError {
-                detail: format!("failed to read pack dir entry: {err}"),
-            })?;
-            let file_type = entry
-                .file_type()
-                .map_err(|err| TreeDiffError::ObjectStoreError {
-                    detail: format!("failed to read pack dir entry type: {err}"),
-                })?;
-            if !file_type.is_file() {
-                continue;
-            }
-
-            let file_name = entry.file_name();
-            if is_pack_file(&file_name) {
-                names.push(file_name.to_string_lossy().as_bytes().to_vec());
-            }
-        }
-    }
-
-    Ok(names)
-}
-
-fn resolve_pack_paths(
-    midx: &MidxView<'_>,
-    pack_dirs: &[PathBuf],
-) -> Result<Vec<PathBuf>, TreeDiffError> {
-    // Resolve pack names from PNAM to full paths, searching pack dirs in order.
-    let mut paths = Vec::with_capacity(midx.pack_count() as usize);
-
-    for name in midx.pack_names() {
-        let mut base = strip_pack_suffix(name);
-        base.extend_from_slice(b".pack");
-        let file_name = String::from_utf8_lossy(&base).into_owned();
-
-        let mut found = None;
-        for dir in pack_dirs {
-            let candidate = dir.join(&file_name);
-            if is_file(&candidate) {
-                found = Some(candidate);
-                break;
-            }
-        }
-
-        match found {
-            Some(path) => paths.push(path),
-            None => {
-                return Err(TreeDiffError::ObjectStoreError {
-                    detail: format!("pack file not found for {}", String::from_utf8_lossy(name)),
-                })
-            }
-        }
-    }
-
-    Ok(paths)
-}
-
-fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
-    if name.ends_with(b".pack") || name.ends_with(b".idx") {
-        let mut base = name.to_vec();
-        if let Some(idx) = base.iter().rposition(|&b| b == b'.') {
-            base.truncate(idx);
-        }
-        base
-    } else {
-        name.to_vec()
-    }
-}
-
 /// Parses an inflated loose object into kind + payload.
 ///
 /// Expects the loose format `<type> <size>\0<payload>` and verifies that the
@@ -1286,29 +1219,4 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
         value = value.checked_mul(10)?.checked_add((b - b'0') as u64)?;
     }
     Some(value)
-}
-
-fn oid_to_hex(oid: &OidBytes) -> Vec<u8> {
-    let mut out = Vec::with_capacity(oid.len() as usize * 2);
-    for &b in oid.as_slice() {
-        out.push(hex_digit(b >> 4));
-        out.push(hex_digit(b & 0x0f));
-    }
-    out
-}
-
-fn hex_digit(val: u8) -> u8 {
-    match val {
-        0..=9 => b'0' + val,
-        10..=15 => b'a' + (val - 10),
-        _ => b'?',
-    }
-}
-
-fn is_pack_file(name: &std::ffi::OsStr) -> bool {
-    Path::new(name).extension().is_some_and(|ext| ext == "pack")
-}
-
-fn is_file(path: &Path) -> bool {
-    fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }

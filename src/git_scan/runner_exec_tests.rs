@@ -1,4 +1,6 @@
 use super::*;
+use std::path::Path;
+
 use crate::git_scan::object_id::OidBytes;
 use crate::git_scan::pack_decode::PackDecodeLimits;
 use crate::git_scan::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};

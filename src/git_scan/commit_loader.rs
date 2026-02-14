@@ -478,43 +478,6 @@ pub fn resolve_pack_paths_from_midx(
     Ok(paths)
 }
 
-/// Collects pack directories from repo paths.
-///
-/// Includes the primary objects pack dir and alternate object pack dirs,
-/// skipping alternates that resolve to the primary objects directory.
-/// Returned order is significant and defines pack-name lookup precedence.
-pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
-    dirs.push(repo.pack_dir.clone());
-
-    for alternate in &repo.alternate_object_dirs {
-        if alternate != &repo.objects_dir {
-            dirs.push(alternate.join("pack"));
-        }
-    }
-
-    dirs
-}
-
-/// Collects loose object directories from repo paths.
-///
-/// Returns directories in precedence order: primary objects dir first, then
-/// unique alternates.
-/// Returned paths are not canonicalized; callers should supply a coherent
-/// `GitRepoPaths` snapshot from `repo_open`.
-pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
-    dirs.push(repo.objects_dir.clone());
-
-    for alternate in &repo.alternate_object_dirs {
-        if alternate != &repo.objects_dir {
-            dirs.push(alternate.clone());
-        }
-    }
-
-    dirs
-}
-
 /// Loads shallow-boundary commit OIDs from `shallow` files.
 ///
 /// Git stores shallow-cut commits in `<gitdir>/shallow` (and, for linked

@@ -59,12 +59,14 @@ use super::spiller::{SpillStats, Spiller};
 use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff::TreeDiffStats;
 
+use super::repo_paths::{
+    collect_loose_dirs, collect_pack_dirs, list_pack_files, resolve_pack_paths,
+};
 use super::runner_exec::{
-    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views, collect_loose_dirs,
-    collect_pack_dirs, estimate_path_arena_capacity, execute_pack_plans_with_scheduler,
-    list_pack_files, load_midx, make_spill_dir, mmap_pack_files, per_worker_cache_bytes,
-    resolve_pack_paths, scan_loose_candidates, select_pack_exec_strategy, PackExecStrategy,
-    SpillCandidateSink,
+    append_scanned_blobs, auto_tree_delta_cache_bytes, build_pack_views,
+    estimate_path_arena_capacity, execute_pack_plans_with_scheduler, load_midx, make_spill_dir,
+    mmap_pack_files, per_worker_cache_bytes, scan_loose_candidates, select_pack_exec_strategy,
+    PackExecStrategy, SpillCandidateSink,
 };
 
 use super::repo_open::RepoJobState;

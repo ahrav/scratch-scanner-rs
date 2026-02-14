@@ -28,7 +28,7 @@ use std::io;
 use std::mem::ManuallyDrop;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,7 +57,6 @@ use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
 use super::pack_plan::{PackPlanError, PackView};
 use super::pack_plan_model::{BaseLoc, PackPlan, NONE_U32};
-use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
 use super::runner::{CandidateSkipReason, GitScanError, PackMmapLimits, SkippedCandidate};
 use super::spiller::Spiller;
@@ -319,125 +318,6 @@ pub(super) fn build_ref_entries(repo: &RepoJobState) -> Vec<RefEntry> {
         });
     }
     refs
-}
-
-/// Collect pack directories, including alternates.
-///
-/// The primary `pack_dir` is returned first, followed by `<alternate>/pack`
-/// for each alternate objects directory. Alternates equal to the main objects
-/// dir are skipped to avoid duplicate scanning.
-pub(super) fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
-    dirs.push(paths.pack_dir.clone());
-    for alternate in &paths.alternate_object_dirs {
-        if alternate == &paths.objects_dir {
-            continue;
-        }
-        dirs.push(alternate.join("pack"));
-    }
-    dirs
-}
-
-/// Collect loose object directories, including alternates.
-///
-/// The primary objects dir is returned first, followed by each alternate.
-/// Alternates equal to the main objects dir are skipped to avoid duplicate
-/// scanning.
-pub(super) fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
-    dirs.push(paths.objects_dir.clone());
-    for alternate in &paths.alternate_object_dirs {
-        if alternate == &paths.objects_dir {
-            continue;
-        }
-        dirs.push(alternate.clone());
-    }
-    dirs
-}
-
-/// List pack file names from the provided pack directories.
-///
-/// Returns raw file names (as bytes) for `.pack` files. Names are converted
-/// through [`OsStr::to_string_lossy`], so non-UTF-8 bytes are replaced with
-/// U+FFFD — acceptable because git pack file names are always ASCII hex.
-/// Missing pack directories are ignored; other IO errors are returned.
-pub(super) fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, GitScanError> {
-    let mut names = Vec::new();
-    for dir in pack_dirs {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(GitScanError::Io(err)),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                continue;
-            }
-            let file_name = entry.file_name();
-            if is_pack_file(&file_name) {
-                names.push(file_name.to_string_lossy().as_bytes().to_vec());
-            }
-        }
-    }
-    Ok(names)
-}
-
-/// Resolve pack file paths referenced by the MIDX.
-///
-/// The MIDX stores pack basenames (with `.idx` suffix); this function strips
-/// the suffix, appends `.pack`, and searches `pack_dirs` in order. The first
-/// match wins, so `pack_dirs` order is significant (primary before alternates).
-///
-/// # Errors
-///
-/// Returns `GitScanError::Io(NotFound)` if any MIDX-referenced pack cannot be
-/// located in the provided directories.
-pub(super) fn resolve_pack_paths(
-    midx: &MidxView<'_>,
-    pack_dirs: &[PathBuf],
-) -> Result<Vec<PathBuf>, GitScanError> {
-    let mut paths = Vec::with_capacity(midx.pack_count() as usize);
-    for name in midx.pack_names() {
-        let mut base = strip_pack_suffix(name);
-        base.extend_from_slice(b".pack");
-        let file_name = String::from_utf8_lossy(&base).into_owned();
-
-        let mut found = None;
-        for dir in pack_dirs {
-            let candidate = dir.join(&file_name);
-            if is_file(&candidate) {
-                found = Some(candidate);
-                break;
-            }
-        }
-        match found {
-            Some(path) => paths.push(path),
-            None => {
-                return Err(GitScanError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("pack file not found for {}", String::from_utf8_lossy(name)),
-                )))
-            }
-        }
-    }
-    Ok(paths)
-}
-
-/// Strip a `.pack` or `.idx` suffix from a pack-related file name.
-///
-/// Both suffixes are handled because the MIDX stores pack basenames with
-/// `.idx` suffixes, while we need `.pack` paths for mmap. Returns the
-/// input unchanged (as a new `Vec`) if neither suffix matches.
-pub(super) fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
-    if name.ends_with(b".pack") {
-        name[..name.len() - 5].to_vec()
-    } else if name.ends_with(b".idx") {
-        name[..name.len() - 4].to_vec()
-    } else {
-        name.to_vec()
-    }
 }
 
 /// Memory-map pack files for zero-copy decoding.
@@ -1943,16 +1823,6 @@ pub(super) fn collect_skipped_candidates(
             }
         }
     }
-}
-
-/// Returns `true` if the file name has a `.pack` extension.
-pub(super) fn is_pack_file(name: &std::ffi::OsStr) -> bool {
-    Path::new(name).extension().is_some_and(|ext| ext == "pack")
-}
-
-/// Returns `true` if `path` exists and is a regular file.
-pub(super) fn is_file(path: &Path) -> bool {
-    fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------

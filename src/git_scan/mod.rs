@@ -86,6 +86,7 @@ pub mod preflight_error;
 pub mod preflight_limits;
 pub mod repo;
 pub mod repo_open;
+pub(super) mod repo_paths;
 pub mod run_format;
 pub mod run_reader;
 pub mod run_writer;
@@ -139,9 +140,8 @@ pub use start_set::{StartSetConfig, StartSetId};
 pub use commit_graph::CommitGraphIndex;
 pub use commit_graph_mem::CommitGraphMem;
 pub use commit_loader::{
-    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
-    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
-    LoadedCommit,
+    load_commits_from_tips, load_commits_with_identities, load_shallow_boundary_roots,
+    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits, LoadedCommit,
 };
 pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
@@ -150,6 +150,7 @@ pub use commit_walk::{
 };
 pub use commit_walk_limits::CommitWalkLimits;
 pub use identity_intern::{CommitIdentityIds, IdentityInterner, SENTINEL_ID};
+pub use repo_paths::{collect_loose_dirs, collect_pack_dirs};
 
 // ── Stage 3: Tree diff & candidate extraction ───────────────────────────
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};

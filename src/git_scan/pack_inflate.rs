@@ -646,6 +646,81 @@ pub fn delta_sizes(delta: &[u8]) -> Result<(usize, usize), DeltaError> {
     Ok((base_size, result_size))
 }
 
+#[inline(always)]
+fn parse_delta_header(
+    base: &[u8],
+    delta: &[u8],
+    max_out: usize,
+) -> Result<(usize, usize), DeltaError> {
+    let mut pos = 0usize;
+    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
+    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
+    if base_size != base.len() {
+        return Err(DeltaError::BaseSizeMismatch);
+    }
+    if result_size > max_out {
+        return Err(DeltaError::OutputOverrun);
+    }
+    Ok((pos, result_size))
+}
+
+/// Executes delta body opcodes and emits contiguous output chunks.
+///
+/// Shared by `apply_delta` and `apply_delta_into`; both callsites keep only
+/// sink-specific write behavior while command decoding and bounds checks stay
+/// centralized here.
+#[inline(always)]
+fn interpret_delta_body(
+    base: &[u8],
+    delta: &[u8],
+    mut pos: usize,
+    result_size: usize,
+    mut emit_chunk: impl FnMut(&[u8]) -> Result<(), DeltaError>,
+) -> Result<(), DeltaError> {
+    let mut out_len = 0usize;
+    while pos < delta.len() {
+        let cmd = delta[pos];
+        pos += 1;
+
+        if (cmd & 0x80) != 0 {
+            let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
+            let end = off.checked_add(size).ok_or(DeltaError::CopyOutOfRange)?;
+            if end > base.len() {
+                return Err(DeltaError::CopyOutOfRange);
+            }
+            let out_end = out_len.saturating_add(size);
+            if out_end > result_size {
+                return Err(DeltaError::OutputOverrun);
+            }
+
+            debug_assert!(off + size <= base.len());
+            emit_chunk(&base[off..end])?;
+            out_len = out_end;
+        } else if cmd != 0 {
+            let size = cmd as usize;
+            if delta.len() - pos < size {
+                return Err(DeltaError::Truncated);
+            }
+            let out_end = out_len.saturating_add(size);
+            if out_end > result_size {
+                return Err(DeltaError::OutputOverrun);
+            }
+
+            debug_assert!(pos + size <= delta.len());
+            emit_chunk(&delta[pos..pos + size])?;
+            pos += size;
+            out_len = out_end;
+        } else {
+            return Err(DeltaError::BadCommandZero);
+        }
+    }
+
+    if out_len != result_size {
+        return Err(DeltaError::ResultSizeMismatch);
+    }
+    Ok(())
+}
+
 /// Apply a git delta buffer to `base`, writing directly into `out`.
 ///
 /// The caller supplies `max_out` as a hard safety cap to prevent allocating
@@ -665,15 +740,7 @@ pub fn apply_delta(
 ) -> Result<(), DeltaError> {
     out.clear();
 
-    let mut pos = 0usize;
-    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
-    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
-    if base_size != base.len() {
-        return Err(DeltaError::BaseSizeMismatch);
-    }
-    if result_size > max_out {
-        return Err(DeltaError::OutputOverrun);
-    }
+    let (pos, result_size) = parse_delta_header(base, delta, max_out)?;
     out.reserve(result_size);
     debug_assert!(
         out.capacity() >= result_size,
@@ -690,63 +757,21 @@ pub fn apply_delta(
     // The loop below uses ONLY raw pointer writes via `copy_nonoverlapping`.
     let out_ptr = out.as_mut_ptr();
 
-    while pos < delta.len() {
-        let cmd = delta[pos];
-        pos += 1;
+    interpret_delta_body(base, delta, pos, result_size, |chunk| {
+        let size = chunk.len();
+        debug_assert!(written + size <= result_size);
 
-        if (cmd & 0x80) != 0 {
-            let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
-
-            let end = match off.checked_add(size) {
-                Some(end) => end,
-                None => return Err(DeltaError::CopyOutOfRange),
-            };
-            if end > base.len() {
-                return Err(DeltaError::CopyOutOfRange);
-            }
-            if written.saturating_add(size) > result_size {
-                return Err(DeltaError::OutputOverrun);
-            }
-
-            debug_assert!(written + size <= result_size);
-            debug_assert!(off + size <= base.len());
-
-            // SAFETY: `out.reserve(result_size)` guarantees capacity >= result_size.
-            // `written + size <= result_size <= capacity`. `base[off..end]` is
-            // bounds-checked above. No aliasing: `out_ptr` points to `out`'s
-            // allocation, `base` is a separate slice.
-            unsafe {
-                std::ptr::copy_nonoverlapping(base.as_ptr().add(off), out_ptr.add(written), size);
-            }
-            written += size;
-        } else if cmd != 0 {
-            let size = cmd as usize;
-            if delta.len() - pos < size {
-                return Err(DeltaError::Truncated);
-            }
-            if written.saturating_add(size) > result_size {
-                return Err(DeltaError::OutputOverrun);
-            }
-
-            debug_assert!(written + size <= result_size);
-            debug_assert!(pos + size <= delta.len());
-
-            // SAFETY: same capacity invariant as above. `delta[pos..pos+size]`
-            // is bounds-checked. No aliasing: `out_ptr` and `delta` are
-            // disjoint allocations.
-            unsafe {
-                std::ptr::copy_nonoverlapping(delta.as_ptr().add(pos), out_ptr.add(written), size);
-            }
-            pos += size;
-            written += size;
-        } else {
-            return Err(DeltaError::BadCommandZero);
+        // SAFETY: `interpret_delta_body` guarantees chunk source bounds and
+        // output bound checks; pointer stability invariant above guarantees
+        // destination validity for `written..written+size`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), out_ptr.add(written), size);
         }
-    }
+        written += size;
+        Ok(())
+    })?;
 
-    if written != result_size {
-        return Err(DeltaError::ResultSizeMismatch);
-    }
+    debug_assert_eq!(written, result_size);
 
     // SAFETY: exactly `written == result_size` bytes initialized above,
     // all within reserved capacity (`out.reserve(result_size)` guarantees
@@ -766,59 +791,8 @@ pub fn apply_delta_into(
     max_out: usize,
     mut on_chunk: impl FnMut(&[u8]) -> Result<(), DeltaError>,
 ) -> Result<usize, DeltaError> {
-    let mut pos = 0usize;
-    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
-    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
-    if base_size != base.len() {
-        return Err(DeltaError::BaseSizeMismatch);
-    }
-    if result_size > max_out {
-        return Err(DeltaError::OutputOverrun);
-    }
-
-    let mut out_len = 0usize;
-    while pos < delta.len() {
-        let cmd = delta[pos];
-        pos += 1;
-
-        if (cmd & 0x80) != 0 {
-            let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
-
-            let end = match off.checked_add(size) {
-                Some(end) => end,
-                None => return Err(DeltaError::CopyOutOfRange),
-            };
-            if end > base.len() {
-                return Err(DeltaError::CopyOutOfRange);
-            }
-            let end = out_len.saturating_add(size);
-            if end > result_size {
-                return Err(DeltaError::OutputOverrun);
-            }
-
-            on_chunk(&base[off..off + size])?;
-            out_len = end;
-        } else if cmd != 0 {
-            let size = cmd as usize;
-            if delta.len() - pos < size {
-                return Err(DeltaError::Truncated);
-            }
-            let end = out_len.saturating_add(size);
-            if end > result_size {
-                return Err(DeltaError::OutputOverrun);
-            }
-
-            on_chunk(&delta[pos..pos + size])?;
-            pos += size;
-            out_len = end;
-        } else {
-            return Err(DeltaError::BadCommandZero);
-        }
-    }
-
-    if out_len != result_size {
-        return Err(DeltaError::ResultSizeMismatch);
-    }
+    let (pos, result_size) = parse_delta_header(base, delta, max_out)?;
+    interpret_delta_body(base, delta, pos, result_size, |chunk| on_chunk(chunk))?;
 
     Ok(result_size)
 }
