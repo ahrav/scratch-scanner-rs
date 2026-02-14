@@ -14,6 +14,7 @@
 //! | Summary | `[summary] …` | `[summary] …` |
 //! | Diagnostic | stderr (always) | stderr (always) |
 //! | CommitMeta | suppressed | `[commit_meta] id={} oid={} ts={}` |
+//! | IdentityDictionary | suppressed | suppressed |
 
 use std::io::{self, BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
@@ -199,6 +200,10 @@ fn write_summary(s: &SummaryEvent, w: &mut impl Write) -> io::Result<()> {
 }
 
 /// Verbose: `[commit_meta] id={commit_id} oid={hex} ts={timestamp}`
+///
+/// The OID is emitted as lowercase hex. `as_slice()` returns 20 bytes for
+/// SHA-1 or 32 bytes for SHA-256, so the hex string is 40 or 64 chars
+/// respectively — no branching required.
 fn write_commit_meta(m: &CommitMetaEvent, w: &mut impl Write) -> io::Result<()> {
     write!(w, "[commit_meta] id={} oid=", m.commit_id)?;
     for &b in m.commit_oid.as_slice() {
@@ -611,6 +616,11 @@ mod tests {
 // Property tests
 // ============================================================================
 
+/// Property-based tests that fuzz the text sink with arbitrary inputs.
+///
+/// Each property (P1–P5) targets a structural invariant of the output format
+/// rather than a specific input value, complementing the exact-match unit
+/// tests above.
 #[cfg(all(test, feature = "stdx-proptest"))]
 mod prop_tests {
     use super::*;
