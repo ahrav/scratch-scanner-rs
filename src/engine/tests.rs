@@ -27,6 +27,8 @@ use super::vectorscan_prefilter::{
     build_stream_match_ctx, gate_match_callback, stream_match_callback, VsStreamMatchCtx,
     VsStreamWindow,
 };
+#[cfg(all(test, feature = "stdx-proptest"))]
+use crate::api::OfflineVerdict;
 #[cfg(feature = "stdx-proptest")]
 use crate::api::Tuning;
 use crate::api::{
@@ -3491,6 +3493,21 @@ fn scan_rules_reference(
                             // Extract secret span to match production behavior.
                             let (secret_start, secret_end) =
                                 extract_secret_span(&caps, rule.secret_group);
+                            // Offline validation: suppress structurally invalid
+                            // tokens (bad CRC32, etc.) for root-level findings,
+                            // matching engine emit-time policy.
+                            if steps.is_empty() {
+                                if let Some(spec) = &rule.offline_validation {
+                                    let secret_bytes = &window[secret_start..secret_end];
+                                    let verdict =
+                                        super::offline_validate::validate(*spec, secret_bytes);
+                                    if matches!(verdict, OfflineVerdict::Invalid)
+                                        && spec.suppresses_on_invalid()
+                                    {
+                                        continue;
+                                    }
+                                }
+                            }
                             let span = (w.start + secret_start)..(w.start + secret_end);
                             out.insert(FindingKey {
                                 rule: rule.name,
@@ -3555,6 +3572,7 @@ fn scan_rules_reference(
                                 return found_any;
                             }
 
+                            let parent_is_root = steps.is_empty();
                             let mut steps = steps.to_vec();
                             steps.push(StepKind::Utf16 {
                                 le: matches!(variant, Variant::Utf16Le),
@@ -3582,6 +3600,21 @@ fn scan_rules_reference(
                                 // Extract secret span to match production behavior.
                                 let (secret_start, secret_end) =
                                     extract_secret_span(&caps, rule.secret_group);
+                                // Offline validation: suppress structurally invalid
+                                // tokens for root-level findings (parent steps empty),
+                                // matching engine emit-time policy.
+                                if parent_is_root {
+                                    if let Some(spec) = &rule.offline_validation {
+                                        let secret_bytes = &decoded[secret_start..secret_end];
+                                        let verdict =
+                                            super::offline_validate::validate(*spec, secret_bytes);
+                                        if matches!(verdict, OfflineVerdict::Invalid)
+                                            && spec.suppresses_on_invalid()
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let span = secret_start..secret_end;
                                 out.insert(FindingKey {
                                     rule: rule.name,

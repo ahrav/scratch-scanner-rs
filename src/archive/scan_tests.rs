@@ -555,7 +555,8 @@ fn gzip_valid_header_empty_deflate_is_corrupt() {
 #[test]
 fn tar_truncated_entry_yields_malformed() {
     // Build a tar where the stream is physically shorter than the declared
-    // entry size.
+    // entry size.  We truncate the output manually to simulate a truncated
+    // stream.
     let payload: Vec<u8> = vec![b'X'; 50];
     let mut tar = Vec::new();
     let hdr = tar_header(b"trunc.txt", 100, b'0');
@@ -598,22 +599,22 @@ fn tar_zero_per_entry_budget_yields_entry_budget() {
     );
 }
 
-// ── write_u64_hex_lower boundary values ─────────────────────
+// ── write_u64_hex_lower boundary values ─────────────────────────────
 
 #[test]
 fn write_u64_hex_lower_boundary_values() {
     let mut buf = [0u8; 16];
 
-    write_u64_hex_lower(0, &mut buf);
+    util::write_u64_hex_lower(0, &mut buf);
     assert_eq!(&buf, b"0000000000000000");
 
-    write_u64_hex_lower(1, &mut buf);
+    util::write_u64_hex_lower(1, &mut buf);
     assert_eq!(&buf, b"0000000000000001");
 
-    write_u64_hex_lower(u64::MAX, &mut buf);
+    util::write_u64_hex_lower(u64::MAX, &mut buf);
     assert_eq!(&buf, b"ffffffffffffffff");
 
-    write_u64_hex_lower(0xFEDCBA9876543210, &mut buf);
+    util::write_u64_hex_lower(0xFEDCBA9876543210, &mut buf);
     assert_eq!(&buf, b"fedcba9876543210");
 }
 

@@ -978,6 +978,10 @@ where
     #[cfg(all(not(miri), target_arch = "x86_64"))]
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by runtime feature detection.
+            return unsafe { Self::search_tags_avx2(tags, tag) };
+        }
         // SAFETY: SSE2 is baseline on x86_64.
         unsafe { Self::search_tags_sse2(tags, tag) }
     }
@@ -1018,7 +1022,7 @@ where
         bits
     }
 
-    /// Compresses a byte-wise movemask into one bit per u16 lane.
+    /// Compresses a byte-wise movemask into one bit per u16 lane (128-bit / 8 lanes).
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     #[inline(always)]
     fn compress_u16_mask(mask: u16) -> u16 {
@@ -1028,6 +1032,22 @@ where
         m = (m | (m >> 2)) & 0x0F0F;
         m = (m | (m >> 4)) & 0x00FF;
         m
+    }
+
+    /// Compresses a byte-wise movemask from a 256-bit u16 compare into one bit per lane.
+    ///
+    /// `_mm256_movemask_epi8` on a `_mm256_cmpeq_epi16` result yields 32 bits where
+    /// each matching u16 lane sets two consecutive bits. This extracts the low bit of
+    /// each pair and packs them into the low 16 bits.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn compress_u16_mask_avx2(mask: u32) -> u16 {
+        let mut m = mask & 0x5555_5555;
+        m = (m | (m >> 1)) & 0x3333_3333;
+        m = (m | (m >> 2)) & 0x0F0F_0F0F;
+        m = (m | (m >> 4)) & 0x00FF_00FF;
+        m = (m | (m >> 8)) & 0x0000_FFFF;
+        m as u16
     }
 
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
@@ -1211,6 +1231,41 @@ where
         } else {
             lanes
         }
+    }
+
+    /// AVX2 entry point: dispatches to u8 (SSE2, already optimal) or u16 (AVX2).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn search_tags_avx2(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        if TagT::BITS == 8 {
+            // u8 tags fit in a single 128-bit register for WAYS ≤ 16; SSE2 is optimal.
+            let tag_u8: u8 = core::mem::transmute_copy(&tag);
+            let tags_ptr = tags.as_ptr() as *const u8;
+            unsafe { Self::search_tags_u8_sse2::<WAYS>(tags_ptr, tag_u8) }
+        } else {
+            let tag_u16: u16 = core::mem::transmute_copy(&tag);
+            let tags_ptr = tags.as_ptr() as *const u16;
+            unsafe { Self::search_tags_u16_avx2::<WAYS>(tags_ptr, tag_u16) }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn search_tags_u16_avx2<const N: usize>(tags: *const u16, tag: u16) -> u16 {
+        use core::arch::x86_64::*;
+
+        if N == 16 {
+            // SAFETY: N == 16 guarantees 32 bytes (16 × u16) are readable from `tags`.
+            // `_mm256_loadu_si256` handles unaligned pointers.
+            let vec = _mm256_loadu_si256(tags as *const __m256i);
+            let needle = _mm256_set1_epi16(tag as i16);
+            let eq = _mm256_cmpeq_epi16(vec, needle);
+            let mask = _mm256_movemask_epi8(eq) as u32;
+            return Self::compress_u16_mask_avx2(mask);
+        }
+
+        // For WAYS < 16, tags fit in one 128-bit register; delegate to SSE2.
+        Self::search_tags_u16_sse2::<N>(tags, tag)
     }
 
     #[cfg(target_arch = "x86")]

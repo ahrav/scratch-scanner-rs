@@ -3,12 +3,79 @@
 //! # Scope
 //! - Streaming archive parsing (gzip/tar/tar.gz/zip) with deterministic budgets.
 //! - Virtual path construction + path budget enforcement.
-//! - Entry scanning is delegated to an `ArchiveEntrySink` to avoid coupling
+//! - Entry scanning is delegated to an [`ArchiveEntrySink`] to avoid coupling
 //!   to the pipeline or simulation harness.
 //!
-//! # Design Notes
+//! # Entry points
+//!
+//! | Function | Format | Access pattern |
+//! |---|---|---|
+//! | [`scan_gzip_stream`] | `.gz` | Sequential (`Read`) |
+//! | [`scan_tar_stream`] | `.tar` (plain or wrapped) | Sequential (`TarRead`) |
+//! | [`scan_targz_stream`] | `.tar.gz` | Sequential (`Read`) |
+//! | [`scan_zip_source`] | `.zip` | Random access (`ZipSource`) |
+//!
+//! # Sliding-window read loop
+//!
+//! Every entry payload is read using the same pattern (shared across gzip,
+//! tar, and zip code paths):
+//!
+//! ```text
+//! stream_buf layout on each iteration:
+//!
+//!   |<-- carry (overlap) -->|<--- new read (up to chunk_size) --->|
+//!   ^                       ^
+//!   buf[0]                  buf[carry]
+//!
+//! carry = overlap.min(bytes_emitted_so_far)
+//! ```
+//!
+//! Before each read, the last `carry` bytes of the previous chunk are
+//! copied to the front of `stream_buf` so that downstream pattern matchers
+//! see a sliding window with `overlap` bytes of look-behind context.
+//! Budget checks happen *after* the read returns: bytes beyond the budget
+//! are truncated (`allowed < n`) and the loop exits.
+//!
+//! # Budget lifecycle
+//!
+//! Each scan function follows the same budget protocol (see [`ArchiveBudgets`]):
+//!
+//! ```text
+//! reset() → enter_archive()
+//!   ├─ begin_entry() / begin_entry_scan()
+//!   │   ├─ charge_compressed_in()   (raw bytes consumed)
+//!   │   ├─ charge_decompressed_out() (payload bytes emitted)
+//!   │   └─ end_entry(scanned)
+//!   ├─ … (repeat per entry)
+//!   └─ exit_archive()
+//! ```
+//!
+//! Budget violations never panic: they return a [`BudgetHit`] that maps
+//! deterministically to [`ArchiveEnd::Partial`] or [`ArchiveEnd::Skipped`].
+//!
+//! # Locator suffixes
+//!
+//! Each virtual path is suffixed with a fixed-length *locator* so that
+//! downstream consumers can re-seek to the exact entry within the archive:
+//!
+//! ```text
+//! @t<16-hex-digits>   tar entry (header block index)
+//! @z<16-hex-digits>   zip entry (local file header offset, when valid)
+//! @c<16-hex-digits>   zip entry (CDFH offset, when LFH offset is invalid)
+//! ```
+//!
+//! # Nested archive handling
+//!
+//! Tar entries whose names match a known archive extension (`.gz`, `.tar`,
+//! `.tar.gz`) are recursively descended up to `max_archive_depth`. Zip
+//! entries inside a tar stream cannot be recursed (no random access) and
+//! are handled according to [`UnsupportedPolicy`](crate::archive::UnsupportedPolicy).
+//! Recursion uses `split_first_mut` to peel per-depth scratch slices
+//! without allocation.
+//!
+//! # Design notes
 //! - No OS dependencies: callers provide `Read`/`Read+Seek` sources.
-//! - All hot-path buffers live in `ArchiveScratch` and are reused.
+//! - All hot-path buffers live in [`ArchiveScratch`] and are reused.
 //! - Callers control chunk overlap semantics via the sink.
 
 use std::io::Read;
@@ -18,13 +85,20 @@ use crate::archive::formats::zip::LimitedRead;
 use crate::archive::formats::{GzipStream, TarCursor, TarNext, TarRead, ZipCursor, ZipEntryMeta};
 use crate::archive::formats::{ZipNext, ZipOpen, ZipSource};
 use crate::archive::path::apply_hash_suffix_truncation;
+use crate::archive::util;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, ArchiveStats, BudgetHit,
     ChargeResult, EntryPathCanonicalizer, EntrySkipReason, PartialReason, VirtualPathBuilder,
     DEFAULT_MAX_COMPONENTS,
 };
 
+/// Length of a locator suffix: `@` + kind byte + 16 hex digits.
 const LOCATOR_LEN: usize = 18;
+
+/// Upper bound on a single `read()` call into `stream_buf`.
+///
+/// Keeps per-iteration work bounded even when `chunk_size` is very large,
+/// so that budget checks and sink delivery happen at a reasonable cadence.
 const ARCHIVE_STREAM_READ_MAX: usize = 256 * 1024;
 
 /// Outcome for a single archive scan.
@@ -67,11 +141,20 @@ pub struct EntryChunk<'a> {
     pub new_bytes_len: usize,
 }
 
-/// Sink interface used by the archive core to scan entry data.
+/// Sink interface used by the archive core to deliver entry data.
 ///
-/// Call order is: `on_entry_start`, zero or more `on_entry_chunk` calls,
-/// then `on_entry_end`. Implementations must tolerate empty entries.
-/// Returning an error aborts the scan and is propagated to the caller.
+/// # Call sequence
+///
+/// For every entry (including those truncated by a budget hit):
+///
+/// 1. Exactly one [`on_entry_start`](Self::on_entry_start) call.
+/// 2. Zero or more [`on_entry_chunk`](Self::on_entry_chunk) calls (zero for
+///    empty entries or entries skipped immediately after start).
+/// 3. Exactly one [`on_entry_end`](Self::on_entry_end) call — **always**
+///    delivered, even when the entry was partially scanned.
+///
+/// Returning an `Err` from any callback aborts the scan immediately; the
+/// error propagates to the caller as the outer `Result::Err`.
 pub trait ArchiveEntrySink {
     type Error;
 
@@ -85,6 +168,19 @@ pub trait ArchiveEntrySink {
 /// Buffers are preallocated to avoid per-entry allocations. This type is not
 /// thread-safe and is intended to be reused across scans by a single worker.
 /// `chunk_size` and `overlap` must match the engine/pipeline settings.
+///
+/// # Per-depth vectors
+///
+/// `vpaths`, `path_budget_used`, and `tar_cursors` are each sized to
+/// `max_archive_depth + 2`. During recursive tar descent, each nesting
+/// level peels its own element via `split_first_mut` so that the child
+/// scan operates on the tail slice without any allocation.
+///
+/// # `stream_buf` layout
+///
+/// `stream_buf` is `chunk_size + overlap` bytes. On each read iteration
+/// the last `overlap` bytes from the previous chunk are copied to the
+/// front, then up to `chunk_size` new bytes are read after them.
 pub struct ArchiveScratch<Z: ZipSource> {
     canon: EntryPathCanonicalizer,
     vpaths: Vec<VirtualPathBuilder>,
@@ -108,6 +204,14 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
     /// `chunk_size` is the non-overlap payload size; `overlap` is carried
     /// forward between chunks to preserve windowed scanning.
     pub fn new(archive: &ArchiveConfig, chunk_size: usize, overlap: usize) -> Self {
+        debug_assert!(chunk_size > 0, "chunk_size must be positive");
+        debug_assert!(
+            overlap <= chunk_size,
+            "overlap ({overlap}) must not exceed chunk_size ({chunk_size})"
+        );
+        // +2: one slot for the root level (not counted in `max_archive_depth`),
+        // plus one for a gzip sub-entry within the root tar (gzip wraps the stream
+        // but occupies a depth slot for its own vpath/cursor).
         let depth_cap = archive.max_archive_depth as usize + 2;
         let mut vpaths = Vec::with_capacity(depth_cap);
         for _ in 0..depth_cap {
@@ -151,34 +255,48 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
         }
     }
 
+    /// Returns `true` if a policy (e.g. `FailRun`) has requested that the
+    /// entire scanning run be aborted, not just the current archive.
     #[inline]
     pub fn abort_run(&self) -> bool {
         self.abort_run
     }
 
+    /// Resets the run-abort flag so the scratch can be reused for the next run.
     #[inline]
     pub fn clear_abort(&mut self) {
         self.abort_run = false;
     }
 }
 
+/// Borrow-split view over [`ArchiveScratch`] plus the caller's sink and stats.
+///
+/// Constructing this from `ArchiveScratch` via [`ArchiveScanCtx::new`]
+/// splits the scratch into independent mutable borrows so that the scan
+/// functions can pass subsets to child contexts (recursive nesting) without
+/// violating Rust's aliasing rules.
 struct ArchiveScanCtx<'a, S, Z: ZipSource> {
+    // ── Per-depth fields (peeled via `split_first_mut` during recursion) ──
+    vpaths: &'a mut [VirtualPathBuilder],
+    path_budget_used: &'a mut [usize],
+    tar_cursors: &'a mut [TarCursor],
+
+    // ── Shared mutable state ─────────────────────────────────────────────
     sink: &'a mut S,
     stats: &'a mut ArchiveStats,
     budgets: &'a mut ArchiveBudgets,
     canon: &'a mut EntryPathCanonicalizer,
-    vpaths: &'a mut [VirtualPathBuilder],
-    path_budget_used: &'a mut [usize],
-    tar_cursors: &'a mut [TarCursor],
     zip_cursor: &'a mut ZipCursor<Z>,
     entry_display_buf: &'a mut Vec<u8>,
     gzip_header_buf: &'a mut Vec<u8>,
     gzip_name_buf: &'a mut Vec<u8>,
     stream_buf: &'a mut Vec<u8>,
+    abort_run: &'a mut bool,
+
+    // ── Immutable config ─────────────────────────────────────────────────
     archive: &'a ArchiveConfig,
     chunk_size: usize,
     overlap: usize,
-    abort_run: &'a mut bool,
 }
 
 impl<'a, S, Z: ZipSource> ArchiveScanCtx<'a, S, Z> {
@@ -209,32 +327,8 @@ impl<'a, S, Z: ZipSource> ArchiveScanCtx<'a, S, Z> {
     }
 }
 
-#[inline(always)]
-fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
-    match reason {
-        ArchiveSkipReason::MetadataBudgetExceeded => PartialReason::MetadataBudgetExceeded,
-        ArchiveSkipReason::PathBudgetExceeded => PartialReason::PathBudgetExceeded,
-        ArchiveSkipReason::EntryCountExceeded => PartialReason::EntryCountExceeded,
-        ArchiveSkipReason::ArchiveOutputBudgetExceeded => {
-            PartialReason::ArchiveOutputBudgetExceeded
-        }
-        ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
-        ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
-        ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-        _ => PartialReason::MalformedZip,
-    }
-}
-
-#[inline(always)]
-fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
-    match hit {
-        BudgetHit::PartialArchive(r) => r,
-        BudgetHit::StopRoot(r) => r,
-        BudgetHit::SkipArchive(r) => map_archive_skip_to_partial(r),
-        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
-    }
-}
-
+/// Map a [`BudgetHit`] to the top-level [`ArchiveEnd`] outcome for the
+/// current archive.
 #[inline(always)]
 fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     match hit {
@@ -245,27 +339,21 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     }
 }
 
-#[inline(always)]
-fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = match nyb {
-            0..=9 => b'0' + nyb,
-            _ => b'a' + (nyb - 10),
-        };
-    }
-}
-
+/// Format a locator suffix into `out`: `@<kind><16-hex-digits>`.
+///
+/// `kind` is one of `b't'` (tar header block index), `b'z'` (zip LFH
+/// offset), or `b'c'` (zip CDFH offset). Returns the full 18-byte slice.
 #[inline]
 fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out[0] = b'@';
     out[1] = kind;
-    write_u64_hex_lower(value, &mut out[2..]);
+    util::write_u64_hex_lower(value, &mut out[2..]);
     out
 }
 
+/// Charge `bytes` against the decompressed-output budget as *discarded*
+/// (read but not delivered to the sink). Returns `Err` if a budget limit
+/// is hit.
 #[inline(always)]
 fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<(), PartialReason> {
     if bytes == 0 {
@@ -273,10 +361,19 @@ fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<()
     }
     match budgets.charge_discarded_out(bytes) {
         ChargeResult::Ok => Ok(()),
-        ChargeResult::Clamp { hit, .. } => Err(budget_hit_to_partial_reason(hit)),
+        ChargeResult::Clamp { hit, .. } => Err(util::budget_hit_to_partial(
+            hit,
+            PartialReason::MalformedTar,
+        )),
     }
 }
 
+/// Drain `remaining` bytes from `input` without delivering them to the sink.
+///
+/// Used after a budget-capped or nested-archive entry to advance the tar
+/// stream past the unconsumed payload. Each drained chunk is charged against
+/// the budget as discarded output; a budget hit aborts the drain early with
+/// the corresponding [`PartialReason`].
 fn discard_remaining_payload(
     input: &mut dyn TarRead,
     budgets: &mut ArchiveBudgets,
@@ -299,10 +396,20 @@ fn discard_remaining_payload(
     Ok(())
 }
 
-/// Scan a gzip stream as a single virtual entry (root scan).
+/// Scan a gzip stream as a single virtual entry (root-level entry point).
 ///
-/// The sink sees exactly one entry (`<gunzip>` when the gzip name is missing).
-/// Budgets are reset and charged against the archive limits in `archive`.
+/// The sink sees exactly one entry whose display name is the embedded gzip
+/// filename, or `<gunzip>` when the gzip header has no `FNAME` field.
+///
+/// Budgets are reset at the start and balanced (`enter_archive` /
+/// `exit_archive`) around the scan. The gzip header buffer is borrowed
+/// from `scratch` for the duration and restored before returning.
+///
+/// # Errors
+///
+/// Sink errors (`S::Error`) are propagated immediately. I/O and budget
+/// failures are represented as [`ArchiveEnd::Partial`] or
+/// [`ArchiveEnd::Skipped`] in the `Ok` variant.
 pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     reader: R,
     root_display: &[u8],
@@ -368,6 +475,9 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         return Ok(budget_hit_to_archive_end(hit));
     }
 
+    // Temporarily take ownership of entry_display_buf so we can borrow its
+    // contents as `display` while still passing `&mut scan` into the inner
+    // function. The buffer is restored immediately after the call.
     let display_buf = std::mem::take(scan.entry_display_buf);
     let display = display_buf.as_slice();
     let outcome = scan_gzip_entry_stream(&mut scan, &mut gz, display, chunk_size);
@@ -380,6 +490,16 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
+/// Inner read loop for a single gzip entry.
+///
+/// Implements the sliding-window pattern described in the module docs:
+/// reads up to `chunk_size` decompressed bytes per iteration, charges
+/// budgets, and delivers each window (including the overlap prefix from
+/// the prior chunk) to the sink. Always delivers `on_entry_end`, even on
+/// truncation.
+///
+/// An entry that yields zero decompressed bytes is treated as corrupt
+/// (`GzipCorrupt`), unless a budget limit was already hit first.
 fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     scan: &mut ArchiveScanCtx<'_, S, Z>,
     gz: &mut GzipStream<R>,
@@ -417,7 +537,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
         if allowance == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -430,7 +550,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
         if read_max == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -455,7 +575,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
         let mut allowed = n as u64;
         if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
-            let r = budget_hit_to_partial_reason(hit);
+            let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
             entry_partial_reason = Some(r);
@@ -506,8 +626,18 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
 /// Scan a tar stream (plain or gzip-wrapped) as sequential entries.
 ///
-/// `ratio_active` controls whether inflation-ratio accounting is enforced for
-/// entry payload reads (true for gzip-wrapped tar streams).
+/// `ratio_active` controls whether inflation-ratio accounting is enforced
+/// for entry payload reads (set `true` when the tar stream is wrapped in
+/// gzip — the ratio tracks compressed-to-decompressed amplification).
+///
+/// Nesting starts at depth 1 (the root archive). Nested archives
+/// discovered inside tar entries are recursed via an internal helper
+/// (`scan_tar_stream_nested`).
+///
+/// # Errors
+///
+/// Sink errors propagate immediately. Budget and I/O failures map to
+/// [`ArchiveEnd::Partial`] / [`ArchiveEnd::Skipped`].
 #[allow(clippy::too_many_arguments)]
 pub fn scan_tar_stream<R: TarRead, S: ArchiveEntrySink, Z: ZipSource>(
     input: &mut R,
@@ -530,6 +660,30 @@ pub fn scan_tar_stream<R: TarRead, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
+/// Recursive inner loop for tar entry iteration.
+///
+/// For each tar entry this function:
+/// 1. Reads the header via [`TarCursor::next_entry`] and builds a
+///    canonicalized virtual path with a `@t` locator suffix.
+/// 2. Skips non-regular entries (directories, symlinks, etc.).
+/// 3. Checks whether the entry name matches a known archive extension.
+///    If so — and the depth limit has not been reached — the entry is
+///    recursively descended as a nested archive (gzip, tar, or tar.gz).
+///    Zip entries inside tar cannot be descended (no random access) and
+///    fall through to raw-byte scanning unless the policy aborts.
+/// 4. Otherwise, runs the sliding-window read loop to deliver payload
+///    chunks to the sink.
+///
+/// After each entry's payload (whether scanned or nested), any unconsumed
+/// bytes are drained via [`discard_remaining_payload`] and tar padding is
+/// consumed to keep the stream aligned for the next header.
+///
+/// # Scratch peeling
+///
+/// The function peels the first element from `scan.vpaths`,
+/// `scan.path_budget_used`, and `scan.tar_cursors` for the current depth
+/// and passes the remaining tail slices to child contexts. This avoids
+/// allocation and ensures each nesting level has its own independent state.
 fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
     scan: &mut ArchiveScanCtx<'_, S, Z>,
     input: &mut dyn TarRead,
@@ -543,6 +697,15 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
     let max_len = scan.archive.max_virtual_path_len_per_entry;
     let max_depth = scan.archive.max_archive_depth;
 
+    debug_assert!(!scan.vpaths.is_empty(), "vpaths exhausted at depth {depth}");
+    debug_assert!(
+        !scan.path_budget_used.is_empty(),
+        "path_budget_used exhausted at depth {depth}"
+    );
+    debug_assert!(
+        !scan.tar_cursors.is_empty(),
+        "tar_cursors exhausted at depth {depth}"
+    );
     let (cur_vpath, rest_vpaths) = scan
         .vpaths
         .split_first_mut()
@@ -694,6 +857,14 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                         let nested_outcome = match kind {
                             ArchiveKind::Gzip => {
+                                debug_assert!(
+                                    !rest_vpaths.is_empty(),
+                                    "vpaths exhausted for nested archive at depth {depth}"
+                                );
+                                debug_assert!(
+                                    !rest_path_used.is_empty(),
+                                    "path_budget_used exhausted for nested archive at depth {depth}"
+                                );
                                 let (gunzip_vpath, vpaths_tail) = rest_vpaths
                                     .split_first_mut()
                                     .expect("vpath scratch exhausted");
@@ -845,7 +1016,10 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                         let mut entry_partial_reason = match nested_outcome.0 {
                             ArchiveEnd::Partial(r) => Some(r),
-                            ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
+                            ArchiveEnd::Skipped(r) => Some(util::budget_hit_to_partial(
+                                BudgetHit::SkipArchive(r),
+                                PartialReason::MalformedTar,
+                            )),
                             ArchiveEnd::Scanned => None,
                         };
 
@@ -863,7 +1037,10 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                         let stop_reason = match nested_outcome.0 {
                             ArchiveEnd::Partial(r) => Some(r),
-                            ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
+                            ArchiveEnd::Skipped(r) => Some(util::budget_hit_to_partial(
+                                BudgetHit::SkipArchive(r),
+                                PartialReason::MalformedTar,
+                            )),
                             ArchiveEnd::Scanned => None,
                         };
                         if let Some(r) = stop_reason {
@@ -938,7 +1115,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
             let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -952,7 +1129,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -981,7 +1158,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
             if let ChargeResult::Clamp { allowed: a, hit } =
                 budgets.charge_decompressed_out(allowed)
             {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                 allowed = a;
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -1069,9 +1246,23 @@ pub fn scan_targz_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
 /// Scan a zip source with random access.
 ///
-/// The source must support `Read + Seek` and be cloneable for payload reads.
-/// Entry names are canonicalized and combined with locator suffixes to form
-/// virtual paths before delivery to the sink.
+/// The source must implement [`ZipSource`] (typically `Read + Seek + Clone`)
+/// to allow seeking to individual local file headers for payload reads.
+///
+/// Entry names are canonicalized, combined with a locator suffix (`@z` for
+/// valid LFH offsets, `@c` otherwise), and delivered to the sink. Entries
+/// that are directories, encrypted, or use an unsupported compression
+/// method are skipped or cause an early return depending on the configured
+/// [`EncryptedPolicy`](crate::archive::EncryptedPolicy) /
+/// [`UnsupportedPolicy`](crate::archive::UnsupportedPolicy).
+///
+/// Unlike the tar scanners, zip scanning does **not** recurse into nested
+/// archives — each entry is always scanned as raw bytes.
+///
+/// # Errors
+///
+/// Sink errors propagate immediately. Budget and I/O failures map to
+/// [`ArchiveEnd`] variants in the `Ok` path.
 pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
     source: Z,
     root_display: &[u8],
@@ -1322,7 +1513,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -1336,7 +1527,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
-                    let r = budget_hit_to_partial_reason(hit);
+                    let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
                 }
@@ -1369,7 +1560,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if let ChargeResult::Clamp { allowed: a, hit } =
                 scratch.budgets.charge_decompressed_out(allowed)
             {
-                let r = budget_hit_to_partial_reason(hit);
+                let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                 allowed = a;
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -1417,4 +1608,4 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
 
 #[cfg(test)]
 #[path = "scan_tests.rs"]
-mod scan_tests;
+mod tests;
