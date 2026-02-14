@@ -185,6 +185,10 @@ name = "runtime_hotpath"
 harness = false
 
 [[bench]]
+name = "archive_detect"
+harness = false
+
+[[bench]]
 name = "event_encoding"
 harness = false
 required-features = ["bench"]

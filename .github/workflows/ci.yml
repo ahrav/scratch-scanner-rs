@@ -98,7 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ubuntu-22.04
-      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests
+      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests,perf-stats
 
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)
