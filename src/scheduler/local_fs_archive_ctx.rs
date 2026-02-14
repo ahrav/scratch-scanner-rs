@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::api::FileId;
 use crate::archive::formats::TarCursor;
 use crate::archive::formats::TarRead;
+use crate::archive::util::write_u64_hex_lower;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult,
     EntryPathCanonicalizer, PartialReason, VirtualPathBuilder,
@@ -54,20 +55,6 @@ pub(super) fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
 /// - `z` = ZIP local file header offset (when valid)
 /// - `c` = ZIP central directory file header offset (fallback)
 pub(super) const LOCATOR_LEN: usize = 18;
-
-/// Write a `u64` as 16 lowercase hex digits into `out16`.
-#[inline(always)]
-pub(super) fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = match nyb {
-            0..=9 => b'0' + nyb,
-            _ => b'a' + (nyb - 10),
-        };
-    }
-}
 
 /// Format a locator suffix into `out` and return the full slice.
 ///
@@ -438,4 +425,50 @@ pub(super) fn discard_remaining_payload(
         remaining = remaining.saturating_sub(n as u64);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_virtual_file_id_sequential_and_wrapping() {
+        let mut next = 0x8000_0000u32;
+
+        let id0 = alloc_virtual_file_id(&mut next);
+        assert_eq!(id0.0, 0x8000_0000);
+        assert_eq!(next, 0x8000_0001);
+
+        let id1 = alloc_virtual_file_id(&mut next);
+        assert_eq!(id1.0, 0x8000_0001);
+        assert_eq!(next, 0x8000_0002);
+    }
+
+    #[test]
+    fn alloc_virtual_file_id_wraps_at_boundary() {
+        // Just before the mask wraps.
+        let mut next = 0xFFFF_FFFFu32;
+
+        let id = alloc_virtual_file_id(&mut next);
+        assert_eq!(id.0, 0xFFFF_FFFF);
+        // After wrapping: (0xFFFF_FFFF + 1) & 0x7FFF_FFFF | 0x8000_0000
+        assert_eq!(next, 0x8000_0000);
+    }
+
+    #[test]
+    fn build_locator_format() {
+        let mut buf = [0u8; LOCATOR_LEN];
+        let loc = build_locator(&mut buf, b't', 0x0000_0000_0000_1234);
+
+        assert_eq!(loc[0], b'@');
+        assert_eq!(loc[1], b't');
+        assert_eq!(&loc[2..], b"0000000000001234");
+    }
+
+    #[test]
+    fn build_locator_zero_value() {
+        let mut buf = [0u8; LOCATOR_LEN];
+        let loc = build_locator(&mut buf, b'z', 0);
+        assert_eq!(&loc[2..], b"0000000000000000");
+    }
 }

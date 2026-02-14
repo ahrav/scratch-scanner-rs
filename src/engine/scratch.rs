@@ -935,6 +935,10 @@ impl ScanScratch {
     /// should be preserved.
     #[inline(always)]
     fn reset_common(&mut self) {
+        debug_assert!(
+            self.root_span_map_ctx.is_none(),
+            "root_span_map_ctx must be cleared before scratch reuse"
+        );
         self.out.clear();
         self.norm_hash.clear();
         self.drop_hint_end.clear();

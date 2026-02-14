@@ -16,6 +16,36 @@
 //! - `slot_size` is a power of two >= `MIN_SLOT_SIZE`, or 0 when disabled
 //! - `storage.len() == sets * WAYS * slot_size` (0 when disabled)
 //! - Pinned slots are never evicted; handles must be dropped to release pins
+//!
+//! # Why raw pointers in `CacheHandle`?
+//!
+//! A lifetime-parameterized `CacheHandle<'cache, S>` would be the ideal
+//! Rust approach, but it is not viable here.  Handles are stored inside
+//! the `TreeBytes` enum which lives in `DiffFrame` stack frames during
+//! tree-diff traversal.  Those frames outlive any `&mut self` borrow of
+//! the cache, so a lifetime parameter would create an unresolvable
+//! conflict: the cache needs `&mut self` for insertions while existing
+//! handles are still live in ancestor frames.
+//!
+//! The raw-pointer approach is safe under these invariants:
+//! - **Single-threaded**: the cache is only accessed from one worker thread.
+//! - **No reallocation**: `storage` and `slots` `Vec`s are allocated once
+//!   in `new()` and never resized, so heap pointers remain stable.
+//! - **Pin-based eviction prevention**: a non-zero pin count on a slot
+//!   prevents the CLOCK eviction sweep from reusing that slot, ensuring
+//!   the pointed-to bytes are not overwritten while a handle exists.
+//!
+//! # Design rationale
+//!
+//! - **CLOCK over LRU**: CLOCK requires only a single reference bit per
+//!   slot (O(1) metadata per access) and avoids the linked-list pointer
+//!   chasing that LRU demands on every hit.
+//! - **WAYS = 4**: balances conflict-miss rate against scan cost.  With 4
+//!   ways per set, a lookup or eviction sweep inspects at most 8 slots
+//!   (4 valid + 4 clock sweeps in the worst case).
+//! - **MIN_SLOT_SIZE = 256**: prevents degenerate configurations with too
+//!   many tiny sets, which would increase conflict rates without improving
+//!   hit ratios for the tree-object payloads this cache targets.
 
 use std::cell::Cell;
 use std::fmt::Debug;
@@ -30,9 +60,13 @@ pub(super) const WAYS: usize = 4;
 /// Common fields shared by every cache slot.
 #[derive(Clone, Debug)]
 pub(super) struct SlotBase {
+    /// Byte length of the stored payload (≤ slot_size).
     pub(super) len: u32,
+    /// CLOCK reference bit: 1 = recently accessed, 0 = eligible for eviction.
     pub(super) clock: u8,
+    /// True if this slot contains a valid cached entry.
     pub(super) valid: bool,
+    /// Pin counter via interior mutability; >0 prevents eviction.
     pub(super) pins: Cell<u16>,
 }
 
@@ -267,6 +301,7 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
     /// Returns true if the entry was cached. Returns false if the cache is
     /// disabled, the payload is too large for a slot, or all candidate slots
     /// are pinned.
+    #[must_use]
     pub(super) fn insert(&mut self, key: &S::Key, args: &S::InsertArgs, bytes: &[u8]) -> bool {
         if self.sets == 0 {
             return false;
@@ -527,5 +562,28 @@ mod tests {
             cache.get_handle(&key).is_none(),
             "unpinned slot should have been evicted"
         );
+    }
+
+    #[test]
+    fn pin_saturation_returns_none() {
+        let mut cache = SetAssociativeCache::<TestSlot>::new(MIN_SLOT_SIZE * WAYS as u32);
+        assert!(cache.insert(&0, &(), b"data"));
+
+        // Manually saturate pins to u16::MAX - 1 so the next get_handle
+        // bumps to u16::MAX (the last success), then the one after
+        // returns None because checked_add(1) overflows.
+        let slot = &cache.slots[0];
+        slot.base().pins.set(u16::MAX - 1);
+
+        // This bumps to u16::MAX — should succeed.
+        let handle = cache.get_handle(&0).unwrap();
+
+        // Now at u16::MAX — checked_add(1) overflows, returns None.
+        assert!(
+            cache.get_handle(&0).is_none(),
+            "pin counter at u16::MAX should refuse new handles"
+        );
+
+        drop(handle);
     }
 }

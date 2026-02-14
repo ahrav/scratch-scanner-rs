@@ -253,4 +253,97 @@ mod tests {
         assert!(!is_gzip_magic(&[0x1f]));
         assert!(!is_gzip_magic(&[0x50, 0x4b]));
     }
+
+    // ── parse_gzip_name tests ───────────────────────────────────────────
+
+    /// Build a minimal gzip header with the given flags, optional FEXTRA,
+    /// and optional FNAME payload.  Returns the raw header bytes.
+    fn build_header(flags: u8, fextra: Option<&[u8]>, fname: Option<&[u8]>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Magic (2) + CM (1) + FLG (1) + MTIME (4) + XFL (1) + OS (1) = 10
+        buf.extend_from_slice(&GZIP_MAGIC);
+        buf.push(GZIP_CM_DEFLATE); // CM
+        buf.push(flags); // FLG
+        buf.extend_from_slice(&[0u8; 4]); // MTIME
+        buf.push(0); // XFL
+        buf.push(0xFF); // OS = unknown
+
+        if let Some(extra) = fextra {
+            let xlen = extra.len() as u16;
+            buf.extend_from_slice(&xlen.to_le_bytes());
+            buf.extend_from_slice(extra);
+        }
+
+        if let Some(name) = fname {
+            buf.extend_from_slice(name);
+            buf.push(0); // NUL terminator
+        }
+
+        buf
+    }
+
+    #[test]
+    fn parse_fname_without_fextra() {
+        let header = build_header(GZIP_FLAG_FNAME, None, Some(b"hello.txt"));
+        let mut name_buf = Vec::with_capacity(256);
+        let len = parse_gzip_name(&header, &mut name_buf, 256);
+        assert_eq!(len, Some(9));
+        assert_eq!(&name_buf, b"hello.txt");
+    }
+
+    #[test]
+    fn parse_fname_with_fextra() {
+        let flags = GZIP_FLAG_FNAME | GZIP_FLAG_FEXTRA;
+        let extra = b"XX"; // 2-byte extra field payload
+        let header = build_header(flags, Some(extra), Some(b"data.bin"));
+        let mut name_buf = Vec::with_capacity(256);
+        let len = parse_gzip_name(&header, &mut name_buf, 256);
+        assert_eq!(len, Some(8));
+        assert_eq!(&name_buf, b"data.bin");
+    }
+
+    #[test]
+    fn parse_truncated_header() {
+        let header = &[0x1f, 0x8b, 0x08]; // Only 3 bytes — too short
+        let mut name_buf = Vec::with_capacity(256);
+        assert_eq!(parse_gzip_name(header, &mut name_buf, 256), None);
+    }
+
+    #[test]
+    fn parse_no_nul_terminator() {
+        // FNAME flag set but name runs to end of buffer without NUL.
+        let mut header = Vec::new();
+        header.extend_from_slice(&GZIP_MAGIC);
+        header.push(GZIP_CM_DEFLATE);
+        header.push(GZIP_FLAG_FNAME);
+        header.extend_from_slice(&[0u8; 6]); // MTIME + XFL + OS
+        header.extend_from_slice(b"noterm"); // No NUL terminator
+        let mut name_buf = Vec::with_capacity(256);
+        assert_eq!(parse_gzip_name(&header, &mut name_buf, 256), None);
+    }
+
+    #[test]
+    fn parse_name_exceeds_max_len() {
+        let long_name = vec![b'a'; 100];
+        let header = build_header(GZIP_FLAG_FNAME, None, Some(&long_name));
+        let mut name_buf = Vec::with_capacity(256);
+        // max_name_len = 50, but name is 100 bytes.
+        assert_eq!(parse_gzip_name(&header, &mut name_buf, 50), None);
+    }
+
+    #[test]
+    fn parse_empty_fname() {
+        // FNAME flag set but name is zero-length (NUL immediately).
+        let header = build_header(GZIP_FLAG_FNAME, None, Some(b""));
+        let mut name_buf = Vec::with_capacity(256);
+        assert_eq!(parse_gzip_name(&header, &mut name_buf, 256), None);
+    }
+
+    #[test]
+    fn parse_wrong_compression_method() {
+        let mut header = build_header(GZIP_FLAG_FNAME, None, Some(b"test.txt"));
+        header[2] = 0x09; // Invalid CM (not deflate)
+        let mut name_buf = Vec::with_capacity(256);
+        assert_eq!(parse_gzip_name(&header, &mut name_buf, 256), None);
+    }
 }
