@@ -425,8 +425,7 @@ impl<'a> PackFile<'a> {
 ///
 /// Returns the number of input bytes consumed from `input`.
 ///
-/// The output buffer is cleared before writing. Callers should reserve at
-/// least `max_out` capacity to satisfy debug assertions and avoid reallocations.
+/// The output buffer is cleared and pre-reserved to `max_out` before writing.
 ///
 /// On error, `out` may contain a partial prefix; callers should discard it.
 /// This does not enforce that the stream ends exactly at the end of `input`;
@@ -438,8 +437,8 @@ pub fn inflate_limited(
 ) -> Result<usize, InflateError> {
     use flate2::{FlushDecompress, Status};
 
-    debug_assert!(out.capacity() >= max_out || max_out == 0);
     out.clear();
+    out.reserve(max_out);
 
     with_inflate_scratch(|de, buf| {
         let mut in_pos: usize = 0;
@@ -732,36 +731,42 @@ fn decode_copy_params(
         return Err(DeltaError::Truncated);
     }
 
+    // SAFETY: `cursor` starts at `start` and is incremented exactly once per set bit
+    // in off_mask (4 bits) then size_mask (3 bits). Total increments =
+    // count_ones(off_mask) + count_ones(size_mask) = `needed`. The upfront check
+    // `end > delta.len()` where `end = start + needed` guarantees all accessed
+    // indices are in-bounds: at each access, cursor < start + needed = end <= delta.len().
+    // Verified by exhaustive test over all 128 mask combos and Miri.
     let mut cursor = start;
     let mut off: usize = 0;
     if (off_mask & 0x01) != 0 {
-        off |= delta[cursor] as usize;
+        off |= unsafe { *delta.get_unchecked(cursor) } as usize;
         cursor += 1;
     }
     if (off_mask & 0x02) != 0 {
-        off |= (delta[cursor] as usize) << 8;
+        off |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 8;
         cursor += 1;
     }
     if (off_mask & 0x04) != 0 {
-        off |= (delta[cursor] as usize) << 16;
+        off |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 16;
         cursor += 1;
     }
     if (off_mask & 0x08) != 0 {
-        off |= (delta[cursor] as usize) << 24;
+        off |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 24;
         cursor += 1;
     }
 
     let mut size: usize = 0;
     if (size_mask & 0x01) != 0 {
-        size |= delta[cursor] as usize;
+        size |= unsafe { *delta.get_unchecked(cursor) } as usize;
         cursor += 1;
     }
     if (size_mask & 0x02) != 0 {
-        size |= (delta[cursor] as usize) << 8;
+        size |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 8;
         cursor += 1;
     }
     if (size_mask & 0x04) != 0 {
-        size |= (delta[cursor] as usize) << 16;
+        size |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 16;
         cursor += 1;
     }
     *pos = cursor;
@@ -825,6 +830,79 @@ mod tests {
             delta.len(),
             "position should match legacy truncation behavior"
         );
+    }
+
+    /// Exhaustive test covering all 128 (off_mask × size_mask) combinations.
+    ///
+    /// For each combination we build a delta payload with known byte values
+    /// and verify decode_copy_params produces the expected offset and size.
+    #[test]
+    fn decode_copy_params_all_128_mask_combos() {
+        // off_mask: 4 bits (0..16), size_mask: 3 bits (0..8) → 128 combos.
+        for off_mask in 0u8..16 {
+            for size_mask in 0u8..8 {
+                let cmd = 0x80 | off_mask | (size_mask << 4);
+                let needed = (off_mask.count_ones() + size_mask.count_ones()) as usize;
+
+                // Build payload: byte values 0x10, 0x20, 0x30, … so each is distinct.
+                let payload: Vec<u8> = (0..needed).map(|i| ((i as u8) + 1) * 0x10).collect();
+
+                let mut pos = 0usize;
+                let (off, size) = decode_copy_params(&payload, &mut pos, cmd)
+                    .unwrap_or_else(|_| panic!("off_mask={off_mask:#x} size_mask={size_mask:#x}"));
+                assert_eq!(
+                    pos, needed,
+                    "pos mismatch for off_mask={off_mask:#x} size_mask={size_mask:#x}"
+                );
+
+                // Reconstruct expected offset.
+                let mut expected_off: usize = 0;
+                let mut idx = 0;
+                if (off_mask & 0x01) != 0 {
+                    expected_off |= payload[idx] as usize;
+                    idx += 1;
+                }
+                if (off_mask & 0x02) != 0 {
+                    expected_off |= (payload[idx] as usize) << 8;
+                    idx += 1;
+                }
+                if (off_mask & 0x04) != 0 {
+                    expected_off |= (payload[idx] as usize) << 16;
+                    idx += 1;
+                }
+                if (off_mask & 0x08) != 0 {
+                    expected_off |= (payload[idx] as usize) << 24;
+                    idx += 1;
+                }
+                assert_eq!(
+                    off, expected_off,
+                    "off mismatch for off_mask={off_mask:#x} size_mask={size_mask:#x}"
+                );
+
+                // Reconstruct expected size.
+                let mut expected_size: usize = 0;
+                if (size_mask & 0x01) != 0 {
+                    expected_size |= payload[idx] as usize;
+                    idx += 1;
+                }
+                if (size_mask & 0x02) != 0 {
+                    expected_size |= (payload[idx] as usize) << 8;
+                    idx += 1;
+                }
+                if (size_mask & 0x04) != 0 {
+                    expected_size |= (payload[idx] as usize) << 16;
+                    idx += 1;
+                }
+                if expected_size == 0 {
+                    expected_size = 0x10000;
+                }
+                assert_eq!(
+                    size, expected_size,
+                    "size mismatch for off_mask={off_mask:#x} size_mask={size_mask:#x}"
+                );
+                let _ = idx; // suppress unused warning
+            }
+        }
     }
 
     #[test]

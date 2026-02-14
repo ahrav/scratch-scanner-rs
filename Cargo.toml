@@ -190,6 +190,10 @@ harness = false
 name = "event_encoding"
 harness = false
 
+[[bench]]
+name = "pack_inflate_perf"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
