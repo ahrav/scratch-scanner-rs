@@ -1777,8 +1777,7 @@ pub(super) fn execute_pack_plans_with_scheduler(
                                 let flat_idx = shard_slot_base[plan_idx] + shard_idx;
                                 *shard_slots[flat_idx]
                                     .lock()
-                                    .expect("scheduler shard output slot poisoned") =
-                                    Some(output);
+                                    .expect("scheduler shard output slot poisoned") = Some(output);
                             }
                             Err(err) => {
                                 abort_flag.store(true, Ordering::Relaxed);
@@ -2035,10 +2034,7 @@ mod bench_support {
     ///
     /// Creates a plan with `need_count` offsets where every offset at index
     /// `i >= dep_gap` depends on the offset at `i - dep_gap`.
-    pub fn bench_synthetic_locality_plan(
-        need_count: usize,
-        dep_gap: usize,
-    ) -> PackPlan {
+    pub fn bench_synthetic_locality_plan(need_count: usize, dep_gap: usize) -> PackPlan {
         let span_bytes = need_count.saturating_mul(1024) as u64;
         let mut plan = bench_synthetic_plan(0, need_count, span_bytes, 0, 0);
         if dep_gap == 0 || dep_gap >= need_count {
@@ -2153,9 +2149,8 @@ mod bench_support {
 
 #[cfg(feature = "bench")]
 pub use bench_support::{
-    bench_apply_locality_shard_cap, bench_apply_locality_shard_cap_old,
-    bench_select_strategy, bench_select_strategy_old,
-    bench_synthetic_locality_plan, bench_synthetic_plan,
+    bench_apply_locality_shard_cap, bench_apply_locality_shard_cap_old, bench_select_strategy,
+    bench_select_strategy_old, bench_synthetic_locality_plan, bench_synthetic_plan,
 };
 
 // ---------------------------------------------------------------------------
