@@ -55,10 +55,13 @@ fn aligned_alloc<T: Copy + Default>(n: usize) -> *mut T {
         .checked_mul(std::mem::size_of::<T>())
         .expect("Allocation size overflow");
     let layout = Layout::from_size_align(size, CACHE_LINE_ALIGN).expect("Invalid layout");
+    // SAFETY: `layout` has non-zero size (asserted above) and valid alignment.
     let ptr = unsafe { alloc(layout) as *mut T };
     assert!(!ptr.is_null(), "Allocation failed");
     // Initialize with default values
     for i in 0..n {
+        // SAFETY: `ptr` is non-null (asserted above) and points to an allocation
+        // of `n` elements, so `ptr.add(i)` is within bounds for `i < n`.
         unsafe { ptr.add(i).write(T::default()) };
     }
     ptr
@@ -71,6 +74,8 @@ fn aligned_dealloc<T>(ptr: *mut T, n: usize) {
         .checked_mul(std::mem::size_of::<T>())
         .expect("Deallocation size overflow");
     let layout = Layout::from_size_align(size, CACHE_LINE_ALIGN).expect("Invalid layout");
+    // SAFETY: `ptr` was allocated by `aligned_alloc` with the same layout
+    // (same size and alignment), and has not been deallocated yet.
     unsafe { dealloc(ptr as *mut u8, layout) };
 }
 
@@ -98,10 +103,14 @@ impl<T: Copy + Default> AlignedBuffer<T> {
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: `self.ptr` is non-null, properly aligned, and points to `self.len`
+        // initialized elements. The `&mut self` borrow ensures exclusive access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     fn as_slice(&self) -> &[T] {
+        // SAFETY: `self.ptr` is non-null, properly aligned, and points to `self.len`
+        // initialized elements. The `&self` borrow ensures no mutable aliases exist.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
@@ -527,6 +536,9 @@ fn bench_memcpy(c: &mut Criterion) {
             }
 
             b.iter(|| {
+                // SAFETY: `src` and `dst` are separate `AlignedBuffer` allocations of
+                // `size` bytes each, so they do not overlap. Both pointers are valid
+                // for reads/writes of `size` bytes.
                 unsafe {
                     std::ptr::copy_nonoverlapping(black_box(src.as_ptr()), dst.as_mut_ptr(), size);
                 }
@@ -556,6 +568,9 @@ fn bench_memmove(c: &mut Criterion) {
             }
 
             b.iter(|| {
+                // SAFETY: `src` and `dst` are separate `AlignedBuffer` allocations of
+                // `size` bytes each. Both pointers are valid for reads/writes of `size`
+                // bytes. `ptr::copy` handles potential overlap (though these do not overlap).
                 unsafe {
                     std::ptr::copy(black_box(src.as_ptr()), dst.as_mut_ptr(), size);
                 }
@@ -779,6 +794,9 @@ fn bench_simd_sum_bytes(c: &mut Criterion) {
                 let chunks = size / 64;
                 let remainder = size % 64;
 
+                // SAFETY: We are on aarch64 (cfg-gated) and the buffer pointer is valid
+                // for `size` bytes. All NEON intrinsics operate within the allocated
+                // region; the remainder loop handles trailing bytes.
                 unsafe {
                     // Accumulate in u16 to avoid overflow, then reduce
                     let mut acc0 = vdupq_n_u16(0);
@@ -860,6 +878,9 @@ fn bench_simd_find_byte(c: &mut Criterion) {
                 let chunks = size / 16;
                 let remainder = size % 16;
 
+                // SAFETY: We are on aarch64 (cfg-gated) and the buffer pointer is valid
+                // for `size` bytes. NEON loads read 16-byte aligned chunks within
+                // bounds; the remainder loop handles trailing bytes.
                 unsafe {
                     let needle = vdupq_n_u8(target);
 

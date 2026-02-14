@@ -19,6 +19,9 @@
 
 pub mod cli;
 pub mod events;
+#[cfg(any(feature = "bench", feature = "tiger-harness"))]
+#[doc(hidden)]
+pub mod harness_api;
 pub mod json_sink;
 pub mod json_write;
 pub mod orchestrator;

@@ -47,6 +47,7 @@ pub struct AtomicBitSet {
 // SAFETY: AtomicU64 is Send+Sync; Vec<AtomicU64> is Send+Sync.
 // The struct contains no raw pointers or non-atomic interior mutability.
 unsafe impl Send for AtomicBitSet {}
+// SAFETY: Same reasoning — all fields are Sync-safe atomics.
 unsafe impl Sync for AtomicBitSet {}
 
 impl std::fmt::Debug for AtomicBitSet {

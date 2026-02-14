@@ -162,6 +162,8 @@ where
     for &tag in sac.tags.iter() {
         assert_eq!(0, tag);
     }
+    // SAFETY: We have exclusive access to `sac` via shared reference in a single-threaded
+    // test, so dereferencing the `UnsafeCell` pointers for `counts` and `clocks` is safe.
     unsafe {
         for &word in (*sac.counts.get()).words().iter() {
             assert_eq!(0, word);
@@ -188,6 +190,7 @@ where
         let key = (i as u64) * sac.sets;
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(i as u64));
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the value was just inserted.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(i as u64));
@@ -198,6 +201,7 @@ where
         let key = (WAYS as u64) * sac.sets;
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(0));
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the value was just inserted.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(0));
@@ -211,6 +215,7 @@ where
 
     {
         let key = 5u64 * sac.sets;
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the key is still present.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(5));
@@ -231,10 +236,12 @@ where
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(i as u64));
         for expected in 2u8..=max_count {
+            // SAFETY: `get` returned `Some`, so the pointer is valid and the key is present.
             let value = unsafe { *sac.get(key).unwrap() };
             assert_eq!(key, value);
             assert_eq!(expected, sac.counts_get(i as u64));
         }
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the key is present.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(max_count, sac.counts_get(i as u64));
@@ -245,6 +252,7 @@ where
         let key = (WAYS as u64) * sac.sets;
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(0));
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the value was just inserted.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(0));
@@ -517,6 +525,7 @@ proptest! {
         for &key in &keys {
             let ptr = cache.get(key);
             prop_assert!(ptr.is_some(), "Key {} should be present", key);
+            // SAFETY: `get` returned `Some`, so the pointer is valid and the key is present.
             let value = unsafe { *ptr.unwrap() };
             prop_assert_eq!(key, value, "Value mismatch for key {}", key);
         }
@@ -549,6 +558,7 @@ proptest! {
                 // Get operation: if key is in reference, it should be in cache.
                 // Note: cache may have evicted the key, so we can't assert presence.
                 if let Some(ptr) = cache.get(key) {
+                    // SAFETY: `get` returned `Some`, so the pointer is valid and points to the cached value.
                     let value = unsafe { *ptr };
                     prop_assert_eq!(key, value, "Value mismatch on get");
                 }
@@ -560,6 +570,7 @@ proptest! {
                 // Immediately verify the just-inserted key is present.
                 let ptr = cache.get(key);
                 prop_assert!(ptr.is_some(), "Just-inserted key {} should be present", key);
+                // SAFETY: `get` returned `Some`, so the pointer is valid; the key was just inserted.
                 let value = unsafe { *ptr.unwrap() };
                 prop_assert_eq!(key, value, "Value mismatch after upsert");
             }

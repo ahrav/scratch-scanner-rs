@@ -80,6 +80,8 @@ fn load_rules_from_path_hash_tracks_loaded_content() {
     let dir = tempfile::tempdir().unwrap();
     let fifo_path = dir.path().join("rules.fifo");
     let fifo_cstr = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo_cstr` is a valid NUL-terminated C string and lives for the duration of
+    // this call. The directory exists (created by `tempdir`) so `mkfifo` will not write OOB.
     let mkfifo_rc = unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) };
     assert_eq!(
         mkfifo_rc,
@@ -115,8 +117,11 @@ fn load_rules_from_path_hash_tracks_loaded_content() {
         thread::sleep(Duration::from_millis(20));
         let writer_cstr = CString::new(writer_fifo.as_os_str().as_bytes()).unwrap();
         for _ in 0..100 {
+            // SAFETY: `writer_cstr` is a valid NUL-terminated C string that outlives this call.
             let fd = unsafe { libc::open(writer_cstr.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
             if fd >= 0 {
+                // SAFETY: `fd` is a valid open file descriptor (checked `fd >= 0` above) and
+                // ownership is transferred to the `File`, which will close it on drop.
                 let mut stream = unsafe { File::from_raw_fd(fd) };
                 stream.write_all(second_payload.as_bytes()).unwrap();
                 return true;

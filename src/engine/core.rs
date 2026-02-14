@@ -1460,6 +1460,9 @@ impl Engine {
                 {
                     let start = slab_range.start as usize;
                     let end = slab_range.end as usize;
+                    // SAFETY: The slab is pre-allocated and never reallocated during a
+                    // scan; `scan_rules_on_buffer` only mutates output fields, not the
+                    // slab region backing `cur_buf`. See the comment block above.
                     unsafe {
                         debug_assert!(end <= scratch.slab.buf.len());
                         let ptr = scratch.slab.buf.as_ptr().add(start);

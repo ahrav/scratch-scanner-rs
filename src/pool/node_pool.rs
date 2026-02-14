@@ -215,6 +215,8 @@ mod miri_tests {
         let mut pool = NodePoolType::<8, 8>::init(1);
         let node = pool.acquire();
         // Write to prove the memory is accessible.
+        // SAFETY: `node` was just returned by `acquire`, so it points to valid,
+        // exclusively-owned, properly-aligned memory of at least NODE_SIZE (8) bytes.
         unsafe { node.as_ptr().write(0xAB) };
         pool.release(node);
     }
@@ -245,6 +247,9 @@ mod miri_tests {
         let b = pool.acquire();
 
         // Write unique values.
+        // SAFETY: `a` and `b` are both live, non-overlapping nodes returned by
+        // `acquire`, so each points to valid, exclusively-owned memory of at
+        // least NODE_SIZE (8) bytes.
         unsafe {
             a.as_ptr().write(1);
             b.as_ptr().write(2);
@@ -253,6 +258,9 @@ mod miri_tests {
         pool.release(a);
         let c = pool.acquire(); // should reuse a's slot
 
+        // SAFETY: `b` is still outstanding (not released) and `c` was freshly
+        // acquired, so both point to valid, non-overlapping, exclusively-owned
+        // memory of at least NODE_SIZE (8) bytes.
         unsafe {
             assert_eq!(b.as_ptr().read(), 2); // b untouched
             c.as_ptr().write(3);
@@ -281,6 +289,8 @@ mod miri_tests {
         let mut pool = NodePoolType::<8, 8>::init(1);
         for _ in 0..10 {
             let node = pool.acquire();
+            // SAFETY: `node` was just returned by `acquire`, so it points to valid,
+            // exclusively-owned, properly-aligned memory of at least NODE_SIZE (8) bytes.
             unsafe { node.as_ptr().write(0xFF) };
             pool.release(node);
         }
@@ -482,7 +492,11 @@ mod tests {
 
             let pool = NodePoolType::<NODE_SIZE, NODE_ALIGNMENT>::init(node_count);
 
-            // Fill entire buffer with sentinel
+            // Fill entire buffer with sentinel.
+            // SAFETY: `pool.buffer` points to `pool.len` bytes of allocated memory
+            // aligned to NODE_ALIGNMENT (>= align_of::<u64>()). The pool is freshly
+            // created so no nodes are outstanding, giving us exclusive access to the
+            // entire buffer. The slice length is exact: `bytes / size_of::<u64>()`.
             unsafe {
                 let bytes = pool.len;
                 let words = slice::from_raw_parts_mut(
@@ -515,7 +529,11 @@ mod tests {
                 "duplicate node pointer returned"
             );
 
-            // Verify sentinel pattern
+            // Verify sentinel pattern.
+            // SAFETY: `node` was just returned by `acquire`, so it points to
+            // NODE_SIZE bytes of exclusively-owned memory aligned to
+            // NODE_ALIGNMENT (>= align_of::<u64>()). The cast to `*mut u64`
+            // is valid because NODE_SIZE is a multiple of size_of::<u64>().
             unsafe {
                 let words = Self::node_as_u64_slice(node);
                 for &word in words.iter() {
@@ -541,6 +559,11 @@ mod tests {
             let idx = index % self.held.len();
             let (node, id) = self.held[idx];
 
+            // SAFETY: `node` is a live, outstanding node from this pool's `acquire`.
+            // It points to NODE_SIZE bytes of exclusively-owned memory aligned to
+            // NODE_ALIGNMENT (>= align_of::<u64>()). We hold no other references
+            // to this node's memory, satisfying the aliasing requirements for
+            // `node_as_u64_slice`.
             unsafe {
                 let words = Self::node_as_u64_slice(node);
 
@@ -569,7 +592,12 @@ mod tests {
         fn verify_all_released(&mut self) {
             assert!(self.held.is_empty(), "not all nodes released");
 
-            // Verify entire buffer is sentinel
+            // Verify entire buffer is sentinel.
+            // SAFETY: All nodes have been released (asserted above), so we have
+            // exclusive access to the entire buffer. `self.node_pool.buffer`
+            // points to `self.node_pool.len` bytes of allocated memory aligned to
+            // NODE_ALIGNMENT (>= align_of::<u64>()). The slice length is exact:
+            // `bytes / size_of::<u64>()`.
             unsafe {
                 let bytes = self.node_pool.len;
                 let words = slice::from_raw_parts(
@@ -583,6 +611,10 @@ mod tests {
         }
 
         unsafe fn node_as_u64_slice<'a>(node: NonNull<u8>) -> &'a mut [u64] {
+            // SAFETY: The caller guarantees `node` points to NODE_SIZE bytes of
+            // exclusively-owned, valid memory aligned to NODE_ALIGNMENT (which is
+            // >= align_of::<u64>()). NODE_SIZE is a multiple of size_of::<u64>()
+            // (asserted in `new`), so the resulting slice is properly sized.
             unsafe {
                 slice::from_raw_parts_mut(
                     node.as_ptr() as *mut u64,
