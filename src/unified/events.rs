@@ -487,7 +487,7 @@ pub(crate) fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &
 //
 // The `<=` form is intentional: it reads as "max writes ≤ budget".
 // Tight bounds (e.g. 2 <= 2) prove the budget is exact, not a lint issue.
-#[allow(clippy::int_plus_one, clippy::eq_op)]
+#[allow(clippy::int_plus_one, clippy::eq_op, clippy::assertions_on_constants)]
 const _: () = {
     // encode_finding segment 1: BufCursor::new(buf, 240)
     // Worst case is the "git" variant (longer source string).

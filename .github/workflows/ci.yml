@@ -162,6 +162,8 @@ jobs:
   loom:
     name: Loom Concurrency Tests
     runs-on: ubuntu-22.04
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps
