@@ -21,14 +21,14 @@
 //!
 //! Multiple workers call [`emit()`](EventSink::emit) concurrently. Each call
 //! formats into a per-thread scratch buffer (via `with_format_buf`), then
-//! acquires the writer mutex only for the `write_all`. This keeps lock hold
-//! time proportional to a single memcpy, not to JSON encoding cost.
+//! acquires the writer mutex for separator selection and `write_all`. The
+//! mutex hold time is two small `write_all` calls (separator + payload),
+//! not JSON encoding cost, so contention stays low.
 //!
 //! **Element order is non-deterministic** — it depends on which thread
 //! acquires the mutex first, not on the order events were produced. This
-//! is acceptable because scan events carry their own identity
-//! (`type` + `source` + `path`) and consumers must not rely on array
-//! position.
+//! is acceptable because consumers should join by event keys (for findings:
+//! `type` + `source` + `path`) rather than relying on array position.
 //!
 //! # Wire invariants
 //!
@@ -88,30 +88,32 @@ impl<W: Write + Send> JsonEventSink<W> {
 
 impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
     fn emit(&self, event: ScanEvent<'_>) {
-        // Determine separator *before* acquiring any lock or formatting.
-        // `Relaxed` is sufficient: the mutex provides happens-before for
-        // the actual write, and we accept non-deterministic element order
-        // (whoever wins the swap gets `\n`, everyone else gets `,\n`).
-        let sep: &[u8] = if self.first.swap(false, Ordering::Relaxed) {
-            b"\n"
-        } else {
-            b",\n"
-        };
-
         with_format_buf(
-            |buf| {
-                buf.extend_from_slice(sep);
-                match &event {
-                    ScanEvent::Finding(f) => encode_finding(f, buf),
-                    ScanEvent::Progress(p) => encode_progress(p, buf),
-                    ScanEvent::Summary(s) => encode_summary(s, buf),
-                    ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
-                    ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
-                    ScanEvent::IdentityDictionary(d) => encode_identity_dictionary(d, buf),
-                }
+            |buf| match &event {
+                ScanEvent::Finding(f) => encode_finding(f, buf),
+                ScanEvent::Progress(p) => encode_progress(p, buf),
+                ScanEvent::Summary(s) => encode_summary(s, buf),
+                ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
+                ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
+                ScanEvent::IdentityDictionary(d) => encode_identity_dictionary(d, buf),
             },
             |bytes| {
                 let mut writer = self.writer.lock().expect("json sink mutex poisoned");
+                // Determine separator under the mutex so the first element
+                // is guaranteed to be preceded by `\n` (not `,\n`).
+                // `Relaxed` is sufficient: the mutex itself provides the
+                // happens-before edge between competing threads.
+                let sep: &[u8] = if self.first.swap(false, Ordering::Relaxed) {
+                    b"\n"
+                } else {
+                    b",\n"
+                };
+                if let Err(e) = writer.write_all(sep) {
+                    if e.kind() == ErrorKind::BrokenPipe {
+                        return;
+                    }
+                    panic!("json event sink write failed: {}", e);
+                }
                 if let Err(e) = writer.write_all(bytes) {
                     if e.kind() == ErrorKind::BrokenPipe {
                         return;
@@ -212,5 +214,64 @@ mod tests {
         let out = collect_json(vec![]);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
         assert!(parsed.is_empty());
+    }
+}
+
+/// Loom model of the separator logic in [`JsonEventSink::emit`].
+///
+/// Two threads race to emit an element. The model captures the essential
+/// synchronization: an [`AtomicBool`] swap determines `\n` vs `,\n`, and
+/// a [`Mutex`] guards the write. The assertion checks that the first byte
+/// written is always `\n` (not `,`), which holds only when the swap
+/// happens **inside** the mutex.
+///
+/// Run with: `RUSTFLAGS="--cfg loom" cargo test --lib unified::json_sink::loom_tests`
+#[cfg(loom)]
+mod loom_tests {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    use loom::sync::{Arc, Mutex};
+
+    #[test]
+    fn separator_first_element_never_has_comma() {
+        loom::model(|| {
+            let first = Arc::new(AtomicBool::new(true));
+            let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+
+            let handles: Vec<_> = (0..2)
+                .map(|id| {
+                    let first = first.clone();
+                    let writer = writer.clone();
+                    loom::thread::spawn(move || {
+                        // --- mirrors production emit() ---
+                        // "Format" payload (like with_format_buf encode closure).
+                        let payload = vec![b'A' + id];
+
+                        // Lock, determine separator, then write both
+                        // (like the write closure in the fixed emit()).
+                        let mut w = writer.lock().unwrap();
+                        let sep: &[u8] = if first.swap(false, Ordering::Relaxed) {
+                            b"\n"
+                        } else {
+                            b",\n"
+                        };
+                        w.extend_from_slice(sep);
+                        w.extend_from_slice(&payload);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let output = writer.lock().unwrap();
+            // Valid: "\nA,\nB" or "\nB,\nA"
+            // Buggy: ",\nB\nA" or ",\nA\nB" (leading comma)
+            assert!(
+                output.starts_with(b"\n"),
+                "TOCTOU: first element preceded by comma: {:?}",
+                String::from_utf8_lossy(&output),
+            );
+        });
     }
 }

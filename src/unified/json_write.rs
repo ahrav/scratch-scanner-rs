@@ -28,8 +28,8 @@
 //!
 //! # Visibility
 //!
-//! Primitives here are crate-internal (`pub(crate)`). Benchmarks and fuzz
-//! targets use the feature-gated `unified::harness_api` facade.
+//! Primitives remain `pub(crate)`; benchmarks and fuzz targets import the
+//! supported surface through `unified::harness_api` re-exports.
 //!
 //! # Caller responsibility
 //!
@@ -93,7 +93,7 @@ const HEX_PAIRS: [[u8; 2]; 256] = {
 /// Uses a 256-entry byte-to-hex-pair lookup table with a single `reserve`
 /// and bulk `MaybeUninit::write` calls to eliminate per-byte bounds checks.
 #[inline]
-pub fn write_oid_hex(oid: &OidBytes, buf: &mut Vec<u8>) {
+pub(crate) fn write_oid_hex(oid: &OidBytes, buf: &mut Vec<u8>) {
     let src = oid.as_slice();
     let out_len = src.len() * 2;
     buf.reserve(out_len);
@@ -168,11 +168,12 @@ fn digit_count(n: u64) -> usize {
 /// Write a u64 as decimal ASCII.
 ///
 /// Uses a two-digits-at-a-time lookup table to halve the number of divisions.
-/// Pre-computes the digit count via [`digit_count`], writes digits forward
-/// into a stack buffer (two at a time from the least-significant end), then
-/// copies to `buf` with a single `extend_from_slice` (memcpy).
+/// Pre-computes the digit count via [`digit_count`], fills a stack buffer
+/// from the least-significant end toward the most-significant (two digits
+/// at a time), then copies the completed string to `buf` with a single
+/// `extend_from_slice` (memcpy).
 #[inline]
-pub fn write_u64(n: u64, buf: &mut Vec<u8>) {
+pub(crate) fn write_u64(n: u64, buf: &mut Vec<u8>) {
     if n == 0 {
         buf.push(b'0');
         return;
@@ -211,12 +212,13 @@ pub fn write_u64(n: u64, buf: &mut Vec<u8>) {
 /// the integer part is incremented and the fraction reset to 0, so the
 /// output is always well-formed (`"2.00"`, not `"1.100"`).
 ///
-/// NaN and infinity are written as `0.00` to keep the output valid JSON.
+/// NaN and infinity trigger a `debug_assert!` in debug builds; in release
+/// builds they fall back to `0.00` to keep the output valid JSON.
 ///
 /// Values with absolute magnitude above `u64::MAX` are clamped to
 /// `u64::MAX.00` so carry handling cannot overflow.
 #[inline]
-pub fn write_f64(n: f64, buf: &mut Vec<u8>) {
+pub(crate) fn write_f64(n: f64, buf: &mut Vec<u8>) {
     if n.is_nan() || n.is_infinite() {
         debug_assert!(
             false,
@@ -321,7 +323,7 @@ impl<'a> BufCursor<'a> {
             (self.end as usize) - (self.ptr as usize),
         );
         // SAFETY: Caller reserved sufficient capacity via `new()` or
-        // `re_reserve()`. Debug-assert verifies in debug builds.
+        // `resume()`. Debug-assert verifies in debug builds.
         unsafe {
             std::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr, s.len());
             self.ptr = self.ptr.add(s.len());
@@ -435,6 +437,41 @@ impl<'a> BufCursor<'a> {
             self.ptr = self.buf.as_mut_ptr().add(self.buf.len());
             self.end = self.buf.as_mut_ptr().add(self.buf.capacity());
         }
+    }
+
+    /// Commit cursor writes, yield `&mut Vec<u8>` to a closure, then resume.
+    ///
+    /// This is the preferred API for interleaving cursor writes with dynamic
+    /// content (e.g. `write_json_str`). The closure-based design makes the
+    /// commit→use→resume sequence impossible to misuse: the cursor cannot be
+    /// accessed while the closure holds the buffer reference.
+    ///
+    /// `additional` is the number of bytes to reserve for cursor writes
+    /// *after* the closure returns (same semantics as [`resume`](Self::resume)).
+    ///
+    /// ```ignore
+    /// cur.push_static(b"\"path\":\"");
+    /// cur.with_buf(80, |buf| write_json_bytes(path, buf));
+    /// cur.push_static(b"\"");
+    /// ```
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn with_buf(&mut self, additional: usize, f: impl FnOnce(&mut Vec<u8>)) {
+        self.commit();
+        f(self.buf);
+        self.resume(additional);
+    }
+}
+
+impl Drop for BufCursor<'_> {
+    /// Safety net: commits any pending writes on drop.
+    ///
+    /// In the normal case `commit()` was already called and the `set_len`
+    /// is a no-op (ptr already equals buf.as_ptr() + buf.len()). During
+    /// panics this ensures partial writes are reflected in the Vec length
+    /// rather than silently lost.
+    fn drop(&mut self) {
+        self.commit();
     }
 }
 
@@ -657,10 +694,12 @@ mod neon {
         while i + 16 <= bytes.len() {
             let chunk = vld1q_u8(bytes.as_ptr().add(i));
             if is_all_safe_neon(chunk) {
-                // SAFETY: We pre-reserved `bytes.len()` bytes. At this point
-                // we have written at most `i` bytes (all safe, 1:1 copy), and
-                // are about to write 16 more. Since `i + 16 <= bytes.len()`
-                // and we reserved `bytes.len()`, capacity is sufficient.
+                // SAFETY: On first entry we pre-reserved `bytes.len()` bytes
+                // and have written at most `i` safe bytes (1:1 copy). After
+                // an escape, `buf.reserve(bytes.len() - i)` re-established
+                // capacity for all remaining input bytes. In both cases,
+                // `i + 16 <= bytes.len()` guarantees at least 16 bytes of
+                // spare capacity remain.
                 let dst = buf.as_mut_ptr().add(buf.len());
                 std::ptr::copy_nonoverlapping(bytes.as_ptr().add(i), dst, 16);
                 buf.set_len(buf.len() + 16);
@@ -681,7 +720,8 @@ mod neon {
                 }
                 if j == 16 {
                     // No escape-worthy byte; the chunk was flagged only for
-                    // high bytes (valid UTF-8). Bulk-copy the whole chunk.
+                    // high bytes (valid UTF-8) or DEL (0x7F), all of which
+                    // are valid in JSON strings. Bulk-copy the whole chunk.
                     let dst = buf.as_mut_ptr().add(buf.len());
                     std::ptr::copy_nonoverlapping(bytes.as_ptr().add(i), dst, 16);
                     buf.set_len(buf.len() + 16);
@@ -831,7 +871,12 @@ mod sse2 {
         while i + 16 <= bytes.len() {
             let chunk = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
             if is_all_safe_sse2(chunk) {
-                // SAFETY: Pre-reserved bytes.len(). Safe chunks copy 1:1.
+                // SAFETY: On first entry we pre-reserved `bytes.len()` bytes
+                // and have written at most `i` safe bytes (1:1 copy). After
+                // an escape, `buf.reserve(bytes.len() - i)` re-established
+                // capacity for all remaining input bytes. In both cases,
+                // `i + 16 <= bytes.len()` guarantees at least 16 bytes of
+                // spare capacity remain.
                 let dst = buf.as_mut_ptr().add(buf.len());
                 std::ptr::copy_nonoverlapping(bytes.as_ptr().add(i), dst, 16);
                 buf.set_len(buf.len() + 16);
@@ -849,7 +894,8 @@ mod sse2 {
                     j += 1;
                 }
                 if j == 16 {
-                    // No escape-worthy byte; chunk flagged for high bytes only.
+                    // No escape-worthy byte; chunk flagged for high bytes or
+                    // DEL (0x7F) only — all valid in JSON strings.
                     let dst = buf.as_mut_ptr().add(buf.len());
                     std::ptr::copy_nonoverlapping(bytes.as_ptr().add(i), dst, 16);
                     buf.set_len(buf.len() + 16);
@@ -922,7 +968,7 @@ mod sse2 {
 /// Falls back to scalar per-byte escaping for short strings or when
 /// escape-worthy characters are encountered.
 #[inline]
-pub fn write_json_str(s: &str, buf: &mut Vec<u8>) {
+pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
     buf.reserve(s.len());
     #[cfg(target_arch = "aarch64")]
     {
@@ -965,7 +1011,7 @@ pub fn write_json_str(s: &str, buf: &mut Vec<u8>) {
 ///
 /// On aarch64 (NEON) and x86_64 (SSE2), a SIMD fast path scans 16 bytes at a
 /// time for safe ASCII runs.
-pub fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
+pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
     buf.reserve(bytes.len());
     #[cfg(target_arch = "aarch64")]
     {
@@ -1551,6 +1597,30 @@ mod tests {
             cur.commit();
         }
         assert_eq!(&buf, b"abcDEFghi");
+    }
+
+    #[test]
+    fn bufcursor_with_buf() {
+        let mut buf = Vec::new();
+        {
+            let mut cur = BufCursor::new(&mut buf, 16);
+            cur.push_static(b"abc");
+            cur.with_buf(16, |b| b.extend_from_slice(b"DEF"));
+            cur.push_static(b"ghi");
+            cur.commit();
+        }
+        assert_eq!(&buf, b"abcDEFghi");
+    }
+
+    #[test]
+    fn bufcursor_drop_commits_pending_writes() {
+        let mut buf = Vec::new();
+        {
+            let mut cur = BufCursor::new(&mut buf, 16);
+            cur.push_static(b"dropped");
+            // No explicit commit() — Drop should handle it.
+        }
+        assert_eq!(&buf, b"dropped");
     }
 
     #[test]

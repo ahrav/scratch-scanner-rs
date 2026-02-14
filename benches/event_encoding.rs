@@ -458,7 +458,6 @@ fn bench_write_f64(c: &mut Criterion) {
 /// Uses a 10-digit value (1.7 billion — a realistic Unix timestamp) since
 /// that's the most common magnitude in scan events.
 fn bench_u64_vs_itoa(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_u64;
     let mut group = c.benchmark_group("u64_vs_itoa");
     group.throughput(Throughput::Elements(1));
 
@@ -474,9 +473,9 @@ fn bench_u64_vs_itoa(c: &mut Criterion) {
 
     group.bench_function("itoa_write", |b| {
         let mut buf = Vec::with_capacity(20);
+        let mut tmp = itoa::Buffer::new();
         b.iter(|| {
             buf.clear();
-            let mut tmp = itoa::Buffer::new();
             let s = tmp.format(black_box(val));
             buf.extend_from_slice(s.as_bytes());
             black_box(&buf);
@@ -495,7 +494,6 @@ fn bench_u64_vs_itoa(c: &mut Criterion) {
 /// This benchmark confirms the fixed-precision shortcut is faster than
 /// `ryu` for the narrow use case of two-decimal-place output.
 fn bench_f64_vs_ryu(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_f64;
     let mut group = c.benchmark_group("f64_vs_ryu");
     group.throughput(Throughput::Elements(1));
 
@@ -511,9 +509,9 @@ fn bench_f64_vs_ryu(c: &mut Criterion) {
 
     group.bench_function("ryu_write", |b| {
         let mut buf = Vec::with_capacity(32);
+        let mut tmp = ryu::Buffer::new();
         b.iter(|| {
             buf.clear();
-            let mut tmp = ryu::Buffer::new();
             let s = tmp.format(black_box(val));
             buf.extend_from_slice(s.as_bytes());
             black_box(&buf);

@@ -19,10 +19,9 @@
 //!
 //! # Visibility
 //!
-//! Several items in this module and in [`super::json_write`] are `pub` rather
-//! than `pub(crate)` so that Criterion benchmarks in `benches/event_encoding.rs`
-//! can import them directly. They are **not** part of a stable public API —
-//! treat them as crate-internal.
+//! Encoder functions and JSON-write primitives are `pub(crate)`. Benchmarks
+//! and fuzz targets import the supported surface through the public,
+//! feature-gated [`super::harness_api`] facade.
 //!
 //! # Performance
 //!
@@ -84,10 +83,12 @@ where
 
 /// Structured scan event emitted during scanning.
 ///
-/// Hot-path variants ([`Finding`](Self::Finding), [`Diagnostic`](Self::Diagnostic),
-/// [`IdentityDictionary`](Self::IdentityDictionary)) borrow from adapter
-/// scratch to avoid allocation. Infrequent variants ([`Progress`](Self::Progress),
-/// [`Summary`](Self::Summary), [`CommitMeta`](Self::CommitMeta)) own their data.
+/// Variants that carry borrowed data ([`Finding`](Self::Finding),
+/// [`Diagnostic`](Self::Diagnostic), [`IdentityDictionary`](Self::IdentityDictionary))
+/// reference adapter or engine-owned buffers to avoid allocation. Variants
+/// that own their data ([`Progress`](Self::Progress), [`Summary`](Self::Summary),
+/// [`CommitMeta`](Self::CommitMeta)) are emitted infrequently enough that the
+/// allocation cost is negligible.
 /// The [`EventSink`] implementation is responsible for serialization.
 pub enum ScanEvent<'a> {
     /// A secret or credential match. Wire format type: `"finding"`.
@@ -261,9 +262,10 @@ pub trait EventEncoder: Send + Sync {
 
 /// JSONL encoder: one JSON object per line, without serde.
 ///
-/// Encodes directly into a `Vec<u8>` via hand-rolled `extend_from_slice`
-/// calls, avoiding the allocation and type-erasure overhead of `serde_json`.
-/// This is the hot path for all structured output during scanning.
+/// Encodes directly into a `Vec<u8>` via [`BufCursor`] pointer writes and
+/// hand-rolled JSON assembly, avoiding the allocation and type-erasure
+/// overhead of `serde_json`. This is the hot path for all structured output
+/// during scanning.
 pub struct JsonlEncoder;
 
 impl JsonlEncoder {
@@ -300,10 +302,9 @@ impl EventEncoder for JsonlEncoder {
 /// `write_json_bytes` / `write_json_str` functions which handle their own
 /// capacity management.
 ///
-/// Wire fields `commit_id` and `change_kind` are only emitted for
-/// [`SourceKind::Git`] findings (when the corresponding `Option` is `Some`).
-/// Filesystem findings omit them entirely to keep output compact.
-pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
+/// Wire fields `commit_id` and `change_kind` are emitted whenever their
+/// corresponding `Option` is `Some`.
+pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     // Static overhead: prefix (~40) + field keys (~60) + 3 u64s (60) + optional fields (~60) + closing (1)
     // = ~221 bytes worst case for static content.
     const STATIC_OVERHEAD: usize = 240;
@@ -356,7 +357,7 @@ pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `progress` object to `buf` (no trailing newline).
-pub fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
+pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
     // Static: prefix (~43) + field keys (~35) + 3 u64s (60) + closing (1) ≈ 140.
     let mut cur = BufCursor::new(buf, 160);
     match p.source {
@@ -380,8 +381,8 @@ pub fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `summary` object to `buf` (no trailing newline).
-pub fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
-    // Static: prefix (~43) + field keys (~80) + 4 u64s (80) + f64 (20) + closing (1) ≈ 224.
+pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
+    // Static: prefix (~43) + field keys (~65) + 4 u64s (80) + f64 (20) + closing (1) ≈ 210.
     let mut cur = BufCursor::new(buf, 240);
     match s.source {
         SourceKind::Fs => {
@@ -410,7 +411,7 @@ pub fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `diagnostic` object to `buf` (no trailing newline).
-pub fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     let mut cur = BufCursor::new(buf, 64);
     cur.push_static(b"{\"type\":\"diagnostic\",\"level\":\"");
     write_json_str(d.level, cur.commit_to_buf());
@@ -442,18 +443,20 @@ fn write_identity_field_cur(cur: &mut BufCursor<'_>, name: &[u8], id: u32) {
 /// `identity` is `None`. When present, individual fields with value
 /// [`SENTINEL_ID`] are emitted as JSON `null` (not as the raw `u32::MAX`
 /// integer) to signal a parse failure to downstream consumers.
-pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
-    // Static: prefix (34) + u64 (20) + oid key (8) + hex (64) + timestamp key (15) + u64 (20)
-    // + 4 identity fields (4 * ~25) + closing (1) ≈ 262.
+pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
+    // Static: prefix (34) + u64 (20) + oid key (8) + hex (64) + timestamp key (14) + u64 (20)
+    // + 4 identity fields (4 * ~40) + closing (1) ≈ 321.
     let mut cur = BufCursor::new(buf, 280);
     cur.push_static(b"{\"type\":\"commit_meta\",\"commit_id\":");
     cur.push_u64(m.commit_id as u64);
     cur.push_static(b",\"oid\":\"");
     // write_oid_hex uses its own reserve + unsafe ptr::write pattern.
     write_oid_hex(&m.commit_oid, cur.commit_to_buf());
-    // Remaining: `","timestamp":` (15) + u64 (20) + 4 identity fields (4 * ~42) + closing (1)
-    // Worst case ≈ 205 bytes.
-    cur.resume(210);
+    // Remaining: `","timestamp":` (14) + u64 (20)
+    // + 4 identity fields: author_name_id (38) + author_email_id (39)
+    //   + committer_name_id (41) + committer_email_id (42) = 160
+    // + closing `}` (1) = 235 bytes worst case.
+    cur.resume(240);
     cur.push_static(b"\",\"timestamp\":");
     cur.push_u64(m.timestamp);
     if let Some(ref ids) = m.identity {
@@ -467,7 +470,7 @@ pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `identity_dictionary` object to `buf` (no trailing newline).
-pub fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
     let mut cur = BufCursor::new(buf, 80);
     cur.push_static(b"{\"type\":\"identity_dictionary\",\"id\":");
     cur.push_u64(d.id as u64);
