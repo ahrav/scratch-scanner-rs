@@ -16,6 +16,45 @@
 
 use std::io::{self, Read};
 
+// ── Counted I/O ─────────────────────────────────────────────────────────────
+
+/// Read wrapper that counts bytes consumed from the underlying reader.
+///
+/// Used to drive best-effort inflation ratio enforcement via budgets.
+///
+/// # Guarantees
+/// - `bytes()` is monotonic and saturating.
+pub struct CountedRead<R> {
+    inner: R,
+    bytes: u64,
+}
+
+impl<R> CountedRead<R> {
+    #[inline]
+    pub fn new(inner: R) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    #[inline]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for CountedRead<R> {
+    #[inline]
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(dst)?;
+        self.bytes = self.bytes.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
 // ── FNV-1a (64-bit) ──────────────────────────────────────────────────────────
 //
 // Non-cryptographic hash used to distinguish truncated display paths and to

@@ -46,6 +46,7 @@ pub mod blob_introducer;
 pub mod blob_spill;
 pub mod byte_arena;
 pub mod bytes;
+pub(crate) mod cache_common;
 pub mod commit_graph;
 pub mod commit_graph_mem;
 pub mod commit_loader;
@@ -62,6 +63,8 @@ pub mod mapping_bridge;
 pub mod midx;
 pub mod midx_build;
 pub mod midx_error;
+#[cfg(test)]
+pub(crate) mod midx_test_builder;
 pub mod object_id;
 pub mod object_store;
 pub mod oid_index;

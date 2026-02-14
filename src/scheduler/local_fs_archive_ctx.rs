@@ -18,7 +18,10 @@ use crate::store::{FsFindingRecord, StoreProducer};
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_gzip::process_gzip_file;
-use super::local_fs_owner::{FileTask, LocalScratch};
+use super::local_fs_owner::{
+    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
+    FileTask, LocalScratch,
+};
 use super::local_fs_tar::{process_tar_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
 use super::metrics::WorkerMetricsLocal;
@@ -248,6 +251,81 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             chunk_size: scratch.chunk_size,
             abort_run: scratch.abort_run.as_ref(),
         }
+    }
+
+    /// Scan a buffer chunk, drain/dedupe findings, emit events + persistence,
+    /// and update chunk metrics.
+    ///
+    /// This is the common core of every archive entry scanning loop. The caller
+    /// is responsible for reading bytes, charging budgets, and managing the outer
+    /// loop condition — this method handles everything from `scan_chunk_into`
+    /// through carry/offset bookkeeping.
+    ///
+    /// Returns `(new_offset, have, carry)` for the next iteration.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan_and_emit_chunk(
+        &mut self,
+        buf: &[u8],
+        carry: usize,
+        offset: u64,
+        allowed: u64,
+        overlap: usize,
+        file_id: FileId,
+        display: &[u8],
+        entry_scanned: &mut bool,
+    ) -> (u64, usize, usize) {
+        let allowed_usize = allowed as usize;
+        let read_len = carry + allowed_usize;
+        let base_offset = offset.saturating_sub(carry as u64);
+        let data = &buf[..read_len];
+
+        self.engine
+            .scan_chunk_into(data, file_id, base_offset, self.scan_scratch);
+        let engine_dropped = self.scan_scratch.dropped_findings();
+        let before_prefix = self.scan_scratch.pending_findings_len();
+        if !*entry_scanned {
+            self.metrics.archive.record_entry_scanned();
+            *entry_scanned = true;
+        }
+
+        self.scan_scratch.drop_prefix_findings(offset);
+        let after_prefix = self.scan_scratch.pending_findings_len();
+
+        self.pending.clear();
+        self.scan_scratch.drain_findings_into(self.pending);
+
+        let before_dedupe = self.pending.len();
+        if self.dedupe && before_dedupe > 1 {
+            dedupe_findings(self.pending);
+        }
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(before_dedupe.saturating_sub(self.pending.len()));
+        account_effective_dropped_findings(self.metrics, engine_dropped, scheduler_pruned);
+
+        self.metrics.findings_emitted = self
+            .metrics
+            .findings_emitted
+            .wrapping_add(self.pending.len() as u64);
+
+        emit_persistence_batch(
+            self.store_producer,
+            self.event_sink,
+            display,
+            self.pending,
+            self.persist_batch,
+            self.metrics,
+        );
+        emit_findings(self.engine.as_ref(), self.event_sink, display, self.pending);
+
+        self.metrics.chunks_scanned = self.metrics.chunks_scanned.saturating_add(1);
+        self.metrics.bytes_scanned = self.metrics.bytes_scanned.saturating_add(allowed);
+
+        let new_offset = offset.saturating_add(allowed);
+        let new_have = read_len;
+        let new_carry = overlap.min(read_len);
+        (new_offset, new_have, new_carry)
     }
 }
 

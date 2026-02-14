@@ -20,11 +20,11 @@
 //!
 //! [SARIF 2.1.0]: https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html
 
-use std::io::{BufWriter, ErrorKind, Write};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use super::events::{with_format_buf, EventSink, FindingEvent, ScanEvent};
+use super::events::{handle_sink_io, with_format_buf, EventSink, FindingEvent, ScanEvent};
 use super::json_write::{write_json_bytes, write_json_str, write_u64};
 
 /// Default buffer size (64 KiB).
@@ -75,12 +75,7 @@ impl<W: Write + Send + 'static> EventSink for SarifEventSink<W> {
                 } else {
                     let _ = writer.write_all(b",");
                 }
-                if let Err(e) = writer.write_all(bytes) {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        return;
-                    }
-                    panic!("sarif event sink write failed: {}", e);
-                }
+                handle_sink_io(writer.write_all(bytes), "sarif event sink write");
             },
         );
     }
@@ -88,18 +83,8 @@ impl<W: Write + Send + 'static> EventSink for SarifEventSink<W> {
     fn flush(&self) {
         let mut writer = self.writer.lock().expect("sarif sink mutex poisoned");
         // Close: results array, run object, runs array, root object.
-        if let Err(e) = writer.write_all(b"]}]}\n") {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("sarif event sink write failed: {}", e);
-        }
-        if let Err(e) = writer.flush() {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("sarif event sink flush failed: {}", e);
-        }
+        handle_sink_io(writer.write_all(b"]}]}\n"), "sarif event sink write");
+        handle_sink_io(writer.flush(), "sarif event sink flush");
     }
 }
 

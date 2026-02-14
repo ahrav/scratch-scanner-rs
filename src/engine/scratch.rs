@@ -890,7 +890,51 @@ impl ScanScratch {
     /// After the first successful call, capacity validation is skipped because
     /// `Engine` is immutable after construction — all checks are idempotent.
     pub(super) fn reset_for_scan(&mut self, engine: &Engine) {
-        // ── Per-scan state clears (must always run) ──────────────────────
+        self.reset_common();
+
+        // ── Per-scan accumulator resets (must always run) ────────────────
+        self.hit_acc_pool
+            .reset_touched(self.touched_pairs.as_slice());
+        self.touched_pairs.clear();
+        self.windows.clear();
+        self.expanded.clear();
+        self.spans.clear();
+
+        self.ensure_capacity(engine);
+    }
+
+    /// Resets per-scan state like `reset_for_scan` but **preserves** the
+    /// prefilter results already stored in `hit_acc_pool` and `touched_pairs`.
+    ///
+    /// # Why a separate method?
+    ///
+    /// `scan_chunk_into` runs the Vectorscan prefilter *before* the per-rule
+    /// scan loop. The prefilter populates `hit_acc_pool` with anchor hits and
+    /// records which (rule, variant) pairs were touched in `touched_pairs`.
+    /// A full `reset_for_scan` would discard that work. This method clears
+    /// everything *except* the accumulator state, so the scan loop can
+    /// immediately consume the prefilter results without re-scanning.
+    pub(super) fn reset_for_scan_after_prefilter(&mut self, engine: &Engine) {
+        self.reset_common();
+
+        // ── Skip hit_acc_pool / touched_pairs reset ─────────────────────
+        // Prefilter results are preserved; only clear the auxiliary buffers.
+        self.windows.clear();
+        self.expanded.clear();
+        self.spans.clear();
+
+        self.ensure_capacity(engine);
+    }
+
+    /// Clear all per-scan transient state.
+    ///
+    /// Shared by `reset_for_scan` and `reset_for_scan_after_prefilter`.
+    /// Does **not** touch accumulators (`hit_acc_pool`, `touched_pairs`) or
+    /// auxiliary buffers (`windows`, `expanded`, `spans`) — the caller
+    /// decides whether to reset those based on whether prefilter results
+    /// should be preserved.
+    #[inline(always)]
+    fn reset_common(&mut self) {
         self.out.clear();
         self.norm_hash.clear();
         self.drop_hint_end.clear();
@@ -930,76 +974,6 @@ impl ScanScratch {
         self.root_span_map_ctx = None;
         #[cfg(feature = "b64-stats")]
         self.base64_stats.reset();
-
-        // ── Per-scan accumulator resets (must always run) ────────────────
-        self.hit_acc_pool
-            .reset_touched(self.touched_pairs.as_slice());
-        self.touched_pairs.clear();
-        self.windows.clear();
-        self.expanded.clear();
-        self.spans.clear();
-
-        self.ensure_capacity(engine);
-    }
-
-    /// Resets per-scan state like `reset_for_scan` but **preserves** the
-    /// prefilter results already stored in `hit_acc_pool` and `touched_pairs`.
-    ///
-    /// # Why a separate method?
-    ///
-    /// `scan_chunk_into` runs the Vectorscan prefilter *before* the per-rule
-    /// scan loop. The prefilter populates `hit_acc_pool` with anchor hits and
-    /// records which (rule, variant) pairs were touched in `touched_pairs`.
-    /// A full `reset_for_scan` would discard that work. This method clears
-    /// everything *except* the accumulator state, so the scan loop can
-    /// immediately consume the prefilter results without re-scanning.
-    pub(super) fn reset_for_scan_after_prefilter(&mut self, engine: &Engine) {
-        // ── Per-scan state clears (same as reset_for_scan) ──────────────
-        self.out.clear();
-        self.norm_hash.clear();
-        self.drop_hint_end.clear();
-        self.findings_dropped = 0;
-        self.safelist_suppressed = 0;
-        self.offline_suppressed = 0;
-        self.work_q.clear();
-        self.work_head = 0;
-        self.slab.reset();
-        self.seen.reset();
-        self.seen_findings_scan.reset();
-        self.total_decode_output_bytes = 0;
-        self.work_items_enqueued = 0;
-        self.decode_ring.reset();
-        self.window_bytes.clear();
-        self.drain_batch.clear();
-        self.pending_windows.reset();
-        self.vs_stream_matches.clear();
-        self.pending_spans.clear();
-        self.span_streams.clear();
-        self.tmp_findings.clear();
-        self.tmp_drop_hint_end.clear();
-        self.tmp_norm_hash.clear();
-        for idx in self.stream_hit_touched.drain() {
-            let slot = idx as usize;
-            if let Some(hit) = self.stream_hit_counts.get_mut(slot) {
-                *hit = 0;
-            }
-        }
-        self.step_arena.reset();
-        self.utf16_buf.clear();
-        if let Some(entropy) = self.entropy_scratch.as_mut() {
-            entropy.reset();
-        }
-        self.root_span_map_ctx = None;
-        #[cfg(feature = "b64-stats")]
-        self.base64_stats.reset();
-
-        // ── Skip hit_acc_pool / touched_pairs reset ─────────────────────
-        // Prefilter results are preserved; only clear the auxiliary buffers.
-        self.windows.clear();
-        self.expanded.clear();
-        self.spans.clear();
-
-        self.ensure_capacity(engine);
     }
 
     /// Idempotent capacity / Vectorscan-scratch validation.
@@ -1022,94 +996,39 @@ impl ScanScratch {
 
         // ── 1. Vectorscan scratch rebinding ───────────────────────────────
         //
-        // Five stanzas (vs, vs_utf16, vs_utf16_stream, vs_stream, vs_gate)
-        // each check whether the scratch is still bound to the current DB
-        // pointer and reallocate if not.
-        match engine.vs.as_ref() {
-            Some(db) => {
-                let need_alloc = match self.vs_scratch.as_ref() {
-                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
-                    None => true,
-                };
-                if need_alloc {
-                    self.vs_scratch = Some(
-                        db.alloc_scratch()
-                            .expect("vectorscan scratch allocation failed"),
-                    );
+        // Five DB/scratch pairs each check whether the scratch is still bound
+        // to the current DB pointer and reallocate if not.
+        macro_rules! rebind_vs_scratch {
+            ($db_field:expr, $scratch_field:expr, $label:literal) => {
+                match $db_field.as_ref() {
+                    Some(db) => {
+                        let need_alloc = match $scratch_field.as_ref() {
+                            Some(s) => s.bound_db_ptr() != db.db_ptr(),
+                            None => true,
+                        };
+                        if need_alloc {
+                            $scratch_field = Some(db.alloc_scratch().expect(concat!(
+                                "vectorscan ",
+                                $label,
+                                " scratch allocation failed"
+                            )));
+                        }
+                    }
+                    None => {
+                        $scratch_field = None;
+                    }
                 }
-            }
-            None => {
-                self.vs_scratch = None;
-            }
+            };
         }
-        match engine.vs_utf16.as_ref() {
-            Some(db) => {
-                let need_alloc = match self.vs_utf16_scratch.as_ref() {
-                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
-                    None => true,
-                };
-                if need_alloc {
-                    self.vs_utf16_scratch = Some(
-                        db.alloc_scratch()
-                            .expect("vectorscan utf16 scratch allocation failed"),
-                    );
-                }
-            }
-            None => {
-                self.vs_utf16_scratch = None;
-            }
-        }
-        match engine.vs_utf16_stream.as_ref() {
-            Some(db) => {
-                let need_alloc = match self.vs_utf16_stream_scratch.as_ref() {
-                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
-                    None => true,
-                };
-                if need_alloc {
-                    self.vs_utf16_stream_scratch = Some(
-                        db.alloc_scratch()
-                            .expect("vectorscan utf16 stream scratch allocation failed"),
-                    );
-                }
-            }
-            None => {
-                self.vs_utf16_stream_scratch = None;
-            }
-        }
-        match engine.vs_stream.as_ref() {
-            Some(db) => {
-                let need_alloc = match self.vs_stream_scratch.as_ref() {
-                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
-                    None => true,
-                };
-                if need_alloc {
-                    self.vs_stream_scratch = Some(
-                        db.alloc_scratch()
-                            .expect("vectorscan stream scratch allocation failed"),
-                    );
-                }
-            }
-            None => {
-                self.vs_stream_scratch = None;
-            }
-        }
-        match engine.vs_gate.as_ref() {
-            Some(db) => {
-                let need_alloc = match self.vs_gate_scratch.as_ref() {
-                    Some(s) => s.bound_db_ptr() != db.db_ptr(),
-                    None => true,
-                };
-                if need_alloc {
-                    self.vs_gate_scratch = Some(
-                        db.alloc_scratch()
-                            .expect("vectorscan gate scratch allocation failed"),
-                    );
-                }
-            }
-            None => {
-                self.vs_gate_scratch = None;
-            }
-        }
+        rebind_vs_scratch!(engine.vs, self.vs_scratch, "prefilter");
+        rebind_vs_scratch!(engine.vs_utf16, self.vs_utf16_scratch, "utf16");
+        rebind_vs_scratch!(
+            engine.vs_utf16_stream,
+            self.vs_utf16_stream_scratch,
+            "utf16 stream"
+        );
+        rebind_vs_scratch!(engine.vs_stream, self.vs_stream_scratch, "stream");
+        rebind_vs_scratch!(engine.vs_gate, self.vs_gate_scratch, "gate");
 
         // ── 2. Hit accumulator pool + per-rule/variant vectors ──────────
         //

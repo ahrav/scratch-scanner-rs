@@ -5,7 +5,7 @@
 //! - `MultiGzDecoder` treats concatenated members as a single stream.
 //!
 //! # Design Notes
-//! - `CountedRead` provides compressed-byte accounting for ratio budgets.
+//! - [`CountedRead`](crate::archive::util::CountedRead) provides compressed-byte accounting for ratio budgets.
 //! - `flate2::read::MultiGzDecoder` may allocate internally; this is treated as
 //!   an allowed library exception under the "no allocations after startup"
 //!   policy.
@@ -17,6 +17,8 @@ use std::io::{self, Read};
 
 use flate2::read::MultiGzDecoder;
 
+pub use crate::archive::util::CountedRead;
+
 /// gzip magic bytes (RFC 1952).
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const GZIP_CM_DEFLATE: u8 = 8;
@@ -26,43 +28,6 @@ const GZIP_FLAG_FNAME: u8 = 0x08;
 #[inline(always)]
 pub fn is_gzip_magic(header: &[u8]) -> bool {
     header.len() >= 2 && header[0] == GZIP_MAGIC[0] && header[1] == GZIP_MAGIC[1]
-}
-
-/// Read wrapper that counts compressed bytes consumed.
-///
-/// This is used to drive best-effort inflation ratio enforcement via budgets.
-///
-/// # Guarantees
-/// - `bytes()` is monotonic and saturating.
-pub struct CountedRead<R> {
-    inner: R,
-    bytes: u64,
-}
-
-impl<R> CountedRead<R> {
-    #[inline]
-    pub fn new(inner: R) -> Self {
-        Self { inner, bytes: 0 }
-    }
-
-    #[inline]
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    #[inline]
-    pub fn into_inner(self) -> R {
-        self.inner
-    }
-}
-
-impl<R: Read> Read for CountedRead<R> {
-    #[inline]
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(dst)?;
-        self.bytes = self.bytes.saturating_add(n as u64);
-        Ok(n)
-    }
 }
 
 /// Reader that can "peek" a bounded prefix without losing it.

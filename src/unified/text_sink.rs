@@ -16,12 +16,12 @@
 //! | CommitMeta | suppressed | `[commit_meta] id={} oid={} ts={}` (identity IDs omitted) |
 //! | IdentityDictionary | suppressed | suppressed |
 
-use std::io::{self, BufWriter, ErrorKind, Write};
+use std::io::{self, BufWriter, Write};
 use std::sync::Mutex;
 
 use super::events::{
-    CommitMetaEvent, DiagnosticEvent, EventSink, FindingEvent, ProgressEvent, ScanEvent,
-    SummaryEvent,
+    handle_sink_io, CommitMetaEvent, DiagnosticEvent, EventSink, FindingEvent, ProgressEvent,
+    ScanEvent, SummaryEvent,
 };
 use super::json_write::write_oid_hex;
 use super::SourceKind;
@@ -56,7 +56,7 @@ impl<W: Write + Send> TextEventSink<W> {
 
     fn write_buffer(&self, buf: &[u8]) {
         let mut w = self.writer.lock().expect("text sink mutex poisoned");
-        handle_write_error(w.write_all(buf));
+        handle_sink_io(w.write_all(buf), "text event sink write");
     }
 }
 
@@ -103,21 +103,7 @@ impl<W: Write + Send + 'static> EventSink for TextEventSink<W> {
 
     fn flush(&self) {
         let mut writer = self.writer.lock().expect("text sink mutex poisoned");
-        handle_write_error(writer.flush());
-    }
-}
-
-/// Swallow `BrokenPipe`; panic on any other I/O error.
-///
-/// All text-sink write paths to the main writer funnel through this so
-/// the error policy is defined in exactly one place. Diagnostics go to
-/// stderr with a separate best-effort policy (see [`write_diagnostic`]).
-fn handle_write_error(result: io::Result<()>) {
-    if let Err(e) = result {
-        if e.kind() == ErrorKind::BrokenPipe {
-            return;
-        }
-        panic!("text event sink write failed: {e}");
+        handle_sink_io(writer.flush(), "text event sink flush");
     }
 }
 
@@ -253,6 +239,8 @@ fn write_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+
     use super::*;
     use crate::unified::events::ScanEvent;
 
@@ -778,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "text event sink write failed")]
+    #[should_panic(expected = "text event sink flush failed")]
     fn non_broken_pipe_error_panics() {
         let sink = TextEventSink::new(FailWriter, false);
         // flush() calls FailWriter::flush() → PermissionDenied → must panic.
@@ -831,7 +819,7 @@ mod tests {
     /// in-memory without hitting the underlying writer. Once the buffer
     /// is full, `BufWriter` flushes to `LimitedWriter`. The first
     /// 32 KiB flush succeeds, but the remaining data triggers
-    /// `WriteZero`, which propagates through [`handle_write_error`] and
+    /// `WriteZero`, which propagates through [`handle_sink_io`] and
     /// panics.
     ///
     /// This is more realistic than [`non_broken_pipe_error_panics`]
@@ -846,7 +834,7 @@ mod tests {
         // Each compact finding line is ~80 bytes. The 64 KiB BufWriter
         // buffer fills after ~800 findings, at which point it flushes to
         // LimitedWriter. The first flush writes 32 KiB successfully but
-        // the remaining data hits WriteZero → panic via handle_write_error.
+        // the remaining data hits WriteZero → panic via handle_sink_io.
         for _ in 0..2_000 {
             sink.emit(ScanEvent::Finding(FindingEvent {
                 source: SourceKind::Fs,

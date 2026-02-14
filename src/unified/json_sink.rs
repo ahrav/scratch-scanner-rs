@@ -40,13 +40,13 @@
 //! - Broken-pipe errors are silently swallowed (for piped consumers like
 //!   `head`); all other I/O errors panic.
 
-use std::io::{BufWriter, ErrorKind, Write};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::events::{
     encode_commit_meta, encode_diagnostic, encode_finding, encode_identity_dictionary,
-    encode_progress, encode_summary, with_format_buf, EventSink, ScanEvent,
+    encode_progress, encode_summary, handle_sink_io, with_format_buf, EventSink, ScanEvent,
 };
 
 /// Default `BufWriter` capacity (64 KiB).
@@ -108,36 +108,16 @@ impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
                 } else {
                     b",\n"
                 };
-                if let Err(e) = writer.write_all(sep) {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        return;
-                    }
-                    panic!("json event sink write failed: {}", e);
-                }
-                if let Err(e) = writer.write_all(bytes) {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        return;
-                    }
-                    panic!("json event sink write failed: {}", e);
-                }
+                handle_sink_io(writer.write_all(sep), "json event sink write");
+                handle_sink_io(writer.write_all(bytes), "json event sink write");
             },
         );
     }
 
     fn flush(&self) {
         let mut writer = self.writer.lock().expect("json sink mutex poisoned");
-        if let Err(e) = writer.write_all(b"\n]\n") {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("json event sink write failed: {}", e);
-        }
-        if let Err(e) = writer.flush() {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("json event sink flush failed: {}", e);
-        }
+        handle_sink_io(writer.write_all(b"\n]\n"), "json event sink write");
+        handle_sink_io(writer.flush(), "json event sink flush");
     }
 }
 
