@@ -1241,10 +1241,16 @@ where
             // u8 tags fit in a single 128-bit register for WAYS ≤ 16; SSE2 is optimal.
             let tag_u8: u8 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u8;
+            // SAFETY: tags_ptr is derived from a valid &[TagT; WAYS] and tag_u8 is
+            // transmute_copy'd from a TagT whose BITS == 8. The caller has verified
+            // that the avx2 target feature is available.
             unsafe { Self::search_tags_u8_sse2::<WAYS>(tags_ptr, tag_u8) }
         } else {
             let tag_u16: u16 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u16;
+            // SAFETY: tags_ptr is derived from a valid &[TagT; WAYS] and tag_u16 is
+            // transmute_copy'd from a TagT whose BITS == 16. The avx2 target feature
+            // is enabled on this function.
             unsafe { Self::search_tags_u16_avx2::<WAYS>(tags_ptr, tag_u16) }
         }
     }
