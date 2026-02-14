@@ -25,6 +25,10 @@ inputs:
     description: "Workspaces for rust-cache (e.g. 'fuzz -> target')"
     required: false
     default: ""
+  targets:
+    description: "Additional rustup targets to install (space-separated)"
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -40,6 +44,7 @@ runs:
       with:
         toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
 
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9

@@ -171,7 +171,8 @@ jobs:
         with:
           toolchain: nightly
           shared-key: nightly-linux-fuzz
-          extra-apt: "clang llvm"
+          extra-apt: "clang llvm musl-tools"
+          targets: "x86_64-unknown-linux-musl"
           cache-workspaces: "fuzz -> target"
 
       - name: Install cargo-fuzz
@@ -213,7 +214,8 @@ jobs:
         with:
           toolchain: nightly
           shared-key: nightly-linux-fuzz
-          extra-apt: "clang llvm"
+          extra-apt: "clang llvm musl-tools"
+          targets: "x86_64-unknown-linux-musl"
           cache-workspaces: "fuzz -> target"
 
       - name: Install cargo-fuzz
