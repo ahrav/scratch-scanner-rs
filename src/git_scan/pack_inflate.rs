@@ -838,35 +838,39 @@ fn decode_copy_params(
     // Verified by exhaustive test over all 128 mask combos and Miri.
     let mut cursor = start;
     let mut off: usize = 0;
-    if (off_mask & 0x01) != 0 {
-        off |= unsafe { *delta.get_unchecked(cursor) } as usize;
-        cursor += 1;
-    }
-    if (off_mask & 0x02) != 0 {
-        off |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 8;
-        cursor += 1;
-    }
-    if (off_mask & 0x04) != 0 {
-        off |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 16;
-        cursor += 1;
-    }
-    if (off_mask & 0x08) != 0 {
-        off |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 24;
-        cursor += 1;
-    }
-
     let mut size: usize = 0;
-    if (size_mask & 0x01) != 0 {
-        size |= unsafe { *delta.get_unchecked(cursor) } as usize;
-        cursor += 1;
-    }
-    if (size_mask & 0x02) != 0 {
-        size |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 8;
-        cursor += 1;
-    }
-    if (size_mask & 0x04) != 0 {
-        size |= (unsafe { *delta.get_unchecked(cursor) } as usize) << 16;
-        cursor += 1;
+    // SAFETY: `cursor` bounds are validated above by proving
+    // `start <= cursor < end <= delta.len()` for every read in this block.
+    unsafe {
+        if (off_mask & 0x01) != 0 {
+            off |= *delta.get_unchecked(cursor) as usize;
+            cursor += 1;
+        }
+        if (off_mask & 0x02) != 0 {
+            off |= (*delta.get_unchecked(cursor) as usize) << 8;
+            cursor += 1;
+        }
+        if (off_mask & 0x04) != 0 {
+            off |= (*delta.get_unchecked(cursor) as usize) << 16;
+            cursor += 1;
+        }
+        if (off_mask & 0x08) != 0 {
+            off |= (*delta.get_unchecked(cursor) as usize) << 24;
+            cursor += 1;
+        }
+
+        if (size_mask & 0x01) != 0 {
+            size |= *delta.get_unchecked(cursor) as usize;
+            cursor += 1;
+        }
+        if (size_mask & 0x02) != 0 {
+            size |= (*delta.get_unchecked(cursor) as usize) << 8;
+            cursor += 1;
+        }
+        if (size_mask & 0x04) != 0 {
+            size |= (*delta.get_unchecked(cursor) as usize) << 16;
+            cursor += 1;
+        }
     }
     *pos = cursor;
 

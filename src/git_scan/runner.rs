@@ -268,7 +268,7 @@ pub(crate) const PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS: u64 = 2_000_000;
 /// Tier ranges:
 /// - `[0, SMALL)` -> `1`
 /// - `[SMALL, MEDIUM)` -> `3`
-/// - `[MEDIUM, +inf)` -> `4`
+/// - `[MEDIUM, +inf)` -> `6`
 ///
 /// Larger repositories intentionally over-subscribe cores to better hide
 /// pack I/O and page-fault latency during decode + scan.
@@ -279,7 +279,7 @@ pub(crate) fn pack_exec_worker_multiplier_for_in_pack(in_pack_objects: u64) -> u
     } else if in_pack_objects < PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS {
         3
     } else {
-        4
+        6
     }
 }
 
@@ -1277,7 +1277,7 @@ mod tests {
                 PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
                 12
             ),
-            48
+            72
         );
     }
 
@@ -1290,6 +1290,13 @@ mod tests {
                 0
             ),
             3
+        );
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                0
+            ),
+            6
         );
     }
 

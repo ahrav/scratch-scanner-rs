@@ -91,6 +91,12 @@ mode) and pack execution introduce parallelism:
   sharded mode, plans use `shard_ranges()` over execution indices. Each
   worker owns its own `PackCache` and `EngineAdapter`, and outputs are
   reassembled in deterministic plan/shard order.
+- **Auto-sized pack worker width** applies when the CLI omits `--workers`.
+  The orchestrator probes `git count-objects -v` (`in-pack`) and chooses
+  `pack_exec_workers` by tier:
+  - `< 100,000` in-pack objects: `1x` logical cores
+  - `< 2,000,000` in-pack objects: `3x` logical cores
+  - `>= 2,000,000` in-pack objects: `6x` logical cores
 
 There are no in-flight queues between the serial stages; instead, each stage
 enforces explicit bounds:
