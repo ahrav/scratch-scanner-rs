@@ -299,8 +299,14 @@ impl TreeCache {
         hash as usize & (self.sets - 1)
     }
 
+    /// Selects a victim slot within the set using the CLOCK algorithm.
+    ///
+    /// The hand sweeps at most `2 × WAYS` positions. On the first pass a
+    /// recently-used slot has its clock bit cleared (second chance). On the
+    /// second pass the same slot will be evictable. Pinned slots are always
+    /// skipped. Returns `None` when every slot in the set is pinned or
+    /// recently used (all slots survived two passes).
     fn select_victim(&mut self, base: usize, set: usize) -> Option<usize> {
-        // CLOCK: pick the first slot with clock=0, clearing clock bits as we go.
         let mut hand = self.clock_hands[set] as usize % WAYS;
         for _ in 0..(WAYS * 2) {
             let idx = base + hand;
@@ -321,8 +327,11 @@ impl TreeCache {
         None
     }
 
+    /// Overwrites slot `idx` with a new entry, copying `bytes` into the arena.
+    ///
+    /// Resets the pin count to 0 (the caller ensures the slot is unpinned
+    /// before calling this).
     fn write_slot(&mut self, idx: usize, oid: OidBytes, bytes: &[u8]) {
-        // Copy into the slot's fixed storage region.
         let offset = idx * self.slot_size as usize;
         let end = offset + bytes.len();
         self.storage[offset..end].copy_from_slice(bytes);
