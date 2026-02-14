@@ -1,5 +1,20 @@
 //! Stable, explicit outcome codes for archive scanning.
 //!
+//! Every archive encounter produces one of three outcomes:
+//!
+//! 1. **Skipped** — the entire archive (or a single entry) was rejected before
+//!    any content bytes were decompressed.  Tracked by [`ArchiveSkipReason`] and
+//!    [`EntrySkipReason`].
+//! 2. **Partial** — decompression started but a budget / integrity limit was hit
+//!    mid-stream; bytes already produced were still scanned.  Tracked by
+//!    [`PartialReason`].
+//! 3. **Scanned** — the archive (or entry) was fully decompressed and scanned.
+//!
+//! [`ArchiveStats`] aggregates per-reason counters and a bounded sample ring
+//! ([`ArchiveSampleRing`]) across all three tiers.  Stats are accumulated
+//! per-worker and merged upward, so all operations are `Copy`-friendly and
+//! allocation-free.
+//!
 //! # Invariants
 //! - Enums are `#[repr(u8)]` with stable discriminants; new variants must be appended.
 //! - `COUNT` constants must match the last variant + 1.
@@ -177,8 +192,10 @@ impl PartialReason {
     }
 }
 
-// Keep these arrays aligned with discriminant order; merge/formatting iterate
-// reasons explicitly and tests assert the alignment.
+// Iteration tables — `merge_from` and formatting code iterate these rather than
+// hard-coding discriminant ranges, so adding a new variant only requires
+// appending here (plus the enum itself).  Tests assert alignment with
+// discriminant order.
 const ARCHIVE_SKIP_REASONS: [ArchiveSkipReason; ArchiveSkipReason::COUNT] = [
     ArchiveSkipReason::Disabled,
     ArchiveSkipReason::UnsupportedFormat,
@@ -226,8 +243,16 @@ const PARTIAL_REASONS: [PartialReason; PartialReason::COUNT] = [
 // Bounded samples (optional)
 // -----------------------------
 
-/// Classifies a bounded sample by granularity (archive vs entry) and
-/// outcome (skipped vs partial).
+/// Classifies a bounded sample along two axes:
+///
+/// | | Skipped | Partial |
+/// |---------|---------|---------|
+/// | Archive | `ArchiveSkipped` | `ArchivePartial` |
+/// | Entry   | `EntrySkipped`   | `EntryPartial`   |
+///
+/// The discriminant determines how [`ArchiveSample::reason`] is interpreted:
+/// skipped variants use [`ArchiveSkipReason`] / [`EntrySkipReason`] discriminants,
+/// while partial variants use [`PartialReason`] discriminants.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleKind {
@@ -243,16 +268,28 @@ pub const ARCHIVE_SAMPLE_MAX: usize = 32;
 pub const ARCHIVE_SAMPLE_PATH_PREFIX_MAX: usize = 192;
 
 /// Bounded sample of a skip/partial outcome with a path prefix.
+///
+/// Fixed-size (`Copy`) so it can live in stack-allocated arrays without heap
+/// allocation on the hot path.  Path bytes beyond [`ARCHIVE_SAMPLE_PATH_PREFIX_MAX`]
+/// are silently truncated.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveSample {
     pub kind: SampleKind,
-    /// Reason enum discriminant (ArchiveSkipReason/EntrySkipReason/PartialReason).
+    /// Raw discriminant of the reason enum that caused this outcome.
+    ///
+    /// Interpretation depends on [`kind`](Self::kind):
+    /// - `ArchiveSkipped` → cast to [`ArchiveSkipReason`]
+    /// - `EntrySkipped`   → cast to [`EntrySkipReason`]
+    /// - `ArchivePartial` / `EntryPartial` → cast to [`PartialReason`]
     pub reason: u8,
+    /// Actual byte length of the path stored in `path_prefix` (may be less
+    /// than the original path if it was truncated).
     pub path_len: u16,
     pub path_prefix: [u8; ARCHIVE_SAMPLE_PATH_PREFIX_MAX],
 }
 
 impl ArchiveSample {
+    /// Zero-valued sentinel used to fill empty slots in [`ArchiveSampleRing`].
     pub const EMPTY: Self = Self {
         kind: SampleKind::ArchiveSkipped,
         reason: 0,
@@ -260,6 +297,7 @@ impl ArchiveSample {
         path_prefix: [0u8; ARCHIVE_SAMPLE_PATH_PREFIX_MAX],
     };
 
+    /// Returns the valid (possibly truncated) path bytes for this sample.
     #[inline]
     pub fn path_bytes(&self) -> &[u8] {
         &self.path_prefix[..self.path_len as usize]
@@ -375,11 +413,20 @@ impl Default for ArchiveStats {
 }
 
 impl ArchiveStats {
+    /// Returns `true` only when both `perf-stats` and `debug_assertions` are active.
+    ///
+    /// In release builds this is a compile-time `false`, so the compiler
+    /// eliminates every `record_*` method body entirely — verified via
+    /// `cargo asm`: `record_archive_seen` (and siblings) are absent from
+    /// the release binary.
     #[inline(always)]
     fn recording_enabled() -> bool {
         cfg!(all(feature = "perf-stats", debug_assertions))
     }
 
+    /// Returns `true` if any archive or entry was seen, scanned, skipped,
+    /// or had path anomalies.  Used to gate summary output — callers skip
+    /// formatting when no archive work occurred at all.
     #[inline]
     pub fn has_activity(&self) -> bool {
         self.archives_seen != 0
@@ -409,6 +456,11 @@ impl ArchiveStats {
         self.archives_scanned = self.archives_scanned.wrapping_add(1);
     }
 
+    /// Record an archive-level skip.  When `sample` is true and the ring has
+    /// capacity, a bounded path sample is captured for later diagnostics.
+    ///
+    /// (The `let _ = ...` in the disabled path suppresses unused-parameter
+    /// warnings; the same pattern appears in all `record_*` siblings.)
     #[inline]
     pub fn record_archive_skipped(
         &mut self,

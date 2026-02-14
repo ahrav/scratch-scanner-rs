@@ -181,6 +181,10 @@ harness = false
 name = "runtime_hotpath"
 harness = false
 
+[[bench]]
+name = "archive_detect"
+harness = false
+
 [profile.dev]
 opt-level = 1
 
