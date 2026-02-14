@@ -171,8 +171,7 @@ jobs:
         with:
           toolchain: nightly
           shared-key: nightly-linux-fuzz
-          extra-apt: "clang llvm musl-tools"
-          targets: "x86_64-unknown-linux-musl"
+          extra-apt: "clang llvm"
           cache-workspaces: "fuzz -> target"
 
       - name: Install cargo-fuzz
@@ -193,10 +192,10 @@ jobs:
       - name: Run pack fuzz targets
         working-directory: fuzz
         run: |
-          cargo +nightly fuzz run fuzz_pack_parse_delta    -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream  -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_delta_into      -- -max_total_time=${FUZZ_SECONDS}
-          cargo +nightly fuzz run fuzz_pack_exec            -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_parse_delta    --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_inflate_stream  --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_delta_into      --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
+          cargo +nightly fuzz run fuzz_pack_exec            --target x86_64-unknown-linux-gnu -- -max_total_time=${FUZZ_SECONDS}
 
   # ---------------------------------------------------------------------------
   # Fuzz: scheduled nightly (Linux)
@@ -214,8 +213,7 @@ jobs:
         with:
           toolchain: nightly
           shared-key: nightly-linux-fuzz
-          extra-apt: "clang llvm musl-tools"
-          targets: "x86_64-unknown-linux-musl"
+          extra-apt: "clang llvm"
           cache-workspaces: "fuzz -> target"
 
       - name: Install cargo-fuzz
@@ -236,15 +234,15 @@ jobs:
       - name: Run fuzz targets
         working-directory: fuzz
         run: |
-          cargo +nightly fuzz run fuzz_anchor_soundness -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_build_and_scan -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_determinism -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_differential -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_parse_delta -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_anchor_soundness --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_b64_gate_build_and_scan --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_b64_gate_determinism --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_b64_gate_differential --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_parse_delta --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_inflate_stream --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_delta_into --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_exec --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_json_write_equivalence --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
 
   # ---------------------------------------------------------------------------
   # Fuzz: scheduled nightly (macOS)

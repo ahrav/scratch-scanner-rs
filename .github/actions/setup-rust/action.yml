@@ -26,7 +26,7 @@ inputs:
     required: false
     default: ""
   targets:
-    description: "Additional rustup targets to install (space-separated)"
+    description: "Additional rustup targets to install (e.g. x86_64-unknown-linux-musl)"
     required: false
     default: ""
 
