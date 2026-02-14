@@ -651,6 +651,9 @@ fn is_zero_block(b: &[u8; TAR_BLOCK_LEN]) -> bool {
         let mut acc: u64 = 0;
         let mut j = 0;
         while j < 64 && i + j < TAR_BLOCK_LEN {
+            // SAFETY: `i + j` is always in `[0, 504]` (outer stride 64, inner stride 8,
+            // total 512), so `ptr.add(i + j)` plus an 8-byte read stays within the
+            // 512-byte array. Formally verified by `kani_proofs::verify_is_zero_block_bounds`.
             acc |= unsafe { ptr.add(i + j).cast::<u64>().read_unaligned() };
             j += 8;
         }

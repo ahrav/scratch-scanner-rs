@@ -944,6 +944,7 @@ mod tests {
         // Mimic parse_local_file_header: clear, set_len, fill.
         buf.clear();
         let store_len = 32usize.min(cap);
+        // SAFETY: `store_len` (32) <= `cap` (64); all bytes are filled immediately below.
         unsafe {
             buf.set_len(store_len);
         }
@@ -964,6 +965,8 @@ mod tests {
 
         buf.clear();
         let store_len = 32usize.min(cap);
+        // SAFETY: `store_len` (32) <= `cap` (64); simulates the error path where
+        // uninit bytes are never read — `clear()` below sets len=0 without reading.
         unsafe {
             buf.set_len(store_len);
         }
@@ -977,6 +980,7 @@ mod tests {
         assert_eq!(buf.capacity(), cap);
 
         // After clear, the buffer is safe to reuse with a new set_len+fill.
+        // SAFETY: 16 <= `cap` (64); all bytes are filled immediately below.
         unsafe {
             buf.set_len(16);
         }
@@ -996,6 +1000,7 @@ mod tests {
         // The code guards: `if store_len > 0 { unsafe { set_len(...) } }`
         // so store_len == 0 never enters the unsafe block.
         if store_len > 0 {
+            // SAFETY: `store_len` <= `cap`; dead code here since `store_len == 0`.
             unsafe {
                 buf.set_len(store_len);
             }
@@ -1011,6 +1016,7 @@ mod tests {
 
         buf.clear();
         let store_len = cap; // store_len == capacity
+                             // SAFETY: `store_len == cap` (64); all bytes are filled immediately below.
         unsafe {
             buf.set_len(store_len);
         }

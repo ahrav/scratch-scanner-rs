@@ -676,6 +676,7 @@ mod tests {
     fn get_unchecked_oob_debug_panics() {
         let vec = ScratchVec::<u32>::with_capacity(4).unwrap();
         // vec is empty, so index 0 is out of bounds.
+        // SAFETY: intentionally OOB to test the debug_assert panic.
         unsafe {
             vec.get_unchecked(0);
         }
@@ -689,6 +690,7 @@ mod tests {
         vec.push(30);
 
         // Valid indices: first, middle, last.
+        // SAFETY: indices 0, 1, 2 are all in bounds (vec.len() == 3).
         unsafe {
             assert_eq!(*vec.get_unchecked(0), 10);
             assert_eq!(*vec.get_unchecked(1), 20);
@@ -697,6 +699,7 @@ mod tests {
 
         // After pop, last valid index shrinks.
         vec.pop();
+        // SAFETY: indices 0, 1 are in bounds (vec.len() == 2).
         unsafe {
             assert_eq!(*vec.get_unchecked(0), 10);
             assert_eq!(*vec.get_unchecked(1), 20);
@@ -705,6 +708,7 @@ mod tests {
         // After clear + refill, indices are fresh.
         vec.clear();
         vec.push(99);
+        // SAFETY: index 0 is in bounds (vec.len() == 1).
         unsafe {
             assert_eq!(*vec.get_unchecked(0), 99);
         }
@@ -949,6 +953,7 @@ mod proptests {
                     }
                     Op::GetUnchecked(idx) => {
                         if idx < scratch.len() {
+                            // SAFETY: `idx < scratch.len()` is checked on the line above.
                             let unchecked = unsafe { *scratch.get_unchecked(idx) };
                             prop_assert_eq!(unchecked, shadow[idx]);
                         }
