@@ -3,6 +3,7 @@ use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
 use crate::archive::PartialReason;
 use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
 use crate::scheduler::engine_trait::{EngineScratch, FindingWithHash, ScanEngine};
+use crate::scheduler::local_fs_archive_ctx::{apply_entry_budget_clamp, ArchiveEnd};
 use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
 use crate::unified::events::VecEventSink;
 use crate::Engine;

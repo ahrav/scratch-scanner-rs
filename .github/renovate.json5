@@ -1,0 +1,62 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":preserveSemverRanges"
+  ],
+
+  // Weekly batching to reduce noise
+  "schedule": ["before 7am on Monday"],
+  "timezone": "America/Los_Angeles",
+
+  // PR limits
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 4,
+
+  // Dependency dashboard for visibility
+  "dependencyDashboard": true,
+
+  // Lock file maintenance (weekly refresh of Cargo.lock)
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 7am on Monday"]
+  },
+
+  "packageRules": [
+    // Group all non-major Cargo updates into one PR
+    {
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "rust minor/patch dependencies",
+      "automerge": true
+    },
+    // Major Cargo updates get individual PRs (need manual review)
+    {
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "labels": ["dependencies", "breaking"]
+    },
+    // Group all GitHub Actions updates
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "automerge": true
+    },
+    // Fuzz workspace - group everything
+    {
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["fuzz/Cargo.toml"],
+      "groupName": "fuzz dependencies",
+      "automerge": true
+    }
+  ],
+
+  // Labels for all Renovate PRs
+  "labels": ["dependencies"],
+
+  // Cargo-specific: keep range strategy as auto (widen or update-lockfile)
+  "cargo": {
+    "rangeStrategy": "auto"
+  }
+}
