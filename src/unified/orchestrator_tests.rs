@@ -30,39 +30,40 @@ fn rules_hash_is_stable_and_hex_sized() {
 }
 
 #[test]
-fn resolve_rule_source_prefers_explicit_path_over_defaults() {
+fn resolve_rule_source_prefers_explicit_path_over_default() {
     let dir = tempfile::tempdir().unwrap();
     let explicit = dir.path().join("custom_rules.yaml");
-    let executable_default = dir.path().join("exe_default_rules.yaml");
+    let candidate = dir.path().join("exe_default_rules.yaml");
     touch_default_rules_file(&explicit);
-    touch_default_rules_file(&executable_default);
+    touch_default_rules_file(&candidate);
 
-    let source = resolve_rule_source(Some(&explicit), Some(executable_default.as_path()));
+    let source = resolve_rule_source(Some(&explicit), Some(candidate.as_path()));
     assert_eq!(source, RuleSource::Explicit(explicit));
 }
 
 #[test]
-fn resolve_rule_source_uses_executable_default_when_present() {
+fn resolve_rule_source_uses_existing_default() {
     let dir = tempfile::tempdir().unwrap();
-    let executable_default = dir.path().join("exe_default_rules.yaml");
-    touch_default_rules_file(&executable_default);
+    let candidate = dir.path().join("default_rules.yaml");
+    touch_default_rules_file(&candidate);
 
-    let source = resolve_rule_source(None, Some(executable_default.as_path()));
-    assert_eq!(source, RuleSource::ExecutableDefault(executable_default));
+    let source = resolve_rule_source(None, Some(candidate.as_path()));
+    assert_eq!(source, RuleSource::DefaultCandidate(candidate));
 }
 
 #[test]
 fn resolve_rule_source_falls_back_to_builtin_when_default_missing() {
     let dir = tempfile::tempdir().unwrap();
-    let executable_default = dir.path().join("exe_default_rules.yaml");
+    let missing = dir.path().join("nonexistent.yaml");
 
-    let source = resolve_rule_source(None, Some(executable_default.as_path()));
-    assert_eq!(
-        source,
-        RuleSource::BuiltInFallback {
-            executable_default_path: Some(executable_default),
-        }
-    );
+    let source = resolve_rule_source(None, Some(missing.as_path()));
+    assert_eq!(source, RuleSource::BuiltInFallback);
+}
+
+#[test]
+fn resolve_rule_source_falls_back_to_builtin_when_no_default_given() {
+    let source = resolve_rule_source(None, None);
+    assert_eq!(source, RuleSource::BuiltInFallback);
 }
 
 #[cfg(unix)]
