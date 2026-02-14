@@ -95,11 +95,29 @@ jobs:
 
       - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
 
-  test-aarch64:
-    name: Test (aarch64)
+  clippy-aarch64:
+    name: Clippy (aarch64)
     runs-on: macos-15
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: brew install boost
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable-macos
+          cache-all-crates: "true"
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test-aarch64:
+    name: Test (aarch64)
+    runs-on: macos-15
+    needs: [clippy-aarch64]
     env:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
@@ -113,6 +131,7 @@ jobs:
         with:
           shared-key: stable-macos
           cache-all-crates: "true"
+          save-if: "false"
       - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
 
   # ---------------------------------------------------------------------------
