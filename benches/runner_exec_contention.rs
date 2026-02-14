@@ -116,12 +116,12 @@ fn per_slot_atomic(thread_count: usize, tasks: usize) {
                 } else {
                     start + chunk
                 };
-                for i in start..end {
+                for (i, slot) in slots.iter().enumerate().take(end).skip(start) {
                     if abort.load(Ordering::Relaxed) {
                         return;
                     }
                     let val = hash_work(i as u64);
-                    *slots[i].lock().unwrap() = Some(val);
+                    *slot.lock().unwrap() = Some(val);
                 }
             });
         }
