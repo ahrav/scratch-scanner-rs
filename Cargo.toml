@@ -21,7 +21,7 @@ crossbeam-utils = "0.8"
 crc32fast = "1.4"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 libc = "0.2"
-memchr = "2.6"
+memchr = "2.8"
 memmap2 = "0.9"
 regex = "1.10"
 regex-syntax = "0.8"
