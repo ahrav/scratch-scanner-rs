@@ -1,188 +1,184 @@
 //! Set-associative cache for tree delta base bytes.
 //!
 //! Stores decompressed tree payloads keyed by `(pack_id, offset)` in
-//! fixed-size slots backed by a pre-allocated arena. The cache is
-//! set-associative with CLOCK eviction and does not allocate on the hot
-//! path (after initialization).
+//! fixed-size slots backed by a pre-allocated arena. Uses the generic
+//! [`super::cache_common`] framework with CLOCK eviction.
 //!
-//! # Layout
-//! - `WAYS` slots per set (fixed)
-//! - Number of sets is rounded down to a power of two
-//! - Each slot owns a fixed `slot_size` byte range in the arena
-//!
-//! Tree payloads larger than `slot_size` are not cached.
-//!
-//! # Invariants
-//! - `sets` is 0 (disabled) or a power of two
-//! - `slot_size` is a power of two, >= `MIN_SLOT_SIZE`
-//! - `storage.len() == sets * WAYS * slot_size`
-//! - Cache is best-effort; insertions may evict existing entries
-//! - Pinned slots are never evicted; handles must be dropped to release pins
+//! Tree payloads larger than the slot size are not cached.
 
-use std::cell::Cell;
-
+use super::cache_common::{CacheHandle, CacheSlot, SetAssociativeCache, SlotBase};
 use super::pack_inflate::ObjectKind;
 
-/// Default slot size for cached delta bases.
-const DEFAULT_SLOT_SIZE: u32 = 4096;
-/// Minimum slot size (prevents tiny, inefficient caches).
-const MIN_SLOT_SIZE: u32 = 256;
-/// Number of ways per set.
-const WAYS: usize = 4;
-
-/// Cache slot metadata.
-#[derive(Clone, Debug)]
-struct Slot {
-    pack_id: u16,
-    offset: u64,
+/// Extra metadata carried by delta cache handles.
+#[derive(Clone, Copy, Debug)]
+pub struct DeltaHandleExtra {
     kind: ObjectKind,
     chain_len: u8,
-    len: u32,
-    clock: u8,
-    valid: bool,
-    pins: Cell<u16>,
 }
 
-impl Slot {
-    #[inline]
+/// Cache slot for delta bases, keyed by `(pack_id, offset)`.
+#[derive(Clone, Debug)]
+struct DeltaSlot {
+    pack_id: u16,
+    /// Byte offset of the object within the pack.
+    offset: u64,
+    /// Resolved object kind of the base (e.g. Tree, Commit).
+    kind: ObjectKind,
+    /// Number of delta links traversed to reach this base (0 = non-delta).
+    chain_len: u8,
+    base: SlotBase,
+}
+
+impl CacheSlot for DeltaSlot {
+    type Key = (u16, u64);
+    type InsertArgs = (ObjectKind, u8);
+    type HandleExtra = DeltaHandleExtra;
+
     fn empty() -> Self {
         Self {
             pack_id: 0,
             offset: 0,
             kind: ObjectKind::Tree,
             chain_len: 0,
-            len: 0,
-            clock: 0,
-            valid: false,
-            pins: Cell::new(0),
+            base: SlotBase::empty(),
         }
+    }
+
+    #[inline]
+    fn base(&self) -> &SlotBase {
+        &self.base
+    }
+
+    #[inline]
+    fn base_mut(&mut self) -> &mut SlotBase {
+        &mut self.base
+    }
+
+    #[inline]
+    fn matches_key(&self, key: &(u16, u64)) -> bool {
+        self.pack_id == key.0 && self.offset == key.1
+    }
+
+    fn write_key(&mut self, key: &(u16, u64), args: &(ObjectKind, u8)) {
+        self.pack_id = key.0;
+        self.offset = key.1;
+        self.kind = args.0;
+        self.chain_len = args.1;
+    }
+
+    fn update_existing(&mut self, args: &(ObjectKind, u8)) {
+        self.kind = args.0;
+        self.chain_len = args.1;
+    }
+
+    fn handle_extra(&self) -> DeltaHandleExtra {
+        DeltaHandleExtra {
+            kind: self.kind,
+            chain_len: self.chain_len,
+        }
+    }
+
+    fn hash_key(key: &(u16, u64)) -> u64 {
+        let (pack_id, offset) = *key;
+        let mut hash = offset ^ ((pack_id as u64) << 48);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+        hash ^= hash >> 33;
+        hash
     }
 }
 
 /// Set-associative cache for tree delta base bytes.
 ///
-/// The cache is not thread-safe; callers must synchronize shared access.
+/// See [`super::cache_common`] for layout, eviction, and pinning details.
+/// When the capacity is too small the cache enters a disabled state where
+/// all operations are no-ops; this avoids special-casing callers.
+///
+/// Not thread-safe; callers must synchronize shared access.
 #[derive(Debug)]
 pub struct TreeDeltaCache {
-    capacity_bytes: u32,
-    slot_size: u32,
-    sets: usize,
-    storage: Vec<u8>,
-    slots: Vec<Slot>,
-    clock_hands: Vec<u8>,
+    inner: SetAssociativeCache<DeltaSlot>,
 }
 
 /// Handle to a pinned delta base stored in the cache.
 ///
-/// The handle keeps the slot pinned until drop so cached bytes are not
-/// overwritten while the caller is still borrowing them.
+/// While this handle exists the underlying slot is pinned (its pin count
+/// is > 0), preventing the CLOCK eviction algorithm from reclaiming the
+/// slot. Dropping the handle releases the pin.
 ///
-/// # Safety
-/// The handle must not outlive the cache that created it.
+/// In addition to the raw bytes, the handle carries the resolved
+/// [`ObjectKind`] and `chain_len` so the delta resolver does not need a
+/// second lookup.
+///
+/// # Lifetime constraint
+///
+/// The inner [`CacheHandle`] stores a raw pointer to the backing
+/// [`SetAssociativeCache`]. Callers must ensure the cache is not dropped
+/// or moved while any handle is live.
 #[derive(Debug)]
 pub struct TreeDeltaCacheHandle {
-    cache: *const TreeDeltaCache,
-    slot: usize,
-    offset: usize,
-    len: usize,
-    kind: ObjectKind,
-    chain_len: u8,
+    inner: CacheHandle<DeltaSlot>,
 }
 
 impl TreeDeltaCacheHandle {
     /// Returns the cached base bytes.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `TreeDeltaCacheHandle` pins the slot for the duration of its
-        // lifetime. Callers ensure the cache outlives the handle.
-        unsafe {
-            let cache = &*self.cache;
-            &cache.storage[self.offset..self.offset + self.len]
-        }
+        self.inner.as_slice()
     }
 
     /// Returns the cached object kind.
     #[must_use]
-    pub const fn kind(&self) -> ObjectKind {
-        self.kind
+    pub fn kind(&self) -> ObjectKind {
+        self.inner.extra().kind
     }
 
     /// Returns the cached delta chain length for this base.
     #[must_use]
-    pub const fn chain_len(&self) -> u8 {
-        self.chain_len
+    pub fn chain_len(&self) -> u8 {
+        self.inner.extra().chain_len
     }
 
     /// Returns the cached payload length in bytes.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 
     /// Returns true if the cached payload is empty.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Drop for TreeDeltaCacheHandle {
-    fn drop(&mut self) {
-        // SAFETY: The handle is only constructed with a valid cache pointer.
-        unsafe {
-            let cache = &*self.cache;
-            let slot = &cache.slots[self.slot];
-            let pins = slot.pins.get();
-            debug_assert!(pins > 0, "tree delta cache pin count underflow");
-            slot.pins.set(pins.saturating_sub(1));
-        }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
 impl TreeDeltaCache {
-    /// Creates a new cache with a byte capacity.
+    /// Creates a new cache sized to approximately `capacity_bytes`.
     ///
-    /// If the capacity is too small to hold at least one set, the cache is
-    /// initialized in a disabled state (all operations are no-ops).
+    /// The actual usable capacity may be slightly smaller: the constructor
+    /// rounds `slot_size` down to a power of two and the set count down to
+    /// a power of two so that set indexing is a simple bitmask.
+    ///
+    /// If the budget is too small for even one full set (`WAYS` ×
+    /// `MIN_SLOT_SIZE`), the cache enters a disabled state where all
+    /// operations are no-ops.
     #[must_use]
     pub fn new(capacity_bytes: u32) -> Self {
-        let min_bytes = MIN_SLOT_SIZE.saturating_mul(WAYS as u32);
-        if capacity_bytes < min_bytes {
-            return Self::disabled(capacity_bytes);
-        }
-
-        let mut slot_size = (capacity_bytes / WAYS as u32).min(DEFAULT_SLOT_SIZE);
-        slot_size = round_down_power_of_two_u32(slot_size).max(MIN_SLOT_SIZE);
-
-        let slots_total = capacity_bytes / slot_size;
-        let sets = round_down_power_of_two_usize((slots_total / WAYS as u32) as usize);
-        if sets == 0 {
-            return Self::disabled(capacity_bytes);
-        }
-
-        let total_slots = sets * WAYS;
-        let storage_len = (total_slots as u32).saturating_mul(slot_size) as usize;
-
         Self {
-            capacity_bytes: storage_len as u32,
-            slot_size,
-            sets,
-            storage: vec![0u8; storage_len],
-            slots: vec![Slot::empty(); total_slots],
-            clock_hands: vec![0u8; sets],
+            inner: SetAssociativeCache::new(capacity_bytes),
         }
     }
 
     /// Returns the configured capacity (rounded to usable bytes).
     #[must_use]
     pub const fn capacity_bytes(&self) -> u32 {
-        self.capacity_bytes
+        self.inner.capacity_bytes()
     }
 
     /// Returns the fixed slot size in bytes.
     #[must_use]
     pub const fn slot_size(&self) -> u32 {
-        self.slot_size
+        self.inner.slot_size()
     }
 
     /// Looks up cached base bytes by `(pack_id, offset)` and returns a pinned handle.
@@ -190,44 +186,21 @@ impl TreeDeltaCache {
     /// Returns `None` if the cache is disabled or if the entry is missing.
     /// On hit, the slot is pinned and the CLOCK bit is set.
     pub fn get_handle(&mut self, pack_id: u16, offset: u64) -> Option<TreeDeltaCacheHandle> {
-        if self.sets == 0 {
-            return None;
-        }
-
-        let set = self.set_index(pack_id, offset);
-        let base = set * WAYS;
-        for way in 0..WAYS {
-            let idx = base + way;
-            let (kind, chain_len, len, hit) = {
-                let slot = &mut self.slots[idx];
-                if slot.valid && slot.pack_id == pack_id && slot.offset == offset {
-                    slot.clock = 1;
-                    slot.pins.set(slot.pins.get().saturating_add(1));
-                    (slot.kind, slot.chain_len, slot.len as usize, true)
-                } else {
-                    (ObjectKind::Tree, 0, 0, false)
-                }
-            };
-            if hit {
-                let offset = idx * self.slot_size as usize;
-                return Some(TreeDeltaCacheHandle {
-                    cache: self as *const TreeDeltaCache,
-                    slot: idx,
-                    offset,
-                    len,
-                    kind,
-                    chain_len,
-                });
-            }
-        }
-        None
+        self.inner
+            .get_handle(&(pack_id, offset))
+            .map(|h| TreeDeltaCacheHandle { inner: h })
     }
 
     /// Inserts base bytes into the cache.
     ///
-    /// Returns true if the entry was cached. Returns false if the cache is
-    /// disabled, the payload is too large for a slot, or all candidate slots
-    /// are pinned.
+    /// If the key `(pack_id, offset)` is already present the clock bit is
+    /// refreshed and `kind`/`chain_len` are updated without copying bytes
+    /// (dedup fast path). Otherwise a victim slot is selected via the CLOCK
+    /// algorithm and overwritten.
+    ///
+    /// Returns `true` if the entry was cached (including dedup hits).
+    /// Returns `false` if the cache is disabled, the payload exceeds
+    /// `slot_size`, or all candidate slots are pinned.
     pub fn insert(
         &mut self,
         pack_id: u16,
@@ -236,128 +209,14 @@ impl TreeDeltaCache {
         chain_len: u8,
         bytes: &[u8],
     ) -> bool {
-        if self.sets == 0 {
-            return false;
-        }
-        if bytes.len() > self.slot_size as usize {
-            return false;
-        }
-
-        let set = self.set_index(pack_id, offset);
-        let base = set * WAYS;
-
-        for way in 0..WAYS {
-            let idx = base + way;
-            if self.slots[idx].valid
-                && self.slots[idx].pack_id == pack_id
-                && self.slots[idx].offset == offset
-            {
-                self.slots[idx].clock = 1;
-                self.slots[idx].kind = kind;
-                self.slots[idx].chain_len = chain_len;
-                return true;
-            }
-        }
-
-        let Some(victim) = self.select_victim(base, set) else {
-            return false;
-        };
-        self.write_slot(victim, pack_id, offset, kind, chain_len, bytes);
-        true
+        self.inner
+            .insert(&(pack_id, offset), &(kind, chain_len), bytes)
     }
-
-    fn disabled(capacity_bytes: u32) -> Self {
-        Self {
-            capacity_bytes,
-            slot_size: 0,
-            sets: 0,
-            storage: Vec::new(),
-            slots: Vec::new(),
-            clock_hands: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn set_index(&self, pack_id: u16, offset: u64) -> usize {
-        let hash = hash_key(pack_id, offset);
-        hash as usize & (self.sets - 1)
-    }
-
-    fn select_victim(&mut self, base: usize, set: usize) -> Option<usize> {
-        // CLOCK: pick the first slot with clock=0, clearing clock bits as we go.
-        let mut hand = self.clock_hands[set] as usize % WAYS;
-        for _ in 0..(WAYS * 2) {
-            let idx = base + hand;
-            let pins = self.slots[idx].pins.get();
-            if pins > 0 {
-                hand = (hand + 1) % WAYS;
-                continue;
-            }
-            let slot = &mut self.slots[idx];
-            if !slot.valid || slot.clock == 0 {
-                self.clock_hands[set] = ((hand + 1) % WAYS) as u8;
-                return Some(idx);
-            }
-            slot.clock = 0;
-            hand = (hand + 1) % WAYS;
-        }
-
-        None
-    }
-
-    fn write_slot(
-        &mut self,
-        idx: usize,
-        pack_id: u16,
-        offset: u64,
-        kind: ObjectKind,
-        chain_len: u8,
-        bytes: &[u8],
-    ) {
-        // Copy into the slot's fixed storage region.
-        let base = idx * self.slot_size as usize;
-        let end = base + bytes.len();
-        self.storage[base..end].copy_from_slice(bytes);
-
-        let slot = &mut self.slots[idx];
-        slot.pack_id = pack_id;
-        slot.offset = offset;
-        slot.kind = kind;
-        slot.chain_len = chain_len;
-        slot.len = bytes.len() as u32;
-        slot.clock = 1;
-        slot.valid = true;
-        slot.pins.set(0);
-    }
-}
-
-fn round_down_power_of_two_usize(val: usize) -> usize {
-    if val == 0 {
-        return 0;
-    }
-    1_usize << (usize::BITS - val.leading_zeros() - 1)
-}
-
-fn round_down_power_of_two_u32(val: u32) -> u32 {
-    if val == 0 {
-        return 0;
-    }
-    1_u32 << (u32::BITS - val.leading_zeros() - 1)
-}
-
-#[inline]
-fn hash_key(pack_id: u16, offset: u64) -> u64 {
-    // Mix pack_id into the high bits and apply a cheap avalanche to
-    // distribute sequential offsets across sets.
-    let mut hash = offset ^ ((pack_id as u64) << 48);
-    hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
-    hash ^= hash >> 33;
-    hash
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::cache_common::WAYS;
     use super::*;
 
     #[test]
@@ -375,7 +234,7 @@ mod tests {
     #[test]
     fn oversize_entry_not_cached() {
         let mut cache = TreeDeltaCache::new(64 * 1024);
-        let payload = vec![0u8; cache.slot_size as usize + 1];
+        let payload = vec![0u8; cache.slot_size() as usize + 1];
 
         assert!(!cache.insert(1, 99, ObjectKind::Tree, 0, &payload));
         assert!(cache.get_handle(1, 99).is_none());
@@ -403,5 +262,20 @@ mod tests {
             .filter(|offset| cache.get_handle(1, **offset).is_some())
             .count();
         assert!(hits <= WAYS);
+    }
+
+    #[test]
+    fn reinsertion_updates_kind_and_chain_len() {
+        let mut cache = TreeDeltaCache::new(64 * 1024);
+        assert!(cache.insert(1, 42, ObjectKind::Tree, 0, b"data"));
+
+        // Re-insert same key with different metadata.
+        assert!(cache.insert(1, 42, ObjectKind::Commit, 5, b"ignored"));
+
+        let handle = cache.get_handle(1, 42).unwrap();
+        assert_eq!(handle.kind(), ObjectKind::Commit);
+        assert_eq!(handle.chain_len(), 5);
+        // Bytes should NOT have changed (dedup fast-path skips the copy).
+        assert_eq!(handle.as_slice(), b"data");
     }
 }

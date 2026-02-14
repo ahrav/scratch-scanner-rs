@@ -42,6 +42,24 @@ use super::SourceKind;
 use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
 
+/// Swallow `BrokenPipe`; panic on any other I/O error.
+///
+/// Most structured-output sink write/flush paths (JSON, JSONL, SARIF, text)
+/// funnel I/O through this so BrokenPipe policy is centralized.
+///
+/// Returns `true` when a `BrokenPipe` was swallowed so callers that perform
+/// multiple I/O operations in sequence can short-circuit immediately.
+#[inline]
+pub(crate) fn handle_sink_io(result: std::io::Result<()>, label: &str) -> bool {
+    if let Err(e) = result {
+        if e.kind() == ErrorKind::BrokenPipe {
+            return true;
+        }
+        panic!("{label} failed: {e}");
+    }
+    false
+}
+
 thread_local! {
     /// Per-thread scratch buffer for formatting events before writing to
     /// the sink. 512 bytes covers a typical finding + newline without
@@ -586,24 +604,14 @@ impl<W: Write + Send + 'static> EventSink for JsonlEventSink<W> {
             |buf| self.encoder.encode(&event, buf),
             |bytes| {
                 let mut writer = self.writer.lock().expect("jsonl sink mutex poisoned");
-                if let Err(e) = writer.write_all(bytes) {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        return;
-                    }
-                    panic!("jsonl event sink write failed: {}", e);
-                }
+                handle_sink_io(writer.write_all(bytes), "jsonl event sink write");
             },
         );
     }
 
     fn flush(&self) {
         let mut writer = self.writer.lock().expect("jsonl sink mutex poisoned");
-        if let Err(e) = writer.flush() {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("jsonl event sink flush failed: {}", e);
-        }
+        handle_sink_io(writer.flush(), "jsonl event sink flush");
     }
 }
 

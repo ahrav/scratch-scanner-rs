@@ -273,13 +273,11 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
     gz: &mut GzipStream<R>,
     display: &[u8],
 ) -> ArchiveEnd {
-    let budgets = &mut *scan.budgets;
     let chunk_size = scan.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
-    let dedupe = scan.dedupe;
     let overlap = scan.engine.required_overlap();
     let file_id = alloc_virtual_file_id(scan.next_virtual_file_id);
 
-    if let Err(hit) = budgets.begin_entry() {
+    if let Err(hit) = scan.budgets.begin_entry() {
         return budget_hit_to_archive_end(hit);
     }
 
@@ -297,9 +295,11 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             buf.as_mut_slice().copy_within(have - carry..have, 0);
         }
 
-        let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
+        let allowance = scan
+            .budgets
+            .remaining_decompressed_allowance_with_ratio_probe(true);
         if allowance == 0 {
-            if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+            if let ChargeResult::Clamp { hit, .. } = scan.budgets.charge_decompressed_out(1) {
                 let r = budget_hit_to_partial_reason(hit);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -312,7 +312,7 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             .min(allowance.min(u64::from(u32::MAX)) as usize);
 
         if read_max == 0 {
-            if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+            if let ChargeResult::Clamp { hit, .. } = scan.budgets.charge_decompressed_out(1) {
                 let r = budget_hit_to_partial_reason(hit);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -335,10 +335,13 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             break;
         }
 
-        budgets.charge_compressed_in(gz.take_compressed_delta());
+        scan.budgets
+            .charge_compressed_in(gz.take_compressed_delta());
 
         let mut allowed = n as u64;
-        if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
+        if let ChargeResult::Clamp { allowed: a, hit } =
+            scan.budgets.charge_decompressed_out(allowed)
+        {
             let r = budget_hit_to_partial_reason(hit);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
@@ -349,65 +352,26 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             break;
         }
 
-        let allowed_usize = allowed as usize;
-        let read_len = carry + allowed_usize;
-
-        let base_offset = offset.saturating_sub(carry as u64);
-        let data = &buf.as_slice()[..read_len];
-
-        scan.engine
-            .scan_chunk_into(data, file_id, base_offset, scan.scan_scratch);
-        let engine_dropped = scan.scan_scratch.dropped_findings();
-        let before_prefix = scan.scan_scratch.pending_findings_len();
-        if !entry_scanned {
-            scan.metrics.archive.record_entry_scanned();
-            entry_scanned = true;
-        }
-
-        let new_bytes_start = offset;
-        scan.scan_scratch.drop_prefix_findings(new_bytes_start);
-        let after_prefix = scan.scan_scratch.pending_findings_len();
-
-        scan.pending.clear();
-        scan.scan_scratch.drain_findings_into(scan.pending);
-
-        let before_dedupe = scan.pending.len();
-        if dedupe && before_dedupe > 1 {
-            dedupe_findings(scan.pending);
-        }
-        let scheduler_pruned = before_prefix
-            .saturating_sub(after_prefix)
-            .saturating_add(before_dedupe.saturating_sub(scan.pending.len()));
-        account_effective_dropped_findings(scan.metrics, engine_dropped, scheduler_pruned);
-
-        scan.metrics.findings_emitted = scan
-            .metrics
-            .findings_emitted
-            .wrapping_add(scan.pending.len() as u64);
-
-        emit_persistence_batch(
-            scan.store_producer,
-            scan.event_sink,
+        let result = scan.scan_and_emit_chunk(
+            buf.as_slice(),
+            carry,
+            offset,
+            allowed,
+            overlap,
+            file_id,
             display,
-            scan.pending,
-            scan.persist_batch,
-            scan.metrics,
+            &mut entry_scanned,
         );
-        emit_findings(scan.engine.as_ref(), scan.event_sink, display, scan.pending);
+        offset = result.offset;
+        have = result.have;
+        carry = result.carry;
 
-        scan.metrics.chunks_scanned = scan.metrics.chunks_scanned.saturating_add(1);
-        scan.metrics.bytes_scanned = scan.metrics.bytes_scanned.saturating_add(allowed);
-
-        offset = offset.saturating_add(allowed);
-        have = read_len;
-        carry = overlap.min(read_len);
-
-        if allowed_usize < n {
+        if (allowed as usize) < n {
             break;
         }
     }
 
-    budgets.end_entry(offset > 0);
+    scan.budgets.end_entry(offset > 0);
     if !entry_scanned && outcome == ArchiveEnd::Scanned {
         outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
         entry_partial_reason = Some(PartialReason::GzipCorrupt);
