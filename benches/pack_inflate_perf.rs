@@ -225,10 +225,50 @@ fn bench_inflate_limited(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_tls_overhead(c: &mut Criterion) {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut group = c.benchmark_group("inflate_tls_overhead");
+
+    // Use a tiny payload (64 bytes) so decompression is fast
+    // and TLS lookup overhead is a larger fraction of total time.
+    let original = vec![0x42u8; 64];
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    group.throughput(Throughput::Elements(1)); // measure calls/sec, not bytes
+
+    // Thread-local path: inflate_limited uses INFLATE_SCRATCH TLS
+    group.bench_function("thread_local", |b| {
+        let mut out = Vec::new();
+        b.iter(|| {
+            pack_inflate::inflate_limited(black_box(&compressed), &mut out, 64).unwrap();
+            black_box(out.len());
+        });
+    });
+
+    // Caller-provided path: inflate_limited_with bypasses TLS
+    group.bench_function("caller_provided", |b| {
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        b.iter(|| {
+            pack_inflate::inflate_limited_with(&mut de, black_box(&compressed), &mut out, 64)
+                .unwrap();
+            black_box(out.len());
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_apply_delta_into,
     bench_apply_delta,
     bench_inflate_limited,
+    bench_tls_overhead,
 );
 criterion_main!(benches);

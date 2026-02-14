@@ -1,6 +1,12 @@
 //! Criterion benchmarks for git_scan parsing: tree entry iteration, path
 //! classification, and commit header parsing.
 //!
+//! ## Benchmark groups
+//!
+//! - **Q1**: `tree_entry::parse_entry` — memchr-accelerated delimiter scan
+//! - **Q2**: `classify_path` + `is_excluded_path` — path policy hot path
+//! - **Q4 + Q5**: `hex_digit` and `parse_unix_timestamp` via `parse_commit`
+//!
 //! Usage:
 //!   cargo bench --bench git_scan_parse -- --save-baseline before
 //!   # ... apply changes ...

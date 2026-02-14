@@ -347,8 +347,8 @@ fn round_down_power_of_two_u32(val: u32) -> u32 {
 
 #[inline]
 fn hash_key(pack_id: u16, offset: u64) -> u64 {
-    // Mix pack_id into the high bits and apply a cheap avalanche to
-    // distribute sequential offsets across sets.
+    // Mix pack_id into the high bits and apply a single-round Murmur3
+    // fmix64 finalizer to distribute sequential offsets across sets.
     let mut hash = offset ^ ((pack_id as u64) << 48);
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xff51afd7ed558ccd);
@@ -379,6 +379,13 @@ mod tests {
 
         assert!(!cache.insert(1, 99, ObjectKind::Tree, 0, &payload));
         assert!(cache.get_handle(1, 99).is_none());
+    }
+
+    #[test]
+    fn hash_key_is_deterministic() {
+        // Pin the hash output to detect accidental algorithm changes.
+        let h = hash_key(7, 42);
+        assert_eq!(h, 0xa475_9818_0eec_55ae);
     }
 
     #[test]

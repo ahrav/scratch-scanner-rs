@@ -493,8 +493,12 @@ pub(super) fn mmap_pack_files(
             )));
         }
         let file = File::open(path)?;
-        // SAFETY: mapping read-only pack files; the OS keeps the mapping valid
-        // even after `file` is dropped.
+        // SAFETY: mapping read-only pack files. Two invariants relied on:
+        // 1. The OS keeps the mapping valid even after `file` is dropped
+        //    (the kernel holds its own file reference).
+        // 2. Pack files are immutable after creation by git. Concurrent
+        //    gc/repack may delete and recreate them, but we hold an open
+        //    fd so the inode remains valid for the lifetime of the mmap.
         let mmap = unsafe { Mmap::map(&file)? };
         advise_sequential(&file, &mmap);
         out[idx] = Some(mmap);
@@ -849,7 +853,7 @@ fn apply_locality_shard_cap(plan: &PackPlan, shard_cap: usize) -> usize {
 ///    offset-based deps in execution order, reduce fan-out to improve cache locality.
 ///
 /// Returns 1 for single-worker execution or degenerate plans (≤ 1 offset).
-#[cfg(any(test, feature = "bench"))]
+#[cfg(test)]
 #[inline(always)]
 pub(super) fn select_plan_shard_count(workers: usize, plan: &PackPlan) -> usize {
     select_plan_shard_count_with_hint(workers, plan, &build_plan_cost_hint(plan))
@@ -2072,35 +2076,6 @@ mod bench_support {
         apply_locality_shard_cap(plan, cap)
     }
 
-    /// Apply locality shard cap using the old (pre-optimization) code path.
-    ///
-    /// This replicates the behavior before the hoisted allocation: each call
-    /// to `estimate_locality_pressure` internally calls `build_exec_pos_by_need`,
-    /// allocating a fresh `Vec<usize>` on every iteration of the while loop.
-    pub fn bench_apply_locality_shard_cap_old(plan: &PackPlan, shard_cap: usize) -> usize {
-        let mut cap = shard_cap.max(1).min(plan.need_offsets.len());
-        while cap > MAX_SHARDS_WITH_DEP_PRESSURE {
-            // Old path: allocate exec_pos inside the loop on every iteration.
-            let exec_pos = build_exec_pos_by_need(plan);
-            let pressure = estimate_locality_pressure(plan, cap, exec_pos.as_deref());
-            if pressure.offset_deps < MIN_LOCALITY_DEP_SAMPLES {
-                break;
-            }
-            let weighted_cross = pressure
-                .cross_shard_offset_deps
-                .saturating_add(pressure.unresolved_offset_bases.saturating_mul(2));
-            if weighted_cross.saturating_mul(100)
-                <= pressure
-                    .offset_deps
-                    .saturating_mul(MAX_LOCALITY_CROSS_PERCENT)
-            {
-                break;
-            }
-            cap -= 1;
-        }
-        cap
-    }
-
     /// Select pack execution strategy using the current (new) code path.
     ///
     /// Returns a discriminant tag (0 = Serial, 1 = PackParallel, 2 = Sharded)
@@ -2113,44 +2088,12 @@ mod bench_support {
             PackExecStrategy::IntraPackSharded { .. } => 2,
         }
     }
-
-    /// Select pack execution strategy using the old (pre-optimization) code path.
-    ///
-    /// Returns a discriminant tag (same encoding as [`bench_select_strategy`]).
-    /// This replicates the behavior before hint caching: `build_plan_cost_hint`
-    /// is called twice per plan — once for `total_need` and once inside
-    /// `select_plan_shard_count`.
-    pub fn bench_select_strategy_old(workers: usize, plans: &[PackPlan]) -> u8 {
-        let workers = workers.max(1);
-        if workers == 1 || plans.is_empty() {
-            return 0;
-        }
-
-        // Old path: compute total_need by iterating need_offsets.len() directly.
-        let total_need: usize = plans.iter().map(|p| p.need_offsets.len()).sum();
-        if total_need < MIN_TOTAL_NEED_FOR_PARALLEL {
-            return 0;
-        }
-
-        if plans.len() >= workers {
-            1
-        } else {
-            let mut shard_counts = Vec::with_capacity(plans.len());
-            for plan in plans {
-                // Old path: select_plan_shard_count calls build_plan_cost_hint
-                // internally, so the hint is computed again for each plan.
-                shard_counts.push((plan.pack_id, select_plan_shard_count(workers, plan)));
-            }
-            let _ = shard_counts; // prevent elision
-            2
-        }
-    }
 }
 
 #[cfg(feature = "bench")]
 pub use bench_support::{
-    bench_apply_locality_shard_cap, bench_apply_locality_shard_cap_old, bench_select_strategy,
-    bench_select_strategy_old, bench_synthetic_locality_plan, bench_synthetic_plan,
+    bench_apply_locality_shard_cap, bench_select_strategy, bench_synthetic_locality_plan,
+    bench_synthetic_plan,
 };
 
 // ---------------------------------------------------------------------------

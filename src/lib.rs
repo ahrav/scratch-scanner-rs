@@ -127,8 +127,8 @@ pub use engine::{Engine, NormHash, ScanScratch};
 
 #[cfg(feature = "bench")]
 pub use git_scan::{
-    bench_apply_locality_shard_cap, bench_apply_locality_shard_cap_old, bench_select_strategy,
-    bench_select_strategy_old, bench_synthetic_locality_plan, bench_synthetic_plan,
+    bench_apply_locality_shard_cap, bench_select_strategy, bench_synthetic_locality_plan,
+    bench_synthetic_plan,
 };
 
 pub use runtime::{

@@ -59,7 +59,6 @@ where
 {
     INFLATE_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        scratch.de.reset(true);
         let s = &mut *scratch;
         f(&mut s.de, &mut s.buf)
     })
@@ -259,7 +258,9 @@ impl<'a> PackFile<'a> {
 
     /// Parse and validate a pack file header for caching.
     pub fn parse_header(bytes: &[u8], oid_len: usize) -> Result<PackHeader, PackParseError> {
-        debug_assert!(oid_len == 20 || oid_len == 32, "oid_len must be 20 or 32");
+        if oid_len != 20 && oid_len != 32 {
+            return Err(PackParseError::BadOidLen(oid_len));
+        }
 
         let min_size = PACK_HEADER_SIZE + oid_len;
         if bytes.len() < min_size {
@@ -469,6 +470,7 @@ pub fn inflate_limited_with(
         in_pos += consumed;
 
         if produced != 0 {
+            debug_assert!(out.len() + produced <= out.capacity());
             // SAFETY: `decompress` initialized exactly `produced` bytes
             // starting at `out[out.len()..]`. `produced <= buf_len <=
             // remaining = max_out - out.len()`, so the new length is
@@ -529,6 +531,7 @@ pub fn inflate_stream(
     use flate2::{FlushDecompress, Status};
 
     with_inflate_scratch(|de, buf| {
+        de.reset(true);
         let mut in_pos: usize = 0;
         let mut out_total: usize = 0;
 
@@ -672,8 +675,19 @@ pub fn apply_delta(
         return Err(DeltaError::OutputOverrun);
     }
     out.reserve(result_size);
+    debug_assert!(
+        out.capacity() >= result_size,
+        "reserve did not allocate enough"
+    );
 
     let mut written = 0usize;
+    // SAFETY — pointer stability invariant:
+    // `out.reserve(result_size)` above pre-allocates all needed capacity.
+    // `out_ptr` is valid for writes up to `result_size` bytes from this
+    // point until `set_len(written)` below. NO Vec methods (push, extend,
+    // reserve, etc.) may be called on `out` in between — any such call
+    // could reallocate, invalidating `out_ptr` and causing use-after-free.
+    // The loop below uses ONLY raw pointer writes via `copy_nonoverlapping`.
     let out_ptr = out.as_mut_ptr();
 
     while pos < delta.len() {
@@ -694,6 +708,9 @@ pub fn apply_delta(
                 return Err(DeltaError::OutputOverrun);
             }
 
+            debug_assert!(written + size <= result_size);
+            debug_assert!(off + size <= base.len());
+
             // SAFETY: `out.reserve(result_size)` guarantees capacity >= result_size.
             // `written + size <= result_size <= capacity`. `base[off..end]` is
             // bounds-checked above. No aliasing: `out_ptr` points to `out`'s
@@ -704,12 +721,15 @@ pub fn apply_delta(
             written += size;
         } else if cmd != 0 {
             let size = cmd as usize;
-            if pos + size > delta.len() {
+            if delta.len() - pos < size {
                 return Err(DeltaError::Truncated);
             }
             if written.saturating_add(size) > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
+
+            debug_assert!(written + size <= result_size);
+            debug_assert!(pos + size <= delta.len());
 
             // SAFETY: same capacity invariant as above. `delta[pos..pos+size]`
             // is bounds-checked. No aliasing: `out_ptr` and `delta` are
@@ -780,7 +800,7 @@ pub fn apply_delta_into(
             out_len = end;
         } else if cmd != 0 {
             let size = cmd as usize;
-            if pos + size > delta.len() {
+            if delta.len() - pos < size {
                 return Err(DeltaError::Truncated);
             }
             let end = out_len.saturating_add(size);
@@ -872,6 +892,11 @@ fn decode_copy_params(
             cursor += 1;
         }
     }
+    debug_assert_eq!(
+        cursor.wrapping_sub(start),
+        needed,
+        "cursor advanced past bounds"
+    );
     *pos = cursor;
 
     if size == 0 {
@@ -1008,6 +1033,345 @@ mod tests {
         }
     }
 
+    /// Build a delta buffer with a single "add literal" instruction.
+    fn make_add_delta(base_size: usize, literal: &[u8]) -> Vec<u8> {
+        assert!(literal.len() <= 127, "add instruction limited to 127 bytes");
+        let mut delta = Vec::new();
+        push_varint(base_size, &mut delta);
+        push_varint(literal.len(), &mut delta);
+        // add instruction: cmd byte = literal length (< 0x80)
+        delta.push(literal.len() as u8);
+        delta.extend_from_slice(literal);
+        delta
+    }
+
+    /// Build a delta with a single "copy from base" instruction.
+    fn make_copy_delta(base_size: usize, off: usize, size: usize) -> Vec<u8> {
+        let mut delta = Vec::new();
+        push_varint(base_size, &mut delta);
+        push_varint(size, &mut delta);
+        // copy instruction: high bit set, encode offset and size bytes.
+        let mut cmd: u8 = 0x80;
+        let mut params = Vec::new();
+        // Encode offset (little-endian, flagged)
+        if (off & 0xff) != 0 || off == 0 {
+            cmd |= 0x01;
+            params.push(off as u8);
+        }
+        if (off >> 8) & 0xff != 0 {
+            cmd |= 0x02;
+            params.push((off >> 8) as u8);
+        }
+        if (off >> 16) & 0xff != 0 {
+            cmd |= 0x04;
+            params.push((off >> 16) as u8);
+        }
+        if (off >> 24) & 0xff != 0 {
+            cmd |= 0x08;
+            params.push((off >> 24) as u8);
+        }
+        // Encode size (little-endian, flagged)
+        if (size & 0xff) != 0 {
+            cmd |= 0x10;
+            params.push(size as u8);
+        }
+        if (size >> 8) & 0xff != 0 {
+            cmd |= 0x20;
+            params.push((size >> 8) as u8);
+        }
+        if (size >> 16) & 0xff != 0 {
+            cmd |= 0x40;
+            params.push((size >> 16) as u8);
+        }
+        delta.push(cmd);
+        delta.extend_from_slice(&params);
+        delta
+    }
+
+    #[test]
+    fn apply_delta_copy_instruction() {
+        let base = b"Hello, World!";
+        // Copy entire base
+        let delta = make_copy_delta(base.len(), 0, base.len());
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta copy");
+        assert_eq!(out, base);
+    }
+
+    #[test]
+    fn apply_delta_copy_partial() {
+        let base = b"ABCDEFGHIJ";
+        // Copy bytes 3..7 ("DEFG")
+        let delta = make_copy_delta(base.len(), 3, 4);
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta partial copy");
+        assert_eq!(&out, b"DEFG");
+    }
+
+    #[test]
+    fn apply_delta_add_literal() {
+        let base = b"unused-base";
+        let literal = b"literal data";
+        let delta = make_add_delta(base.len(), literal);
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta add");
+        assert_eq!(&out, literal);
+    }
+
+    #[test]
+    fn apply_delta_mixed_copy_and_add() {
+        let base = b"ABCDEFGHIJ";
+        let mut delta = Vec::new();
+        // Header: base_size=10, result_size=9 ("ABCDE" + "XYZ" + "J")
+        push_varint(10, &mut delta);
+        push_varint(9, &mut delta);
+        // Copy 5 bytes from offset 0 ("ABCDE")
+        delta.push(0x80 | 0x01 | 0x10); // copy, 1-byte offset, 1-byte size
+        delta.push(0x00); // offset = 0
+        delta.push(0x05); // size = 5
+                          // Add 3 literal bytes ("XYZ")
+        delta.push(0x03);
+        delta.extend_from_slice(b"XYZ");
+        // Copy 1 byte from offset 9 ("J")
+        delta.push(0x80 | 0x01 | 0x10); // copy
+        delta.push(0x09); // offset = 9
+        delta.push(0x01); // size = 1
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta mixed");
+        assert_eq!(&out, b"ABCDEXYZJ");
+    }
+
+    #[test]
+    fn apply_delta_base_size_mismatch() {
+        let base = b"short";
+        let mut delta = Vec::new();
+        push_varint(100, &mut delta); // claims base is 100 bytes
+        push_varint(5, &mut delta);
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::BaseSizeMismatch);
+    }
+
+    #[test]
+    fn apply_delta_result_exceeds_max_out() {
+        let base = b"base";
+        let mut delta = Vec::new();
+        push_varint(4, &mut delta);
+        push_varint(1000, &mut delta); // result_size 1000
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 100).unwrap_err(); // max_out 100
+        assert_eq!(err, DeltaError::OutputOverrun);
+    }
+
+    #[test]
+    fn apply_delta_bad_command_zero() {
+        let base = b"data";
+        let mut delta = Vec::new();
+        push_varint(4, &mut delta);
+        push_varint(4, &mut delta);
+        delta.push(0x00); // command zero is invalid
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::BadCommandZero);
+    }
+
+    #[test]
+    fn apply_delta_copy_out_of_range() {
+        let base = b"short";
+        let mut delta = Vec::new();
+        push_varint(5, &mut delta);
+        push_varint(10, &mut delta);
+        // Copy 10 bytes from offset 0, but base is only 5 bytes
+        delta.push(0x80 | 0x01 | 0x10);
+        delta.push(0x00); // offset 0
+        delta.push(0x0a); // size 10
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::CopyOutOfRange);
+    }
+
+    #[test]
+    fn apply_delta_truncated_add() {
+        let base = b"data";
+        let mut delta = Vec::new();
+        push_varint(4, &mut delta);
+        push_varint(5, &mut delta);
+        delta.push(0x05); // add 5 bytes, but supply none
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::Truncated);
+    }
+
+    #[test]
+    fn apply_delta_result_size_mismatch() {
+        let base = b"ABCDEFGHIJ";
+        let mut delta = Vec::new();
+        push_varint(10, &mut delta);
+        push_varint(10, &mut delta); // promises 10 bytes
+                                     // But only copy 5
+        delta.push(0x80 | 0x01 | 0x10);
+        delta.push(0x00);
+        delta.push(0x05);
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::ResultSizeMismatch);
+    }
+
+    #[test]
+    fn apply_delta_empty_delta_body() {
+        // Delta with base_size=0, result_size=0, and no instructions.
+        let base: &[u8] = &[];
+        let mut delta = Vec::new();
+        push_varint(0, &mut delta);
+        push_varint(0, &mut delta);
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("empty delta");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_delta_output_reuses_vec() {
+        // Verify out is cleared and old contents don't leak.
+        let base = b"ABCD";
+        let delta = make_copy_delta(4, 0, 4);
+
+        let mut out = Vec::from("leftover garbage data that should be cleared");
+        apply_delta(base, &delta, &mut out, 1024).expect("reuse vec");
+        assert_eq!(&out, b"ABCD");
+    }
+
+    /// Compress `data` using zlib (flate2).
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn inflate_limited_with_basic_round_trip() {
+        let original = b"Hello, this is test data for inflate_limited_with!";
+        let compressed = zlib_compress(original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 1024).expect("inflate basic");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(&out, original);
+    }
+
+    #[test]
+    fn inflate_limited_with_exact_max_out() {
+        // Decompress data whose uncompressed size exactly equals max_out.
+        let original = vec![0xAB_u8; 256];
+        let compressed = zlib_compress(&original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 256).expect("inflate exact");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn inflate_limited_with_exceeds_max_out() {
+        // Data decompresses to 256 bytes but max_out is 100.
+        let original = vec![0xCD_u8; 256];
+        let compressed = zlib_compress(&original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let err = inflate_limited_with(&mut de, &compressed, &mut out, 100).unwrap_err();
+
+        assert_eq!(err, InflateError::LimitExceeded);
+        // Partial output may have been written, but it must not exceed max_out.
+        assert!(out.len() <= 100);
+    }
+
+    #[test]
+    fn inflate_limited_with_empty_input() {
+        // Empty compressed data is not valid zlib — should error.
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let result = inflate_limited_with(&mut de, &[], &mut out, 1024);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn inflate_limited_with_corrupt_input() {
+        // Garbage bytes are not valid zlib.
+        let garbage = [0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let result = inflate_limited_with(&mut de, &garbage, &mut out, 1024);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn inflate_limited_with_reuses_decompress() {
+        // Call inflate_limited_with twice with the same Decompress instance.
+        // The function should reset internally.
+        let original1 = b"First payload";
+        let original2 = b"Second payload, slightly different";
+        let compressed1 = zlib_compress(original1);
+        let compressed2 = zlib_compress(original2);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+
+        inflate_limited_with(&mut de, &compressed1, &mut out, 1024).expect("inflate first");
+        assert_eq!(&out, original1);
+
+        inflate_limited_with(&mut de, &compressed2, &mut out, 1024).expect("inflate second");
+        assert_eq!(&out, original2.as_slice());
+    }
+
+    #[test]
+    fn inflate_limited_with_zero_byte_output() {
+        // Compress empty data — decompresses to 0 bytes.
+        let compressed = zlib_compress(&[]);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 1024).expect("inflate empty");
+
+        assert_eq!(consumed, compressed.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inflate_limited_with_clears_existing_output() {
+        // out has stale data; inflate_limited_with should clear it.
+        let original = b"fresh output";
+        let compressed = zlib_compress(original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::from("stale garbage that should be cleared");
+        inflate_limited_with(&mut de, &compressed, &mut out, 1024).expect("inflate clear");
+        assert_eq!(&out, original);
+    }
+
     #[test]
     fn apply_delta_into_copy_zero_size_round_trip() {
         let base = vec![0xa5_u8; 0x1_0000];
@@ -1025,5 +1389,46 @@ mod tests {
 
         assert_eq!(written, base.len());
         assert_eq!(out, base);
+    }
+
+    /// Miri target: exercises inflate_limited_with spare-capacity write + set_len.
+    #[test]
+    fn inflate_limited_with_miri_roundtrip() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original = b"hello miri roundtrip test data";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed = inflate_limited_with(&mut de, &compressed, &mut out, 256).unwrap();
+        assert_eq!(out, original);
+        assert_eq!(consumed, compressed.len());
+    }
+
+    /// Miri target: exercises apply_delta raw-pointer copy and insert paths.
+    #[test]
+    fn apply_delta_miri_copy_and_insert() {
+        let base = b"ABCDEFGHIJ";
+        // Delta: base_size=10, result_size=8, copy 4 bytes from off=2, insert 4 literal bytes.
+        let delta: &[u8] = &[
+            10, // base_size varint
+            8,  // result_size varint
+            0x80 | 0x01 | 0x10,
+            2,
+            4, // copy: off=2, size=4 -> "CDEF"
+            4,
+            b'X',
+            b'Y',
+            b'Z',
+            b'W', // insert 4 bytes -> "XYZW"
+        ];
+        let mut out = Vec::new();
+        apply_delta(base, delta, &mut out, 64).unwrap();
+        assert_eq!(&out, b"CDEFXYZW");
     }
 }

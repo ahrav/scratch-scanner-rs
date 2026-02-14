@@ -125,10 +125,11 @@ impl SpillIndexEntry {
 
 /// Fixed-size open-addressed hash table for spilled tree payloads.
 ///
-/// Uses linear probing with FNV-1a hashing. There are no tombstones; once all
-/// slots are occupied, inserts fail and callers may disable indexing. This
-/// keeps lookup and insert logic simple and deterministic at the cost of
-/// best-effort behavior under high spill pressure.
+/// Uses linear probing with OID-derived hashing (first 8 bytes of the OID
+/// read as a little-endian u64). There are no tombstones; once all slots are
+/// occupied, inserts fail and callers may disable indexing. This keeps lookup
+/// and insert logic simple and deterministic at the cost of best-effort
+/// behavior under high spill pressure.
 ///
 /// Invariants:
 /// - `slots.len()` is power-of-two so masking is cheap.
@@ -286,6 +287,18 @@ impl TreeBytes {
 /// Eliminates per-hop `Vec::new()` / `Vec::with_capacity()` allocations
 /// in [`ObjectStore::read_pack_object`]. The decompressor is reset before
 /// each inflate call so no stale state leaks between objects.
+///
+/// # Buffer ping-pong protocol
+///
+/// During the unwind phase of delta resolution, `base_buf` and `result_buf`
+/// alternate roles via `std::mem::swap`:
+///
+/// 1. Delta payload is inflated into `inflate_buf`.
+/// 2. `apply_delta(base_buf, inflate_buf, result_buf, …)` produces output.
+/// 3. `swap(&mut base_buf, &mut result_buf)` — the result becomes the base
+///    for the next frame.
+///
+/// After the final unwind step, the resolved object is in `base_buf`.
 struct TreeDecodeBufs {
     de: flate2::Decompress,
     inflate_buf: Vec<u8>,
@@ -589,7 +602,6 @@ impl<'a> ObjectStore<'a> {
 
     /// Resolves a pack object at `offset`, iteratively unwinding any delta
     /// chain.
-    #[allow(unused_assignments)] // base_kind/base_chain_len initializers
     ///
     /// **Phase 1 — Walk forward**: follows OFS delta base offsets (and delta
     /// cache hits) without recursion, pushing one `TreeDeltaFrame` per hop.
@@ -604,6 +616,7 @@ impl<'a> ObjectStore<'a> {
     /// Scratch buffers in `decode_bufs` are reused across calls, eliminating
     /// per-hop `Vec::new()` / `Vec::with_capacity()` allocations that the
     /// previous recursive implementation performed.
+    #[allow(unused_assignments)] // base_kind/base_chain_len initializers
     fn read_pack_object(
         &mut self,
         pack_id: u16,
@@ -617,6 +630,12 @@ impl<'a> ObjectStore<'a> {
         let max_object_bytes = self.max_object_bytes;
 
         // -- Phase 1: Walk forward through the delta chain -----------------
+        //
+        // delta_stack is intentionally local (not in TreeDecodeBufs) because
+        // the REF delta path below may re-enter read_pack_object via
+        // load_object_with_depth. A shared delta_stack would be clobbered
+        // by the inner call. The per-call Vec::new() cost is acceptable
+        // since delta chains are bounded by MAX_DELTA_DEPTH (64 frames).
         let mut delta_stack: Vec<TreeDeltaFrame> = Vec::new();
         let mut current_offset = offset;
         let mut remaining_depth = depth;
@@ -744,15 +763,23 @@ impl<'a> ObjectStore<'a> {
                         delta_size: payload_size,
                     });
 
-                    // Load external base. This may re-enter read_pack_object
-                    // via load_object_with_depth, reusing decode_bufs
-                    // internally; that is safe because the inner call fully
-                    // resolves before returning an owned Vec.
+                    // INVARIANT: Phase 1 must NOT use decode_bufs (inflate_buf,
+                    // result_buf, base_buf) for any inflate operations before
+                    // this point. The inner load_object_with_depth call
+                    // re-enters read_pack_object and freely overwrites
+                    // decode_bufs. Its returned Vec is independent (owned),
+                    // so copying into base_buf after the call is safe.
+                    // Violating this invariant would silently corrupt the
+                    // outer call's partially-inflated buffers.
                     let loaded = self.load_object_with_depth(&base_oid, remaining_depth - 1)?;
                     base_kind = loaded.kind;
                     base_chain_len = loaded.chain_len;
 
                     // Copy loaded bytes into base_buf (inner call is done).
+                    // NOTE: The inner call may mem::take decode_bufs.base_buf,
+                    // losing its capacity. The extend_from_slice below will
+                    // re-allocate. This is acceptable for REF deltas
+                    // (cross-pack, relatively rare).
                     self.decode_bufs.base_buf.clear();
                     self.decode_bufs.base_buf.extend_from_slice(&loaded.bytes);
                     break;
@@ -772,6 +799,12 @@ impl<'a> ObjectStore<'a> {
                     &self.decode_bufs.base_buf,
                 );
             }
+            // NOTE: mem::take drains base_buf's capacity (replaces with
+            // Vec::new()). A swap-based approach was evaluated but does not
+            // help: the returned Vec is consumed by the caller, so there is
+            // no way to reclaim its allocation. Re-growing base_buf on the
+            // next call is cheap for typical tree sizes (< 8 KB) and dwarfed
+            // by inflate/delta-apply costs.
             let bytes = std::mem::take(&mut self.decode_bufs.base_buf);
             return Ok(DecodedTreeObject {
                 kind: base_kind,
@@ -841,6 +874,9 @@ impl<'a> ObjectStore<'a> {
         }
 
         perf::record_tree_delta_chain(base_chain_len);
+        // NOTE: same capacity-loss tradeoff as the fast path above.
+        // inflate_buf and result_buf retain their capacity (only swapped,
+        // never taken), so the main per-call cost is re-growing base_buf.
         let bytes = std::mem::take(&mut self.decode_bufs.base_buf);
         Ok(DecodedTreeObject {
             kind: base_kind,

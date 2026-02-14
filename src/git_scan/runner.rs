@@ -252,6 +252,14 @@ fn detected_parallelism() -> usize {
         .max(1)
 }
 
+/// Maximum pack execution workers regardless of core count.
+///
+/// Prevents excessive memory usage from per-worker `Decompress` (~37 KiB),
+/// scratch buffers, and `PackCache` allocations (4 MB floor each).
+/// On a 64-core machine with the 6x large-repo multiplier the uncapped
+/// count would be 384, consuming over 1.5 GiB in cache alone.
+pub(crate) const MAX_PACK_EXEC_WORKERS: usize = 128;
+
 /// Repositories below this `in-pack` object count use the baseline 1× core
 /// multiplier for pack execution.
 ///
@@ -293,13 +301,19 @@ pub(crate) fn auto_pack_exec_workers_for_in_pack(in_pack_objects: u64) -> usize 
 ///
 /// `cores` is clamped to at least `1`, and multiplication is saturating to
 /// prevent overflow if a caller passes an extreme core count in tests.
+/// The result is capped at [`MAX_PACK_EXEC_WORKERS`] to prevent OOM on
+/// high-core-count machines where per-worker memory (Decompress ~37 KiB,
+/// scratch buffers, PackCache 4 MB floor) would otherwise be excessive.
 #[inline(always)]
 pub(crate) fn auto_pack_exec_workers_for_in_pack_with_cores(
     in_pack_objects: u64,
     cores: usize,
 ) -> usize {
     let multiplier = pack_exec_worker_multiplier_for_in_pack(in_pack_objects);
-    cores.max(1).saturating_mul(multiplier)
+    cores
+        .max(1)
+        .saturating_mul(multiplier)
+        .min(MAX_PACK_EXEC_WORKERS)
 }
 
 /// Blob-intro worker count.
@@ -1297,6 +1311,70 @@ mod tests {
                 0
             ),
             6
+        );
+    }
+
+    #[test]
+    fn auto_pack_exec_workers_caps_at_max_on_high_core_count() {
+        // 64 cores × 6x multiplier = 384, but must be capped at MAX_PACK_EXEC_WORKERS (128).
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                64
+            ),
+            MAX_PACK_EXEC_WORKERS
+        );
+    }
+
+    #[test]
+    fn auto_pack_exec_workers_below_cap_unchanged() {
+        // 4 cores × 6x = 24, below cap — should remain 24.
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                4
+            ),
+            24
+        );
+        // 16 cores × 6x = 96, below cap — should remain 96.
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                16
+            ),
+            96
+        );
+    }
+
+    #[test]
+    fn auto_pack_exec_workers_boundary_at_cap() {
+        // 22 cores × 6x = 132, exceeds cap — should be capped to 128.
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                22
+            ),
+            MAX_PACK_EXEC_WORKERS
+        );
+        // 21 cores × 6x = 126, below cap — should remain 126.
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_MEDIUM_REPO_MAX_IN_PACK_OBJECTS,
+                21
+            ),
+            126
+        );
+    }
+
+    #[test]
+    fn auto_pack_exec_workers_medium_tier_not_capped_below_max() {
+        // 12 cores × 3x = 36, well below cap.
+        assert_eq!(
+            auto_pack_exec_workers_for_in_pack_with_cores(
+                PACK_EXEC_SMALL_REPO_MAX_IN_PACK_OBJECTS,
+                12
+            ),
+            36
         );
     }
 

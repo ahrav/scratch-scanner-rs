@@ -276,7 +276,7 @@ fn round_down_power_of_two_u32(val: u32) -> u32 {
 }
 
 fn hash_oid(oid: &OidBytes) -> u64 {
-    // SplitMix64 avalanche on the first 8 OID bytes. Sequential OIDs
+    // Murmur3 fmix64 finalizer on the first 8 OID bytes. Sequential OIDs
     // (common in packs) share long prefixes; without mixing they cluster
     // into the same sets, degrading the 4-way associative cache to a
     // single-set LRU. The finalizer is the same one used in
@@ -342,6 +342,16 @@ mod tests {
             }
         }
         assert!(hit_count >= 1);
+    }
+
+    #[test]
+    fn hash_oid_is_deterministic() {
+        // Pin the hash output to detect accidental algorithm changes.
+        let mut oid_bytes = [0u8; 20];
+        oid_bytes[0..8].copy_from_slice(&42u64.to_le_bytes());
+        let oid = OidBytes::sha1(oid_bytes);
+        let h = hash_oid(&oid);
+        assert_eq!(h, 0xe366_d96c_81ba_7514);
     }
 
     #[test]
