@@ -24,7 +24,7 @@ fn make_tree_entries(count: usize, name_len: usize) -> Vec<u8> {
         // name: pad with 'a' bytes, suffix with index to make unique
         let suffix = format!("{i:06}");
         let pad = name_len.saturating_sub(suffix.len());
-        buf.extend(std::iter::repeat(b'a').take(pad));
+        buf.extend(std::iter::repeat_n(b'a', pad));
         buf.extend_from_slice(suffix.as_bytes());
         // NUL
         buf.push(0);
