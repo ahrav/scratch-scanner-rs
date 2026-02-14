@@ -30,50 +30,39 @@ fn rules_hash_is_stable_and_hex_sized() {
 }
 
 #[test]
-fn resolve_rule_source_prefers_explicit_path_over_defaults() {
+fn resolve_rule_source_prefers_explicit_path_over_default() {
     let dir = tempfile::tempdir().unwrap();
     let explicit = dir.path().join("custom_rules.yaml");
     let candidate = dir.path().join("exe_default_rules.yaml");
     touch_default_rules_file(&explicit);
     touch_default_rules_file(&candidate);
 
-    let source = resolve_rule_source(Some(&explicit), &[candidate]);
+    let source = resolve_rule_source(Some(&explicit), Some(candidate.as_path()));
     assert_eq!(source, RuleSource::Explicit(explicit));
 }
 
 #[test]
-fn resolve_rule_source_uses_first_existing_candidate() {
+fn resolve_rule_source_uses_existing_default() {
     let dir = tempfile::tempdir().unwrap();
     let candidate = dir.path().join("default_rules.yaml");
     touch_default_rules_file(&candidate);
 
-    let source = resolve_rule_source(None, std::slice::from_ref(&candidate));
+    let source = resolve_rule_source(None, Some(candidate.as_path()));
     assert_eq!(source, RuleSource::DefaultCandidate(candidate));
 }
 
 #[test]
-fn resolve_rule_source_skips_missing_candidates() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("missing.yaml");
-    let present = dir.path().join("present.yaml");
-    touch_default_rules_file(&present);
-
-    let source = resolve_rule_source(None, &[missing, present.clone()]);
-    assert_eq!(source, RuleSource::DefaultCandidate(present));
-}
-
-#[test]
-fn resolve_rule_source_falls_back_to_builtin_when_no_candidates_exist() {
+fn resolve_rule_source_falls_back_to_builtin_when_default_missing() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("nonexistent.yaml");
 
-    let source = resolve_rule_source(None, &[missing]);
+    let source = resolve_rule_source(None, Some(missing.as_path()));
     assert_eq!(source, RuleSource::BuiltInFallback);
 }
 
 #[test]
-fn resolve_rule_source_falls_back_to_builtin_when_no_candidates_given() {
-    let source = resolve_rule_source(None, &[]);
+fn resolve_rule_source_falls_back_to_builtin_when_no_default_given() {
+    let source = resolve_rule_source(None, None);
     assert_eq!(source, RuleSource::BuiltInFallback);
 }
 

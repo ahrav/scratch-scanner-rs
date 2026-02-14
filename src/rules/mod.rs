@@ -176,32 +176,25 @@ pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, Ru
     Ok(rules)
 }
 
-/// Returns candidate paths for `default_rules.yaml` in priority order.
+/// Returns the default rules file path next to the current executable.
 ///
-/// Candidates (checked in order):
-/// 1. Next to the current executable
-/// 2. Current working directory
+/// Returns `None` if the executable path cannot be determined (e.g., `/proc`
+/// not mounted in containers, or the binary has no parent directory).
+/// The returned path is a candidate location and may not exist.
 ///
-/// Paths are returned regardless of existence — the caller probes each one.
-pub(crate) fn default_rules_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(2);
-    match std::env::current_exe() {
-        Ok(exe) => {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("default_rules.yaml"));
-            }
-        }
+/// Only the executable-adjacent location is checked. The current working
+/// directory is intentionally excluded because this tool scans untrusted
+/// repositories — loading a `default_rules.yaml` planted inside a repo
+/// would let an attacker suppress detections or crash the scanner.
+pub(crate) fn default_rules_path() -> Option<PathBuf> {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
         Err(e) => {
             eprintln!("warning: cannot determine executable path: {e}");
+            return None;
         }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd_candidate = cwd.join("default_rules.yaml");
-        if !candidates.iter().any(|c| c == &cwd_candidate) {
-            candidates.push(cwd_candidate);
-        }
-    }
-    candidates
+    };
+    Some(exe.parent()?.join("default_rules.yaml"))
 }
 
 /// The built-in rule set, embedded from `default_rules.yaml` at compile time.

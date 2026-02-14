@@ -1202,7 +1202,7 @@ fn apply_transform_filter(
 /// # Invariants
 /// - `Explicit` stores the CLI-provided path as-is; existence/readability are
 ///   validated by the loader.
-/// - `DefaultCandidate` is selected only when probing confirms the file exists.
+/// - `DefaultCandidate` is selected only when probing confirms the exe-adjacent file exists.
 /// - `BuiltInFallback` is used when no on-disk candidate was found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuleSource {
@@ -1225,19 +1225,19 @@ impl RuleSource {
 /// Resolve which rule source to use according to precedence.
 ///
 /// Explicit `--rules` paths are accepted without existence checks so downstream
-/// loader diagnostics can report precise read/parse failures. Default candidates
-/// (exe-adjacent, then CWD) are accepted only if `try_exists()` confirms they
-/// exist; probe failures emit an explicit warning before falling back.
-fn resolve_rule_source(rules_file: Option<&Path>, default_candidates: &[PathBuf]) -> RuleSource {
+/// loader diagnostics can report precise read/parse failures. The exe-adjacent
+/// default is accepted only if `try_exists()` confirms the file is present;
+/// probe failures emit a warning before falling back to the built-in set.
+fn resolve_rule_source(rules_file: Option<&Path>, default_path: Option<&Path>) -> RuleSource {
     if let Some(path) = rules_file {
         return RuleSource::Explicit(path.to_path_buf());
     }
-    for path in default_candidates {
+    if let Some(path) = default_path {
         match path.try_exists() {
-            Ok(true) => return RuleSource::DefaultCandidate(path.clone()),
+            Ok(true) => return RuleSource::DefaultCandidate(path.to_path_buf()),
             Ok(false) => {}
             Err(err) => {
-                eprintln!("warning: failed to probe {}: {err}", path.display(),);
+                eprintln!("warning: failed to probe {}: {err}", path.display());
             }
         }
     }
@@ -1280,16 +1280,15 @@ fn load_rules_from_path(path: &Path, source: &RuleSource) -> (Vec<RuleSpec>, u64
 /// # Selection order
 /// 1. `--rules` explicit path
 /// 2. `default_rules.yaml` next to the executable
-/// 3. `default_rules.yaml` in the current working directory
-/// 4. Compile-time embedded fallback (`default_rules.yaml`)
+/// 3. Compile-time embedded fallback (`default_rules.yaml`)
 ///
 /// # Effects
 /// - Emits provenance logs (source label and deterministic fast hash fingerprint).
 /// - Exits with status `2` if a selected on-disk source (explicit or
 ///   default candidate) cannot be read/parsed.
 fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
-    let candidates = crate::rules::default_rules_candidates();
-    let source = resolve_rule_source(rules_file, &candidates);
+    let default_path = crate::rules::default_rules_path();
+    let source = resolve_rule_source(rules_file, default_path.as_deref());
     match &source {
         RuleSource::Explicit(path) | RuleSource::DefaultCandidate(path) => {
             let (rules, _) = load_rules_from_path(path, &source);
