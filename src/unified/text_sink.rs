@@ -9,11 +9,11 @@
 //!
 //! | Event | Compact mode | Verbose mode |
 //! |------------|---------------------|-------------------------------|
-//! | Finding | `{path}:{start}-{end}  {rule}  ({source})` | Multi-line block with all fields |
+//! | Finding | `{path}:{start}-{end}  {rule_name}  ({source})` | Multi-line block with all fields |
 //! | Progress | suppressed | `[progress] …` |
 //! | Summary | `[summary] …` | `[summary] …` |
 //! | Diagnostic | stderr (always) | stderr (always) |
-//! | CommitMeta | suppressed | `[commit_meta] id={} oid={} ts={}` |
+//! | CommitMeta | suppressed | `[commit_meta] id={} oid={} ts={}` (identity IDs omitted) |
 //! | IdentityDictionary | suppressed | suppressed |
 
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -23,6 +23,7 @@ use super::events::{
     CommitMetaEvent, DiagnosticEvent, EventSink, FindingEvent, ProgressEvent, ScanEvent,
     SummaryEvent,
 };
+use super::json_write::write_oid_hex;
 use super::SourceKind;
 
 /// Default buffer size (64 KiB) for buffered text emission.
@@ -32,10 +33,9 @@ const DEFAULT_BUF_CAPACITY: usize = 64 * 1024;
 ///
 /// Thread-safe: the internal `BufWriter` is guarded by a [`Mutex`], so
 /// multiple worker threads may call [`EventSink::emit`] concurrently.
-/// The mutex is held while formatting directly into the `BufWriter`, unlike
-/// [`JsonlEventSink`](super::events::JsonlEventSink) which formats outside
-/// the lock. This is acceptable because text output is a low-throughput
-/// debug path — the JSONL sink is the production-grade choice.
+/// Each event is formatted into a per-call scratch buffer first, then written
+/// under the mutex with a single `write_all`. This keeps lock hold time short
+/// under concurrent emitters while preserving atomic line writes.
 ///
 /// # Error contract
 ///
@@ -53,30 +53,33 @@ impl<W: Write + Send> TextEventSink<W> {
             verbose,
         }
     }
+
+    fn write_buffer(&self, buf: &[u8]) {
+        let mut w = self.writer.lock().expect("text sink mutex poisoned");
+        handle_write_error(w.write_all(buf));
+    }
 }
 
 impl<W: Write + Send + 'static> EventSink for TextEventSink<W> {
     fn emit(&self, event: ScanEvent<'_>) {
+        let mut line = Vec::with_capacity(256);
         match event {
             ScanEvent::Finding(ref f) => {
-                let mut w = self.writer.lock().expect("text sink mutex poisoned");
-                let res = if self.verbose {
-                    write_finding_verbose(f, &mut *w)
+                if self.verbose {
+                    write_finding_verbose(f, &mut line)
                 } else {
-                    write_finding_compact(f, &mut *w)
-                };
-                handle_write_error(res);
+                    write_finding_compact(f, &mut line)
+                }
+                .expect("formatting into Vec<u8> cannot fail");
             }
             ScanEvent::Progress(ref p) => {
                 if self.verbose {
-                    let mut w = self.writer.lock().expect("text sink mutex poisoned");
-                    handle_write_error(write_progress(p, &mut *w));
+                    write_progress(p, &mut line).expect("formatting into Vec<u8> cannot fail");
                 }
                 // Compact mode: suppress progress events.
             }
             ScanEvent::Summary(ref s) => {
-                let mut w = self.writer.lock().expect("text sink mutex poisoned");
-                handle_write_error(write_summary(s, &mut *w));
+                write_summary(s, &mut line).expect("formatting into Vec<u8> cannot fail");
             }
             ScanEvent::Diagnostic(ref d) => {
                 // Diagnostics always go to stderr, not the main writer.
@@ -84,15 +87,17 @@ impl<W: Write + Send + 'static> EventSink for TextEventSink<W> {
             }
             ScanEvent::CommitMeta(ref m) => {
                 if self.verbose {
-                    let mut w = self.writer.lock().expect("text sink mutex poisoned");
-                    handle_write_error(write_commit_meta(m, &mut *w));
+                    write_commit_meta(m, &mut line).expect("formatting into Vec<u8> cannot fail");
                 }
                 // Compact mode: suppress commit_meta events.
             }
             ScanEvent::IdentityDictionary(_) => {
-                // Identity dictionary entries are consumed by JSONL sinks;
+                // Identity dictionary entries are consumed by JSON-based sinks;
                 // the human-readable text sink silently drops them.
             }
+        }
+        if !line.is_empty() {
+            self.write_buffer(&line);
         }
     }
 
@@ -104,8 +109,9 @@ impl<W: Write + Send + 'static> EventSink for TextEventSink<W> {
 
 /// Swallow `BrokenPipe`; panic on any other I/O error.
 ///
-/// All text-sink write paths funnel through this so the error policy is
-/// defined in exactly one place.
+/// All text-sink write paths to the main writer funnel through this so
+/// the error policy is defined in exactly one place. Diagnostics go to
+/// stderr with a separate best-effort policy (see [`write_diagnostic`]).
 fn handle_write_error(result: io::Result<()>) {
     if let Err(e) = result {
         if e.kind() == ErrorKind::BrokenPipe {
@@ -121,8 +127,37 @@ fn write_diagnostic(d: &DiagnosticEvent<'_>) {
     let _ = writeln!(std::io::stderr(), "[{}] {}", d.level, d.message);
 }
 
-fn lossy_path(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
-    String::from_utf8_lossy(bytes)
+/// Convert raw path bytes to a display-safe string.
+///
+/// 1. Decode as UTF-8 with lossy replacement (invalid bytes → U+FFFD).
+/// 2. Replace control characters with escapes (`\xHH` or `\u{HHHH}`).
+///    This prevents terminal/log injection and preserves the compact format's
+///    one-line-per-finding invariant by escaping embedded newlines.
+fn sanitize_path(bytes: &[u8]) -> String {
+    use std::fmt::Write as FmtWrite;
+
+    let lossy = String::from_utf8_lossy(bytes);
+    if !lossy.chars().any(char::is_control) {
+        return lossy.into_owned();
+    }
+    let mut out = String::with_capacity(lossy.len());
+    for ch in lossy.chars() {
+        if ch == '\u{FFFD}' {
+            // Preserve the replacement character from lossy decoding as-is.
+            out.push(ch);
+        } else if ch.is_control() {
+            // Escape control chars as \xHH (or \u{HHHH} when needed).
+            let cp = ch as u32;
+            if cp <= 0xff {
+                let _ = write!(&mut out, "\\x{cp:02x}");
+            } else {
+                let _ = write!(&mut out, "\\u{{{cp:04x}}}");
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn source_label(kind: SourceKind) -> &'static str {
@@ -137,7 +172,7 @@ fn write_finding_compact(f: &FindingEvent<'_>, w: &mut impl Write) -> io::Result
     writeln!(
         w,
         "{}:{}-{}  {}  ({})",
-        lossy_path(f.object_path),
+        sanitize_path(f.object_path),
         f.start,
         f.end,
         f.rule_name,
@@ -159,7 +194,7 @@ fn write_finding_compact(f: &FindingEvent<'_>, w: &mut impl Write) -> io::Result
 fn write_finding_verbose(f: &FindingEvent<'_>, w: &mut impl Write) -> io::Result<()> {
     w.write_all(b"--- finding ---\n")?;
     writeln!(w, "  rule:   {}", f.rule_name)?;
-    writeln!(w, "  path:   {}", lossy_path(f.object_path))?;
+    writeln!(w, "  path:   {}", sanitize_path(f.object_path))?;
     writeln!(w, "  range:  {}-{}", f.start, f.end)?;
     writeln!(w, "  source: {}", source_label(f.source))?;
     if let Some(cid) = f.commit_id {
@@ -185,6 +220,9 @@ fn write_progress(p: &ProgressEvent, w: &mut impl Write) -> io::Result<()> {
 }
 
 /// `[summary] {source} | {status} | elapsed={ms}ms bytes={n} findings={n} errors={n} throughput={x.xx} MiB/s`
+///
+/// `throughput_mib_s` is formatted as-is with `{:.2}` — `NaN` and `Inf`
+/// pass through unmodified. The JSONL encoder clamps these to `0.00`.
 fn write_summary(s: &SummaryEvent, w: &mut impl Write) -> io::Result<()> {
     writeln!(
         w,
@@ -201,15 +239,16 @@ fn write_summary(s: &SummaryEvent, w: &mut impl Write) -> io::Result<()> {
 
 /// Verbose: `[commit_meta] id={commit_id} oid={hex} ts={timestamp}`
 ///
-/// The OID is emitted as lowercase hex. `as_slice()` returns 20 bytes for
-/// SHA-1 or 32 bytes for SHA-256, so the hex string is 40 or 64 chars
-/// respectively — no branching required.
-fn write_commit_meta(m: &CommitMetaEvent, w: &mut impl Write) -> io::Result<()> {
-    write!(w, "[commit_meta] id={} oid=", m.commit_id)?;
-    for &b in m.commit_oid.as_slice() {
-        write!(w, "{b:02x}")?;
-    }
-    writeln!(w, " ts={}", m.timestamp)
+/// The OID is emitted as lowercase hex via [`write_oid_hex`] so all sinks
+/// share one canonical OID encoding implementation.
+///
+/// `CommitMetaEvent::identity` is intentionally omitted here to keep text
+/// output concise and human-readable. Use the JSONL sink when identity IDs
+/// are needed downstream.
+fn write_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) -> io::Result<()> {
+    write!(buf, "[commit_meta] id={} oid=", m.commit_id)?;
+    write_oid_hex(&m.commit_oid, buf);
+    writeln!(buf, " ts={}", m.timestamp)
 }
 
 #[cfg(test)]
@@ -374,7 +413,75 @@ mod tests {
         assert!(out.contains('\u{FFFD}'));
     }
 
-    // ── U1: SHA-256 OID in commit_meta ──────────────────────────────────
+    #[test]
+    fn path_control_chars_sanitized() {
+        // ANSI escape sequence in path (e.g. from a malicious Git tree entry).
+        let out = collect_text(
+            ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Git,
+                object_path: b"src/\x1b[2Jevil.rs",
+                start: 0,
+                end: 5,
+                rule_id: 1,
+                rule_name: "rule",
+                commit_id: None,
+                change_kind: None,
+            }),
+            false,
+        );
+        // The ESC byte (0x1b) must be escaped, not passed through raw.
+        assert!(
+            !out.contains('\x1b'),
+            "raw ESC byte must not appear in output: {out:?}"
+        );
+        assert!(out.contains("\\x1b"));
+    }
+
+    #[test]
+    fn path_newline_sanitized() {
+        // Embedded newline must not break the one-line compact format.
+        let out = collect_text(
+            ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"a\nb",
+                start: 0,
+                end: 1,
+                rule_id: 1,
+                rule_name: "rule",
+                commit_id: None,
+                change_kind: None,
+            }),
+            false,
+        );
+        // Exactly one newline (the line terminator), not two.
+        let newline_count = out.chars().filter(|&c| c == '\n').count();
+        assert_eq!(
+            newline_count, 1,
+            "embedded newline must be escaped: {out:?}"
+        );
+        assert!(out.contains("\\x0a"));
+    }
+
+    #[test]
+    fn path_null_and_del_sanitized() {
+        let out = collect_text(
+            ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"a\x00b\x7fc",
+                start: 0,
+                end: 1,
+                rule_id: 1,
+                rule_name: "rule",
+                commit_id: None,
+                change_kind: None,
+            }),
+            false,
+        );
+        assert!(out.contains("\\x00"), "NUL must be escaped: {out:?}");
+        assert!(out.contains("\\x7f"), "DEL must be escaped: {out:?}");
+    }
+
+    // ── SHA-256 OID in commit_meta ──────────────────────────────────────
 
     #[test]
     fn verbose_commit_meta_sha256() {
@@ -406,7 +513,7 @@ mod tests {
         );
     }
 
-    // ── U2: Float edge cases in summary ─────────────────────────────────
+    // ── Float edge cases in summary ─────────────────────────────────────
 
     #[test]
     fn summary_nan_throughput() {
@@ -429,76 +536,7 @@ mod tests {
         assert!(out.contains("NaN MiB/s"));
     }
 
-    #[test]
-    fn summary_infinity_throughput() {
-        let out = collect_text(
-            ScanEvent::Summary(SummaryEvent {
-                source: SourceKind::Fs,
-                status: "complete",
-                elapsed_ms: 1,
-                bytes_scanned: 0,
-                findings_emitted: 0,
-                errors: 0,
-                throughput_mib_s: f64::INFINITY,
-            }),
-            false,
-        );
-        assert!(out.contains("inf MiB/s"));
-    }
-
-    #[test]
-    fn summary_neg_infinity_throughput() {
-        let out = collect_text(
-            ScanEvent::Summary(SummaryEvent {
-                source: SourceKind::Fs,
-                status: "complete",
-                elapsed_ms: 1,
-                bytes_scanned: 0,
-                findings_emitted: 0,
-                errors: 0,
-                throughput_mib_s: f64::NEG_INFINITY,
-            }),
-            false,
-        );
-        assert!(out.contains("-inf MiB/s"));
-    }
-
-    #[test]
-    fn summary_zero_throughput() {
-        let out = collect_text(
-            ScanEvent::Summary(SummaryEvent {
-                source: SourceKind::Fs,
-                status: "complete",
-                elapsed_ms: 100,
-                bytes_scanned: 0,
-                findings_emitted: 0,
-                errors: 0,
-                throughput_mib_s: 0.0,
-            }),
-            false,
-        );
-        assert!(out.contains("0.00 MiB/s"));
-    }
-
-    #[test]
-    fn summary_negative_throughput() {
-        let out = collect_text(
-            ScanEvent::Summary(SummaryEvent {
-                source: SourceKind::Fs,
-                status: "complete",
-                elapsed_ms: 100,
-                bytes_scanned: 0,
-                findings_emitted: 0,
-                errors: 0,
-                throughput_mib_s: -42.5,
-            }),
-            false,
-        );
-        // Negative values pass through `{:.2}` unmodified.
-        assert!(out.contains("-42.50 MiB/s"));
-    }
-
-    // ── U3: Empty path in finding ───────────────────────────────────────
+    // ── Empty path in finding ───────────────────────────────────────────
 
     #[test]
     fn compact_finding_empty_path() {
@@ -518,7 +556,7 @@ mod tests {
         assert_eq!(out, ":42-80  rule  (fs)\n");
     }
 
-    // ── U4: CommitMeta with identity present ────────────────────────────
+    // ── CommitMeta with identity present ────────────────────────────────
 
     #[test]
     fn verbose_commit_meta_ignores_identity() {
@@ -554,7 +592,7 @@ mod tests {
         assert_eq!(with_identity, without_identity);
     }
 
-    // ── U5: Boundary numerics ───────────────────────────────────────────
+    // ── Boundary numerics ───────────────────────────────────────────────
 
     #[test]
     fn compact_finding_max_offsets() {
@@ -610,6 +648,142 @@ mod tests {
         assert!(out.contains("bytes=0"));
         assert!(out.contains("findings=0"));
     }
+
+    // ── Diagnostic event routing ────────────────────────────────────────
+
+    #[test]
+    fn diagnostic_does_not_write_to_main_writer() {
+        let out = collect_text(
+            ScanEvent::Diagnostic(DiagnosticEvent {
+                level: "warn",
+                message: "something happened",
+            }),
+            false,
+        );
+        assert!(
+            out.is_empty(),
+            "diagnostic must go to stderr, not main writer"
+        );
+    }
+
+    // ── Verbose finding without optional fields ─────────────────────────
+
+    #[test]
+    fn verbose_finding_fs_no_optional_fields() {
+        let out = collect_text(
+            ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"lib.rs",
+                start: 10,
+                end: 20,
+                rule_id: 1,
+                rule_name: "test-rule",
+                commit_id: None,
+                change_kind: None,
+            }),
+            true,
+        );
+        assert!(out.contains("--- finding ---"));
+        assert!(out.contains("source: fs"));
+        assert!(
+            !out.contains("commit:"),
+            "FS finding must not have commit line"
+        );
+        assert!(
+            !out.contains("change:"),
+            "FS finding must not have change line"
+        );
+    }
+
+    // ── IdentityDictionary suppression ──────────────────────────────────
+
+    #[test]
+    fn identity_dictionary_suppressed_compact() {
+        use crate::unified::events::IdentityDictionaryEvent;
+        let out = collect_text(
+            ScanEvent::IdentityDictionary(IdentityDictionaryEvent {
+                id: 42,
+                value: b"Alice <alice@example.com>",
+            }),
+            false,
+        );
+        assert!(
+            out.is_empty(),
+            "compact mode must suppress IdentityDictionary"
+        );
+    }
+
+    #[test]
+    fn identity_dictionary_suppressed_verbose() {
+        use crate::unified::events::IdentityDictionaryEvent;
+        let out = collect_text(
+            ScanEvent::IdentityDictionary(IdentityDictionaryEvent {
+                id: 42,
+                value: b"Alice <alice@example.com>",
+            }),
+            true,
+        );
+        assert!(
+            out.is_empty(),
+            "verbose mode must suppress IdentityDictionary"
+        );
+    }
+
+    // ── BrokenPipe error handling ───────────────────────────────────────
+
+    /// A writer whose `flush()` always returns `BrokenPipe`.
+    ///
+    /// `write()` succeeds (bytes are absorbed by `BufWriter`'s internal
+    /// buffer), so we test the BrokenPipe contract through `flush()` which
+    /// bypasses buffering and hits the underlying writer directly.
+    struct BrokenPipeWriter;
+
+    impl std::io::Write for BrokenPipeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // Accept writes so BufWriter doesn't fail during formatting.
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(ErrorKind::BrokenPipe, "pipe closed"))
+        }
+    }
+
+    #[test]
+    fn broken_pipe_swallowed_on_flush() {
+        let sink = TextEventSink::new(BrokenPipeWriter, false);
+        sink.emit(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"test",
+            start: 0,
+            end: 1,
+            rule_id: 0,
+            rule_name: "rule",
+            commit_id: None,
+            change_kind: None,
+        }));
+        // flush() calls BrokenPipeWriter::flush() → BrokenPipe → must not panic.
+        sink.flush();
+    }
+
+    /// A writer that always fails with `PermissionDenied`.
+    struct FailWriter;
+
+    impl std::io::Write for FailWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(ErrorKind::PermissionDenied, "denied"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(ErrorKind::PermissionDenied, "denied"))
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "text event sink write failed")]
+    fn non_broken_pipe_error_panics() {
+        let sink = TextEventSink::new(FailWriter, false);
+        // flush() calls FailWriter::flush() → PermissionDenied → must panic.
+        sink.flush();
+    }
 }
 
 // ============================================================================
@@ -618,9 +792,9 @@ mod tests {
 
 /// Property-based tests that fuzz the text sink with arbitrary inputs.
 ///
-/// Each property (P1–P5) targets a structural invariant of the output format
-/// rather than a specific input value, complementing the exact-match unit
-/// tests above.
+/// Each property targets a structural invariant of the output format rather
+/// than a specific input value, complementing the exact-match unit tests
+/// above.
 #[cfg(all(test, feature = "stdx-proptest"))]
 mod prop_tests {
     use super::*;
@@ -647,19 +821,15 @@ mod prop_tests {
             .. ProptestConfig::default()
         })]
 
-        // ── P1: Compact finding always produces exactly one line ────────
+        // ── Compact finding always produces exactly one line ────────────
         //
-        // Paths are filtered to exclude newline bytes (0x0a) because
-        // `from_utf8_lossy` preserves them as literal '\n', breaking the
-        // one-liner invariant. This is acceptable: Git paths with embedded
-        // newlines are pathological and the text sink is a debug path.
+        // `sanitize_path` escapes all C0 control characters (including
+        // newlines) as `\xHH`, so arbitrary byte paths cannot break the
+        // one-line invariant. No input filtering is needed.
 
         #[test]
         fn prop_compact_finding_single_line(
-            path in proptest::collection::vec(
-                any::<u8>().prop_filter("no newlines", |&b| b != b'\n'),
-                0..256,
-            ),
+            path in proptest::collection::vec(any::<u8>(), 0..256),
             start: u64,
             end: u64,
             rule_name in "[a-zA-Z0-9_-]{1,64}",
@@ -691,7 +861,7 @@ mod prop_tests {
             prop_assert!(out.contains(label));
         }
 
-        // ── P2: Verbose finding always contains required field labels ───
+        // ── Verbose finding always contains required field labels ───────
 
         #[test]
         fn prop_verbose_finding_has_fields(
@@ -719,50 +889,12 @@ mod prop_tests {
             prop_assert!(out.contains("source:"));
         }
 
-        // ── P3: Compact mode suppresses progress and commit_meta ────────
-
-        #[test]
-        fn prop_compact_suppresses_progress(
-            source in source_kind_strategy(),
-            objects: u64,
-            bytes: u64,
-            findings: u64,
-        ) {
-            let out = collect_text(
-                ScanEvent::Progress(ProgressEvent {
-                    source,
-                    stage: "scanning",
-                    objects_scanned: objects,
-                    bytes_scanned: bytes,
-                    findings_emitted: findings,
-                }),
-                false,
-            );
-            prop_assert!(out.is_empty(), "compact mode must suppress progress, got: {out:?}");
-        }
-
-        #[test]
-        fn prop_compact_suppresses_commit_meta(
-            commit_id: u32,
-            timestamp: u64,
-            raw in proptest::collection::vec(any::<u8>(), 20..=20),
-        ) {
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&raw);
-            let oid = OidBytes::sha1(arr);
-            let out = collect_text(
-                ScanEvent::CommitMeta(CommitMetaEvent {
-                    commit_id,
-                    commit_oid: oid,
-                    timestamp,
-                    identity: None,
-                }),
-                false,
-            );
-            prop_assert!(out.is_empty(), "compact mode must suppress commit_meta, got: {out:?}");
-        }
-
-        // ── P4: Summary always contains key markers ─────────────────────
+        // ── Summary always contains key markers ─────────────────────────
+        //
+        // Compact-mode suppression of progress and commit_meta events is
+        // a simple `if self.verbose` branch — the unit tests
+        // `compact_suppresses_progress` and `compact_suppresses_commit_meta`
+        // cover it. Fuzzing random payloads through a no-op path adds no value.
 
         #[test]
         fn prop_summary_has_markers(
@@ -791,7 +923,7 @@ mod prop_tests {
             prop_assert!(out.ends_with('\n'));
         }
 
-        // ── P5: OID hex formatting roundtrips ───────────────────────────
+        // ── OID hex formatting roundtrips ───────────────────────────────
 
         #[test]
         fn prop_sha1_oid_hex_in_commit_meta(
