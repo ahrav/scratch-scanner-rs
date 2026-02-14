@@ -100,6 +100,24 @@ jobs:
           key: ubuntu-22.04
       - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests,perf-stats
 
+  loom:
+    name: Loom Concurrency Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04-loom
+      - name: Run loom tests
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test --lib -- loom_tests
+
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)
     if: github.event_name == 'pull_request'
@@ -189,6 +207,7 @@ jobs:
           cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_encode_pipeline -- -runs=${FUZZ_RUNS}
 
   fuzz-macos:
     name: Fuzz (Scheduled, Nightly Only, macOS)
@@ -227,6 +246,7 @@ jobs:
           cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_encode_pipeline -- -runs=${FUZZ_RUNS}
 
   miri:
     name: Miri (Scheduled, Nightly)

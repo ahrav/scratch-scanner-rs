@@ -165,43 +165,61 @@ fn digit_count(n: u64) -> usize {
     }
 }
 
-/// Write a u64 as decimal ASCII.
+/// Write `n` as decimal ASCII digits into `dst` and return the byte count
+/// (1..=20).
 ///
-/// Uses a two-digits-at-a-time lookup table to halve the number of divisions.
-/// Pre-computes the digit count via [`digit_count`], fills a stack buffer
-/// from the least-significant end toward the most-significant (two digits
-/// at a time), then copies the completed string to `buf` with a single
-/// `extend_from_slice` (memcpy).
-#[inline]
-pub(crate) fn write_u64(n: u64, buf: &mut Vec<u8>) {
+/// Shared core for [`write_u64`] (stack buffer → `extend_from_slice`) and
+/// [`BufCursor::push_u64`] (direct pointer write). Uses two-digits-at-a-time
+/// decomposition via [`DIGIT_PAIRS`].
+///
+/// # Safety
+///
+/// `dst` must point to at least 20 writable bytes.
+#[inline(always)]
+unsafe fn format_u64_raw(n: u64, dst: *mut u8) -> usize {
     if n == 0 {
-        buf.push(b'0');
-        return;
+        // SAFETY: caller guarantees at least 20 bytes at `dst`.
+        unsafe {
+            *dst = b'0';
+        }
+        return 1;
     }
 
     let digits = digit_count(n);
-    let mut tmp = [0u8; 20]; // u64::MAX is 20 digits
-    let mut pos = digits;
-    let mut v = n;
+    // SAFETY: `digit_count` returns 1..=20, and caller guarantees 20 bytes.
+    unsafe {
+        let mut pos = digits;
+        let mut v = n;
 
-    // Process two digits at a time from the least-significant end.
-    while v >= 100 {
-        let rem = (v % 100) as usize;
-        v /= 100;
-        pos -= 2;
-        tmp[pos] = DIGIT_PAIRS[rem][0];
-        tmp[pos + 1] = DIGIT_PAIRS[rem][1];
+        while v >= 100 {
+            let rem = (v % 100) as usize;
+            v /= 100;
+            pos -= 2;
+            *dst.add(pos) = DIGIT_PAIRS[rem][0];
+            *dst.add(pos + 1) = DIGIT_PAIRS[rem][1];
+        }
+
+        if v >= 10 {
+            let rem = v as usize;
+            *dst = DIGIT_PAIRS[rem][0];
+            *dst.add(1) = DIGIT_PAIRS[rem][1];
+        } else {
+            *dst = b'0' + v as u8;
+        }
     }
+    digits
+}
 
-    // Handle remaining 1 or 2 digits.
-    if v >= 10 {
-        let rem = v as usize;
-        tmp[0] = DIGIT_PAIRS[rem][0];
-        tmp[1] = DIGIT_PAIRS[rem][1];
-    } else {
-        tmp[0] = b'0' + v as u8;
-    }
-
+/// Write a u64 as decimal ASCII.
+///
+/// Delegates to [`format_u64_raw`] for the digit decomposition, then copies
+/// the result into `buf` with a single `extend_from_slice`.
+#[inline]
+pub(crate) fn write_u64(n: u64, buf: &mut Vec<u8>) {
+    let mut tmp = [0u8; 20];
+    // SAFETY: `tmp` is exactly 20 bytes, satisfying `format_u64_raw`'s
+    // requirement of at least 20 writable bytes.
+    let digits = unsafe { format_u64_raw(n, tmp.as_mut_ptr()) };
     buf.extend_from_slice(&tmp[..digits]);
 }
 
@@ -290,6 +308,7 @@ pub(crate) fn write_bool(v: bool, buf: &mut Vec<u8>) {
 ///   or is equal to `end` (no remaining capacity).
 /// - `ptr <= end` at all times.
 /// - `commit()` is called before any external mutation of `buf`.
+#[must_use = "dropping a BufCursor without commit() relies on the Drop safety net"]
 pub(crate) struct BufCursor<'a> {
     buf: &'a mut Vec<u8>,
     ptr: *mut u8,
@@ -346,7 +365,8 @@ impl<'a> BufCursor<'a> {
 
     /// Write a u64 as decimal ASCII directly into the cursor.
     ///
-    /// Requires at most 20 bytes of remaining capacity.
+    /// Requires at most 20 bytes of remaining capacity. Delegates to
+    /// [`format_u64_raw`] for the digit decomposition.
     #[inline(always)]
     pub(crate) fn push_u64(&mut self, n: u64) {
         debug_assert!(
@@ -354,38 +374,11 @@ impl<'a> BufCursor<'a> {
             "BufCursor overflow: need 20 bytes for u64, have {}",
             (self.end as usize) - (self.ptr as usize),
         );
-        if n == 0 {
-            // SAFETY: debug_assert above guarantees >= 20 bytes of capacity; writing 1 byte.
-            unsafe {
-                *self.ptr = b'0';
-                self.ptr = self.ptr.add(1);
-            }
-            return;
-        }
-
-        let digits = digit_count(n);
-        // SAFETY: digit_count returns 1..=20, and we asserted capacity >= 20.
+        // SAFETY: debug_assert above guarantees >= 20 bytes of capacity.
+        // `format_u64_raw` writes 1..=20 bytes and returns the count.
+        let digits = unsafe { format_u64_raw(n, self.ptr) };
+        // SAFETY: `digits` bytes were written starting at `self.ptr`.
         unsafe {
-            let base = self.ptr;
-            let mut pos = digits;
-            let mut v = n;
-
-            while v >= 100 {
-                let rem = (v % 100) as usize;
-                v /= 100;
-                pos -= 2;
-                *base.add(pos) = DIGIT_PAIRS[rem][0];
-                *base.add(pos + 1) = DIGIT_PAIRS[rem][1];
-            }
-
-            if v >= 10 {
-                let rem = v as usize;
-                *base = DIGIT_PAIRS[rem][0];
-                *base.add(1) = DIGIT_PAIRS[rem][1];
-            } else {
-                *base = b'0' + v as u8;
-            }
-
             self.ptr = self.ptr.add(digits);
         }
     }
@@ -416,9 +409,15 @@ impl<'a> BufCursor<'a> {
     #[inline(always)]
     pub(crate) fn commit(&mut self) {
         let new_len = self.ptr as usize - self.buf.as_ptr() as usize;
-        debug_assert!(new_len <= self.buf.capacity());
+        assert!(
+            new_len <= self.buf.capacity(),
+            "BufCursor::commit: new_len ({new_len}) exceeds capacity ({}); \
+             a reserve budget was too small",
+            self.buf.capacity(),
+        );
         // SAFETY: All bytes between old len and new_len were initialized
-        // by push_static / push_byte / push_u64.
+        // by push_static / push_byte / push_u64. The assert above
+        // guarantees new_len <= capacity.
         unsafe {
             self.buf.set_len(new_len);
         }
@@ -555,30 +554,6 @@ fn write_json_bytes_scalar(bytes: &[u8], buf: &mut Vec<u8>) {
     }
 }
 
-/// Escape or pass-through a single byte — the universal per-byte handler.
-///
-/// Unlike [`escape_json_byte`] (which requires `needs_json_escape(byte)`),
-/// this function handles *all* byte values: JSON-special bytes are escaped,
-/// and everything else (printable ASCII, UTF-8 continuation bytes) is
-/// pushed verbatim. Used by the SIMD tail loop where `i` may land
-/// mid-codepoint, so the caller cannot distinguish safe-vs-unsafe up front.
-#[inline(always)]
-fn escape_single_byte(byte: u8, buf: &mut Vec<u8>) {
-    match byte {
-        b'"' => buf.extend_from_slice(b"\\\""),
-        b'\\' => buf.extend_from_slice(b"\\\\"),
-        b'\n' => buf.extend_from_slice(b"\\n"),
-        b'\r' => buf.extend_from_slice(b"\\r"),
-        b'\t' => buf.extend_from_slice(b"\\t"),
-        0x00..=0x1f => {
-            buf.extend_from_slice(b"\\u00");
-            buf.push(HEX_DIGITS[(byte >> 4) as usize]);
-            buf.push(HEX_DIGITS[(byte & 0xf) as usize]);
-        }
-        _ => buf.push(byte),
-    }
-}
-
 // ============================================================================
 // Escape helper functions
 // ============================================================================
@@ -594,14 +569,13 @@ fn needs_json_escape(byte: u8) -> bool {
     byte == b'"' || byte == b'\\' || byte < 0x20
 }
 
-/// Write the JSON escape sequence for a single byte.
+/// Escape or pass-through a single byte for JSON output.
 ///
-/// # Precondition
-///
-/// Callers must ensure `needs_json_escape(byte)` is `true`. The fallthrough
-/// arm (`_ => buf.push(byte)`) exists only as a defensive catch-all; in
-/// correct usage it is unreachable. See [`escape_single_byte`] for the
-/// variant that handles all byte values without a precondition.
+/// Handles all byte values: JSON-special bytes (`"`, `\`, control chars
+/// 0x00..=0x1f) are escaped, and everything else (printable ASCII, high
+/// bytes for UTF-8 continuations) is pushed verbatim. Used by both the
+/// scalar string walker and the SIMD tail loop where `i` may land
+/// mid-codepoint.
 #[inline(always)]
 fn escape_json_byte(byte: u8, buf: &mut Vec<u8>) {
     match byte {
@@ -733,7 +707,7 @@ mod neon {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr().add(i), dst, j);
                         buf.set_len(buf.len() + j);
                     }
-                    super::escape_single_byte(chunk_bytes[j], buf);
+                    super::escape_json_byte(chunk_bytes[j], buf);
                     i += j + 1;
                     // Re-reserve for remaining bytes (escapes may expand output).
                     buf.reserve(bytes.len() - i);
@@ -745,7 +719,7 @@ mod neon {
         // to avoid requiring `i` to be on a char boundary (it might be
         // mid-codepoint after copying a chunk containing multi-byte UTF-8).
         for &b in &bytes[i..] {
-            super::escape_single_byte(b, buf);
+            super::escape_json_byte(b, buf);
         }
     }
 
@@ -906,7 +880,7 @@ mod sse2 {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr().add(i), dst, j);
                         buf.set_len(buf.len() + j);
                     }
-                    super::escape_single_byte(chunk_bytes[j], buf);
+                    super::escape_json_byte(chunk_bytes[j], buf);
                     i += j + 1;
                     buf.reserve(bytes.len() - i);
                 }
@@ -915,7 +889,7 @@ mod sse2 {
 
         // Scalar tail: byte-level to avoid char-boundary requirement on `i`.
         for &b in &bytes[i..] {
-            super::escape_single_byte(b, buf);
+            super::escape_json_byte(b, buf);
         }
     }
 
@@ -969,8 +943,9 @@ mod sse2 {
 /// escape-worthy characters are encountered.
 #[inline]
 pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
-    buf.reserve(s.len());
-    #[cfg(target_arch = "aarch64")]
+    // No pre-reserve here: the SIMD paths and scalar path each manage
+    // their own capacity internally.
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
         if s.len() >= 16 {
             // SAFETY: NEON is guaranteed on aarch64. The function operates on
@@ -981,7 +956,7 @@ pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
             return;
         }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         if s.len() >= 16 {
             // SAFETY: SSE2 is guaranteed on x86_64. The function operates on
@@ -1012,8 +987,9 @@ pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
 /// On aarch64 (NEON) and x86_64 (SSE2), a SIMD fast path scans 16 bytes at a
 /// time for safe ASCII runs.
 pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
-    buf.reserve(bytes.len());
-    #[cfg(target_arch = "aarch64")]
+    // No pre-reserve here: the SIMD paths and scalar path each manage
+    // their own capacity internally.
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
         if bytes.len() >= 16 {
             // SAFETY: NEON is guaranteed on aarch64. The function reads from a
@@ -1024,7 +1000,7 @@ pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
             return;
         }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         if bytes.len() >= 16 {
             // SAFETY: SSE2 is guaranteed on x86_64. The function reads from a

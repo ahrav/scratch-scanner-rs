@@ -5,7 +5,9 @@
 
 use crate::git_scan::object_id::OidBytes;
 
-use super::events::{self, CommitMetaEvent, FindingEvent};
+use super::events::{
+    self, CommitMetaEvent, DiagnosticEvent, FindingEvent, IdentityDictionaryEvent,
+};
 use super::json_write;
 use super::text_sink;
 
@@ -49,6 +51,18 @@ pub fn write_json_str(s: &str, buf: &mut Vec<u8>) {
 #[inline(always)]
 pub fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
     json_write::write_json_bytes(bytes, buf);
+}
+
+/// Encode a diagnostic event into JSON object bytes (no trailing newline).
+#[inline(always)]
+pub fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
+    events::encode_diagnostic(d, buf);
+}
+
+/// Encode an identity dictionary event into JSON object bytes (no trailing newline).
+#[inline(always)]
+pub fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
+    events::encode_identity_dictionary(d, buf);
 }
 
 /// Convert raw path bytes to a display-safe string, escaping control characters.

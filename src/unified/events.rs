@@ -35,7 +35,9 @@ use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
 
-use super::json_write::{write_f64, write_json_bytes, write_json_str, write_oid_hex, BufCursor};
+use super::json_write::{
+    write_f64, write_json_bytes, write_json_str, write_oid_hex, write_u64, BufCursor,
+};
 use super::SourceKind;
 use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
@@ -357,70 +359,63 @@ pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `progress` object to `buf` (no trailing newline).
+///
+/// Cold path (~1 call per progress interval); uses plain `extend_from_slice`
+/// rather than [`BufCursor`] to keep the code straightforward.
 pub(crate) fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
-    // Static: prefix (~43) + field keys (~35) + 3 u64s (60) + closing (1) ≈ 140.
-    let mut cur = BufCursor::new(buf, 160);
     match p.source {
         SourceKind::Fs => {
-            cur.push_static(b"{\"type\":\"progress\",\"source\":\"fs\",\"stage\":\"");
+            buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"fs\",\"stage\":\"")
         }
         SourceKind::Git => {
-            cur.push_static(b"{\"type\":\"progress\",\"source\":\"git\",\"stage\":\"");
+            buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"git\",\"stage\":\"")
         }
     }
-    write_json_str(p.stage, cur.commit_to_buf());
-    cur.resume(120);
-    cur.push_static(b"\",\"objects\":");
-    cur.push_u64(p.objects_scanned);
-    cur.push_static(b",\"bytes\":");
-    cur.push_u64(p.bytes_scanned);
-    cur.push_static(b",\"findings\":");
-    cur.push_u64(p.findings_emitted);
-    cur.push_byte(b'}');
-    cur.commit();
+    write_json_str(p.stage, buf);
+    buf.extend_from_slice(b"\",\"objects\":");
+    write_u64(p.objects_scanned, buf);
+    buf.extend_from_slice(b",\"bytes\":");
+    write_u64(p.bytes_scanned, buf);
+    buf.extend_from_slice(b",\"findings\":");
+    write_u64(p.findings_emitted, buf);
+    buf.push(b'}');
 }
 
 /// Append a JSONL `summary` object to `buf` (no trailing newline).
+///
+/// Cold path (called once at scan end); uses plain `extend_from_slice`.
 pub(crate) fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
-    // Static: prefix (~43) + field keys (~65) + 4 u64s (80) + f64 (20) + closing (1) ≈ 210.
-    let mut cur = BufCursor::new(buf, 240);
     match s.source {
         SourceKind::Fs => {
-            cur.push_static(b"{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"");
+            buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"")
         }
         SourceKind::Git => {
-            cur.push_static(b"{\"type\":\"summary\",\"source\":\"git\",\"status\":\"");
+            buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"git\",\"status\":\"")
         }
     }
-    write_json_str(s.status, cur.commit_to_buf());
-    cur.resume(200);
-    cur.push_static(b"\",\"elapsed_ms\":");
-    cur.push_u64(s.elapsed_ms);
-    cur.push_static(b",\"bytes\":");
-    cur.push_u64(s.bytes_scanned);
-    cur.push_static(b",\"findings\":");
-    cur.push_u64(s.findings_emitted);
-    cur.push_static(b",\"errors\":");
-    cur.push_u64(s.errors);
-    cur.push_static(b",\"throughput_mib_s\":");
-    // Commit before write_f64 (uses extend_from_slice internally).
-    write_f64(s.throughput_mib_s, cur.commit_to_buf());
-    cur.resume(2);
-    cur.push_byte(b'}');
-    cur.commit();
+    write_json_str(s.status, buf);
+    buf.extend_from_slice(b"\",\"elapsed_ms\":");
+    write_u64(s.elapsed_ms, buf);
+    buf.extend_from_slice(b",\"bytes\":");
+    write_u64(s.bytes_scanned, buf);
+    buf.extend_from_slice(b",\"findings\":");
+    write_u64(s.findings_emitted, buf);
+    buf.extend_from_slice(b",\"errors\":");
+    write_u64(s.errors, buf);
+    buf.extend_from_slice(b",\"throughput_mib_s\":");
+    write_f64(s.throughput_mib_s, buf);
+    buf.push(b'}');
 }
 
 /// Append a JSONL `diagnostic` object to `buf` (no trailing newline).
+///
+/// Cold path (rare debug/perf diagnostics); uses plain `extend_from_slice`.
 pub(crate) fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
-    let mut cur = BufCursor::new(buf, 64);
-    cur.push_static(b"{\"type\":\"diagnostic\",\"level\":\"");
-    write_json_str(d.level, cur.commit_to_buf());
-    cur.resume(16);
-    cur.push_static(b"\",\"message\":\"");
-    write_json_str(d.message, cur.commit_to_buf());
-    cur.resume(4);
-    cur.push_static(b"\"}");
-    cur.commit();
+    buf.extend_from_slice(b"{\"type\":\"diagnostic\",\"level\":\"");
+    write_json_str(d.level, buf);
+    buf.extend_from_slice(b"\",\"message\":\"");
+    write_json_str(d.message, buf);
+    buf.extend_from_slice(b"\"}");
 }
 
 /// Cursor-based identity field writer — emits `,"<name>":<id>` or
@@ -470,16 +465,94 @@ pub(crate) fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
 }
 
 /// Append a JSONL `identity_dictionary` object to `buf` (no trailing newline).
+///
+/// Cold path (emitted once per unique identity during init); uses plain
+/// `extend_from_slice`.
 pub(crate) fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
-    let mut cur = BufCursor::new(buf, 80);
-    cur.push_static(b"{\"type\":\"identity_dictionary\",\"id\":");
-    cur.push_u64(d.id as u64);
-    cur.push_static(b",\"value\":\"");
-    write_json_bytes(d.value, cur.commit_to_buf());
-    cur.resume(4);
-    cur.push_static(b"\"}");
-    cur.commit();
+    buf.extend_from_slice(b"{\"type\":\"identity_dictionary\",\"id\":");
+    write_u64(d.id as u64, buf);
+    buf.extend_from_slice(b",\"value\":\"");
+    write_json_bytes(d.value, buf);
+    buf.extend_from_slice(b"\"}");
 }
+
+// ============================================================================
+// Compile-time capacity budget verification for BufCursor segments
+// ============================================================================
+
+// Each assertion proves that the worst-case bytes written in a BufCursor
+// segment cannot exceed the budget passed to `new()` or `resume()`.
+// Evaluated at compile time — zero runtime cost, build fails if a budget
+// is ever too small.
+//
+// The `<=` form is intentional: it reads as "max writes ≤ budget".
+// Tight bounds (e.g. 2 <= 2) prove the budget is exact, not a lint issue.
+#[allow(clippy::int_plus_one, clippy::eq_op)]
+const _: () = {
+    // encode_finding segment 1: BufCursor::new(buf, 240)
+    // Worst case is the "git" variant (longer source string).
+    assert!(b"{\"type\":\"finding\",\"source\":\"git\",\"path\":\"".len() <= 240);
+
+    // encode_finding segment 2: cur.resume(170)
+    assert!(
+        b"\",\"start\":".len()
+            + 20 // push_u64 max decimal digits
+            + b",\"end\":".len()
+            + 20
+            + b",\"rule_id\":".len()
+            + 20
+            + b",\"rule\":\"".len()
+            <= 170
+    );
+
+    // encode_finding segment 3: cur.resume(80)
+    // Worst-case path: both commit_id and change_kind are Some.
+    // The closing `}` is written in segment 3b (after commit_to_buf for
+    // change_kind's dynamic write), so it is NOT counted here.
+    assert!(
+        1 // push_byte(b'"')
+            + b",\"commit_id\":".len()
+            + 20 // push_u64
+            + b",\"change_kind\":\"".len()
+            <= 80
+    );
+    // Alternate path: commit_id Some, change_kind None — closing `}` here.
+    assert!(
+        1 // push_byte(b'"')
+            + b",\"commit_id\":".len()
+            + 20 // push_u64
+            + 1  // push_byte(b'}')
+            <= 80
+    );
+
+    // encode_finding segment 3b: cur.resume(2) — change_kind Some branch
+    assert!(
+        1 // push_byte(b'"')
+            + 1 // push_byte(b'}')
+            <= 2
+    );
+
+    // encode_commit_meta segment 1: BufCursor::new(buf, 280)
+    assert!(
+        b"{\"type\":\"commit_meta\",\"commit_id\":".len()
+            + 20 // push_u64
+            + b",\"oid\":\"".len()
+            <= 280
+    );
+
+    // encode_commit_meta segment 2: cur.resume(240)
+    // Worst case: identity present, all fields non-sentinel (push_u64 = 20).
+    assert!(
+        b"\",\"timestamp\":".len()
+            + 20 // push_u64
+            + (b",\"".len() + b"author_name_id".len() + b"\":".len() + 20)
+            + (b",\"".len() + b"author_email_id".len() + b"\":".len() + 20)
+            + (b",\"".len() + b"committer_name_id".len() + b"\":".len() + 20)
+            + (b",\"".len() + b"committer_email_id".len() + b"\":".len() + 20)
+            + 1 // push_byte(b'}')
+            <= 240
+    );
+};
 
 // ============================================================================
 // JSONL event sink
