@@ -46,7 +46,7 @@ pub mod blob_introducer;
 pub mod blob_spill;
 pub mod byte_arena;
 pub mod bytes;
-pub(crate) mod cache_common;
+pub(super) mod cache_common;
 pub mod commit_graph;
 pub mod commit_graph_mem;
 pub mod commit_loader;

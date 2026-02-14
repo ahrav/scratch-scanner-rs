@@ -256,12 +256,10 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
     /// Scan a buffer chunk, drain/dedupe findings, emit events + persistence,
     /// and update chunk metrics.
     ///
-    /// This is the common core of every archive entry scanning loop. The caller
-    /// is responsible for reading bytes, charging budgets, and managing the outer
-    /// loop condition — this method handles everything from `scan_chunk_into`
-    /// through carry/offset bookkeeping.
-    ///
-    /// Returns `(new_offset, have, carry)` for the next iteration.
+    /// Shared core used by archive entry scanning loops (gzip, tar, zip).
+    /// The caller is responsible for reading bytes, charging budgets, and
+    /// managing the outer loop condition — this method handles everything
+    /// from `scan_chunk_into` through carry/offset bookkeeping.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_and_emit_chunk(
@@ -274,7 +272,7 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
         file_id: FileId,
         display: &[u8],
         entry_scanned: &mut bool,
-    ) -> (u64, usize, usize) {
+    ) -> ChunkScanResult {
         let allowed_usize = allowed as usize;
         let read_len = carry + allowed_usize;
         let base_offset = offset.saturating_sub(carry as u64);
@@ -322,11 +320,22 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
         self.metrics.chunks_scanned = self.metrics.chunks_scanned.saturating_add(1);
         self.metrics.bytes_scanned = self.metrics.bytes_scanned.saturating_add(allowed);
 
-        let new_offset = offset.saturating_add(allowed);
-        let new_have = read_len;
-        let new_carry = overlap.min(read_len);
-        (new_offset, new_have, new_carry)
+        ChunkScanResult {
+            offset: offset.saturating_add(allowed),
+            have: read_len,
+            carry: overlap.min(read_len),
+        }
     }
+}
+
+/// Loop-iteration state returned by [`ArchiveScanCtx::scan_and_emit_chunk`].
+pub(super) struct ChunkScanResult {
+    /// Byte offset for the next iteration.
+    pub offset: u64,
+    /// Number of valid bytes currently in the buffer.
+    pub have: usize,
+    /// Carry-forward overlap for the next read.
+    pub carry: usize,
 }
 
 /// Charge decompressed bytes that were read but not scanned (entry truncation).

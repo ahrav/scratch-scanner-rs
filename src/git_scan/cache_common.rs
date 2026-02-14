@@ -1,9 +1,10 @@
 //! Generic set-associative cache with CLOCK eviction.
 //!
 //! Provides a reusable cache framework parameterized over slot metadata.
-//! Concrete caches ([`super::tree_cache::TreeCache`],
-//! [`super::tree_delta_cache::TreeDeltaCache`]) implement the [`CacheSlot`]
-//! trait to specialize key matching, hashing, and per-handle metadata.
+//! Cache-specific slot types implement [`CacheSlot`] to specialize key
+//! matching, hashing, and per-handle metadata. Concrete caches
+//! ([`super::tree_cache::TreeCache`], [`super::tree_delta_cache::TreeDeltaCache`])
+//! compose [`SetAssociativeCache`] with those slot types.
 //!
 //! # Layout
 //! - `WAYS` slots per set (fixed at 4)
@@ -12,8 +13,8 @@
 //!
 //! # Invariants
 //! - `sets` is 0 (disabled) or a power of two
-//! - `slot_size` is a power of two, >= `MIN_SLOT_SIZE`
-//! - `storage.len() == sets * WAYS * slot_size`
+//! - `slot_size` is a power of two >= `MIN_SLOT_SIZE`, or 0 when disabled
+//! - `storage.len() == sets * WAYS * slot_size` (0 when disabled)
 //! - Pinned slots are never evicted; handles must be dropped to release pins
 
 use std::cell::Cell;
@@ -22,7 +23,7 @@ use std::fmt::Debug;
 /// Default slot size for cached payloads.
 const DEFAULT_SLOT_SIZE: u32 = 4096;
 /// Minimum slot size (prevents tiny, inefficient caches).
-const MIN_SLOT_SIZE: u32 = 256;
+pub(super) const MIN_SLOT_SIZE: u32 = 256;
 /// Number of ways per set.
 pub(super) const WAYS: usize = 4;
 
@@ -97,26 +98,47 @@ pub(super) struct SetAssociativeCache<S: CacheSlot> {
 /// while the caller is still borrowing them.
 ///
 /// # Safety
-/// The handle must not outlive the cache that created it.
-#[derive(Debug)]
+///
+/// The handle stores raw pointers directly into the heap-allocated
+/// `Vec<u8>` (storage) and `Vec<S>` (slots) buffers owned by the parent
+/// [`SetAssociativeCache`]. These heap pointers remain valid as long as
+/// the backing `Vec`s are not reallocated or dropped — which is
+/// guaranteed because:
+/// - `storage` is never resized after construction.
+/// - `slots` is never resized after construction.
+/// - The cache must not be dropped while handles are live.
+///
+/// Callers must ensure the [`SetAssociativeCache`] outlives every handle
+/// obtained from it. In practice this is enforced structurally: handles
+/// are created and consumed within the same tree-walk scope.
 pub(super) struct CacheHandle<S: CacheSlot> {
-    cache: *const SetAssociativeCache<S>,
-    slot: usize,
-    offset: usize,
+    /// Pointer to the start of this slot's byte range in the storage arena.
+    data: *const u8,
+    /// Pointer to the slot's pin counter (heap-allocated in the slots vec).
+    pins: *const Cell<u16>,
     len: usize,
     extra: S::HandleExtra,
+    _marker: std::marker::PhantomData<S>,
+}
+
+// Manual Debug: PhantomData is fine, but we want a meaningful debug repr.
+impl<S: CacheSlot> std::fmt::Debug for CacheHandle<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheHandle")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: CacheSlot> CacheHandle<S> {
     /// Returns the cached bytes.
     #[must_use]
     pub(super) fn as_slice(&self) -> &[u8] {
-        // SAFETY: `CacheHandle` pins the slot for the duration of its
-        // lifetime. Callers ensure the cache outlives the handle.
-        unsafe {
-            let cache = &*self.cache;
-            &cache.storage[self.offset..self.offset + self.len]
-        }
+        // SAFETY: `data` points into the cache's heap-allocated storage
+        // arena. The arena is never reallocated after construction, and
+        // the pinned slot prevents the cache from overwriting these bytes.
+        // Callers ensure the cache outlives the handle.
+        unsafe { std::slice::from_raw_parts(self.data, self.len) }
     }
 
     /// Returns the handle's extra metadata.
@@ -143,13 +165,14 @@ impl<S: CacheSlot> CacheHandle<S> {
 
 impl<S: CacheSlot> Drop for CacheHandle<S> {
     fn drop(&mut self) {
-        // SAFETY: The handle is only constructed with a valid cache pointer.
+        // SAFETY: `pins` points into the cache's heap-allocated slot vec.
+        // The slot vec is never reallocated after construction, and callers
+        // ensure the cache outlives the handle.
         unsafe {
-            let cache = &*self.cache;
-            let slot = &cache.slots[self.slot];
-            let pins = slot.base().pins.get();
-            debug_assert!(pins > 0, "cache pin count underflow");
-            slot.base().pins.set(pins.saturating_sub(1));
+            let pins = &*self.pins;
+            let count = pins.get();
+            debug_assert!(count > 0, "cache pin count underflow");
+            pins.set(count.saturating_sub(1));
         }
     }
 }
@@ -202,7 +225,8 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
 
     /// Looks up cached bytes by key and returns a pinned handle.
     ///
-    /// Returns `None` if the cache is disabled or if the entry is missing.
+    /// Returns `None` if the cache is disabled, the entry is missing, or
+    /// the slot's pin count is at `u16::MAX` (saturated).
     /// On hit, the slot is pinned and the CLOCK bit is set.
     pub(super) fn get_handle(&mut self, key: &S::Key) -> Option<CacheHandle<S>> {
         if self.sets == 0 {
@@ -215,19 +239,23 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
             let idx = base + way;
             let slot = &mut self.slots[idx];
             if slot.base().valid && slot.matches_key(key) {
+                let new_pins = slot.base().pins.get().checked_add(1)?;
                 slot.base_mut().clock = 1;
-                slot.base()
-                    .pins
-                    .set(slot.base().pins.get().saturating_add(1));
+                slot.base().pins.set(new_pins);
                 let extra = slot.handle_extra();
                 let len = slot.base().len as usize;
                 let offset = idx * self.slot_size as usize;
+                // SAFETY: `storage` and `slots` are heap-allocated Vecs
+                // that are never resized after construction. The raw
+                // pointers point directly into these heap buffers.
+                let data = unsafe { self.storage.as_ptr().add(offset) };
+                let pins = &slot.base().pins as *const Cell<u16>;
                 return Some(CacheHandle {
-                    cache: self as *const Self,
-                    slot: idx,
-                    offset,
+                    data,
+                    pins,
                     len,
                     extra,
+                    _marker: std::marker::PhantomData,
                 });
             }
         }
@@ -321,14 +349,14 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
     }
 }
 
-pub(super) fn round_down_power_of_two_usize(val: usize) -> usize {
+fn round_down_power_of_two_usize(val: usize) -> usize {
     if val == 0 {
         return 0;
     }
     1_usize << (usize::BITS - val.leading_zeros() - 1)
 }
 
-pub(super) fn round_down_power_of_two_u32(val: u32) -> u32 {
+fn round_down_power_of_two_u32(val: u32) -> u32 {
     if val == 0 {
         return 0;
     }
@@ -422,5 +450,82 @@ mod tests {
             .count();
         assert!(hits <= WAYS);
         assert!(hits >= 1);
+    }
+
+    #[test]
+    fn pinned_slot_not_evicted() {
+        // Use a small cache with exactly 1 set so all keys map to the same set.
+        let mut cache = SetAssociativeCache::<TestSlot>::new(MIN_SLOT_SIZE * WAYS as u32);
+        assert!(cache.sets > 0);
+
+        // Fill all WAYS slots.
+        let mut keys = Vec::new();
+        for i in 0..WAYS {
+            let key = (i as u64) * (cache.sets as u64);
+            keys.push(key);
+            assert!(cache.insert(&key, &(), &[i as u8]));
+        }
+
+        // Pin the first slot by holding a handle.
+        let handle = cache.get_handle(&keys[0]).unwrap();
+
+        // Insert one more key into the same set, forcing eviction.
+        let overflow_key = (WAYS as u64) * (cache.sets as u64);
+        assert!(cache.insert(&overflow_key, &(), &[0xff]));
+
+        // The pinned slot must still be present (not evicted).
+        assert_eq!(handle.as_slice(), &[0u8]);
+        // Verify via a fresh lookup that the pinned key is still cached.
+        assert!(cache.get_handle(&keys[0]).is_some());
+
+        drop(handle);
+    }
+
+    #[test]
+    fn insert_fails_when_all_slots_pinned() {
+        let mut cache = SetAssociativeCache::<TestSlot>::new(MIN_SLOT_SIZE * WAYS as u32);
+        assert!(cache.sets > 0);
+
+        // Fill and pin all WAYS slots.
+        let mut keys = Vec::new();
+        let mut handles = Vec::new();
+        for i in 0..WAYS {
+            let key = (i as u64) * (cache.sets as u64);
+            keys.push(key);
+            assert!(cache.insert(&key, &(), &[i as u8]));
+            handles.push(cache.get_handle(&key).unwrap());
+        }
+
+        // Try to insert a new key into the same (fully pinned) set.
+        let overflow_key = (WAYS as u64) * (cache.sets as u64);
+        assert!(
+            !cache.insert(&overflow_key, &(), &[0xff]),
+            "insert should fail when all candidate slots are pinned"
+        );
+
+        drop(handles);
+    }
+
+    #[test]
+    fn drop_releases_pin_for_eviction() {
+        let mut cache = SetAssociativeCache::<TestSlot>::new(MIN_SLOT_SIZE * WAYS as u32);
+        assert!(cache.sets > 0);
+
+        let key: u64 = 0;
+        assert!(cache.insert(&key, &(), b"data"));
+
+        // Pin and then unpin by dropping the handle.
+        let handle = cache.get_handle(&key).unwrap();
+        drop(handle);
+
+        // Fill the set to force eviction of the now-unpinned slot.
+        for i in 1..=WAYS {
+            let k = (i as u64) * (cache.sets as u64);
+            assert!(cache.insert(&k, &(), b"x"));
+        }
+        assert!(
+            cache.get_handle(&key).is_none(),
+            "unpinned slot should have been evicted"
+        );
     }
 }

@@ -336,7 +336,7 @@ mod tests {
         ));
     }
 
-    use super::super::midx_test_builder::MidxTestBuilder as MidxBuilder;
+    use super::super::midx_test_builder::MidxBuilder;
 
     #[test]
     fn pack_candidate_collector_maps_packed_and_loose() {

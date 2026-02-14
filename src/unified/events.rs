@@ -44,16 +44,20 @@ use crate::git_scan::object_id::OidBytes;
 
 /// Swallow `BrokenPipe`; panic on any other I/O error.
 ///
-/// Every structured-output sink (JSON, JSONL, SARIF, text) funnels write
-/// errors through this so the BrokenPipe policy is defined once.
+/// Most structured-output sink write/flush paths (JSON, JSONL, SARIF, text)
+/// funnel I/O through this so BrokenPipe policy is centralized.
+///
+/// Returns `true` when a `BrokenPipe` was swallowed so callers that perform
+/// multiple I/O operations in sequence can short-circuit immediately.
 #[inline]
-pub(crate) fn handle_sink_io(result: std::io::Result<()>, label: &str) {
+pub(crate) fn handle_sink_io(result: std::io::Result<()>, label: &str) -> bool {
     if let Err(e) = result {
         if e.kind() == ErrorKind::BrokenPipe {
-            return;
+            return true;
         }
         panic!("{label} failed: {e}");
     }
+    false
 }
 
 thread_local! {

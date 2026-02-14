@@ -180,7 +180,7 @@ mod tests {
     use crate::git_scan::midx::MidxView;
     use crate::git_scan::object_id::ObjectFormat;
 
-    use super::super::midx_test_builder::MidxTestBuilder as MidxBuilder;
+    use super::super::midx_test_builder::MidxBuilder;
 
     #[test]
     fn oid_index_matches_midx_lookup() {

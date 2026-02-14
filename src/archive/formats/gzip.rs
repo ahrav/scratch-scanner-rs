@@ -17,7 +17,7 @@ use std::io::{self, Read};
 
 use flate2::read::MultiGzDecoder;
 
-pub use crate::archive::util::CountedRead;
+use crate::archive::util::CountedRead;
 
 /// gzip magic bytes (RFC 1952).
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];

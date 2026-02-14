@@ -959,9 +959,14 @@ macro_rules! dispatch_simd_or_scalar {
             #[cfg(all(target_arch = "aarch64", not(miri)))]
             {
                 if $input.len() >= 16 {
-                    // SAFETY: NEON is guaranteed on aarch64. The function
-                    // operates on valid input and writes only to the
-                    // caller-owned Vec<u8>.
+                    // SAFETY: NEON is guaranteed on all AArch64 targets.
+                    // `$input` satisfies the SIMD function's contract:
+                    //   - `&str` callers guarantee valid UTF-8 (high bytes
+                    //     are valid multi-byte continuations).
+                    //   - `&[u8]` callers pass arbitrary bytes; the SIMD
+                    //     function delegates non-ASCII tails to scalar
+                    //     UTF-8 validation.
+                    // Output goes solely to the caller-owned `buf`.
                     unsafe { $neon_fn($input, buf); }
                     return;
                 }
@@ -969,7 +974,8 @@ macro_rules! dispatch_simd_or_scalar {
             #[cfg(all(target_arch = "x86_64", not(miri)))]
             {
                 if $input.len() >= 16 {
-                    // SAFETY: SSE2 is guaranteed on x86_64.
+                    // SAFETY: SSE2 is guaranteed on all x86_64 targets.
+                    // Same input contract as the NEON path above.
                     unsafe { $sse2_fn($input, buf); }
                     return;
                 }

@@ -670,7 +670,7 @@ mod tests {
 
     use super::super::object_id::{ObjectFormat, OidBytes};
 
-    use super::super::midx_test_builder::MidxTestBuilder as MidxBuilder;
+    use super::super::midx_test_builder::MidxBuilder;
 
     fn encode_entry_header(obj_type: u8, mut size: u64) -> Vec<u8> {
         let mut out = Vec::new();

@@ -18,12 +18,12 @@ const CHUNK_OOFF: [u8; 4] = *b"OOFF";
 /// Does **not** write checksums or LOFF — sufficient for round-trip parsing
 /// tests but not for checksum-validating tooling.
 #[derive(Default)]
-pub(crate) struct MidxTestBuilder {
+pub(crate) struct MidxBuilder {
     pub(crate) pack_names: Vec<Vec<u8>>,
     pub(crate) objects: Vec<([u8; 20], u16, u64)>,
 }
 
-impl MidxTestBuilder {
+impl MidxBuilder {
     pub(crate) fn new() -> Self {
         Self::default()
     }

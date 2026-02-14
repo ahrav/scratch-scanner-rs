@@ -61,9 +61,9 @@ impl CacheSlot for TreeSlot {
 
 /// Set-associative cache for tree payload bytes.
 ///
-/// See the [module documentation](self) for layout, eviction, and pinning
-/// details. When `sets == 0` the cache is disabled and all operations are
-/// no-ops; this avoids special-casing callers when the budget is too small.
+/// See [`super::cache_common`] for layout, eviction, and pinning details.
+/// When the capacity is too small the cache enters a disabled state where
+/// all operations are no-ops; this avoids special-casing callers.
 ///
 /// Not thread-safe; callers must synchronize shared access.
 #[derive(Debug)]
@@ -79,10 +79,10 @@ pub struct TreeCache {
 ///
 /// # Lifetime constraint
 ///
-/// The handle stores a raw pointer to the parent [`TreeCache`]. Callers
-/// must ensure the cache is not dropped or moved while any handle is live.
-/// In practice this is enforced structurally: handles are created from
-/// `&mut TreeCache` and consumed within the same tree-walk scope.
+/// The inner [`CacheHandle`] stores a raw pointer to the backing
+/// [`SetAssociativeCache`]. Callers must ensure the cache is not dropped
+/// or moved while any handle is live. This is a runtime contract; it is
+/// not enforced by Rust lifetimes.
 #[derive(Debug)]
 pub struct TreeCacheHandle {
     inner: CacheHandle<TreeSlot>,
@@ -119,6 +119,12 @@ impl TreeCache {
         self.inner.capacity_bytes()
     }
 
+    /// Returns the fixed slot size in bytes.
+    #[must_use]
+    pub const fn slot_size(&self) -> u32 {
+        self.inner.slot_size()
+    }
+
     /// Looks up cached tree bytes by OID and returns a pinned handle.
     ///
     /// Returns `None` if the cache is disabled or if the entry is missing.
@@ -145,10 +151,8 @@ impl TreeCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cache_common::WAYS;
+    use super::super::cache_common::{MIN_SLOT_SIZE, WAYS};
     use super::*;
-
-    const MIN_SLOT_SIZE: u32 = 256;
 
     #[test]
     fn insert_and_get() {
@@ -165,7 +169,7 @@ mod tests {
     fn oversize_entry_not_cached() {
         let mut cache = TreeCache::new(64 * 1024);
         let oid = OidBytes::sha1([0x22; 20]);
-        let payload = vec![0u8; cache.inner.slot_size() as usize + 1];
+        let payload = vec![0u8; cache.slot_size() as usize + 1];
 
         assert!(!cache.insert(oid, &payload));
         assert!(cache.get_handle(&oid).is_none());
@@ -174,7 +178,7 @@ mod tests {
     #[test]
     fn eviction_within_set() {
         let mut cache = TreeCache::new(64 * 1024);
-        assert!(cache.inner.capacity_bytes() > 0);
+        assert!(cache.capacity_bytes() > 0);
 
         let mut oids = Vec::new();
         for i in 0..=WAYS {

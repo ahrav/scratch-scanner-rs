@@ -626,7 +626,7 @@ fn normalize_pack_name(name: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::midx_test_builder::MidxTestBuilder as MidxBuilder;
+    use super::super::midx_test_builder::MidxBuilder;
     use super::*;
 
     #[test]

@@ -90,9 +90,9 @@ impl CacheSlot for DeltaSlot {
 
 /// Set-associative cache for tree delta base bytes.
 ///
-/// See the [module documentation](self) for layout, eviction, and pinning
-/// details. When `sets == 0` the cache is disabled and all operations are
-/// no-ops; this avoids special-casing callers when the budget is too small.
+/// See [`super::cache_common`] for layout, eviction, and pinning details.
+/// When the capacity is too small the cache enters a disabled state where
+/// all operations are no-ops; this avoids special-casing callers.
 ///
 /// Not thread-safe; callers must synchronize shared access.
 #[derive(Debug)]
@@ -112,9 +112,9 @@ pub struct TreeDeltaCache {
 ///
 /// # Lifetime constraint
 ///
-/// The handle stores a raw pointer to the parent [`TreeDeltaCache`].
-/// Callers must ensure the cache is not dropped or moved while any handle
-/// is live.
+/// The inner [`CacheHandle`] stores a raw pointer to the backing
+/// [`SetAssociativeCache`]. Callers must ensure the cache is not dropped
+/// or moved while any handle is live.
 #[derive(Debug)]
 pub struct TreeDeltaCacheHandle {
     inner: CacheHandle<DeltaSlot>,
@@ -262,5 +262,20 @@ mod tests {
             .filter(|offset| cache.get_handle(1, **offset).is_some())
             .count();
         assert!(hits <= WAYS);
+    }
+
+    #[test]
+    fn reinsertion_updates_kind_and_chain_len() {
+        let mut cache = TreeDeltaCache::new(64 * 1024);
+        assert!(cache.insert(1, 42, ObjectKind::Tree, 0, b"data"));
+
+        // Re-insert same key with different metadata.
+        assert!(cache.insert(1, 42, ObjectKind::Commit, 5, b"ignored"));
+
+        let handle = cache.get_handle(1, 42).unwrap();
+        assert_eq!(handle.kind(), ObjectKind::Commit);
+        assert_eq!(handle.chain_len(), 5);
+        // Bytes should NOT have changed (dedup fast-path skips the copy).
+        assert_eq!(handle.as_slice(), b"data");
     }
 }

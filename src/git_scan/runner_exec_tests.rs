@@ -245,7 +245,7 @@ fn auto_tree_delta_cache_bytes_allows_cap_below_floor() {
     );
 }
 
-use super::super::midx_test_builder::MidxTestBuilder as MidxBuilder;
+use super::super::midx_test_builder::MidxBuilder;
 
 fn test_engine() -> Engine {
     let rule = RuleSpec {

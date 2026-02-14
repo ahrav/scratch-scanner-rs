@@ -352,7 +352,7 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             break;
         }
 
-        let (new_off, new_have, new_carry) = scan.scan_and_emit_chunk(
+        let result = scan.scan_and_emit_chunk(
             buf.as_slice(),
             carry,
             offset,
@@ -362,9 +362,9 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             display,
             &mut entry_scanned,
         );
-        offset = new_off;
-        have = new_have;
-        carry = new_carry;
+        offset = result.offset;
+        have = result.have;
+        carry = result.carry;
 
         if (allowed as usize) < n {
             break;
