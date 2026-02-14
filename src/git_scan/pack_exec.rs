@@ -9,12 +9,10 @@
 //!   cache misses may trigger on-demand re-decodes into scratch buffers.
 //! - `inflate_buf`, `result_buf`, and `base_buf` are reused across offsets
 //!   to avoid repeated allocations on the hot path.
-//! - Oversized objects are decoded into spill-backed mmaps under the
-//!   caller-provided `spill_dir`, keeping RAM bounded while still scanning.
+//! - Oversized blobs and delta outputs are streamed into spill-backed mmaps
+//!   under the caller-provided `spill_dir`, keeping resident memory bounded.
 //! - When the allocation guard is enabled, per-offset decoding and sink
 //!   emission must not allocate.
-//! - Oversized blobs and delta outputs may be spilled to mmap-backed files
-//!   under a caller-provided spill directory.
 //!
 //! Execution order is driven by `PackPlan.exec_order`: when absent (no
 //! delta dependencies, or the DFS order matches the natural ascending
@@ -73,7 +71,9 @@ use super::perf;
 /// the delta application base.
 #[derive(Debug)]
 pub struct ExternalBase {
+    /// Git object kind of the resolved base object.
     pub kind: ObjectKind,
+    /// Fully inflated base bytes used as delta input.
     pub bytes: Vec<u8>,
 }
 
@@ -306,14 +306,20 @@ pub const CACHE_REJECT_BUCKETS: usize = 32;
 /// Aggregate cache reject histogram across pack-exec reports.
 #[derive(Debug, Default, Clone)]
 pub struct CacheRejectHistogram {
+    /// Total number of rejected cache insert attempts.
     pub rejects: u64,
+    /// Total bytes across all rejected cache insert attempts.
     pub bytes_total: u64,
+    /// Largest rejected entry size (bytes).
     pub bytes_max: u32,
+    /// Log2 bucketed reject counts (`[2^i, 2^(i+1)-1]`, bucket 0 includes size 0/1).
     pub buckets: [u64; CACHE_REJECT_BUCKETS],
 }
 
 impl CacheRejectHistogram {
-    /// Formats the top-N buckets by count.
+    /// Formats the top-N buckets by count as `"[start-end:count, ...]"`.
+    ///
+    /// Ties are ordered by lower bucket index first to keep output stable.
     #[must_use]
     pub fn format_top(&self, top_n: usize) -> String {
         let mut entries: Vec<(usize, u64)> = self
@@ -436,6 +442,9 @@ fn cache_reject_bucket_index(size: u32) -> usize {
     (31 - size.leading_zeros()) as usize
 }
 
+/// Returns the inclusive `(start, end)` byte range represented by bucket `idx`.
+///
+/// Bucket `0` represents both `0` and `1` bytes; bucket `31` saturates to `u32::MAX`.
 fn cache_reject_bucket_range(idx: usize) -> (u32, u32) {
     if idx == 0 {
         return (0, 1);
@@ -506,6 +515,7 @@ pub struct CandidateRange {
 }
 
 impl CandidateRange {
+    /// Returns the sentinel range used for "no candidates for this offset".
     #[inline(always)]
     pub const fn missing() -> Self {
         Self {
@@ -526,6 +536,7 @@ impl CandidateRange {
         Self { start, end }
     }
 
+    /// Encodes an optional `(start, end)` range, mapping `None` to [`Self::missing`].
     #[inline(always)]
     pub fn from_option(range: Option<(usize, usize)>) -> Self {
         if let Some((start, end)) = range {
@@ -535,6 +546,9 @@ impl CandidateRange {
         }
     }
 
+    /// Decodes this packed range into half-open bounds `[start, end)`.
+    ///
+    /// Returns `None` when the sentinel form from [`Self::missing`] is present.
     #[inline(always)]
     pub fn bounds(self) -> Option<(usize, usize)> {
         if self.start == NONE_U32 {
@@ -544,6 +558,9 @@ impl CandidateRange {
         Some((self.start as usize, self.end as usize))
     }
 
+    /// Returns the number of candidates represented by this range.
+    ///
+    /// Missing ranges report `0`.
     #[inline(always)]
     pub fn candidate_count(self) -> usize {
         if let Some((start, end)) = self.bounds() {
@@ -655,6 +672,10 @@ impl PackExecScratch {
     ///
     /// This only reserves capacity; it does not prefill contents. Callers
     /// rely on this to avoid per-offset allocations on the hot path.
+    ///
+    /// Also rebuilds `delta_deps_hot` and `external_base_oids` so that every
+    /// `DeltaDepHot::external_oid_idx` points at the matching interned OID for
+    /// this exact plan.
     fn prepare(&mut self, plan: &PackPlan, limits: &PackDecodeLimits) {
         self.bufs.prepare(limits, plan.max_delta_depth);
         if self.delta_deps_hot.capacity() < plan.delta_deps.len() {
@@ -923,8 +944,7 @@ pub fn execute_pack_plan_with_reader<S: PackObjectSink, B: ExternalBaseProvider,
 ///
 /// `paths` must contain all path refs referenced by plan candidates.
 /// `cache` is updated with decoded objects when capacity allows.
-/// `spill_dir` is used for oversized blob spill files.
-/// `spill_dir` is used for spill-backed large blob or delta outputs.
+/// `spill_dir` is used for spill-backed large blob and delta outputs.
 ///
 /// The returned report includes both successful decode stats and per-offset
 /// skip reasons for non-fatal failures (decode errors, missing bases, and
@@ -1168,6 +1188,7 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
 /// - `candidate_ranges` — precomputed by [`build_candidate_ranges`],
 ///   indexed by `need_offsets` position. Must have length
 ///   `plan.need_offsets.len()`.
+/// - each entry in `exec_indices` must be `< plan.need_offsets.len()`.
 ///
 /// # Delta base resolution
 ///
@@ -1181,6 +1202,11 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
 ///
 /// Same as [`execute_pack_plan_with_scratch`]: `PackParse` and `Sink`
 /// errors are fatal; decode failures are recorded as skips.
+///
+/// # Panics
+///
+/// Panics if `exec_indices` contains an out-of-bounds index for
+/// `plan.need_offsets` or `candidate_ranges`.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBaseProvider>(
     plan: &PackPlan,
@@ -1247,6 +1273,9 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
 /// This variant avoids materializing `exec_indices` when a plan has no
 /// `exec_order` permutation. Candidate ranges are discovered with a single
 /// forward merge cursor over `candidate_offsets`.
+///
+/// `start_idx..end_idx` must be a valid half-open range over
+/// `plan.need_offsets`.
 ///
 /// # Errors
 ///
@@ -1363,6 +1392,7 @@ fn read_pack_bytes<R: PackReader>(reader: &mut R, out: &mut Vec<u8>) -> Result<(
 /// scans of the candidate list by leveraging sorted candidate offsets.
 ///
 /// Assumes `candidate_offsets` is sorted ascending by offset.
+/// Runs in `O(need_offsets.len() + candidate_offsets.len())`.
 pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>) {
     // Single pass over sorted offsets; each need offset maps to a contiguous
     // range in `candidate_offsets` (if any). Requires plan invariants:
@@ -1383,6 +1413,8 @@ pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>)
     }
 }
 
+/// Reads and validates an entry header, normalizing parse failures into
+/// `PackDecodeError::PackParse`.
 #[inline]
 fn read_entry_header(
     pack: &PackFile<'_>,
@@ -1393,6 +1425,8 @@ fn read_entry_header(
         .map_err(PackDecodeError::PackParse)
 }
 
+/// Converts an entry size to `usize` and preserves object-vs-delta overflow
+/// classification for diagnostics.
 #[inline]
 fn size_to_usize(size: u64, kind: EntryKind) -> Result<usize, PackDecodeError> {
     usize::try_from(size).map_err(|_| match kind {
@@ -1407,6 +1441,7 @@ fn size_to_usize(size: u64, kind: EntryKind) -> Result<usize, PackDecodeError> {
     })
 }
 
+/// Converts a delta payload size to `usize`, reporting overflow as `DeltaTooLarge`.
 #[inline]
 fn delta_size_to_usize(size: u64) -> Result<usize, PackDecodeError> {
     usize::try_from(size).map_err(|_| PackDecodeError::DeltaTooLarge {
@@ -1415,6 +1450,7 @@ fn delta_size_to_usize(size: u64) -> Result<usize, PackDecodeError> {
     })
 }
 
+/// Converts a pack byte offset to `usize` for slice indexing.
 #[inline]
 fn data_start_to_usize(data_start: u64) -> Result<usize, PackDecodeError> {
     usize::try_from(data_start)
@@ -1487,6 +1523,7 @@ fn inflate_delta_payload<'a>(
     }
 }
 
+/// Appends a non-fatal skip and updates hot-path skip counters.
 #[inline]
 fn record_skip(
     report: &mut PackExecReport,
@@ -1498,6 +1535,7 @@ fn record_skip(
     hot_stats.inc_skipped();
 }
 
+/// Maps internal delta decode failures into external skip taxonomy.
 #[inline]
 fn skip_reason_from_delta_error(err: DeltaDecodeError) -> SkipReason {
     match err {
@@ -2065,6 +2103,9 @@ fn decode_delta_output(
 }
 
 /// Lookup the delta dependency by `need_offsets` index using the dense index.
+///
+/// `delta_dep_index` stores either a real index into `delta_deps` or
+/// [`NONE_U32`] for "no dependency metadata".
 #[inline]
 fn delta_dep_at_index(
     delta_deps: &[DeltaDepHot],

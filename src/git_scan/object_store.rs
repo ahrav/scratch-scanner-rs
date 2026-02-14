@@ -20,11 +20,12 @@
 //! # Invariants
 //! - `max_object_bytes` caps all inflated payloads and delta buffers
 //! - Delta chains are bounded by `MAX_DELTA_DEPTH`
-//! - Repo artifacts must be `Ready` (commit-graph + MIDX present)
+//! - `repo.mmaps.midx` must be populated before opening the store
 //! - Tree cache is best-effort: oversize payloads are not cached
 //! - Tree delta cache is best-effort: oversize bases are not cached
 //! - Spill arena stores large tree payloads in a fixed-size mmapped file;
 //!   spill indexing is best-effort and may disable itself when full
+//! - `ObjectStore` is worker-local (`&mut self` API) and not shared
 //!
 //! # Load Pipeline
 //! - Validate OID length
@@ -143,6 +144,9 @@ struct SpillIndex {
 }
 
 impl SpillIndex {
+    /// Creates an index with best-effort capacity clamping.
+    ///
+    /// `entries == 0` disables indexing entirely.
     fn new(entries: usize) -> Self {
         if entries == 0 {
             return Self {
@@ -160,6 +164,10 @@ impl SpillIndex {
         }
     }
 
+    /// Returns the spill location for `oid` if present.
+    ///
+    /// Because the table has no tombstones, probing can stop on the first
+    /// empty slot without risking false negatives.
     fn lookup(&self, oid: &OidBytes) -> Option<(u64, u64)> {
         if self.slots.is_empty() {
             return None;
@@ -179,6 +187,9 @@ impl SpillIndex {
         None
     }
 
+    /// Inserts or updates an OID -> spill location mapping.
+    ///
+    /// Returns `false` when indexing is disabled or the table is full.
     fn insert(&mut self, oid: &OidBytes, offset: u64, len: u64) -> bool {
         if self.slots.is_empty() {
             return false;
@@ -329,6 +340,9 @@ impl TreeDecodeBufs {
         }
     }
 
+    /// Leases a reusable delta-frame stack for one decode operation.
+    ///
+    /// Recursive REF-delta loads can borrow independent stacks from this pool.
     #[inline]
     fn take_delta_stack(&mut self) -> Vec<TreeDeltaFrame> {
         let mut stack = self.delta_stack_pool.pop().unwrap_or_default();
@@ -336,6 +350,7 @@ impl TreeDecodeBufs {
         stack
     }
 
+    /// Returns a previously leased delta-frame stack to the pool.
     #[inline]
     fn return_delta_stack(&mut self, mut stack: Vec<TreeDeltaFrame>) {
         stack.clear();
@@ -355,12 +370,16 @@ struct TreeDeltaFrame {
     delta_size: usize,
 }
 
+/// Source of loaded object bytes, used for perf accounting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectSource {
     Pack,
     Loose,
 }
 
+/// Fully decoded object loaded from a pack entry.
+///
+/// `chain_len` counts applied delta edges; non-delta entries have `chain_len=0`.
 #[derive(Debug)]
 struct DecodedTreeObject {
     kind: ObjectKind,
@@ -368,6 +387,9 @@ struct DecodedTreeObject {
     chain_len: u8,
 }
 
+/// Result of object lookup across pack and loose stores.
+///
+/// `chain_len` is meaningful only for pack-backed objects.
 #[derive(Debug)]
 struct LoadedObject {
     kind: ObjectKind,
@@ -594,6 +616,9 @@ impl<'a> ObjectStore<'a> {
         Err(TreeDiffError::TreeNotFound)
     }
 
+    /// Loads an object from pack storage via MIDX lookup.
+    ///
+    /// Returns `Ok(None)` when the OID is not present in the MIDX.
     fn load_object_from_pack(
         &mut self,
         oid: &OidBytes,
@@ -1013,6 +1038,13 @@ impl<'a> ObjectStore<'a> {
         Ok((bv.clone(), *header))
     }
 
+    /// Attempts to write a large payload into the spill arena.
+    ///
+    /// This is best-effort by design:
+    /// - Small payloads remain in RAM.
+    /// - Arena out-of-space disables future spills.
+    /// - Index insert failure disables future index updates but still permits
+    ///   arena appends.
     fn try_spill(
         &mut self,
         oid: &OidBytes,
@@ -1052,6 +1084,10 @@ impl<'a> ObjectStore<'a> {
 }
 
 impl TreeSource for ObjectStore<'_> {
+    /// Loads and validates a tree payload.
+    ///
+    /// Lookup order is cache -> spill index -> pack/loose object store. Non-tree
+    /// objects are rejected even if the OID resolves successfully.
     fn load_tree(&mut self, oid: &OidBytes) -> Result<TreeBytes, TreeDiffError> {
         let (result, nanos) = perf::time(|| {
             if oid.len() != self.oid_len {
@@ -1131,12 +1167,14 @@ fn hash_oid(oid: &OidBytes) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Normalizes foreign errors into object-store context.
 fn store_error<E: std::fmt::Display>(err: E) -> TreeDiffError {
     TreeDiffError::ObjectStoreError {
         detail: err.to_string(),
     }
 }
 
+/// Formats the root OID suffix used in pack decode diagnostics.
 fn format_root_oid(root_oid: Option<OidBytes>) -> String {
     match root_oid {
         Some(oid) => format!(" (root oid {oid})"),
@@ -1207,6 +1245,9 @@ fn parse_loose_object(
     Ok((kind, payload.to_vec()))
 }
 
+/// Parses a non-empty ASCII decimal sequence with overflow checks.
+///
+/// Returns `None` for empty input, non-digit bytes, or arithmetic overflow.
 fn parse_decimal(bytes: &[u8]) -> Option<u64> {
     if bytes.is_empty() {
         return None;
