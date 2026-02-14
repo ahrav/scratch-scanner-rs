@@ -768,7 +768,7 @@ impl<R: ?Sized + Read> Read for LimitedRead<'_, R> {
 
 impl<R: ?Sized + Read> TarRead for LimitedRead<'_, R> {}
 
-use crate::archive::util::CountedRead;
+pub use crate::archive::util::CountedRead;
 
 fn rfind_sig_u32_le(hay: &[u8], sig: u32) -> Option<usize> {
     if hay.len() < 4 {

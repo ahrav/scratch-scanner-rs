@@ -653,6 +653,14 @@ impl ScanEngine for IdEngine {
 }
 
 #[test]
+fn zip_module_reexports_counted_read() {
+    // Keep `archive::formats::zip::CountedRead` available for downstream users.
+    let reader = std::io::Cursor::new(Vec::<u8>::new());
+    let counted = scanner_rs::archive::formats::zip::CountedRead::new(reader);
+    assert_eq!(counted.bytes(), 0);
+}
+
+#[test]
 fn finds_secret_in_gzip_with_virtual_path() {
     let tmp = TempDir::new().unwrap();
     let gz = tmp.path().join("payload.txt.gz");
