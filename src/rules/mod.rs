@@ -176,7 +176,7 @@ pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, Ru
     Ok(rules)
 }
 
-/// Returns the default rules file path next to the current executable.
+/// Returns candidate paths for `default_rules.yaml` in priority order.
 ///
 /// Candidates (checked in order):
 /// 1. Next to the current executable
