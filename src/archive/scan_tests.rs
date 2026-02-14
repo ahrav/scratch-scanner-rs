@@ -555,8 +555,8 @@ fn gzip_valid_header_empty_deflate_is_corrupt() {
 #[test]
 fn tar_truncated_entry_yields_malformed() {
     // Build a tar where the stream is physically shorter than the declared
-    // entry size.  `build_tar_with_declared_size` pads to `declared_size`,
-    // so we truncate the output manually.
+    // entry size.  We truncate the output manually to simulate a truncated
+    // stream.
     let payload: Vec<u8> = vec![b'X'; 50];
     let mut tar = Vec::new();
     let hdr = tar_header(b"trunc.txt", 100, b'0');
@@ -599,7 +599,7 @@ fn tar_zero_per_entry_budget_yields_entry_budget() {
     );
 }
 
-// ── Gap 9: write_u64_hex_lower boundary values ─────────────────────
+// ── write_u64_hex_lower boundary values ─────────────────────────────
 
 #[test]
 fn write_u64_hex_lower_boundary_values() {

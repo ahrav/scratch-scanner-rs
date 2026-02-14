@@ -349,6 +349,8 @@ impl CpuSet {
         {
             // SAFETY: zeroed cpu_set_t is valid, then we explicitly clear it
             let mut inner: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `inner` was zero-initialized above; CPU_ZERO simply
+            // clears all bits in a valid cpu_set_t.
             unsafe { libc::CPU_ZERO(&mut inner) };
             Self { inner }
         }

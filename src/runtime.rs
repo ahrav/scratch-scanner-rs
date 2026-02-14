@@ -763,13 +763,10 @@ pub fn read_file_chunks(
             unsafe { copy_nonoverlapping(tail.as_ptr(), buf_ptr, tail_len) };
         }
 
-        let read_dst = unsafe {
-            // SAFETY:
-            // - `tail_len + chunk_size <= BUFFER_LEN_MAX` (asserted above).
-            // - `buf_ptr` is valid for `BUFFER_LEN_MAX` bytes.
-            // - `buf_ptr.add(tail_len)` stays within the allocation.
-            slice::from_raw_parts_mut(buf_ptr.add(tail_len), chunk_size)
-        };
+        // SAFETY: `tail_len + chunk_size <= BUFFER_LEN_MAX` (asserted above);
+        // `buf_ptr` is valid for `BUFFER_LEN_MAX` bytes; `buf_ptr.add(tail_len)`
+        // stays within the allocation.
+        let read_dst = unsafe { slice::from_raw_parts_mut(buf_ptr.add(tail_len), chunk_size) };
         let read = file.read(read_dst)?;
         if read == 0 {
             break;

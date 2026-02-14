@@ -675,7 +675,7 @@ mod tests {
         assert!(r.truncated);
     }
 
-    // ── Gap 7: Percent-escape boundary truncation ──────────────────────
+    // ── Percent-escape boundary truncation ──────────────────────────────
 
     #[test]
     fn hash_suffix_trunc_cut_on_percent_removes_lone_percent() {

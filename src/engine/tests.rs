@@ -140,6 +140,9 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
         );
         return false;
     }
+    // SAFETY: The FFI callback writes at most `pending_cap` elements into the vec's spare
+    // capacity, and `pending_len` is set by the callback to the number actually written,
+    // so `pending_len <= pending.capacity()` and all elements are initialized.
     unsafe { pending.set_len(pending_len as usize) };
     let mut hit = !pending.is_empty();
     pending.clear();
@@ -156,6 +159,8 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     {
         return false;
     }
+    // SAFETY: Same as above -- the callback initialized `pending_len` elements within the
+    // vec's spare capacity after `clear()` reset the length to zero.
     unsafe { pending.set_len(pending_len as usize) };
     if !pending.is_empty() {
         hit = true;

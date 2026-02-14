@@ -124,3 +124,10 @@ path = "fuzz_targets/fuzz_hit_pool_callback.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_json_write_equivalence"
+path = "fuzz_targets/fuzz_json_write_equivalence.rs"
+test = false
+doc = false
+bench = false

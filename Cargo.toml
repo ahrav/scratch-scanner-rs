@@ -7,6 +7,9 @@ edition = "2021"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }
 
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 [dependencies]
 aegis = "0.9"
 ahash = "0.8"
@@ -180,6 +183,11 @@ harness = false
 [[bench]]
 name = "runtime_hotpath"
 harness = false
+
+[[bench]]
+name = "event_encoding"
+harness = false
+required-features = ["bench"]
 
 [profile.dev]
 opt-level = 1

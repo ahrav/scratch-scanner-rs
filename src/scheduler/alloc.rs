@@ -412,10 +412,10 @@ fn update_peak(current: u64) {
 // - Wrapping/overflow is handled gracefully (counters are monotonic or approximate)
 //
 // # Why No `# Safety` on Methods?
-//
-// The `unsafe` is on the trait impl, not individual methods. Each method's
-// safety requirements are inherited from `GlobalAlloc` documentation.
-
+// SAFETY: Delegates all allocation to `System` which upholds `GlobalAlloc` invariants.
+// SAFETY: All methods delegate to `System` (the default global allocator),
+// only adding atomic counter updates. The `unsafe` is on the trait impl,
+// not individual methods.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);

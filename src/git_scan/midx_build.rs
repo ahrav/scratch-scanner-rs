@@ -189,6 +189,8 @@ pub fn build_midx_bytes(
     let mut total_objects: u64 = 0;
 
     for (pack_id, path) in idx_paths.iter().enumerate() {
+        // SAFETY: The .idx file is read-only and its length is fixed for
+        // the duration of the mmap. No other process modifies it during the build.
         let mmap = unsafe {
             let file = fs::File::open(path)?;
             Mmap::map(&file)?
