@@ -483,10 +483,18 @@ mod neon {
                 buf.extend_from_slice(&bytes[safe_start..i]);
             }
 
-            // Scalar tail for remaining < 16 bytes.
-            if i < bytes.len() {
-                debug_assert!(s.is_char_boundary(i));
-                super::write_json_str_scalar(&s[i..], buf);
+            // Byte-by-byte tail for remaining < 16 bytes.
+            // We cannot delegate to `write_json_str_scalar` because `i` may
+            // land in the middle of a multi-byte UTF-8 codepoint that
+            // straddled the last 16-byte SIMD window boundary.
+            while i < bytes.len() {
+                let b = bytes[i];
+                if super::needs_json_escape(b) {
+                    super::escape_json_byte(b, buf);
+                } else {
+                    buf.push(b);
+                }
+                i += 1;
             }
         }
     }
@@ -642,10 +650,18 @@ mod sse2 {
                 buf.extend_from_slice(&bytes[safe_start..i]);
             }
 
-            // Scalar tail for remaining < 16 bytes.
-            if i < bytes.len() {
-                debug_assert!(s.is_char_boundary(i));
-                super::write_json_str_scalar(&s[i..], buf);
+            // Byte-by-byte tail for remaining < 16 bytes.
+            // We cannot delegate to `write_json_str_scalar` because `i` may
+            // land in the middle of a multi-byte UTF-8 codepoint that
+            // straddled the last 16-byte SIMD window boundary.
+            while i < bytes.len() {
+                let b = bytes[i];
+                if super::needs_json_escape(b) {
+                    super::escape_json_byte(b, buf);
+                } else {
+                    buf.push(b);
+                }
+                i += 1;
             }
         }
     }
@@ -1438,6 +1454,34 @@ mod tests {
         write_json_str(&s, &mut buf_dispatch);
         write_json_str_scalar(&s, &mut buf_scalar);
         assert_eq!(buf_dispatch, buf_scalar, "4-byte UTF-8 at byte 15");
+    }
+
+    /// Regression: multi-byte codepoint straddling the last SIMD window into
+    /// the < 16-byte tail.  Before the fix, the tail called
+    /// `write_json_str_scalar(&s[i..])` where `i` was not a char boundary.
+    #[test]
+    fn utf8_multibyte_straddles_into_tail() {
+        let mut buf_dispatch = Vec::new();
+        let mut buf_scalar = Vec::new();
+
+        // 14 ASCII + 4-byte codepoint (bytes 14-17) + 2 ASCII = 20 bytes.
+        // SIMD processes window 0-15 byte-by-byte (non-ASCII at 14).
+        // After: i=16, remaining tail = bytes 16-19 (4 bytes).
+        // Byte 16 is a UTF-8 continuation byte, NOT a char boundary.
+        let mut s = String::from("aaaaaaaaaaaaaa"); // 14 'a's
+        s.push('\u{10B5E}'); // 4-byte: 0xF0 0x90 0xAD 0x9E
+        s.push_str("bb"); // total = 20 bytes
+        assert_eq!(s.len(), 20);
+        assert!(!s.is_char_boundary(16)); // confirm the problematic position
+
+        buf_dispatch.clear();
+        buf_scalar.clear();
+        write_json_str(&s, &mut buf_dispatch);
+        write_json_str_scalar(&s, &mut buf_scalar);
+        assert_eq!(
+            buf_dispatch, buf_scalar,
+            "4-byte codepoint straddling SIMD window into tail"
+        );
     }
 }
 
