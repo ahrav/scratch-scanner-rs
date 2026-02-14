@@ -63,7 +63,7 @@ use super::errors::TreeDiffError;
 use super::midx::MidxView;
 use super::object_id::OidBytes;
 use super::pack_inflate::{
-    apply_delta, inflate_exact, inflate_limited, EntryKind, ObjectKind, PackFile,
+    apply_delta, inflate_exact, inflate_limited, EntryKind, ObjectKind, PackFile, PackHeader,
 };
 use super::perf;
 use super::repo::GitRepoPaths;
@@ -83,10 +83,6 @@ const LOOSE_HEADER_MAX_BYTES: usize = 64;
 const MIN_SPILL_INDEX_ENTRIES: usize = 64;
 /// Maximum number of spill-index slots (power of two).
 const MAX_SPILL_INDEX_ENTRIES: usize = 1_048_576;
-/// FNV-1a offset basis for spill index hashing.
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-/// FNV-1a prime for spill index hashing.
-const FNV_PRIME: u64 = 0x00000100000001b3;
 
 /// Fixed spill-index slot storing an OID key and spill offset/length.
 ///
@@ -375,7 +371,7 @@ pub struct ObjectStore<'a> {
     max_object_bytes: usize,
     midx: MidxView<'a>,
     pack_paths: Arc<[PathBuf]>,
-    pack_cache: Vec<Option<BytesView>>,
+    pack_cache: Vec<Option<(BytesView, PackHeader)>>,
     loose_dirs: Arc<[PathBuf]>,
     tree_cache: TreeCache,
     tree_delta_cache: TreeDeltaCache,
@@ -527,8 +523,15 @@ impl<'a> ObjectStore<'a> {
         };
 
         let (pack_id, offset) = self.midx.offset_at(idx).map_err(store_error)?;
-        let pack = self.pack_data(pack_id)?;
-        let obj = self.read_pack_object(pack_id, pack.as_ref(), offset, depth, Some(*oid))?;
+        let (pack, pack_header) = self.pack_data(pack_id)?;
+        let obj = self.read_pack_object(
+            pack_id,
+            pack.as_ref(),
+            pack_header,
+            offset,
+            depth,
+            Some(*oid),
+        )?;
         Ok(Some(obj))
     }
 
@@ -536,19 +539,15 @@ impl<'a> ObjectStore<'a> {
         &mut self,
         pack_id: u16,
         pack_bytes: &[u8],
+        pack_header: PackHeader,
         offset: u64,
         depth: u8,
         root_oid: Option<OidBytes>,
     ) -> Result<DecodedTreeObject, TreeDiffError> {
         // Pack objects can be delta chains; bound recursion by depth.
-        let pack = PackFile::parse(pack_bytes, self.oid_len as usize).map_err(|err| {
-            TreeDiffError::ObjectStoreError {
-                detail: format!(
-                    "pack {pack_id} offset {offset}: {err}{}",
-                    format_root_oid(root_oid)
-                ),
-            }
-        })?;
+        // Use the cached PackHeader to avoid re-validating the "PACK"
+        // signature and version on every recursive delta hop.
+        let pack = PackFile::from_header(pack_bytes, pack_header);
         let header = pack
             .entry_header_at(offset, MAX_ENTRY_HEADER_BYTES)
             .map_err(|err| TreeDiffError::ObjectStoreError {
@@ -633,6 +632,7 @@ impl<'a> ObjectStore<'a> {
                     let base = self.read_pack_object(
                         pack_id,
                         pack_bytes,
+                        pack_header,
                         base_offset,
                         depth - 1,
                         root_oid,
@@ -789,8 +789,14 @@ impl<'a> ObjectStore<'a> {
         Ok(None)
     }
 
-    /// Returns cached pack bytes for the given pack id, mapping if needed.
-    fn pack_data(&mut self, pack_id: u16) -> Result<BytesView, TreeDiffError> {
+    /// Returns cached pack bytes and pre-parsed header for the given pack id,
+    /// mapping and validating the header if needed.
+    ///
+    /// Caching the `PackHeader` alongside the bytes avoids re-validating the
+    /// "PACK" signature, version, and recomputing `data_end` on every call to
+    /// `read_pack_object` — including recursive delta chain resolution where
+    /// the same pack is parsed N times for a chain of depth N.
+    fn pack_data(&mut self, pack_id: u16) -> Result<(BytesView, PackHeader), TreeDiffError> {
         // Pack files are immutable during the scan. Cache their bytes so
         // recursive delta resolution can reuse pack data cheaply.
         let idx = pack_id as usize;
@@ -822,13 +828,18 @@ impl<'a> ObjectStore<'a> {
                     detail: format!("failed to mmap pack {}: {err}", path.display()),
                 })?
             };
-            self.pack_cache[idx] = Some(BytesView::from_mmap(mmap));
+            let bv = BytesView::from_mmap(mmap);
+            let header =
+                PackFile::parse_header(bv.as_ref(), self.oid_len as usize).map_err(|err| {
+                    TreeDiffError::ObjectStoreError {
+                        detail: format!("pack {} header: {err}", path.display()),
+                    }
+                })?;
+            self.pack_cache[idx] = Some((bv, header));
         }
 
-        Ok(self.pack_cache[idx]
-            .as_ref()
-            .expect("pack bytes present")
-            .clone())
+        let (bv, header) = self.pack_cache[idx].as_ref().expect("pack bytes present");
+        Ok((bv.clone(), *header))
     }
 
     fn try_spill(
@@ -936,14 +947,17 @@ fn spill_index_entries(max_spill_bytes: u64, spill_min_bytes: usize) -> usize {
     entries.next_power_of_two()
 }
 
-/// Hashes an OID for spill-index probing (FNV-1a).
+/// Hashes an OID for spill-index probing.
+///
+/// OIDs are already cryptographic hashes with excellent byte distribution,
+/// so the first 8 bytes provide sufficient entropy for power-of-two table
+/// indexing. This replaces FNV-1a which created a 60-cycle serial multiply
+/// dependency chain on ARM (20 bytes × 3-cycle MUL latency).
 fn hash_oid(oid: &OidBytes) -> u64 {
-    let mut hash = FNV_OFFSET_BASIS;
-    for &byte in oid.as_slice() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    let bytes = oid.as_slice();
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(buf)
 }
 
 fn store_error<E: std::fmt::Display>(err: E) -> TreeDiffError {

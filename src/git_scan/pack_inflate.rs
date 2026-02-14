@@ -30,10 +30,21 @@ const MAX_OFS_BYTES: usize = 10; // ceil(64/7)
 /// Internal inflate buffer size.
 const INFLATE_BUF_SIZE: usize = 64 * 1024;
 
+/// Combined per-thread inflate scratch state.
+///
+/// Merging `Decompress` and the scratch buffer into a single `thread_local!`
+/// halves the TLS lookup and `RefCell::borrow_mut()` overhead (1 borrow
+/// instead of 2).
+struct InflateScratch {
+    de: Decompress,
+    buf: [u8; INFLATE_BUF_SIZE],
+}
+
 thread_local! {
-    static INFLATE_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
-    static INFLATE_BUF: RefCell<[u8; INFLATE_BUF_SIZE]> =
-        const { RefCell::new([0u8; INFLATE_BUF_SIZE]) };
+    static INFLATE_SCRATCH: RefCell<InflateScratch> = RefCell::new(InflateScratch {
+        de: Decompress::new(true),
+        buf: [0u8; INFLATE_BUF_SIZE],
+    });
 }
 
 /// Runs an inflate operation using per-thread scratch buffers.
@@ -46,13 +57,11 @@ fn with_inflate_scratch<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Decompress, &mut [u8]) -> R,
 {
-    INFLATE_DECOMPRESS.with(|de| {
-        INFLATE_BUF.with(|buf| {
-            let mut de = de.borrow_mut();
-            de.reset(true);
-            let mut buf = buf.borrow_mut();
-            f(&mut de, &mut *buf)
-        })
+    INFLATE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.de.reset(true);
+        let s = &mut *scratch;
+        f(&mut s.de, &mut s.buf)
     })
 }
 
@@ -613,12 +622,15 @@ pub fn apply_delta(
     max_out: usize,
 ) -> Result<(), DeltaError> {
     out.clear();
-    let mut written = 0usize;
+    // Pre-read the result size from the delta header and allocate once,
+    // eliminating 2-4 reallocs during typical tree delta application.
+    // The delta_sizes() call reads only 2 varints (< 10 bytes of L1-hot data).
+    let (_, result_size) = delta_sizes(delta)?;
+    if result_size > max_out {
+        return Err(DeltaError::OutputOverrun);
+    }
+    out.reserve(result_size);
     let res = apply_delta_into(base, delta, max_out, |chunk| {
-        written = written.saturating_add(chunk.len());
-        if out.capacity() < written {
-            out.reserve(written - out.capacity());
-        }
         out.extend_from_slice(chunk);
         Ok(())
     });

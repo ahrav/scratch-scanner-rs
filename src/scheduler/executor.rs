@@ -420,7 +420,13 @@ impl<T> Shared<T> {
         if n == 0 {
             return;
         }
-        let idx = self.next_unpark.fetch_add(1, Ordering::Relaxed) % n;
+        let raw = self.next_unpark.fetch_add(1, Ordering::Relaxed);
+        // Use bitmask for power-of-2 worker counts (AND vs udiv+msub on ARM).
+        let idx = if n.is_power_of_two() {
+            raw & (n - 1)
+        } else {
+            raw % n
+        };
         self.unparkers[idx].unpark();
     }
 
