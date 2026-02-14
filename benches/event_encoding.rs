@@ -17,6 +17,7 @@ use scanner_rs::unified::events::{
     encode_commit_meta, encode_finding, CommitMetaEvent, EventEncoder, EventSink, FindingEvent,
     JsonlEncoder, JsonlEventSink, ScanEvent,
 };
+use scanner_rs::unified::json_sink::JsonEventSink;
 use scanner_rs::unified::SourceKind;
 use std::io;
 
@@ -309,6 +310,66 @@ fn bench_write_f64(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compare custom `write_u64` against the `itoa` crate.
+fn bench_u64_vs_itoa(c: &mut Criterion) {
+    use scanner_rs::unified::json_write::write_u64;
+    let mut group = c.benchmark_group("u64_vs_itoa");
+    group.throughput(Throughput::Elements(1));
+
+    let val = 1_700_000_000u64;
+    group.bench_function("custom_write_u64", |b| {
+        let mut buf = Vec::with_capacity(20);
+        b.iter(|| {
+            buf.clear();
+            write_u64(black_box(val), &mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("itoa_write", |b| {
+        let mut buf = Vec::with_capacity(20);
+        b.iter(|| {
+            buf.clear();
+            let mut tmp = itoa::Buffer::new();
+            let s = tmp.format(black_box(val));
+            buf.extend_from_slice(s.as_bytes());
+            black_box(&buf);
+        });
+    });
+
+    group.finish();
+}
+
+/// Compare custom `write_f64` against the `ryu` crate.
+fn bench_f64_vs_ryu(c: &mut Criterion) {
+    use scanner_rs::unified::json_write::write_f64;
+    let mut group = c.benchmark_group("f64_vs_ryu");
+    group.throughput(Throughput::Elements(1));
+
+    let val = 81.23f64;
+    group.bench_function("custom_write_f64", |b| {
+        let mut buf = Vec::with_capacity(32);
+        b.iter(|| {
+            buf.clear();
+            write_f64(black_box(val), &mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("ryu_write", |b| {
+        let mut buf = Vec::with_capacity(32);
+        b.iter(|| {
+            buf.clear();
+            let mut tmp = ryu::Buffer::new();
+            let s = tmp.format(black_box(val));
+            buf.extend_from_slice(s.as_bytes());
+            black_box(&buf);
+        });
+    });
+
+    group.finish();
+}
+
 // ============================================================================
 // Encoder-level benchmarks
 // ============================================================================
@@ -442,6 +503,44 @@ fn bench_sink_emit(c: &mut Criterion) {
     group.finish();
 }
 
+/// JSON array sink benchmark: emit 1000 findings into /dev/null.
+///
+/// Mirrors `bench_sink_emit` (JSONL) to enable direct comparison of
+/// the separator + array framing overhead.
+fn bench_json_sink_emit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("json_sink_emit");
+    group.throughput(Throughput::Elements(1000));
+
+    group.bench_function("1000_findings_dev_null", |b| {
+        let sink = JsonEventSink::new(io::sink());
+        let findings: Vec<FindingEvent<'static>> = (0..1000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    make_fs_finding()
+                } else {
+                    make_git_finding()
+                }
+            })
+            .collect();
+        b.iter(|| {
+            for f in &findings {
+                sink.emit(ScanEvent::Finding(FindingEvent {
+                    source: f.source,
+                    object_path: f.object_path,
+                    start: f.start,
+                    end: f.end,
+                    rule_id: f.rule_id,
+                    rule_name: f.rule_name,
+                    commit_id: f.commit_id,
+                    change_kind: f.change_kind,
+                }));
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     primitives,
     bench_write_u64,
@@ -456,5 +555,7 @@ criterion_group!(
     bench_encode_commit_meta,
     bench_encode_batch,
     bench_sink_emit,
+    bench_json_sink_emit,
 );
-criterion_main!(primitives, encoding);
+criterion_group!(comparison, bench_u64_vs_itoa, bench_f64_vs_ryu,);
+criterion_main!(primitives, encoding, comparison);

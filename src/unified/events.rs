@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
 
-use super::json_write::{write_f64, write_json_bytes, write_json_str, write_oid_hex, write_u64};
+use super::json_write::{write_f64, write_json_bytes, write_json_str, write_oid_hex, BufCursor};
 use super::SourceKind;
 use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
@@ -256,131 +256,179 @@ impl EventEncoder for JsonlEncoder {
 }
 
 /// Append a JSONL `finding` object to `buf` (no trailing newline).
+///
+/// Uses [`BufCursor`] to write static JSON framing and numeric fields via
+/// raw pointer arithmetic, eliminating per-field bounds checks. Dynamic
+/// content (path bytes, rule name) is written through the standard
+/// `write_json_bytes` / `write_json_str` functions which handle their own
+/// capacity management.
 pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
-    // Pre-reserve: typical finding is ~128 bytes + path + rule name.
-    buf.reserve(128 + f.object_path.len() + f.rule_name.len());
-    // Merge the opening static segments with source kind to eliminate
-    // the separate `write_source` call and two `extend_from_slice` calls.
+    // Static overhead: prefix (~40) + field keys (~60) + 3 u64s (60) + optional fields (~60) + closing (1)
+    // = ~221 bytes worst case for static content.
+    const STATIC_OVERHEAD: usize = 240;
+    let mut cur = BufCursor::new(buf, STATIC_OVERHEAD);
+
+    // Merged prefix: type + source + path key + opening quote.
     match f.source {
         SourceKind::Fs => {
-            buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"fs\",\"path\":\"")
+            cur.push_static(b"{\"type\":\"finding\",\"source\":\"fs\",\"path\":\"");
         }
         SourceKind::Git => {
-            buf.extend_from_slice(b"{\"type\":\"finding\",\"source\":\"git\",\"path\":\"")
+            cur.push_static(b"{\"type\":\"finding\",\"source\":\"git\",\"path\":\"");
         }
     }
-    write_json_bytes(f.object_path, buf);
-    buf.extend_from_slice(b"\",\"start\":");
-    write_u64(f.start, buf);
-    buf.extend_from_slice(b",\"end\":");
-    write_u64(f.end, buf);
-    buf.extend_from_slice(b",\"rule_id\":");
-    write_u64(f.rule_id as u64, buf);
-    buf.extend_from_slice(b",\"rule\":\"");
-    write_json_str(f.rule_name, buf);
-    buf.push(b'"');
+    // Commit and borrow buf for dynamic write_json_bytes (may reallocate).
+    write_json_bytes(f.object_path, cur.commit_to_buf());
+    // After dynamic write, re-reserve for remaining static content:
+    // `","start":` (10) + u64 (20) + `,"end":` (7) + u64 (20)
+    // + `,"rule_id":` (11) + u64 (20) + `,"rule":"` (9) = 97
+    // + optional commit_id (13+20) + optional change_kind (16+20+1) + closing `"}` (2)
+    // ≈ 170 bytes.
+    cur.resume(170);
+
+    cur.push_static(b"\",\"start\":");
+    cur.push_u64(f.start);
+    cur.push_static(b",\"end\":");
+    cur.push_u64(f.end);
+    cur.push_static(b",\"rule_id\":");
+    cur.push_u64(f.rule_id as u64);
+    cur.push_static(b",\"rule\":\"");
+    // Commit and borrow buf for dynamic write_json_str (may reallocate).
+    write_json_str(f.rule_name, cur.commit_to_buf());
+    // Re-reserve for optional tail: `"` + optional fields + `}`.
+    cur.resume(80);
+    cur.push_byte(b'"');
+
     if let Some(cid) = f.commit_id {
-        buf.extend_from_slice(b",\"commit_id\":");
-        write_u64(cid as u64, buf);
+        cur.push_static(b",\"commit_id\":");
+        cur.push_u64(cid as u64);
     }
     if let Some(ck) = f.change_kind {
-        buf.extend_from_slice(b",\"change_kind\":\"");
-        write_json_str(ck, buf);
-        buf.push(b'"');
+        cur.push_static(b",\"change_kind\":\"");
+        // Commit and borrow buf for dynamic write.
+        write_json_str(ck, cur.commit_to_buf());
+        cur.resume(2);
+        cur.push_byte(b'"');
     }
-    buf.push(b'}');
+    cur.push_byte(b'}');
+    cur.commit();
 }
 
 /// Append a JSONL `progress` object to `buf` (no trailing newline).
 pub fn encode_progress(p: &ProgressEvent, buf: &mut Vec<u8>) {
+    // Static: prefix (~43) + field keys (~35) + 3 u64s (60) + closing (1) ≈ 140.
+    let mut cur = BufCursor::new(buf, 160);
     match p.source {
         SourceKind::Fs => {
-            buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"fs\",\"stage\":\"")
+            cur.push_static(b"{\"type\":\"progress\",\"source\":\"fs\",\"stage\":\"");
         }
         SourceKind::Git => {
-            buf.extend_from_slice(b"{\"type\":\"progress\",\"source\":\"git\",\"stage\":\"")
+            cur.push_static(b"{\"type\":\"progress\",\"source\":\"git\",\"stage\":\"");
         }
     }
-    write_json_str(p.stage, buf);
-    buf.extend_from_slice(b"\",\"objects\":");
-    write_u64(p.objects_scanned, buf);
-    buf.extend_from_slice(b",\"bytes\":");
-    write_u64(p.bytes_scanned, buf);
-    buf.extend_from_slice(b",\"findings\":");
-    write_u64(p.findings_emitted, buf);
-    buf.push(b'}');
+    write_json_str(p.stage, cur.commit_to_buf());
+    cur.resume(120);
+    cur.push_static(b"\",\"objects\":");
+    cur.push_u64(p.objects_scanned);
+    cur.push_static(b",\"bytes\":");
+    cur.push_u64(p.bytes_scanned);
+    cur.push_static(b",\"findings\":");
+    cur.push_u64(p.findings_emitted);
+    cur.push_byte(b'}');
+    cur.commit();
 }
 
 /// Append a JSONL `summary` object to `buf` (no trailing newline).
 pub fn encode_summary(s: &SummaryEvent, buf: &mut Vec<u8>) {
+    // Static: prefix (~43) + field keys (~80) + 4 u64s (80) + f64 (20) + closing (1) ≈ 224.
+    let mut cur = BufCursor::new(buf, 240);
     match s.source {
         SourceKind::Fs => {
-            buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"")
+            cur.push_static(b"{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"");
         }
         SourceKind::Git => {
-            buf.extend_from_slice(b"{\"type\":\"summary\",\"source\":\"git\",\"status\":\"")
+            cur.push_static(b"{\"type\":\"summary\",\"source\":\"git\",\"status\":\"");
         }
     }
-    write_json_str(s.status, buf);
-    buf.extend_from_slice(b"\",\"elapsed_ms\":");
-    write_u64(s.elapsed_ms, buf);
-    buf.extend_from_slice(b",\"bytes\":");
-    write_u64(s.bytes_scanned, buf);
-    buf.extend_from_slice(b",\"findings\":");
-    write_u64(s.findings_emitted, buf);
-    buf.extend_from_slice(b",\"errors\":");
-    write_u64(s.errors, buf);
-    buf.extend_from_slice(b",\"throughput_mib_s\":");
-    write_f64(s.throughput_mib_s, buf);
-    buf.push(b'}');
+    write_json_str(s.status, cur.commit_to_buf());
+    cur.resume(200);
+    cur.push_static(b"\",\"elapsed_ms\":");
+    cur.push_u64(s.elapsed_ms);
+    cur.push_static(b",\"bytes\":");
+    cur.push_u64(s.bytes_scanned);
+    cur.push_static(b",\"findings\":");
+    cur.push_u64(s.findings_emitted);
+    cur.push_static(b",\"errors\":");
+    cur.push_u64(s.errors);
+    cur.push_static(b",\"throughput_mib_s\":");
+    // Commit before write_f64 (uses extend_from_slice internally).
+    write_f64(s.throughput_mib_s, cur.commit_to_buf());
+    cur.resume(2);
+    cur.push_byte(b'}');
+    cur.commit();
 }
 
 /// Append a JSONL `diagnostic` object to `buf` (no trailing newline).
 pub fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b"{\"type\":\"diagnostic\",\"level\":\"");
-    write_json_str(d.level, buf);
-    buf.extend_from_slice(b"\",\"message\":\"");
-    write_json_str(d.message, buf);
-    buf.extend_from_slice(b"\"}");
+    let mut cur = BufCursor::new(buf, 64);
+    cur.push_static(b"{\"type\":\"diagnostic\",\"level\":\"");
+    write_json_str(d.level, cur.commit_to_buf());
+    cur.resume(16);
+    cur.push_static(b"\",\"message\":\"");
+    write_json_str(d.message, cur.commit_to_buf());
+    cur.resume(4);
+    cur.push_static(b"\"}");
+    cur.commit();
 }
 
-/// Writes a single identity field, emitting `null` for [`SENTINEL_ID`].
+/// Cursor-based identity field writer — no per-call bounds checks.
 #[inline]
-fn write_identity_field(name: &[u8], id: u32, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b",\"");
-    buf.extend_from_slice(name);
-    buf.extend_from_slice(b"\":");
+fn write_identity_field_cur(cur: &mut BufCursor<'_>, name: &[u8], id: u32) {
+    cur.push_static(b",\"");
+    cur.push_static(name);
+    cur.push_static(b"\":");
     if id == SENTINEL_ID {
-        buf.extend_from_slice(b"null");
+        cur.push_static(b"null");
     } else {
-        write_u64(id as u64, buf);
+        cur.push_u64(id as u64);
     }
 }
 
 /// Append a JSONL `commit_meta` object to `buf` (no trailing newline).
 pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b"{\"type\":\"commit_meta\",\"commit_id\":");
-    write_u64(m.commit_id as u64, buf);
-    buf.extend_from_slice(b",\"oid\":\"");
-    write_oid_hex(&m.commit_oid, buf);
-    buf.extend_from_slice(b"\",\"timestamp\":");
-    write_u64(m.timestamp, buf);
+    // Static: prefix (34) + u64 (20) + oid key (8) + hex (64) + timestamp key (15) + u64 (20)
+    // + 4 identity fields (4 * ~25) + closing (1) ≈ 262.
+    let mut cur = BufCursor::new(buf, 280);
+    cur.push_static(b"{\"type\":\"commit_meta\",\"commit_id\":");
+    cur.push_u64(m.commit_id as u64);
+    cur.push_static(b",\"oid\":\"");
+    // write_oid_hex uses its own reserve + unsafe ptr::write pattern.
+    write_oid_hex(&m.commit_oid, cur.commit_to_buf());
+    // Remaining: `","timestamp":` (15) + u64 (20) + 4 identity fields (4 * ~42) + closing (1)
+    // Worst case ≈ 205 bytes.
+    cur.resume(210);
+    cur.push_static(b"\",\"timestamp\":");
+    cur.push_u64(m.timestamp);
     if let Some(ref ids) = m.identity {
-        write_identity_field(b"author_name_id", ids.author_name, buf);
-        write_identity_field(b"author_email_id", ids.author_email, buf);
-        write_identity_field(b"committer_name_id", ids.committer_name, buf);
-        write_identity_field(b"committer_email_id", ids.committer_email, buf);
+        write_identity_field_cur(&mut cur, b"author_name_id", ids.author_name);
+        write_identity_field_cur(&mut cur, b"author_email_id", ids.author_email);
+        write_identity_field_cur(&mut cur, b"committer_name_id", ids.committer_name);
+        write_identity_field_cur(&mut cur, b"committer_email_id", ids.committer_email);
     }
-    buf.push(b'}');
+    cur.push_byte(b'}');
+    cur.commit();
 }
 
 /// Append a JSONL `identity_dictionary` object to `buf` (no trailing newline).
 pub fn encode_identity_dictionary(d: &IdentityDictionaryEvent<'_>, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(b"{\"type\":\"identity_dictionary\",\"id\":");
-    write_u64(d.id as u64, buf);
-    buf.extend_from_slice(b",\"value\":\"");
-    write_json_bytes(d.value, buf);
-    buf.extend_from_slice(b"\"}");
+    let mut cur = BufCursor::new(buf, 80);
+    cur.push_static(b"{\"type\":\"identity_dictionary\",\"id\":");
+    cur.push_u64(d.id as u64);
+    cur.push_static(b",\"value\":\"");
+    write_json_bytes(d.value, cur.commit_to_buf());
+    cur.resume(4);
+    cur.push_static(b"\"}");
+    cur.commit();
 }
 
 // ============================================================================

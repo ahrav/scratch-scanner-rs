@@ -82,27 +82,29 @@ impl<W: Write + Send> JsonEventSink<W> {
 
 impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
     fn emit(&self, event: ScanEvent<'_>) {
+        // Determine separator *before* acquiring any lock or formatting.
+        // `Relaxed` is sufficient because the mutex provides happens-before
+        // ordering for the actual write.
+        let sep: &[u8] = if self.first.swap(false, Ordering::Relaxed) {
+            b"\n"
+        } else {
+            b",\n"
+        };
+
         with_format_buf(
-            |buf| match &event {
-                ScanEvent::Finding(f) => encode_finding(f, buf),
-                ScanEvent::Progress(p) => encode_progress(p, buf),
-                ScanEvent::Summary(s) => encode_summary(s, buf),
-                ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
-                ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
-                ScanEvent::IdentityDictionary(d) => encode_identity_dictionary(d, buf),
+            |buf| {
+                buf.extend_from_slice(sep);
+                match &event {
+                    ScanEvent::Finding(f) => encode_finding(f, buf),
+                    ScanEvent::Progress(p) => encode_progress(p, buf),
+                    ScanEvent::Summary(s) => encode_summary(s, buf),
+                    ScanEvent::Diagnostic(d) => encode_diagnostic(d, buf),
+                    ScanEvent::CommitMeta(m) => encode_commit_meta(m, buf),
+                    ScanEvent::IdentityDictionary(d) => encode_identity_dictionary(d, buf),
+                }
             },
             |bytes| {
                 let mut writer = self.writer.lock().expect("json sink mutex poisoned");
-                // Comma state machine: the first element gets a bare newline,
-                // all subsequent elements get ",\n". `Relaxed` is sufficient
-                // because the mutex already provides happens-before ordering.
-                // Separator write errors are intentionally discarded (`let _ =`);
-                // if the writer is broken, the payload write below will surface it.
-                if self.first.swap(false, Ordering::Relaxed) {
-                    let _ = writer.write_all(b"\n");
-                } else {
-                    let _ = writer.write_all(b",\n");
-                }
                 if let Err(e) = writer.write_all(bytes) {
                     if e.kind() == ErrorKind::BrokenPipe {
                         return;
