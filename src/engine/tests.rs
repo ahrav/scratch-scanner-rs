@@ -27,6 +27,8 @@ use super::vectorscan_prefilter::{
     build_stream_match_ctx, gate_match_callback, stream_match_callback, VsStreamMatchCtx,
     VsStreamWindow,
 };
+#[cfg(all(test, feature = "stdx-proptest"))]
+use crate::api::OfflineVerdict;
 #[cfg(feature = "stdx-proptest")]
 use crate::api::Tuning;
 use crate::api::{
@@ -138,6 +140,9 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
         );
         return false;
     }
+    // SAFETY: The FFI callback writes at most `pending_cap` elements into the vec's spare
+    // capacity, and `pending_len` is set by the callback to the number actually written,
+    // so `pending_len <= pending.capacity()` and all elements are initialized.
     unsafe { pending.set_len(pending_len as usize) };
     let mut hit = !pending.is_empty();
     pending.clear();
@@ -154,6 +159,8 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
     {
         return false;
     }
+    // SAFETY: Same as above -- the callback initialized `pending_len` elements within the
+    // vec's spare capacity after `clear()` reset the length to zero.
     unsafe { pending.set_len(pending_len as usize) };
     if !pending.is_empty() {
         hit = true;
@@ -3486,6 +3493,21 @@ fn scan_rules_reference(
                             // Extract secret span to match production behavior.
                             let (secret_start, secret_end) =
                                 extract_secret_span(&caps, rule.secret_group);
+                            // Offline validation: suppress structurally invalid
+                            // tokens (bad CRC32, etc.) for root-level findings,
+                            // matching engine emit-time policy.
+                            if steps.is_empty() {
+                                if let Some(spec) = &rule.offline_validation {
+                                    let secret_bytes = &window[secret_start..secret_end];
+                                    let verdict =
+                                        super::offline_validate::validate(*spec, secret_bytes);
+                                    if matches!(verdict, OfflineVerdict::Invalid)
+                                        && spec.suppresses_on_invalid()
+                                    {
+                                        continue;
+                                    }
+                                }
+                            }
                             let span = (w.start + secret_start)..(w.start + secret_end);
                             out.insert(FindingKey {
                                 rule: rule.name,
@@ -3550,6 +3572,7 @@ fn scan_rules_reference(
                                 return found_any;
                             }
 
+                            let parent_is_root = steps.is_empty();
                             let mut steps = steps.to_vec();
                             steps.push(StepKind::Utf16 {
                                 le: matches!(variant, Variant::Utf16Le),
@@ -3577,6 +3600,21 @@ fn scan_rules_reference(
                                 // Extract secret span to match production behavior.
                                 let (secret_start, secret_end) =
                                     extract_secret_span(&caps, rule.secret_group);
+                                // Offline validation: suppress structurally invalid
+                                // tokens for root-level findings (parent steps empty),
+                                // matching engine emit-time policy.
+                                if parent_is_root {
+                                    if let Some(spec) = &rule.offline_validation {
+                                        let secret_bytes = &decoded[secret_start..secret_end];
+                                        let verdict =
+                                            super::offline_validate::validate(*spec, secret_bytes);
+                                        if matches!(verdict, OfflineVerdict::Invalid)
+                                            && spec.suppresses_on_invalid()
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let span = secret_start..secret_end;
                                 out.insert(FindingKey {
                                     rule: rule.name,
@@ -4601,6 +4639,60 @@ fn test_chunked_scan_trailing_context_not_dropped() {
     assert_eq!(
         f.span_end, 60,
         "Secret should end at offset 60 (excluding delimiter)"
+    );
+}
+
+/// Regression test: base64-encoded slack webhook URL with tiny chunk size.
+///
+/// Bug: For base64 transform findings, `drop_hint_end` was set to
+/// `root_span_hint.end` (the mapped match end in root-buffer coordinates),
+/// which can fall *inside* the encoded region. A base64 region is only
+/// decodable when the full span (including `=` padding) is visible, so a
+/// finding may first appear in a chunk whose overlap boundary exceeds the
+/// mapped match end. `drop_prefix_findings` would then discard it as a
+/// "prior-chunk duplicate" that was never actually emitted.
+///
+/// Fix: `drop_hint_end_for_match` now extends to the end of the encoded
+/// base64 region, ensuring the finding survives until the overlap fully
+/// covers the encoded span.
+#[test]
+fn test_chunked_base64_drop_hint_covers_encoded_region() {
+    let buf: Vec<u8> = vec![
+        98, 31, 202, 153, 57, 129, 44, 220, 242, 146, 212, 47, 218, 232, 250, 28, 221, 188, 19,
+        176, 82, 223, 61, 36, 182, 134, 39, 74, 181, 210, 55, 63, 124, 51, 114, 8, 155, 155, 247,
+        198, 15, 87, 57, 202, 89, 8, 95, 136, 117, 113, 126, 135, 65, 79, 237, 70, 118, 65, 71,
+        103, 65, 100, 65, 66, 48, 65, 72, 65, 65, 99, 119, 65, 54, 65, 67, 56, 65, 76, 119, 66,
+        111, 65, 71, 56, 65, 98, 119, 66, 114, 65, 72, 77, 65, 76, 103, 66, 122, 65, 71, 119, 65,
+        89, 81, 66, 106, 65, 71, 115, 65, 76, 103, 66, 106, 65, 71, 56, 65, 98, 81, 65, 118, 65,
+        72, 77, 65, 90, 81, 66, 121, 65, 72, 89, 65, 97, 81, 66, 106, 65, 71, 85, 65, 99, 119, 65,
+        118, 65, 69, 69, 65, 81, 81, 66, 85, 65, 69, 107, 65, 79, 65, 66, 82, 65, 69, 119, 65, 83,
+        103, 66, 54, 65, 69, 77, 65, 83, 103, 66, 53, 65, 69, 56, 65, 85, 119, 66, 122, 65, 69,
+        107, 65, 98, 81, 66, 79, 65, 70, 77, 65, 89, 119, 66, 106, 65, 71, 85, 65, 82, 103, 66, 87,
+        65, 72, 73, 65, 90, 103, 66, 71, 65, 68, 81, 65, 83, 103, 66, 71, 65, 71, 103, 65, 99, 103,
+        66, 54, 65, 71, 119, 65, 87, 65, 66, 66, 65, 72, 73, 65, 97, 65, 65, 121, 65, 69, 69, 65,
+        101, 103, 66, 82, 65, 72, 103, 65, 75, 119, 61, 61, 49, 247, 144, 167, 153, 202, 213, 40,
+        125, 92, 5, 234, 167, 35, 124, 169, 105, 208, 92, 140, 88, 134, 246, 67, 154, 213, 42, 162,
+    ];
+
+    let engine = demo_engine();
+    let mut scratch = engine.new_scratch();
+
+    let full = engine.scan_chunk_records(&buf, FileId(0), 0, &mut scratch);
+    let full_keys: std::collections::HashSet<_> = full
+        .iter()
+        .map(|r| (r.rule_id, r.span_start, r.span_end))
+        .collect();
+
+    let chunked = scan_in_chunks(&engine, &buf, 11);
+    let chunked_keys: std::collections::HashSet<_> = chunked
+        .iter()
+        .map(|r| (r.rule_id, r.span_start, r.span_end))
+        .collect();
+
+    assert!(
+        chunked_keys.is_superset(&full_keys),
+        "Chunked scan (chunk_size=11) missed findings present in full scan.\n\
+         Full: {full_keys:?}\nChunked: {chunked_keys:?}"
     );
 }
 

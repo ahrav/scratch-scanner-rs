@@ -181,6 +181,11 @@ pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, Ru
 /// Returns `None` if the executable path cannot be determined (e.g., `/proc`
 /// not mounted in containers, or the binary has no parent directory).
 /// The returned path is a candidate location and may not exist.
+///
+/// Only the executable-adjacent location is checked. The current working
+/// directory is intentionally excluded because this tool scans untrusted
+/// repositories — loading a `default_rules.yaml` planted inside a repo
+/// would let an attacker suppress detections or crash the scanner.
 pub(crate) fn default_rules_path() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,

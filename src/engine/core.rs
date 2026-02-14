@@ -1418,7 +1418,19 @@ impl Engine {
             // the slot without writing a default back — saving a 40-byte
             // store per iteration. The slot is never re-read because
             // work_head advances monotonically.
-            let item = scratch.work_q[scratch.work_head];
+            //
+            // SAFETY: `work_head < work_q.len()` is the loop condition
+            // (checked on line above). `work_head` only increments by 1
+            // per iteration, and `work_q` only grows (push) during the
+            // loop body, never shrinks.
+            //
+            // NOTE: As of 2025-02, LLVM elides the bounds check on safe
+            // indexing here (ccmp+b.hs pattern on AArch64). This unsafe
+            // produces identical ASM and exists as a regression guard to
+            // ensure the bounds check is never re-introduced by future
+            // code changes. If this policy is revisited, revert to safe
+            // indexing: `let item = scratch.work_q[scratch.work_head];`
+            let item = unsafe { *scratch.work_q.get_unchecked(scratch.work_head) };
             scratch.work_head += 1;
 
             if !item.is_decode_span() {
@@ -1448,6 +1460,9 @@ impl Engine {
                 {
                     let start = slab_range.start as usize;
                     let end = slab_range.end as usize;
+                    // SAFETY: The slab is pre-allocated and never reallocated during a
+                    // scan; `scan_rules_on_buffer` only mutates output fields, not the
+                    // slab region backing `cur_buf`. See the comment block above.
                     unsafe {
                         debug_assert!(end <= scratch.slab.buf.len());
                         let ptr = scratch.slab.buf.as_ptr().add(start);

@@ -593,6 +593,7 @@ where
 
     #[inline]
     fn metric_ref(&self) -> &Metrics {
+        // SAFETY: Single-threaded access; no mutable aliases exist.
         unsafe { &*self.metrics.as_ref().get() }
     }
 
@@ -746,6 +747,7 @@ where
     /// Note: values are left untouched; counts determine occupancy.
     pub fn reset(&mut self) {
         self.tags.fill(TagT::default());
+        // SAFETY: Exclusive `&mut self` guarantees no concurrent access to counts/clocks.
         unsafe {
             (*self.counts.get()).words_mut().fill(0);
             (*self.clocks.get()).words_mut().fill(0);
@@ -800,6 +802,7 @@ where
 
         let idx = set.offset + way as u64;
         let idx_usize = Self::index_usize(idx);
+        // SAFETY: Slot is occupied (search found it), so the value is initialized.
         let removed = unsafe { self.values.read_copy(idx_usize) };
         self.counts_set(idx, 0);
         self.values.write_uninit(idx_usize);
@@ -832,6 +835,7 @@ where
             let idx = set.offset + way as u64;
             let idx_usize = offset_usize + way_usize;
             self.counts_set(idx, 1);
+            // SAFETY: Slot is occupied (search matched), so the value is initialized.
             let evicted = unsafe { self.values.read_copy(idx_usize) };
             self.values.write(idx_usize, *value);
             return UpsertResult {
@@ -863,6 +867,7 @@ where
             count -= 1;
             self.counts_set(idx, count as u8);
             if count == 0 {
+                // SAFETY: Count was non-zero before decrement, so the slot was occupied and initialized.
                 evicted = Some(unsafe { self.values.read_copy(idx_usize) });
                 break;
             }
@@ -902,7 +907,10 @@ where
         debug_assert!(offset_usize + WAYS <= self.tags.len());
         debug_assert!(offset_usize + WAYS <= self.values.len());
 
+        // SAFETY: offset_usize + WAYS is bounds-checked by debug_asserts above; pointer
+        // arithmetic stays within the allocated tags buffer.
         let tags = unsafe { self.tags.as_ptr().add(offset_usize) as *mut [TagT; WAYS] };
+        // SAFETY: Same bounds check applies; pointer stays within the allocated values buffer.
         let values = unsafe { self.values.as_ptr().add(offset_usize) as *mut [C::Value; WAYS] };
 
         Set {
@@ -919,6 +927,7 @@ where
     /// iterations when few tags match.
     #[inline]
     fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16> {
+        // SAFETY: `set.tags` was derived from a valid in-bounds pointer in `associate`.
         let tags = unsafe { &*set.tags };
         let mut ways_mask = Self::search_tags(tags, set.tag);
         if ways_mask == 0 {
@@ -932,6 +941,7 @@ where
             ways_mask &= ways_mask - 1; // Clear lowest set bit (Kernighan's trick)
 
             if self.counts_get(set.offset + way as u64) > 0 {
+                // SAFETY: `set.values` points to a valid in-bounds array; `way` < WAYS and count > 0 confirms initialization.
                 let v = unsafe { &(*set.values)[way] };
                 if C::key_from_value(v) == key {
                     return Some(way as u16);
@@ -968,6 +978,10 @@ where
     #[cfg(all(not(miri), target_arch = "x86_64"))]
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by runtime feature detection.
+            return unsafe { Self::search_tags_avx2(tags, tag) };
+        }
         // SAFETY: SSE2 is baseline on x86_64.
         unsafe { Self::search_tags_sse2(tags, tag) }
     }
@@ -1008,7 +1022,7 @@ where
         bits
     }
 
-    /// Compresses a byte-wise movemask into one bit per u16 lane.
+    /// Compresses a byte-wise movemask into one bit per u16 lane (128-bit / 8 lanes).
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     #[inline(always)]
     fn compress_u16_mask(mask: u16) -> u16 {
@@ -1020,6 +1034,22 @@ where
         m
     }
 
+    /// Compresses a byte-wise movemask from a 256-bit u16 compare into one bit per lane.
+    ///
+    /// `_mm256_movemask_epi8` on a `_mm256_cmpeq_epi16` result yields 32 bits where
+    /// each matching u16 lane sets two consecutive bits. This extracts the low bit of
+    /// each pair and packs them into the low 16 bits.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn compress_u16_mask_avx2(mask: u32) -> u16 {
+        let mut m = mask & 0x5555_5555;
+        m = (m | (m >> 1)) & 0x3333_3333;
+        m = (m | (m >> 2)) & 0x0F0F_0F0F;
+        m = (m | (m >> 4)) & 0x00FF_00FF;
+        m = (m | (m >> 8)) & 0x0000_FFFF;
+        m as u16
+    }
+
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
@@ -1027,10 +1057,12 @@ where
         if TagT::BITS == 8 {
             let tag_u8: u8 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u8;
+            // SAFETY: Caller guaranteed NEON is available; tags_ptr is valid for WAYS elements.
             unsafe { Self::search_tags_u8_neon::<WAYS>(tags_ptr, tag_u8) }
         } else {
             let tag_u16: u16 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u16;
+            // SAFETY: Caller guaranteed NEON is available; tags_ptr is valid for WAYS elements.
             unsafe { Self::search_tags_u16_neon::<WAYS>(tags_ptr, tag_u16) }
         }
     }
@@ -1128,10 +1160,12 @@ where
         if TagT::BITS == 8 {
             let tag_u8: u8 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u8;
+            // SAFETY: Caller guaranteed SSE2 is available; tags_ptr is valid for WAYS elements.
             unsafe { Self::search_tags_u8_sse2::<WAYS>(tags_ptr, tag_u8) }
         } else {
             let tag_u16: u16 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u16;
+            // SAFETY: Caller guaranteed SSE2 is available; tags_ptr is valid for WAYS elements.
             unsafe { Self::search_tags_u16_sse2::<WAYS>(tags_ptr, tag_u16) }
         }
     }
@@ -1199,16 +1233,59 @@ where
         }
     }
 
+    /// AVX2 entry point: dispatches to u8 (SSE2, already optimal) or u16 (AVX2).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn search_tags_avx2(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        if TagT::BITS == 8 {
+            // u8 tags fit in a single 128-bit register for WAYS ≤ 16; SSE2 is optimal.
+            let tag_u8: u8 = core::mem::transmute_copy(&tag);
+            let tags_ptr = tags.as_ptr() as *const u8;
+            // SAFETY: tags_ptr is derived from a valid &[TagT; WAYS] and tag_u8 is
+            // transmute_copy'd from a TagT whose BITS == 8. The caller has verified
+            // that the avx2 target feature is available.
+            unsafe { Self::search_tags_u8_sse2::<WAYS>(tags_ptr, tag_u8) }
+        } else {
+            let tag_u16: u16 = core::mem::transmute_copy(&tag);
+            let tags_ptr = tags.as_ptr() as *const u16;
+            // SAFETY: tags_ptr is derived from a valid &[TagT; WAYS] and tag_u16 is
+            // transmute_copy'd from a TagT whose BITS == 16. The avx2 target feature
+            // is enabled on this function.
+            unsafe { Self::search_tags_u16_avx2::<WAYS>(tags_ptr, tag_u16) }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn search_tags_u16_avx2<const N: usize>(tags: *const u16, tag: u16) -> u16 {
+        use core::arch::x86_64::*;
+
+        if N == 16 {
+            // SAFETY: N == 16 guarantees 32 bytes (16 × u16) are readable from `tags`.
+            // `_mm256_loadu_si256` handles unaligned pointers.
+            let vec = _mm256_loadu_si256(tags as *const __m256i);
+            let needle = _mm256_set1_epi16(tag as i16);
+            let eq = _mm256_cmpeq_epi16(vec, needle);
+            let mask = _mm256_movemask_epi8(eq) as u32;
+            return Self::compress_u16_mask_avx2(mask);
+        }
+
+        // For WAYS < 16, tags fit in one 128-bit register; delegate to SSE2.
+        Self::search_tags_u16_sse2::<N>(tags, tag)
+    }
+
     #[cfg(target_arch = "x86")]
     #[target_feature(enable = "sse2")]
     unsafe fn search_tags_sse2(tags: &[TagT; WAYS], tag: TagT) -> u16 {
         if TagT::BITS == 8 {
             let tag_u8: u8 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u8;
+            // SAFETY: Caller guaranteed SSE2 is available; tags_ptr is valid for WAYS elements.
             unsafe { Self::search_tags_u8_sse2::<WAYS>(tags_ptr, tag_u8) }
         } else {
             let tag_u16: u16 = core::mem::transmute_copy(&tag);
             let tags_ptr = tags.as_ptr() as *const u16;
+            // SAFETY: Caller guaranteed SSE2 is available; tags_ptr is valid for WAYS elements.
             unsafe { Self::search_tags_u16_sse2::<WAYS>(tags_ptr, tag_u16) }
         }
     }
@@ -1279,12 +1356,14 @@ where
     /// Reads the CLOCK count for a slot at `index`.
     #[inline]
     fn counts_get(&self, index: u64) -> u8 {
+        // SAFETY: Single-threaded access; no mutable aliases to `counts` exist.
         unsafe { (*self.counts.get()).get(index) }
     }
 
     /// Writes the CLOCK count for a slot at `index`.
     #[inline]
     fn counts_set(&self, index: u64, value: u8) {
+        // SAFETY: Single-threaded access; no other references to `counts` exist.
         unsafe {
             (*self.counts.get()).set(index, value);
         }
@@ -1293,12 +1372,14 @@ where
     /// Reads the clock hand value for the set at `index`.
     #[inline]
     fn clocks_get(&self, index: u64) -> u8 {
+        // SAFETY: Single-threaded access; no mutable aliases to `clocks` exist.
         unsafe { (*self.clocks.get()).get(index) }
     }
 
     /// Writes the clock hand value for the set at `index`.
     #[inline]
     fn clocks_set(&self, index: u64, value: u8) {
+        // SAFETY: Single-threaded access; no other references to `clocks` exist.
         unsafe {
             (*self.clocks.get()).set(index, value);
         }

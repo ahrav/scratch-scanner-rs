@@ -1202,16 +1202,13 @@ fn apply_transform_filter(
 /// # Invariants
 /// - `Explicit` stores the CLI-provided path as-is; existence/readability are
 ///   validated by the loader.
-/// - `ExecutableDefault` is selected only when probing confirms the file exists.
-/// - `BuiltInFallback` stores the probed executable-dir candidate path for
-///   diagnostics even when absent.
+/// - `DefaultCandidate` is selected only when probing confirms the exe-adjacent file exists.
+/// - `BuiltInFallback` is used when no on-disk candidate was found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RuleSource {
     Explicit(PathBuf),
-    ExecutableDefault(PathBuf),
-    BuiltInFallback {
-        executable_default_path: Option<PathBuf>,
-    },
+    DefaultCandidate(PathBuf),
+    BuiltInFallback,
 }
 
 impl RuleSource {
@@ -1219,8 +1216,8 @@ impl RuleSource {
     const fn source_label(&self) -> &'static str {
         match self {
             Self::Explicit(_) => "explicit",
-            Self::ExecutableDefault(_) => "executable-default",
-            Self::BuiltInFallback { .. } => "built-in",
+            Self::DefaultCandidate(_) => "default",
+            Self::BuiltInFallback => "built-in",
         }
     }
 }
@@ -1228,30 +1225,23 @@ impl RuleSource {
 /// Resolve which rule source to use according to precedence.
 ///
 /// Explicit `--rules` paths are accepted without existence checks so downstream
-/// loader diagnostics can report precise read/parse failures. Default candidates
-/// are accepted only if `try_exists()` confirms they exist; probe failures emit
-/// an explicit warning before falling back.
-fn resolve_rule_source(
-    rules_file: Option<&Path>,
-    executable_default_path: Option<&Path>,
-) -> RuleSource {
+/// loader diagnostics can report precise read/parse failures. The exe-adjacent
+/// default is accepted only if `try_exists()` confirms the file is present;
+/// probe failures emit a warning before falling back to the built-in set.
+fn resolve_rule_source(rules_file: Option<&Path>, default_path: Option<&Path>) -> RuleSource {
     if let Some(path) = rules_file {
         return RuleSource::Explicit(path.to_path_buf());
     }
-    if let Some(path) = executable_default_path {
+    if let Some(path) = default_path {
         match path.try_exists() {
-            Ok(true) => return RuleSource::ExecutableDefault(path.to_path_buf()),
+            Ok(true) => return RuleSource::DefaultCandidate(path.to_path_buf()),
             Ok(false) => {}
             Err(err) => {
-                eprintln!(
-                    "warning: failed to probe default_rules.yaml next to executable: {err}; using compiled-in fallback"
-                );
+                eprintln!("warning: failed to probe {}: {err}", path.display());
             }
         }
     }
-    RuleSource::BuiltInFallback {
-        executable_default_path: executable_default_path.map(Path::to_path_buf),
-    }
+    RuleSource::BuiltInFallback
 }
 
 /// Load and parse rules from `path`, returning `(rules, hash)`.
@@ -1295,21 +1285,19 @@ fn load_rules_from_path(path: &Path, source: &RuleSource) -> (Vec<RuleSpec>, u64
 /// # Effects
 /// - Emits provenance logs (source label and deterministic fast hash fingerprint).
 /// - Exits with status `2` if a selected on-disk source (explicit or
-///   executable-default) cannot be read/parsed.
+///   default candidate) cannot be read/parsed.
 fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
-    let executable_default_path = crate::rules::default_rules_path();
-    let source = resolve_rule_source(rules_file, executable_default_path.as_deref());
+    let default_path = crate::rules::default_rules_path();
+    let source = resolve_rule_source(rules_file, default_path.as_deref());
     match &source {
-        RuleSource::Explicit(path) | RuleSource::ExecutableDefault(path) => {
+        RuleSource::Explicit(path) | RuleSource::DefaultCandidate(path) => {
             let (rules, _) = load_rules_from_path(path, &source);
             rules
         }
-        RuleSource::BuiltInFallback { .. } => {
+        RuleSource::BuiltInFallback => {
             let rules = demo_rules();
             let built_in_hash = crate::rules::builtin_rules_hash64();
-            eprintln!(
-                "warning: no usable default_rules.yaml found next to executable; using compiled-in fallback"
-            );
+            eprintln!("warning: no usable default_rules.yaml found; using compiled-in fallback");
             eprintln!(
                 "info: using compiled-in rule set ({} rules, source: {}, rule_hash: {built_in_hash:016x})",
                 rules.len(),

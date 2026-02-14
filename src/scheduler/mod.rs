@@ -227,10 +227,15 @@ pub mod ts_chunk;
 pub mod worker_id;
 
 // I/O backends
+mod local_fs_archive_ctx;
+mod local_fs_extract;
+mod local_fs_gzip;
 pub mod local_fs_owner;
 pub use local_fs_owner as local;
+mod local_fs_tar;
 #[cfg(target_os = "linux")]
 pub mod local_fs_uring;
+mod local_fs_zip;
 pub mod parallel_scan;
 pub mod remote;
 

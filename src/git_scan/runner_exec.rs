@@ -515,6 +515,8 @@ pub(super) fn mmap_pack_files(
 /// return codes are intentionally discarded.
 #[cfg(unix)]
 pub(super) fn advise_sequential(file: &File, reader: &Mmap) {
+    // SAFETY: `file` is a valid open fd and `reader` is a live mmap.
+    // Both libc calls are advisory hints; invalid arguments are harmless.
     unsafe {
         #[cfg(target_os = "linux")]
         let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);

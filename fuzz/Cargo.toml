@@ -16,6 +16,8 @@ memchr = "2"
 tempfile = "3"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 
+serde_json = "1"
+
 [dependencies.scanner-rs]
 path = ".."
 features = ["tiger-harness"]
@@ -128,6 +130,20 @@ bench = false
 [[bin]]
 name = "fuzz_json_write_equivalence"
 path = "fuzz_targets/fuzz_json_write_equivalence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_text_sanitize_path"
+path = "fuzz_targets/fuzz_text_sanitize_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_encode_pipeline"
+path = "fuzz_targets/fuzz_encode_pipeline.rs"
 test = false
 doc = false
 bench = false

@@ -81,6 +81,8 @@ extern "C" fn count_callback(
     _flags: std::ffi::c_uint,
     ctx: *mut std::ffi::c_void,
 ) -> std::ffi::c_int {
+    // SAFETY: The caller (Vectorscan) passes back the `ctx` pointer we provided
+    // to `hs_scan`, which is a valid `*mut u64` pointing to a local variable.
     unsafe {
         let count = ctx as *mut u64;
         *count += 1;
@@ -104,6 +106,9 @@ impl VsDb {
         let mut db: *mut vs::hs_database_t = std::ptr::null_mut();
         let mut compile_err: *mut vs::hs_compile_error_t = std::ptr::null_mut();
 
+        // SAFETY: FFI call to Vectorscan. All pointer arrays (`pattern_ptrs`, `flags`,
+        // `ids`) have matching length. `db` and `compile_err` are valid out-pointers.
+        // The `CString` values in `c_patterns` remain alive for the duration of this call.
         let rc = unsafe {
             vs::hs_compile_multi(
                 pattern_ptrs.as_ptr(),
@@ -119,6 +124,8 @@ impl VsDb {
 
         if rc != vs::HS_SUCCESS as i32 {
             let msg = if !compile_err.is_null() {
+                // SAFETY: `compile_err` is non-null and was populated by `hs_compile_multi`.
+                // The `message` field is a valid C string. We free the error after reading.
                 unsafe {
                     let msg = std::ffi::CStr::from_ptr((*compile_err).message)
                         .to_string_lossy()
@@ -133,8 +140,11 @@ impl VsDb {
         }
 
         let mut scratch: *mut vs::hs_scratch_t = std::ptr::null_mut();
+        // SAFETY: `db` is a valid compiled database (compilation succeeded above).
+        // `scratch` is a valid out-pointer.
         let rc = unsafe { vs::hs_alloc_scratch(db, &mut scratch) };
         if rc != vs::HS_SUCCESS as i32 {
+            // SAFETY: `db` was successfully compiled and has not been freed yet.
             unsafe { vs::hs_free_database(db) };
             return Err(format!("hs_alloc_scratch failed: rc={}", rc));
         }
@@ -144,6 +154,8 @@ impl VsDb {
 
     fn scan(&self, data: &[u8]) -> u64 {
         let mut count: u64 = 0;
+        // SAFETY: `self.db` and `self.scratch` are valid (initialized in `compile`).
+        // `data` is a valid byte slice. `count` is a valid `u64` used as callback context.
         let rc = unsafe {
             vs::hs_scan(
                 self.db,
@@ -162,6 +174,9 @@ impl VsDb {
 
 impl Drop for VsDb {
     fn drop(&mut self) {
+        // SAFETY: `self.scratch` and `self.db` were successfully allocated in
+        // `compile` and have not been freed yet. Scratch is freed before its
+        // associated database.
         unsafe {
             vs::hs_free_scratch(self.scratch);
             vs::hs_free_database(self.db);

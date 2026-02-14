@@ -200,6 +200,8 @@ impl RootSpanMapCtx {
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
+        // SAFETY: `encoded_ptr` and `encoded_len` were captured from a valid slice
+        // that outlives the scan; no mutation occurs while this reference is live.
         let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
         let start = map_decoded_offset(tc, encoded, span.start);
         let end = map_decoded_offset(tc, encoded, span.end);
@@ -226,6 +228,8 @@ impl RootSpanMapCtx {
             return None;
         }
 
+        // SAFETY: `encoded_ptr`/`encoded_len` were captured from a valid slice
+        // that outlives the scan; no mutation occurs while this reference is live.
         let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
         let plus_to_space = tc.plus_to_space;
         let span_start = root_span
@@ -296,10 +300,29 @@ impl RootSpanMapCtx {
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
+
+        // Base64: extend drop boundary to the end of the encoded region.
+        //
+        // A base64 region is only fully decodable when the entire encoded span
+        // (including `=` padding) is visible in the chunk. Findings within the
+        // decoded output are therefore only discoverable once the chunk extends
+        // past the encoded region boundary. Using `root_span_hint.end` alone
+        // can leave `drop_hint_end` *inside* the encoded region, causing
+        // `drop_prefix_findings` to incorrectly discard findings that were
+        // never emitted by a prior (shorter) chunk.
+        //
+        // Extending to `root_start + encoded_len` ensures the finding survives
+        // until the overlap window fully covers the encoded span.
+        if tc.id == TransformId::Base64 {
+            return Some(self.root_start + self.encoded_len);
+        }
+
         if tc.id != TransformId::UrlPercent {
             return None;
         }
 
+        // SAFETY: `encoded_ptr`/`encoded_len` were captured from a valid slice
+        // that outlives the scan; no mutation occurs while this reference is live.
         let encoded = unsafe { std::slice::from_raw_parts(self.encoded_ptr, self.encoded_len) };
         let plus_to_space = tc.plus_to_space;
         let span_end = match_span
