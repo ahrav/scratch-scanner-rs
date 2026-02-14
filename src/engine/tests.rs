@@ -4642,6 +4642,60 @@ fn test_chunked_scan_trailing_context_not_dropped() {
     );
 }
 
+/// Regression test: base64-encoded slack webhook URL with tiny chunk size.
+///
+/// Bug: For base64 transform findings, `drop_hint_end` was set to
+/// `root_span_hint.end` (the mapped match end in root-buffer coordinates),
+/// which can fall *inside* the encoded region. A base64 region is only
+/// decodable when the full span (including `=` padding) is visible, so a
+/// finding may first appear in a chunk whose overlap boundary exceeds the
+/// mapped match end. `drop_prefix_findings` would then discard it as a
+/// "prior-chunk duplicate" that was never actually emitted.
+///
+/// Fix: `drop_hint_end_for_match` now extends to the end of the encoded
+/// base64 region, ensuring the finding survives until the overlap fully
+/// covers the encoded span.
+#[test]
+fn test_chunked_base64_drop_hint_covers_encoded_region() {
+    let buf: Vec<u8> = vec![
+        98, 31, 202, 153, 57, 129, 44, 220, 242, 146, 212, 47, 218, 232, 250, 28, 221, 188, 19,
+        176, 82, 223, 61, 36, 182, 134, 39, 74, 181, 210, 55, 63, 124, 51, 114, 8, 155, 155, 247,
+        198, 15, 87, 57, 202, 89, 8, 95, 136, 117, 113, 126, 135, 65, 79, 237, 70, 118, 65, 71,
+        103, 65, 100, 65, 66, 48, 65, 72, 65, 65, 99, 119, 65, 54, 65, 67, 56, 65, 76, 119, 66,
+        111, 65, 71, 56, 65, 98, 119, 66, 114, 65, 72, 77, 65, 76, 103, 66, 122, 65, 71, 119, 65,
+        89, 81, 66, 106, 65, 71, 115, 65, 76, 103, 66, 106, 65, 71, 56, 65, 98, 81, 65, 118, 65,
+        72, 77, 65, 90, 81, 66, 121, 65, 72, 89, 65, 97, 81, 66, 106, 65, 71, 85, 65, 99, 119, 65,
+        118, 65, 69, 69, 65, 81, 81, 66, 85, 65, 69, 107, 65, 79, 65, 66, 82, 65, 69, 119, 65, 83,
+        103, 66, 54, 65, 69, 77, 65, 83, 103, 66, 53, 65, 69, 56, 65, 85, 119, 66, 122, 65, 69,
+        107, 65, 98, 81, 66, 79, 65, 70, 77, 65, 89, 119, 66, 106, 65, 71, 85, 65, 82, 103, 66, 87,
+        65, 72, 73, 65, 90, 103, 66, 71, 65, 68, 81, 65, 83, 103, 66, 71, 65, 71, 103, 65, 99, 103,
+        66, 54, 65, 71, 119, 65, 87, 65, 66, 66, 65, 72, 73, 65, 97, 65, 65, 121, 65, 69, 69, 65,
+        101, 103, 66, 82, 65, 72, 103, 65, 75, 119, 61, 61, 49, 247, 144, 167, 153, 202, 213, 40,
+        125, 92, 5, 234, 167, 35, 124, 169, 105, 208, 92, 140, 88, 134, 246, 67, 154, 213, 42, 162,
+    ];
+
+    let engine = demo_engine();
+    let mut scratch = engine.new_scratch();
+
+    let full = engine.scan_chunk_records(&buf, FileId(0), 0, &mut scratch);
+    let full_keys: std::collections::HashSet<_> = full
+        .iter()
+        .map(|r| (r.rule_id, r.span_start, r.span_end))
+        .collect();
+
+    let chunked = scan_in_chunks(&engine, &buf, 11);
+    let chunked_keys: std::collections::HashSet<_> = chunked
+        .iter()
+        .map(|r| (r.rule_id, r.span_start, r.span_end))
+        .collect();
+
+    assert!(
+        chunked_keys.is_superset(&full_keys),
+        "Chunked scan (chunk_size=11) missed findings present in full scan.\n\
+         Full: {full_keys:?}\nChunked: {chunked_keys:?}"
+    );
+}
+
 // --------------------------
 // Property tests for engine correctness and chunking.
 // Gated behind `stdx-proptest` to keep `cargo test` fast.

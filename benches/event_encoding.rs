@@ -13,6 +13,7 @@
 //! |---|---|---|
 //! | `primitives` | `write_u64`, `write_oid_hex`, `write_json_str`, `write_json_bytes`, `write_f64` | Bytes/sec throughput |
 //! | `encoding` | `encode_finding`, `encode_commit_meta`, batch encode, `JsonlEventSink::emit` | Events/sec throughput |
+//! | `comparison` | `write_u64` vs `itoa`, `write_f64` vs `ryu` | Elements/sec (head-to-head) |
 //!
 //! ## Running
 //!
@@ -37,6 +38,7 @@ use scanner_rs::unified::harness_api::{
     encode_commit_meta, encode_finding, write_f64, write_json_bytes, write_json_str, write_oid_hex,
     write_u64,
 };
+use scanner_rs::unified::json_sink::JsonEventSink;
 use scanner_rs::unified::SourceKind;
 use std::io;
 
@@ -446,6 +448,79 @@ fn bench_write_f64(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compare custom `write_u64` against the `itoa` crate.
+///
+/// `itoa` is the de-facto standard for integer-to-ASCII in the Rust ecosystem
+/// (used by serde_json). This benchmark validates that our hand-rolled
+/// two-digits-at-a-time implementation stays competitive. If `itoa` pulls
+/// ahead significantly, the custom implementation should be reconsidered.
+///
+/// Uses a 10-digit value (1.7 billion — a realistic Unix timestamp) since
+/// that's the most common magnitude in scan events.
+fn bench_u64_vs_itoa(c: &mut Criterion) {
+    let mut group = c.benchmark_group("u64_vs_itoa");
+    group.throughput(Throughput::Elements(1));
+
+    let val = 1_700_000_000u64;
+    group.bench_function("custom_write_u64", |b| {
+        let mut buf = Vec::with_capacity(20);
+        b.iter(|| {
+            buf.clear();
+            write_u64(black_box(val), &mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("itoa_write", |b| {
+        let mut buf = Vec::with_capacity(20);
+        let mut tmp = itoa::Buffer::new();
+        b.iter(|| {
+            buf.clear();
+            let s = tmp.format(black_box(val));
+            buf.extend_from_slice(s.as_bytes());
+            black_box(&buf);
+        });
+    });
+
+    group.finish();
+}
+
+/// Compare custom `write_f64` against the `ryu` crate.
+///
+/// `ryu` is the fastest general-purpose float-to-string implementation
+/// (Ryū algorithm, used by serde_json). Our `write_f64` is *not*
+/// general-purpose — it emits exactly two decimal places via integer
+/// arithmetic, avoiding the full shortest-representation algorithm.
+/// This benchmark confirms the fixed-precision shortcut is faster than
+/// `ryu` for the narrow use case of two-decimal-place output.
+fn bench_f64_vs_ryu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("f64_vs_ryu");
+    group.throughput(Throughput::Elements(1));
+
+    let val = 81.23f64;
+    group.bench_function("custom_write_f64", |b| {
+        let mut buf = Vec::with_capacity(32);
+        b.iter(|| {
+            buf.clear();
+            write_f64(black_box(val), &mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("ryu_write", |b| {
+        let mut buf = Vec::with_capacity(32);
+        let mut tmp = ryu::Buffer::new();
+        b.iter(|| {
+            buf.clear();
+            let s = tmp.format(black_box(val));
+            buf.extend_from_slice(s.as_bytes());
+            black_box(&buf);
+        });
+    });
+
+    group.finish();
+}
+
 // ============================================================================
 // Encoder-level benchmarks
 // ============================================================================
@@ -602,6 +677,44 @@ fn bench_sink_emit(c: &mut Criterion) {
     group.finish();
 }
 
+/// JSON array sink benchmark: emit 1000 findings into /dev/null.
+///
+/// Mirrors `bench_sink_emit` (JSONL) to enable direct comparison of
+/// the separator + array framing overhead.
+fn bench_json_sink_emit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("json_sink_emit");
+    group.throughput(Throughput::Elements(1000));
+
+    group.bench_function("1000_findings_dev_null", |b| {
+        let sink = JsonEventSink::new(io::sink());
+        let findings: Vec<FindingEvent<'static>> = (0..1000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    make_fs_finding()
+                } else {
+                    make_git_finding()
+                }
+            })
+            .collect();
+        b.iter(|| {
+            for f in &findings {
+                sink.emit(ScanEvent::Finding(FindingEvent {
+                    source: f.source,
+                    object_path: f.object_path,
+                    start: f.start,
+                    end: f.end,
+                    rule_id: f.rule_id,
+                    rule_name: f.rule_name,
+                    commit_id: f.commit_id,
+                    change_kind: f.change_kind,
+                }));
+            }
+        });
+    });
+
+    group.finish();
+}
+
 /// Emit findings from multiple threads through a shared `JsonlEventSink`.
 ///
 /// Unlike `bench_sink_emit` (single-threaded), this exercises the mutex
@@ -666,6 +779,8 @@ criterion_group!(
     bench_encode_commit_meta,
     bench_encode_batch,
     bench_sink_emit,
+    bench_json_sink_emit,
     bench_sink_contention,
 );
-criterion_main!(primitives, encoding);
+criterion_group!(comparison, bench_u64_vs_itoa, bench_f64_vs_ryu,);
+criterion_main!(primitives, encoding, comparison);

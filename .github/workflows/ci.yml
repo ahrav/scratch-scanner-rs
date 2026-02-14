@@ -159,6 +159,26 @@ jobs:
 
       - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests,perf-stats
 
+  loom:
+    name: Loom Concurrency Tests
+    runs-on: ubuntu-22.04
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04-loom
+      - name: Run loom tests
+        env:
+          RUSTFLAGS: "--cfg loom"
+        run: cargo test --lib -- loom_tests
+
   # ---------------------------------------------------------------------------
   # Security audit (independent, always runs)
   # ---------------------------------------------------------------------------
@@ -262,6 +282,7 @@ jobs:
           cargo +nightly fuzz run fuzz_pack_delta_into --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_exec --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_json_write_equivalence --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_encode_pipeline --target x86_64-unknown-linux-gnu -- -runs=${FUZZ_RUNS}
 
   # ---------------------------------------------------------------------------
   # Fuzz: scheduled nightly (macOS)
@@ -314,6 +335,7 @@ jobs:
           cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_encode_pipeline -- -runs=${FUZZ_RUNS}
 
   # ---------------------------------------------------------------------------
   # Miri: scheduled nightly

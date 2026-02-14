@@ -300,6 +300,23 @@ impl RootSpanMapCtx {
         // SAFETY: The engine-owned transform config lives for the duration
         // of the scan, and encoded bytes are valid while the map context is set.
         let tc = unsafe { &*self.tc };
+
+        // Base64: extend drop boundary to the end of the encoded region.
+        //
+        // A base64 region is only fully decodable when the entire encoded span
+        // (including `=` padding) is visible in the chunk. Findings within the
+        // decoded output are therefore only discoverable once the chunk extends
+        // past the encoded region boundary. Using `root_span_hint.end` alone
+        // can leave `drop_hint_end` *inside* the encoded region, causing
+        // `drop_prefix_findings` to incorrectly discard findings that were
+        // never emitted by a prior (shorter) chunk.
+        //
+        // Extending to `root_start + encoded_len` ensures the finding survives
+        // until the overlap window fully covers the encoded span.
+        if tc.id == TransformId::Base64 {
+            return Some(self.root_start + self.encoded_len);
+        }
+
         if tc.id != TransformId::UrlPercent {
             return None;
         }

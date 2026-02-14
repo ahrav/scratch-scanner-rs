@@ -11,6 +11,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(
 undocumented_unsafe_blocks = "warn"
 
 [dependencies]
+# DO NOT add pure-rust feature here — production needs the C/NEON backend.
+# If this fails locally, upgrade clang to >= 14 (SHA3 NEON intrinsics).
 aegis = "0.9"
 ahash = "0.8"
 base64 = "0.22"
@@ -61,6 +63,7 @@ property-tests = []  # Gate property-based tests behind explicit opt-in
 smoke-tests = []  # Gate smoke (binary end-to-end) tests behind explicit opt-in
 diagnostic-tests = []  # Gate diagnostic tests behind explicit opt-in
 rocksdb = ["dep:rocksdb"]
+aegis-pure-rust = ["aegis/pure-rust"]  # Use pure-Rust AEGIS on machines without SHA3 NEON (clang < 14)
 git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
 real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 
@@ -69,6 +72,8 @@ loom = "0.7"
 proptest = "1.4"
 criterion = "0.5"
 tempfile = "3.10"
+itoa = "1"
+ryu = "1"
 
 [[bench]]
 name = "scan"
