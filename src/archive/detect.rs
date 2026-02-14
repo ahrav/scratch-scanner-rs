@@ -287,6 +287,53 @@ mod tests {
     }
 
     #[test]
+    fn sniff_magic_ustar() {
+        // Valid ustar header: "ustar" at offset 257 in a 512-byte block.
+        let mut header = [0u8; 512];
+        header[257..262].copy_from_slice(b"ustar");
+        assert_eq!(sniff_kind_from_header(&header), Some(ArchiveKind::Tar));
+
+        // Too short to contain ustar magic (< 512 bytes).
+        assert_eq!(sniff_kind_from_header(&header[..256]), None);
+
+        // 512 bytes but wrong magic at offset 257.
+        let mut bad = [0u8; 512];
+        bad[257..262].copy_from_slice(b"nstar");
+        assert_eq!(sniff_kind_from_header(&bad), None);
+    }
+
+    #[test]
+    fn is_container_classification() {
+        assert!(!ArchiveKind::Gzip.is_container());
+        assert!(ArchiveKind::Tar.is_container());
+        assert!(ArchiveKind::Zip.is_container());
+        assert!(ArchiveKind::TarGz.is_container());
+    }
+
+    #[test]
+    fn double_dot_edge_cases() {
+        // `file..gz` ends with `.gz` — the extra dot is part of the basename.
+        assert_eq!(
+            detect_kind_from_name_bytes(b"file..gz"),
+            Some(ArchiveKind::Gzip)
+        );
+        assert_eq!(
+            detect_kind_from_name_bytes(b"file..tar.gz"),
+            Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(
+            detect_kind_from_name_bytes(b"file..tar"),
+            Some(ArchiveKind::Tar)
+        );
+        assert_eq!(
+            detect_kind_from_name_bytes(b"file..zip"),
+            Some(ArchiveKind::Zip)
+        );
+        // Double dot not adjacent to a recognized extension.
+        assert_eq!(detect_kind_from_name_bytes(b"file..rs"), None);
+    }
+
+    #[test]
     fn extension_wins_over_sniff_for_targz() {
         use std::path::PathBuf;
         let p = PathBuf::from("x.tar.gz");

@@ -337,7 +337,7 @@ impl ArchiveSampleRing {
     pub fn push(&mut self, kind: SampleKind, reason: u8, path: &[u8]) {
         let idx = self.len as usize;
         if idx >= ARCHIVE_SAMPLE_MAX {
-            self.dropped = self.dropped.wrapping_add(1);
+            self.dropped = self.dropped.saturating_add(1);
             return;
         }
 
