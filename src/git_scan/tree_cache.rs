@@ -5,11 +5,36 @@
 //! and does not allocate on the hot path (after initialization).
 //!
 //! # Layout
-//! - `WAYS` slots per set (fixed)
-//! - Number of sets is rounded down to a power of two
-//! - Each slot owns a fixed `slot_size` byte range in the arena
 //!
-//! Tree payloads larger than `slot_size` are not cached.
+//! ```text
+//! ┌─────────────────────────────────────────────────┐
+//! │  Set 0           │  Set 1           │  ...      │
+//! │ [w0][w1][w2][w3] │ [w0][w1][w2][w3] │           │
+//! └─────────────────────────────────────────────────┘
+//!        ▲ each slot is `slot_size` bytes in the arena
+//! ```
+//!
+//! - `WAYS` slots per set (4-way associative)
+//! - Number of sets is rounded down to a power of two for bitmask indexing
+//! - Each slot owns a fixed `slot_size` byte range in the contiguous arena
+//!
+//! Tree payloads larger than `slot_size` are silently not cached.
+//!
+//! # Eviction (CLOCK)
+//!
+//! Each slot carries a 1-bit "clock" (recently-used) flag. On eviction the
+//! hand sweeps through the set, clearing clock bits it encounters. The first
+//! slot found with `clock == 0` (or an invalid slot) is chosen as the victim.
+//! Pinned slots (those with an outstanding [`TreeCacheHandle`]) are skipped
+//! unconditionally. The hand sweeps at most `2 × WAYS` positions; if every
+//! slot is either pinned or recently used, the insertion is dropped.
+//!
+//! # Pinning
+//!
+//! [`TreeCacheHandle`] increments a per-slot pin count on creation and
+//! decrements it on drop. While any pin is held the slot is immune to
+//! eviction, guaranteeing the borrowed bytes remain stable. Callers must
+//! ensure the handle does not outlive the cache itself.
 //!
 //! # Invariants
 //! - `sets` is 0 (disabled) or a power of two
@@ -29,13 +54,24 @@ const MIN_SLOT_SIZE: u32 = 256;
 /// Number of ways per set.
 const WAYS: usize = 4;
 
-/// Cache slot metadata.
+/// Metadata for a single cache slot.
+///
+/// Each slot corresponds to a fixed region in the arena (`storage`). The
+/// `valid` flag distinguishes populated slots from empty ones so the cache
+/// can be initialized without sentinel OIDs.
 #[derive(Clone, Debug)]
 struct Slot {
+    /// Object identifier of the cached tree.
     oid: OidBytes,
+    /// Actual byte length of the payload (may be less than `slot_size`).
     len: u32,
+    /// CLOCK bit: set to 1 on access, cleared during eviction sweeps.
     clock: u8,
+    /// Whether this slot holds a valid entry.
     valid: bool,
+    /// Number of outstanding [`TreeCacheHandle`]s referencing this slot.
+    /// Uses `Cell` so pin counts can be mutated through shared references
+    /// (the handle holds a raw pointer, not `&mut`).
     pins: Cell<u16>,
 }
 
@@ -54,29 +90,49 @@ impl Slot {
 
 /// Set-associative cache for tree payload bytes.
 ///
-/// The cache is not thread-safe; callers must synchronize shared access.
+/// See the [module documentation](self) for layout, eviction, and pinning
+/// details. When `sets == 0` the cache is disabled and all operations are
+/// no-ops; this avoids special-casing callers when the budget is too small.
+///
+/// Not thread-safe; callers must synchronize shared access.
 #[derive(Debug)]
 pub struct TreeCache {
+    /// Usable capacity (rounded from the requested value to fit whole sets).
     capacity_bytes: u32,
+    /// Fixed byte size of every slot in the arena (power of two).
     slot_size: u32,
+    /// Number of sets (power of two, or 0 when disabled).
     sets: usize,
+    /// Contiguous arena: `sets * WAYS * slot_size` bytes, pre-allocated once.
     storage: Vec<u8>,
+    /// Per-slot metadata, indexed as `set * WAYS + way`.
     slots: Vec<Slot>,
+    /// Per-set CLOCK hand position (index into 0..WAYS).
     clock_hands: Vec<u8>,
 }
 
 /// Handle to a pinned tree payload stored in the cache.
 ///
-/// The handle keeps the slot pinned until drop so cached bytes are not
-/// overwritten while the caller is still borrowing them.
+/// While this handle exists the underlying slot is pinned (its pin count
+/// is > 0), preventing the CLOCK eviction algorithm from reclaiming the
+/// slot. Dropping the handle releases the pin.
 ///
-/// # Safety
-/// The handle must not outlive the cache that created it.
+/// # Lifetime constraint
+///
+/// The handle stores a raw pointer to the parent [`TreeCache`]. Callers
+/// must ensure the cache is not dropped or moved while any handle is live.
+/// In practice this is enforced structurally: handles are created from
+/// `&mut TreeCache` and consumed within the same tree-walk scope.
 #[derive(Debug)]
 pub struct TreeCacheHandle {
+    /// Raw pointer back to the owning cache (for arena access on read and
+    /// pin-count decrement on drop).
     cache: *const TreeCache,
+    /// Absolute slot index in `slots` (used for pin-count bookkeeping).
     slot: usize,
+    /// Byte offset into `storage` where the payload begins.
     offset: usize,
+    /// Byte length of the cached payload.
     len: usize,
 }
 
@@ -107,10 +163,15 @@ impl Drop for TreeCacheHandle {
 }
 
 impl TreeCache {
-    /// Creates a new cache with a byte capacity.
+    /// Creates a new cache sized to approximately `capacity_bytes`.
     ///
-    /// If the capacity is too small to hold at least one set, the cache is
-    /// initialized in a disabled state (all operations are no-ops).
+    /// The actual usable capacity may be slightly smaller: the constructor
+    /// rounds `slot_size` down to a power of two and the set count down to
+    /// a power of two so that set indexing is a simple bitmask.
+    ///
+    /// If the budget is too small for even one full set (`WAYS` ×
+    /// `MIN_SLOT_SIZE`), the cache enters a disabled state where all
+    /// operations are no-ops.
     #[must_use]
     pub fn new(capacity_bytes: u32) -> Self {
         let min_bytes = MIN_SLOT_SIZE.saturating_mul(WAYS as u32);
@@ -118,9 +179,12 @@ impl TreeCache {
             return Self::disabled(capacity_bytes);
         }
 
+        // Derive slot size: spread capacity across at least WAYS slots,
+        // cap at DEFAULT_SLOT_SIZE, then round down to a power of two.
         let mut slot_size = (capacity_bytes / WAYS as u32).min(DEFAULT_SLOT_SIZE);
         slot_size = round_down_power_of_two_u32(slot_size).max(MIN_SLOT_SIZE);
 
+        // Derive set count from remaining budget after fixing slot size.
         let slots_total = capacity_bytes / slot_size;
         let sets = round_down_power_of_two_usize((slots_total / WAYS as u32) as usize);
         if sets == 0 {
@@ -178,9 +242,13 @@ impl TreeCache {
 
     /// Inserts tree bytes into the cache.
     ///
-    /// Returns true if the entry was cached. Returns false if the cache is
-    /// disabled, the payload is too large for a slot, or all candidate slots
-    /// are pinned.
+    /// If the OID is already present the clock bit is refreshed without
+    /// copying bytes (dedup fast path). Otherwise a victim slot is selected
+    /// via the CLOCK algorithm and overwritten.
+    ///
+    /// Returns `true` if the entry was cached (including dedup hits).
+    /// Returns `false` if the cache is disabled, the payload exceeds
+    /// `slot_size`, or all candidate slots are pinned.
     pub fn insert(&mut self, oid: OidBytes, bytes: &[u8]) -> bool {
         if self.sets == 0 {
             return false;
@@ -192,6 +260,8 @@ impl TreeCache {
         let set = self.set_index(&oid);
         let base = set * WAYS;
 
+        // Dedup: if the OID already lives in this set, just refresh the
+        // clock bit and return without copying.
         for way in 0..WAYS {
             let idx = base + way;
             if self.slots[idx].valid && self.slots[idx].oid == oid {
@@ -207,6 +277,10 @@ impl TreeCache {
         true
     }
 
+    /// Returns a cache in the disabled state (`sets == 0`).
+    ///
+    /// All public methods early-return when `sets == 0`, so callers do not
+    /// need to check for the disabled state explicitly.
     fn disabled(capacity_bytes: u32) -> Self {
         Self {
             capacity_bytes,
@@ -218,6 +292,7 @@ impl TreeCache {
         }
     }
 
+    /// Maps an OID to its set index via bitmask (requires `sets` is a power of two).
     #[inline]
     fn set_index(&self, oid: &OidBytes) -> usize {
         let hash = hash_oid(oid);

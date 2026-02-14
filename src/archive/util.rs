@@ -72,8 +72,9 @@ const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
 ///
 /// # Panics
 ///
-/// Debug-asserts that `out16.len() == 16`.  In release builds an incorrect
-/// length causes out-of-bounds indexing.
+/// Debug-asserts that `out16.len() == 16`.  In release builds the
+/// debug-assert is elided, but an incorrect length still panics via
+/// Rust's bounds-checked indexing.
 #[inline(always)]
 pub(crate) fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     debug_assert_eq!(out16.len(), 16);
@@ -102,6 +103,12 @@ fn read_some<R: Read + ?Sized>(r: &mut R, dst: &mut [u8]) -> io::Result<usize> {
 /// (e.g. `"tar truncated"`, `"zip truncated"`) so callers can distinguish
 /// which format hit a short read without wrapping `read_exact` at every
 /// call site.
+///
+/// # Errors
+///
+/// - [`io::ErrorKind::UnexpectedEof`] with message `"{label} truncated"`
+///   if the stream ends before `dst` is filled.
+/// - Any other [`io::Error`] propagated from the underlying reader.
 pub(crate) fn read_exact_n<R: Read + ?Sized>(
     r: &mut R,
     dst: &mut [u8],
@@ -155,6 +162,9 @@ pub(crate) fn budget_hit_to_partial(
             // MalformedZip) that don't have a direct PartialReason variant.
             _ => format_fallback,
         },
+        // The budget system only ever produces
+        // `SkipEntry(EntryOutputBudgetExceeded)`, so the inner reason is
+        // redundant here.  We discard it and map directly.
         BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
     }
 }
