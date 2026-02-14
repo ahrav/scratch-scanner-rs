@@ -162,6 +162,8 @@ where
     for &tag in sac.tags.iter() {
         assert_eq!(0, tag);
     }
+    // SAFETY: We have exclusive access to `sac` via shared reference in a single-threaded
+    // test, so dereferencing the `UnsafeCell` pointers for `counts` and `clocks` is safe.
     unsafe {
         for &word in (*sac.counts.get()).words().iter() {
             assert_eq!(0, word);
@@ -188,6 +190,7 @@ where
         let key = (i as u64) * sac.sets;
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(i as u64));
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the value was just inserted.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(i as u64));
@@ -198,6 +201,7 @@ where
         let key = (WAYS as u64) * sac.sets;
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(0));
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the value was just inserted.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(0));
@@ -211,6 +215,7 @@ where
 
     {
         let key = 5u64 * sac.sets;
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the key is still present.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(5));
@@ -231,10 +236,12 @@ where
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(i as u64));
         for expected in 2u8..=max_count {
+            // SAFETY: `get` returned `Some`, so the pointer is valid and the key is present.
             let value = unsafe { *sac.get(key).unwrap() };
             assert_eq!(key, value);
             assert_eq!(expected, sac.counts_get(i as u64));
         }
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the key is present.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(max_count, sac.counts_get(i as u64));
@@ -245,6 +252,7 @@ where
         let key = (WAYS as u64) * sac.sets;
         let _ = sac.upsert(&key);
         assert_eq!(1, sac.counts_get(0));
+        // SAFETY: `get` returned `Some`, so the pointer is valid and the value was just inserted.
         let value = unsafe { *sac.get(key).unwrap() };
         assert_eq!(key, value);
         assert_eq!(2, sac.counts_get(0));
@@ -388,6 +396,40 @@ proptest! {
     }
 }
 
+// ---- AVX2 compress_u16_mask equivalence ----
+
+// Verify that the 32-bit compress (used by AVX2 u16 path) produces the same
+// result as splitting into two 16-bit compresses and combining (SSE2 approach).
+#[cfg(target_arch = "x86_64")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(
+        crate::test_utils::proptest_cases(64)
+    ))]
+
+    #[test]
+    fn compress_u16_mask_avx2_matches_split(raw_mask in any::<u32>()) {
+        // Simulate _mm256_cmpeq_epi16 output: each u16 lane produces either
+        // 0x0000 (no match) or 0xFFFF (match) in the movemask, yielding pairs
+        // of identical bits. Constrain input to valid movemask patterns.
+        let mut valid_mask = 0u32;
+        for lane in 0..16u32 {
+            if raw_mask & (1 << lane) != 0 {
+                valid_mask |= 0b11 << (lane * 2);
+            }
+        }
+
+        let avx2_result = SearchTagsCache::<u16, 16, 4>::compress_u16_mask_avx2(valid_mask);
+
+        // SSE2 approach: split into low/high 16-bit halves, compress each.
+        let lo = SearchTagsCache::<u16, 16, 4>::compress_u16_mask(valid_mask as u16);
+        let hi = SearchTagsCache::<u16, 16, 4>::compress_u16_mask((valid_mask >> 16) as u16);
+        let sse2_result = lo | (hi << 8);
+
+        prop_assert_eq!(avx2_result, sse2_result,
+            "mask=0x{:08X} avx2=0x{:04X} sse2=0x{:04X}", valid_mask, avx2_result, sse2_result);
+    }
+}
+
 // ---- Additional property tests for hot paths ----
 
 /// Context that hashes with a good distribution for testing associate().
@@ -483,6 +525,7 @@ proptest! {
         for &key in &keys {
             let ptr = cache.get(key);
             prop_assert!(ptr.is_some(), "Key {} should be present", key);
+            // SAFETY: `get` returned `Some`, so the pointer is valid and the key is present.
             let value = unsafe { *ptr.unwrap() };
             prop_assert_eq!(key, value, "Value mismatch for key {}", key);
         }
@@ -515,6 +558,7 @@ proptest! {
                 // Get operation: if key is in reference, it should be in cache.
                 // Note: cache may have evicted the key, so we can't assert presence.
                 if let Some(ptr) = cache.get(key) {
+                    // SAFETY: `get` returned `Some`, so the pointer is valid and points to the cached value.
                     let value = unsafe { *ptr };
                     prop_assert_eq!(key, value, "Value mismatch on get");
                 }
@@ -526,6 +570,7 @@ proptest! {
                 // Immediately verify the just-inserted key is present.
                 let ptr = cache.get(key);
                 prop_assert!(ptr.is_some(), "Just-inserted key {} should be present", key);
+                // SAFETY: `get` returned `Some`, so the pointer is valid; the key was just inserted.
                 let value = unsafe { *ptr.unwrap() };
                 prop_assert_eq!(key, value, "Value mismatch after upsert");
             }

@@ -695,6 +695,8 @@ impl Engine {
         // 3. Pointer and length are captured before any subsequent mutation.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
+        // SAFETY: See the 3-point justification above — `utf16_buf` is not
+        // mutated while this slice reference is live.
         let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
         if decoded.is_empty() {
             return;
@@ -1092,6 +1094,8 @@ impl Engine {
         // full SAFETY justification.
         let decoded_len = scratch.utf16_buf.len();
         let decoded_ptr = scratch.utf16_buf.as_slice().as_ptr();
+        // SAFETY: Same raw-pointer reborrow as `run_rule_on_utf16_window_aligned`;
+        // `utf16_buf` is not mutated while this slice reference is live.
         let decoded = unsafe { std::slice::from_raw_parts(decoded_ptr, decoded_len) };
         if decoded.is_empty() {
             return;

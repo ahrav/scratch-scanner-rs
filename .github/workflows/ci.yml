@@ -61,6 +61,22 @@ jobs:
           key: ubuntu-22.04
       - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
 
+  test-aarch64:
+    name: Test (aarch64)
+    runs-on: macos-14
+    env:
+      PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
+      PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: brew install boost
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-14
+      - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
+
   test-full-harness:
     name: Test (Scheduled, Full Harness)
     if: github.event_name == 'schedule'
@@ -82,7 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ubuntu-22.04
-      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests
+      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests,perf-stats
 
   fuzz-pack-smoke:
     name: Fuzz Pack Smoke (PR)
@@ -172,6 +188,7 @@ jobs:
           cargo +nightly fuzz run fuzz_pack_inflate_stream -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
 
   fuzz-macos:
     name: Fuzz (Scheduled, Nightly Only, macOS)
@@ -209,6 +226,7 @@ jobs:
           cargo +nightly fuzz run fuzz_pack_inflate_stream -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
           cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
 
   miri:
     name: Miri (Scheduled, Nightly)
@@ -270,3 +288,38 @@ jobs:
           kani-version: "0.67.0"
       - name: Run Kani proofs
         run: cargo kani --features kani
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  benchmark:
+    name: Benchmark (Scheduled)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04-bench
+      - name: Run benchmarks
+        run: cargo bench --features bench --bench event_encoding -- --output-format bencher | tee output.txt
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: output.txt
+          alert-threshold: "130%"
+          fail-on-alert: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'schedule' }}

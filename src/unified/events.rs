@@ -2,9 +2,11 @@
 //!
 //! # Architecture
 //!
-//! Workers emit [`ScanEvent`] values through an [`EventSink`]. The default
-//! implementation ([`JsonlEventSink`]) serializes each event as a single
-//! JSON line (JSONL) and writes it atomically to the underlying writer.
+//! Workers emit [`ScanEvent`] values through an [`EventSink`]. Encoding
+//! is factored out into a separate [`EventEncoder`] trait so it can be
+//! tested and benchmarked without I/O. The default stack pairs
+//! [`JsonlEncoder`] with [`JsonlEventSink`], which serializes each event
+//! as a single JSON line (JSONL) and writes it atomically to the writer.
 //!
 //! # Wire format
 //!
@@ -12,11 +14,23 @@
 //! workers is non-deterministic, but individual events are never interleaved
 //! at the byte level.
 //!
+//! Event types on the wire: `finding`, `progress`, `summary`, `diagnostic`,
+//! `commit_meta`, `identity_dictionary`.
+//!
+//! # Visibility
+//!
+//! Several items in this module and in [`super::json_write`] are `pub` rather
+//! than `pub(crate)` so that Criterion benchmarks in `benches/event_encoding.rs`
+//! can import them directly. They are **not** part of a stable public API —
+//! treat them as crate-internal.
+//!
 //! # Performance
 //!
-//! Formatting happens into a caller-provided `Vec<u8>` buffer (typically
-//! from per-worker scratch). The mutex is held only for the `write_all`
-//! call, not during formatting.
+//! Each [`EventSink::emit`] call formats into a thread-local scratch
+//! buffer ([`with_format_buf`]) and then copies the finished bytes into
+//! the sink under a mutex. The mutex is held only for the `write_all`
+//! call, not during formatting, so contention scales with write latency
+//! rather than encoding cost.
 
 use std::cell::RefCell;
 use std::io::{BufWriter, ErrorKind, Write};
@@ -28,6 +42,9 @@ use crate::git_scan::identity_intern::{CommitIdentityIds, SENTINEL_ID};
 use crate::git_scan::object_id::OidBytes;
 
 thread_local! {
+    /// Per-thread scratch buffer for formatting events before writing to
+    /// the sink. 512 bytes covers a typical finding + newline without
+    /// reallocation; the buffer grows if needed and is reused across calls.
     static EMIT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512));
 }
 
@@ -50,6 +67,10 @@ where
             f(&buf);
         } else {
             // Reentrant call — allocate a one-off buffer.
+            debug_assert!(
+                false,
+                "with_format_buf: reentrant borrow detected; allocating fallback buffer"
+            );
             let mut buf = Vec::with_capacity(256);
             encode(&mut buf);
             f(&buf);
@@ -63,12 +84,19 @@ where
 
 /// Structured scan event emitted during scanning.
 ///
-/// All variants borrow where possible to avoid allocation on the hot path.
+/// Hot-path variants ([`Finding`](Self::Finding), [`Diagnostic`](Self::Diagnostic),
+/// [`IdentityDictionary`](Self::IdentityDictionary)) borrow from adapter
+/// scratch to avoid allocation. Infrequent variants ([`Progress`](Self::Progress),
+/// [`Summary`](Self::Summary), [`CommitMeta`](Self::CommitMeta)) own their data.
 /// The [`EventSink`] implementation is responsible for serialization.
 pub enum ScanEvent<'a> {
+    /// A secret or credential match. Wire format type: `"finding"`.
     Finding(FindingEvent<'a>),
+    /// Periodic scan progress checkpoint. Wire format type: `"progress"`.
     Progress(ProgressEvent),
+    /// Final scan summary emitted once at completion. Wire format type: `"summary"`.
     Summary(SummaryEvent),
+    /// Debug or performance diagnostic. Wire format type: `"diagnostic"`.
     Diagnostic(DiagnosticEvent<'a>),
     /// Commit metadata emitted exactly once per referenced commit.
     ///
@@ -105,6 +133,7 @@ pub struct FindingEvent<'a> {
     /// Human-readable rule name (e.g. `"aws-access-key"`).
     pub rule_name: &'a str,
     /// Commit-graph position for Git findings; `None` for filesystem scans.
+    /// Serves as the join key to [`CommitMetaEvent::commit_id`].
     pub commit_id: Option<u32>,
     /// Change kind (`"add"` / `"modify"`) for Git findings; `None` for FS.
     pub change_kind: Option<&'a str>,
@@ -208,7 +237,11 @@ pub struct IdentityDictionaryEvent<'a> {
 pub trait EventSink: Send + Sync {
     /// Serialize and write a single event. Must not block indefinitely.
     fn emit(&self, event: ScanEvent<'_>);
-    /// Flush any buffered output. Called once at end-of-scan.
+    /// Flush any buffered output. Called exactly once at end-of-scan.
+    ///
+    /// After `flush` returns, all previously emitted events must be visible
+    /// to the downstream consumer. No further `emit` calls are made after
+    /// `flush`.
     fn flush(&self);
 }
 
@@ -226,7 +259,11 @@ pub trait EventEncoder: Send + Sync {
 // JSONL encoder
 // ============================================================================
 
-/// JSONL encoder: one JSON object per line, no serde.
+/// JSONL encoder: one JSON object per line, without serde.
+///
+/// Encodes directly into a `Vec<u8>` via hand-rolled `extend_from_slice`
+/// calls, avoiding the allocation and type-erasure overhead of `serde_json`.
+/// This is the hot path for all structured output during scanning.
 pub struct JsonlEncoder;
 
 impl JsonlEncoder {
@@ -262,6 +299,10 @@ impl EventEncoder for JsonlEncoder {
 /// content (path bytes, rule name) is written through the standard
 /// `write_json_bytes` / `write_json_str` functions which handle their own
 /// capacity management.
+///
+/// Wire fields `commit_id` and `change_kind` are only emitted for
+/// [`SourceKind::Git`] findings (when the corresponding `Option` is `Some`).
+/// Filesystem findings omit them entirely to keep output compact.
 pub fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     // Static overhead: prefix (~40) + field keys (~60) + 3 u64s (60) + optional fields (~60) + closing (1)
     // = ~221 bytes worst case for static content.
@@ -381,7 +422,8 @@ pub fn encode_diagnostic(d: &DiagnosticEvent<'_>, buf: &mut Vec<u8>) {
     cur.commit();
 }
 
-/// Cursor-based identity field writer — no per-call bounds checks.
+/// Cursor-based identity field writer — emits `,"<name>":<id>` or
+/// `,"<name>":null` when `id` is [`SENTINEL_ID`] (parse failure).
 #[inline]
 fn write_identity_field_cur(cur: &mut BufCursor<'_>, name: &[u8], id: u32) {
     cur.push_static(b",\"");
@@ -395,6 +437,11 @@ fn write_identity_field_cur(cur: &mut BufCursor<'_>, name: &[u8], id: u32) {
 }
 
 /// Append a JSONL `commit_meta` object to `buf` (no trailing newline).
+///
+/// Identity fields (`author_name_id`, etc.) are omitted entirely when
+/// `identity` is `None`. When present, individual fields with value
+/// [`SENTINEL_ID`] are emitted as JSON `null` (not as the raw `u32::MAX`
+/// integer) to signal a parse failure to downstream consumers.
 pub fn encode_commit_meta(m: &CommitMetaEvent, buf: &mut Vec<u8>) {
     // Static: prefix (34) + u64 (20) + oid key (8) + hex (64) + timestamp key (15) + u64 (20)
     // + 4 identity fields (4 * ~25) + closing (1) ≈ 262.
@@ -558,7 +605,16 @@ mod tests {
         let encoder = JsonlEncoder::new();
         let mut buf = Vec::new();
         encoder.encode(&event, &mut buf);
-        String::from_utf8(buf).unwrap()
+        let s = String::from_utf8(buf).unwrap();
+
+        // Every JSONL line (minus trailing newline) must parse as valid JSON.
+        let line = s.trim_end_matches('\n');
+        assert!(
+            serde_json::from_str::<serde_json::Value>(line).is_ok(),
+            "encoder produced invalid JSON: {line}"
+        );
+
+        s
     }
 
     #[test]

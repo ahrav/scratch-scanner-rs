@@ -1313,7 +1313,9 @@ mod simd_b64 {
                 out: [0u8; 12],
                 guard: [0xA5; 4],
             };
+            // SAFETY: `vdupq_n_u8` is a NEON intrinsic available on all aarch64 targets.
             let v = unsafe { vdupq_n_u8(0x11) };
+            // SAFETY: `store_low12` writes exactly 12 bytes; `guarded.out` is 12 bytes.
             unsafe { store_low12(v, &mut guarded.out) };
             assert_eq!(guarded.guard, [0xA5; 4]);
         }
@@ -1322,6 +1324,7 @@ mod simd_b64 {
         fn decode_simd_chunks_decodes_clean_input() {
             let src = b"QUJDREVGR0hJSktM";
             let mut dst = [0u8; 12];
+            // SAFETY: `dst` has 12 bytes, `src` is 16 bytes; (16/16)*12 = 12 fits in `dst`.
             let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
             assert_eq!((consumed, written), (16, 12));
             assert_eq!(&dst, b"ABCDEFGHIJKL");
@@ -1487,7 +1490,11 @@ mod simd_b64 {
                 out: [0u8; 12],
                 guard: [0xA5; 4],
             };
+            // SAFETY: SSE2 is available on all x86_64 targets. `_mm_set1_epi8` has
+            // no memory-safety preconditions.
             let v = unsafe { _mm_set1_epi8(0x11) };
+            // SAFETY: `guarded.out` is a 12-byte array, which satisfies store_low12's
+            // requirement of a buffer with at least 12 writable bytes.
             unsafe { store_low12(v, &mut guarded.out) };
             assert_eq!(guarded.guard, [0xA5; 4]);
         }
@@ -1496,6 +1503,8 @@ mod simd_b64 {
         fn decode_simd_chunks_rejects_invalid_punctuation() {
             let src = b"AAAA:AAAAAAAAAAA";
             let mut dst = [0u8; 12];
+            // SAFETY: `src` is a valid byte slice and `dst` has enough room (12 bytes)
+            // for one decoded SIMD chunk. SSE2 is available on all x86_64 targets.
             let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
             assert_eq!((consumed, written), (0, 0));
         }
@@ -1504,6 +1513,8 @@ mod simd_b64 {
         fn decode_simd_chunks_decodes_clean_input() {
             let src = b"QUJDREVGR0hJSktM";
             let mut dst = [0u8; 12];
+            // SAFETY: `src` is a valid 16-byte slice and `dst` has 12 bytes of space,
+            // satisfying decode_simd_chunks' buffer requirements. SSE2 is available.
             let (consumed, written) = unsafe { decode_simd_chunks(src, &mut dst) };
             assert_eq!((consumed, written), (16, 12));
             assert_eq!(&dst, b"ABCDEFGHIJKL");

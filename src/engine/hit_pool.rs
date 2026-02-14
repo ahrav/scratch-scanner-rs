@@ -165,10 +165,9 @@ pub(super) struct HitAccPool {
     touched_words: *mut u64,
 }
 
-/// # Safety
-/// All raw pointers in `HitAccPool` are exclusively owned heap allocations,
-/// never aliased, and only accessed through `&self` / `&mut self`. This is
-/// the same ownership model as `ScratchVec` which also implements `Send`.
+// SAFETY: All raw pointers in `HitAccPool` are exclusively owned heap allocations,
+// never aliased, and only accessed through `&self` / `&mut self`. This is
+// the same ownership model as `ScratchVec` which also implements `Send`.
 unsafe impl Send for HitAccPool {}
 
 impl Drop for HitAccPool {
@@ -340,6 +339,8 @@ impl HitAccPool {
         touched_pairs: &mut ScratchVec<u32>,
     ) {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, and `touched_pairs`
+        // is a valid scratch buffer pre-allocated for `pair_count` entries.
         unsafe { self.push_span_unchecked_hot(pair, span, touched_pairs) };
     }
 
@@ -357,12 +358,16 @@ impl HitAccPool {
         touched_pairs: &mut ScratchVec<u32>,
     ) {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: Caller guarantees `pair < pair_count` and `touched_pairs`
+        // has capacity for at least `pair_count` entries.
         unsafe {
             self.mark_touched_unchecked(pair, touched_pairs);
         }
 
         // Read len/coalesced as values so the mutable borrow of pair_meta
         // doesn't extend across coalesce_overflow.
+        // SAFETY: `pair < pair_count` (caller invariant), so `pair_meta.add(pair)`
+        // is within the allocation. The pointer is valid and properly aligned.
         let (len, coalesced) = unsafe {
             let m = &*self.pair_meta.add(pair);
             (m.len as usize, m.coalesced)
@@ -370,6 +375,7 @@ impl HitAccPool {
 
         if coalesced != 0 {
             // Expand coalesced window, preserving the earliest anchor hint.
+            // SAFETY: `pair < pair_count`, so `coalesced.add(pair)` is in-bounds.
             let c = unsafe { &mut *self.coalesced.add(pair) };
             c.start = c.start.min(span.start);
             c.end = c.end.max(span.end);
@@ -380,6 +386,9 @@ impl HitAccPool {
         let max_hits = self.max_hits as usize;
         if len < max_hits {
             let base = pair * max_hits;
+            // SAFETY: `pair < pair_count` and `len < max_hits`, so
+            // `base + len` is within the windows allocation. `pair_meta.add(pair)`
+            // is in-bounds for the same reason.
             unsafe {
                 *self.windows.add(base + len) = span;
                 (*self.pair_meta.add(pair)).len = (len + 1) as u16;
@@ -477,18 +486,21 @@ impl HitAccPool {
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn is_coalesced(&self, pair: usize) -> bool {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, so `pair_meta.add(pair)` is in-bounds.
         unsafe { (*self.pair_meta.add(pair)).coalesced != 0 }
     }
 
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn pair_len(&self, pair: usize) -> u32 {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, so `pair_meta.add(pair)` is in-bounds.
         unsafe { (*self.pair_meta.add(pair)).len as u32 }
     }
 
     #[cfg(all(test, feature = "stdx-proptest"))]
     pub(super) fn coalesced_span(&self, pair: usize) -> SpanU32 {
         debug_assert!(pair < self.pair_count as usize);
+        // SAFETY: `pair < pair_count` is asserted above, so `coalesced.add(pair)` is in-bounds.
         unsafe { *self.coalesced.add(pair) }
     }
 
@@ -496,6 +508,7 @@ impl HitAccPool {
     pub(super) fn window_at(&self, pair: usize, idx: usize) -> SpanU32 {
         let base = pair * self.max_hits as usize;
         debug_assert!(base + idx < (self.pair_count as usize) * (self.max_hits as usize));
+        // SAFETY: `base + idx` is within the allocated window buffer as asserted above.
         unsafe { *self.windows.add(base + idx) }
     }
 }
@@ -801,6 +814,8 @@ mod tests {
 
         for (pair, span) in ops {
             pool_safe.push_span(pair, span, &mut touched_safe);
+            // SAFETY: `pair` values are all < `pair_count` (4), `touched_hot` has
+            // capacity for `pair_count` entries, and we have exclusive access.
             unsafe {
                 pool_hot.push_span_unchecked_hot(pair, span, &mut touched_hot);
             }

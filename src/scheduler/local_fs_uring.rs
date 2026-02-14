@@ -392,6 +392,10 @@ impl FixedBufferHandle {
     fn as_mut_slice(&mut self) -> &mut [u8] {
         let ptr = self.pool.buf_ptr(self.index);
         let len = self.pool.buf_len(self.index);
+        // SAFETY: `buf_ptr` returns a valid pointer into the pool's mmap region for
+        // this buffer index, and `buf_len` returns its exact length. Each buffer index
+        // is owned by exactly one handle at a time (enforced by the free queue), and
+        // `&mut self` guarantees exclusive access.
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 }
@@ -1649,6 +1653,9 @@ fn io_worker_loop<E: ScanEngine>(
                 let op_slot = free_ops.pop().unwrap();
                 let entry = entry.user_data(op_slot as u64);
 
+                // SAFETY: `entry` is a fully-built statx SQE whose fd, path pointer,
+                // and statx buffer all remain valid until the CQE is reaped. The
+                // op_slot user_data ensures we can match the completion.
                 unsafe {
                     let mut sq = ring.submission();
                     if sq.push(&entry).is_err() {
@@ -1748,6 +1755,9 @@ fn io_worker_loop<E: ScanEngine>(
                 }
                 .user_data(op_slot as u64);
 
+                // SAFETY: `entry` is a fully-built openat SQE. The path CString
+                // (`_path`) is kept alive in the Op::Open variant until the CQE is
+                // reaped, so the pointer remains valid for the kernel's lifetime.
                 unsafe {
                     let mut sq = ring.submission();
                     if sq.push(&entry).is_err() {

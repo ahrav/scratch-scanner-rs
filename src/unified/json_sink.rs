@@ -24,6 +24,12 @@
 //! acquires the writer mutex only for the `write_all`. This keeps lock hold
 //! time proportional to a single memcpy, not to JSON encoding cost.
 //!
+//! **Element order is non-deterministic** — it depends on which thread
+//! acquires the mutex first, not on the order events were produced. This
+//! is acceptable because scan events carry their own identity
+//! (`type` + `source` + `path`) and consumers must not rely on array
+//! position.
+//!
 //! # Wire invariants
 //!
 //! - The opening `[` is written eagerly in [`JsonEventSink::new`].
@@ -83,8 +89,9 @@ impl<W: Write + Send> JsonEventSink<W> {
 impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
     fn emit(&self, event: ScanEvent<'_>) {
         // Determine separator *before* acquiring any lock or formatting.
-        // `Relaxed` is sufficient because the mutex provides happens-before
-        // ordering for the actual write.
+        // `Relaxed` is sufficient: the mutex provides happens-before for
+        // the actual write, and we accept non-deterministic element order
+        // (whoever wins the swap gets `\n`, everyone else gets `,\n`).
         let sep: &[u8] = if self.first.swap(false, Ordering::Relaxed) {
             b"\n"
         } else {

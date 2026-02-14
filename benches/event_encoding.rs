@@ -1,9 +1,27 @@
 //! Criterion benchmarks for the JSONL event encoding pipeline.
 //!
-//! Measures throughput of each encoding primitive (`write_u64`, `write_oid_hex`,
-//! `write_json_str`, `write_json_bytes`, `write_f64`) and end-to-end event
-//! encoding (`encode_finding`, `encode_commit_meta`, batch encoding, and
-//! `JsonlEventSink` emission).
+//! These benchmarks quantify the cost of serializing scan results into JSONL
+//! lines — the hot path for every finding and commit-meta record emitted
+//! during a scan. They exist to catch regressions in the hand-rolled
+//! JSON-writing primitives (which use SIMD fast paths on aarch64/x86_64)
+//! and to validate that end-to-end event encoding stays below ~100 ns per
+//! event on typical hardware.
+//!
+//! ## What is measured
+//!
+//! | Group | Functions | Key metric |
+//! |---|---|---|
+//! | `primitives` | `write_u64`, `write_oid_hex`, `write_json_str`, `write_json_bytes`, `write_f64` | Bytes/sec throughput |
+//! | `encoding` | `encode_finding`, `encode_commit_meta`, batch encode, `JsonlEventSink::emit` | Events/sec throughput |
+//! | `comparison` | `write_u64` vs `itoa`, `write_f64` vs `ryu` | Elements/sec (head-to-head) |
+//!
+//! ## Running
+//!
+//! ```sh
+//! cargo bench --bench event_encoding           # full suite
+//! cargo bench --bench event_encoding -- write_  # only primitives
+//! cargo bench --bench event_encoding -- encode_ # only encoder-level
+//! ```
 //!
 //! ## Determinism
 //!
@@ -14,8 +32,11 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use scanner_rs::git_scan::identity_intern::CommitIdentityIds;
 use scanner_rs::git_scan::object_id::OidBytes;
 use scanner_rs::unified::events::{
-    encode_commit_meta, encode_finding, CommitMetaEvent, EventEncoder, EventSink, FindingEvent,
-    JsonlEncoder, JsonlEventSink, ScanEvent,
+    CommitMetaEvent, EventEncoder, EventSink, FindingEvent, JsonlEncoder, JsonlEventSink, ScanEvent,
+};
+use scanner_rs::unified::harness_api::{
+    encode_commit_meta, encode_finding, write_f64, write_json_bytes, write_json_str, write_oid_hex,
+    write_u64,
 };
 use scanner_rs::unified::json_sink::JsonEventSink;
 use scanner_rs::unified::SourceKind;
@@ -25,6 +46,13 @@ use std::io;
 // Deterministic PRNG (no `rand` dependency)
 // ============================================================================
 
+/// Minimal xorshift64 PRNG for generating deterministic benchmark inputs.
+///
+/// We avoid pulling in `rand` just for benchmarks — a full-featured RNG
+/// isn't needed since the only requirement is repeatability across runs
+/// (identical seeds → identical byte sequences). The quality of randomness
+/// is irrelevant; we just need diverse-looking data that exercises the
+/// encoder's code paths consistently.
 struct XorShift64 {
     state: u64,
 }
@@ -62,6 +90,10 @@ impl XorShift64 {
 // ============================================================================
 
 /// Generate a clean ASCII string of length `n` (printable, no escapes needed).
+///
+/// Excludes `"` and `\\` so the string passes through `write_json_str` without
+/// triggering any escape logic — this isolates the SIMD bulk-copy fast path
+/// and gives a ceiling measurement for string-writing throughput.
 fn make_clean_ascii(n: usize) -> String {
     let mut rng = XorShift64::new(0xCAFE_BABE_0000 + n as u64);
     let mut s = String::with_capacity(n);
@@ -79,7 +111,12 @@ fn make_clean_ascii(n: usize) -> String {
     s
 }
 
-/// Generate a string of length `n` with an escape-worthy char every 16 bytes.
+/// Generate a string of length `n` with a `"` every 16 bytes that requires escaping.
+///
+/// The 1-in-16 ratio is deliberately chosen to model realistic path/rule-name
+/// strings that occasionally contain characters needing JSON escaping. It forces
+/// the SIMD scanner to find a hit roughly once per 16-byte NEON/SSE register
+/// load, exercising the SIMD→scalar fallback transition on every chunk.
 fn make_ascii_with_escapes(n: usize) -> String {
     let mut rng = XorShift64::new(0xDEAD_BEEF_0000 + n as u64);
     let mut s = String::with_capacity(n);
@@ -100,12 +137,45 @@ fn make_ascii_with_escapes(n: usize) -> String {
     s
 }
 
+/// Generate a string of length `n` with escapes placed sparsely (not every chunk).
+///
+/// Places `"` characters at positions 50, 150, and 350 (if within range).
+/// This models realistic file paths where most of the string is clean ASCII
+/// but occasional characters need escaping. Unlike [`make_ascii_with_escapes`]
+/// which bails SIMD on every chunk, this exercises the SIMD resume-after-escape
+/// path where most chunks pass through the fast path.
+fn make_sparse_escapes(n: usize) -> String {
+    let mut rng = XorShift64::new(0xFACE_CAFE_0000 + n as u64);
+    let mut s = String::with_capacity(n);
+    let escape_positions = [50, 150, 350];
+    for i in 0..n {
+        if escape_positions.contains(&i) {
+            s.push('"');
+        } else {
+            let mut b = (rng.next_u64() % 93 + 0x21) as u8;
+            if b == b'"' {
+                b = b'a';
+            }
+            if b == b'\\' {
+                b = b'b';
+            }
+            s.push(b as char);
+        }
+    }
+    s
+}
+
 /// Generate clean ASCII bytes of length `n`.
 fn make_clean_bytes(n: usize) -> Vec<u8> {
     make_clean_ascii(n).into_bytes()
 }
 
-/// Generate bytes with a 0xff at position 10 (forces scalar fallback).
+/// Generate bytes with a `0xFF` at position 10 (forces scalar fallback).
+///
+/// `write_json_bytes` must hex-escape any byte outside the printable ASCII
+/// range. Placing a single high byte early exercises the transition from the
+/// SIMD all-ASCII fast path into the scalar escape handler, which is the
+/// most expensive per-byte code path in the byte writer.
 fn make_bytes_with_high(n: usize) -> Vec<u8> {
     let mut v = make_clean_bytes(n);
     if v.len() > 10 {
@@ -114,6 +184,7 @@ fn make_bytes_with_high(n: usize) -> Vec<u8> {
     v
 }
 
+/// Fixed SHA-1 OID (20 bytes → 40 hex chars) for `write_oid_hex` benchmarks.
 fn make_sha1_oid() -> OidBytes {
     let mut bytes = [0u8; 20];
     let mut rng = XorShift64::new(0x51A1_0000);
@@ -121,6 +192,7 @@ fn make_sha1_oid() -> OidBytes {
     OidBytes::sha1(bytes)
 }
 
+/// Fixed SHA-256 OID (32 bytes → 64 hex chars) for `write_oid_hex` benchmarks.
 fn make_sha256_oid() -> OidBytes {
     let mut bytes = [0u8; 32];
     let mut rng = XorShift64::new(0x256_0000);
@@ -128,6 +200,11 @@ fn make_sha256_oid() -> OidBytes {
     OidBytes::sha256(bytes)
 }
 
+/// Filesystem-sourced finding — no `commit_id` or `change_kind` fields.
+///
+/// Models the simpler code path where optional Git-specific fields are `None`,
+/// producing a shorter JSON line. Paired with [`make_git_finding`] to measure
+/// the cost difference between the two variants.
 fn make_fs_finding() -> FindingEvent<'static> {
     FindingEvent {
         source: SourceKind::Fs,
@@ -141,6 +218,11 @@ fn make_fs_finding() -> FindingEvent<'static> {
     }
 }
 
+/// Git-sourced finding — includes `commit_id` and `change_kind` fields.
+///
+/// Exercises the longer encoding path with two extra JSON key-value pairs.
+/// The `commit_id` adds a `write_u64` call and `change_kind` adds a
+/// `write_json_str` call, so this variant is the ceiling cost per finding.
 fn make_git_finding() -> FindingEvent<'static> {
     FindingEvent {
         source: SourceKind::Git,
@@ -154,6 +236,7 @@ fn make_git_finding() -> FindingEvent<'static> {
     }
 }
 
+/// Commit metadata without identity (author/committer) — shortest variant.
 fn make_commit_meta_no_identity() -> CommitMetaEvent {
     CommitMetaEvent {
         commit_id: 42,
@@ -163,6 +246,10 @@ fn make_commit_meta_no_identity() -> CommitMetaEvent {
     }
 }
 
+/// Commit metadata with all four identity IDs — longest variant.
+///
+/// The identity fields add four `write_u64` calls, which is the overhead
+/// we want to track relative to the no-identity baseline.
 fn make_commit_meta_with_identity() -> CommitMetaEvent {
     CommitMetaEvent {
         commit_id: 42,
@@ -181,8 +268,12 @@ fn make_commit_meta_with_identity() -> CommitMetaEvent {
 // Primitive microbenchmarks
 // ============================================================================
 
+/// Measure `write_u64` across three magnitude bands.
+///
+/// The two-digits-at-a-time lookup table means cost scales with digit count,
+/// not with the numeric value itself. The three cases (1-digit, 10-digit,
+/// 20-digit) confirm that per-digit cost is constant.
 fn bench_write_u64(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_u64;
     let mut group = c.benchmark_group("write_u64");
 
     for &(label, val) in &[
@@ -203,8 +294,12 @@ fn bench_write_u64(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measure `write_oid_hex` for SHA-1 (40 hex chars) and SHA-256 (64 hex chars).
+///
+/// Both use the same 256-entry lookup table with bulk pointer writes. The
+/// SHA-256 case should be ~1.6× the SHA-1 cost, confirming linear scaling
+/// with no per-call overhead domination.
 fn bench_write_oid_hex(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_oid_hex;
     let mut group = c.benchmark_group("write_oid_hex");
 
     let sha1 = make_sha1_oid();
@@ -233,9 +328,30 @@ fn bench_write_oid_hex(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measure `write_json_str` across string lengths (32, 128, 512 bytes) and
+/// two content profiles: clean ASCII (SIMD-only) and escape-heavy (1-in-16).
+///
+/// The clean vs. escaped comparison quantifies the cost of SIMD→scalar
+/// fallbacks. On aarch64 with NEON, clean ASCII should approach memcpy speed;
+/// the escaped variant should be measurably slower but still sub-linear in
+/// escape count thanks to the 16-byte bulk scan.
 fn bench_write_json_str(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_json_str;
     let mut group = c.benchmark_group("write_json_str");
+
+    // Sub-16-byte strings: always take the scalar path (below SIMD threshold).
+    // Rule names like "aws-access-key" (14 chars) fall in this range.
+    for &size in &[4, 8, 14] {
+        let clean = make_clean_ascii(size);
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(BenchmarkId::new("scalar_short", size), &clean, |b, s| {
+            let mut buf = Vec::with_capacity(size + 16);
+            b.iter(|| {
+                buf.clear();
+                write_json_str(black_box(s), &mut buf);
+                black_box(&buf);
+            });
+        });
+    }
 
     for &size in &[32, 128, 512] {
         let clean = make_clean_ascii(size);
@@ -263,11 +379,28 @@ fn bench_write_json_str(c: &mut Criterion) {
         });
     }
 
+    // Sparse escapes: only a few escapes in a long string — exercises SIMD
+    // resume-after-escape (most chunks pass all-safe check).
+    let sparse = make_sparse_escapes(512);
+    group.throughput(Throughput::Bytes(512));
+    group.bench_with_input(BenchmarkId::new("sparse_escapes", 512), &sparse, |b, s| {
+        let mut buf = Vec::with_capacity(512 + 64);
+        b.iter(|| {
+            buf.clear();
+            write_json_str(black_box(s), &mut buf);
+            black_box(&buf);
+        });
+    });
+
     group.finish();
 }
 
+/// Measure `write_json_bytes` for clean ASCII vs. a buffer containing `0xFF`.
+///
+/// Git object paths are raw bytes (not guaranteed UTF-8), so `write_json_bytes`
+/// must handle high bytes via Unicode escape (`\\u00XX`). The `with_0xff` variant
+/// confirms the scalar fallback cost is bounded.
 fn bench_write_json_bytes(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_json_bytes;
     let mut group = c.benchmark_group("write_json_bytes");
 
     let clean = make_clean_bytes(128);
@@ -295,8 +428,13 @@ fn bench_write_json_bytes(c: &mut Criterion) {
     group.finish();
 }
 
+/// Measure `write_f64` with a representative two-decimal-place value.
+///
+/// `write_f64` uses a hand-rolled fixed-precision formatter (integer part via
+/// `write_u64`, fractional part via two-digit lookup) — no `ryu` dependency.
+/// This benchmark exists mainly as a regression guard — f64 fields are rare
+/// in scan events today but the primitive is shared infrastructure.
 fn bench_write_f64(c: &mut Criterion) {
-    use scanner_rs::unified::json_write::write_f64;
     let mut group = c.benchmark_group("write_f64");
     group.throughput(Throughput::Elements(1));
     group.bench_function("81.23", |b| {
@@ -311,6 +449,14 @@ fn bench_write_f64(c: &mut Criterion) {
 }
 
 /// Compare custom `write_u64` against the `itoa` crate.
+///
+/// `itoa` is the de-facto standard for integer-to-ASCII in the Rust ecosystem
+/// (used by serde_json). This benchmark validates that our hand-rolled
+/// two-digits-at-a-time implementation stays competitive. If `itoa` pulls
+/// ahead significantly, the custom implementation should be reconsidered.
+///
+/// Uses a 10-digit value (1.7 billion — a realistic Unix timestamp) since
+/// that's the most common magnitude in scan events.
 fn bench_u64_vs_itoa(c: &mut Criterion) {
     use scanner_rs::unified::json_write::write_u64;
     let mut group = c.benchmark_group("u64_vs_itoa");
@@ -341,6 +487,13 @@ fn bench_u64_vs_itoa(c: &mut Criterion) {
 }
 
 /// Compare custom `write_f64` against the `ryu` crate.
+///
+/// `ryu` is the fastest general-purpose float-to-string implementation
+/// (Ryū algorithm, used by serde_json). Our `write_f64` is *not*
+/// general-purpose — it emits exactly two decimal places via integer
+/// arithmetic, avoiding the full shortest-representation algorithm.
+/// This benchmark confirms the fixed-precision shortcut is faster than
+/// `ryu` for the narrow use case of two-decimal-place output.
 fn bench_f64_vs_ryu(c: &mut Criterion) {
     use scanner_rs::unified::json_write::write_f64;
     let mut group = c.benchmark_group("f64_vs_ryu");
@@ -374,6 +527,12 @@ fn bench_f64_vs_ryu(c: &mut Criterion) {
 // Encoder-level benchmarks
 // ============================================================================
 
+/// End-to-end `encode_finding` for both FS and Git variants.
+///
+/// This is the most representative single-event benchmark: it calls
+/// `write_json_bytes` (path), `write_u64` (offsets, rule_id), and
+/// `write_json_str` (rule_name), composing all primitives into one JSON line.
+/// The FS vs. Git delta isolates the cost of the two optional fields.
 fn bench_encode_finding(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_finding");
     group.throughput(Throughput::Elements(1));
@@ -401,6 +560,11 @@ fn bench_encode_finding(c: &mut Criterion) {
     group.finish();
 }
 
+/// End-to-end `encode_commit_meta` with and without identity fields.
+///
+/// `CommitMeta` events are emitted once per commit (not per finding), so they
+/// are less frequent but still latency-sensitive. The identity variant adds
+/// four `write_u64` calls; the delta quantifies per-field overhead.
 fn bench_encode_commit_meta(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_commit_meta");
     group.throughput(Throughput::Elements(1));
@@ -428,6 +592,12 @@ fn bench_encode_commit_meta(c: &mut Criterion) {
     group.finish();
 }
 
+/// Batch-encode 1000 findings through `JsonlEncoder::encode`.
+///
+/// Simulates a worker's inner loop: encode many events into a shared buffer
+/// without I/O. The 50/50 FS/Git mix models a realistic workload. Throughput
+/// is reported as elements/sec (1000 findings per iteration) to track
+/// amortized per-event cost including buffer growth.
 fn bench_encode_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_batch");
     let encoder = JsonlEncoder::new();
@@ -468,7 +638,13 @@ fn bench_encode_batch(c: &mut Criterion) {
     group.finish();
 }
 
-/// Sink benchmark: emit 1000 findings into /dev/null.
+/// Emit 1000 findings through `JsonlEventSink` into `io::sink()`.
+///
+/// Unlike `bench_encode_batch`, this exercises the full emit path: thread-local
+/// buffer acquisition, encoding, mutex lock, and `write_all`. The `io::sink()`
+/// writer discards bytes instantly, so the measured cost is pure serialization
+/// + synchronization overhead without I/O latency. Comparing against the batch
+///   benchmark isolates the cost of the thread-local + mutex machinery.
 fn bench_sink_emit(c: &mut Criterion) {
     let mut group = c.benchmark_group("sink_emit");
     group.throughput(Throughput::Elements(1000));
@@ -541,6 +717,56 @@ fn bench_json_sink_emit(c: &mut Criterion) {
     group.finish();
 }
 
+/// Emit findings from multiple threads through a shared `JsonlEventSink`.
+///
+/// Unlike `bench_sink_emit` (single-threaded), this exercises the mutex
+/// contention path that production workers encounter. The `io::sink()` writer
+/// removes I/O variance, isolating pure formatting + synchronization cost.
+fn bench_sink_contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sink_contention");
+
+    for &threads in &[2, 4, 8] {
+        group.throughput(Throughput::Elements(1000));
+        group.bench_function(BenchmarkId::new("threads", threads), |b| {
+            let sink = std::sync::Arc::new(JsonlEventSink::new(io::sink()));
+            let findings: Vec<FindingEvent<'static>> = (0..1000)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        make_fs_finding()
+                    } else {
+                        make_git_finding()
+                    }
+                })
+                .collect();
+            b.iter(|| {
+                std::thread::scope(|s| {
+                    let per_thread = 1000 / threads;
+                    for t in 0..threads {
+                        let sink = &sink;
+                        let chunk = &findings[t * per_thread..(t + 1) * per_thread];
+                        s.spawn(move || {
+                            for f in chunk {
+                                sink.emit(ScanEvent::Finding(FindingEvent {
+                                    source: f.source,
+                                    object_path: f.object_path,
+                                    start: f.start,
+                                    end: f.end,
+                                    rule_id: f.rule_id,
+                                    rule_name: f.rule_name,
+                                    commit_id: f.commit_id,
+                                    change_kind: f.change_kind,
+                                }));
+                            }
+                        });
+                    }
+                });
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     primitives,
     bench_write_u64,
@@ -556,6 +782,7 @@ criterion_group!(
     bench_encode_batch,
     bench_sink_emit,
     bench_json_sink_emit,
+    bench_sink_contention,
 );
 criterion_group!(comparison, bench_u64_vs_itoa, bench_f64_vs_ryu,);
 criterion_main!(primitives, encoding, comparison);
