@@ -7,6 +7,7 @@ use crate::git_scan::object_id::OidBytes;
 
 use super::events::{self, CommitMetaEvent, FindingEvent};
 use super::json_write;
+use super::text_sink;
 
 /// Encode a finding event into JSON object bytes (no trailing newline).
 #[inline(always)]
@@ -48,4 +49,10 @@ pub fn write_json_str(s: &str, buf: &mut Vec<u8>) {
 #[inline(always)]
 pub fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
     json_write::write_json_bytes(bytes, buf);
+}
+
+/// Convert raw path bytes to a display-safe string, escaping control characters.
+#[inline(always)]
+pub fn sanitize_path(bytes: &[u8]) -> String {
+    text_sink::sanitize_path(bytes)
 }

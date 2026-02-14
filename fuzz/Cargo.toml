@@ -131,3 +131,10 @@ path = "fuzz_targets/fuzz_json_write_equivalence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_text_sanitize_path"
+path = "fuzz_targets/fuzz_text_sanitize_path.rs"
+test = false
+doc = false
+bench = false
