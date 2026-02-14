@@ -97,8 +97,8 @@ pub fn detect_kind_from_path(path: &Path) -> Option<ArchiveKind> {
 /// Detect from a UTF-8 filename string.
 ///
 /// Thin wrapper over [`detect_kind_from_name_bytes`]; prefer the byte variant
-/// when the input is already `&[u8]` (e.g., tar entry names) to avoid a
-/// UTF-8 validation round-trip.
+/// when the input is already `&[u8]` (e.g., tar entry names) to skip the
+/// `&[u8]` → `&str` UTF-8 validation the caller would otherwise need.
 #[inline]
 pub fn detect_kind_from_name(name: &str) -> Option<ArchiveKind> {
     detect_kind_from_name_bytes(name.as_bytes())
@@ -108,7 +108,7 @@ pub fn detect_kind_from_name(name: &str) -> Option<ArchiveKind> {
 ///
 /// Minimum buffer sizes for each format:
 /// - **gzip**: 2 bytes (`1f 8b`)
-/// - **zip**: 4 bytes (`PK\x03\x04`)
+/// - **zip**: 4 bytes (`PK` prefix + one of four signature pairs; see [`is_zip_magic`])
 /// - **tar (ustar)**: 512 bytes (magic at offset 257)
 ///
 /// Returns `Gzip` for any gzip stream — callers must rely on the filename
@@ -513,6 +513,9 @@ mod kani_proofs {
 
     /// Prove `detect_z_suffix` never panics for any `(name, len)` pair
     /// where `len == name.len()` and `len <= 32`.
+    ///
+    /// Intentionally unconstrained — in production, `detect_kind_from_name_bytes`
+    /// only calls this after `len >= 3`, but we prove safety without that precondition.
     #[kani::proof]
     #[kani::unwind(34)]
     fn verify_detect_z_suffix_no_panic() {
@@ -526,6 +529,8 @@ mod kani_proofs {
     }
 
     /// Prove `detect_r_suffix` never panics for any `(name, len)` pair.
+    ///
+    /// Intentionally unconstrained — see `verify_detect_z_suffix_no_panic`.
     #[kani::proof]
     #[kani::unwind(34)]
     fn verify_detect_r_suffix_no_panic() {
@@ -539,6 +544,8 @@ mod kani_proofs {
     }
 
     /// Prove `detect_p_suffix` never panics for any `(name, len)` pair.
+    ///
+    /// Intentionally unconstrained — see `verify_detect_z_suffix_no_panic`.
     #[kani::proof]
     #[kani::unwind(34)]
     fn verify_detect_p_suffix_no_panic() {

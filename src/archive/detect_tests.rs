@@ -121,6 +121,15 @@ proptest! {
             "short input {:?} should be None",
             String::from_utf8_lossy(&name)
         );
+        // Also test inputs that become < 3 bytes after trailing-slash stripping.
+        let mut with_slashes = name.clone();
+        with_slashes.extend_from_slice(b"///");
+        prop_assert_eq!(
+            detect_kind_from_name_bytes(&with_slashes),
+            None,
+            "input {:?} with trailing slashes should be None",
+            String::from_utf8_lossy(&with_slashes)
+        );
     }
 
     /// `detect_kind_from_name(s)` must equal `detect_kind_from_name_bytes(s.as_bytes())`
@@ -135,23 +144,11 @@ proptest! {
         );
     }
 
-    /// The `| 0x20` trick maps non-alpha bytes in the 0x40–0x5F range to
-    /// 0x60–0x7F. Verify that no such byte triggers a false positive.
-    /// Specifically, test bytes where `b | 0x20` equals one of our dispatch
-    /// targets (`z`, `r`, `p`) but `b` is not an alpha char.
+    /// Append various non-alpha bytes (control chars, punctuation, high bytes)
+    /// and verify the optimized dispatch agrees with the reference oracle.
+    /// This guards against `| 0x20` mapping a non-letter to a dispatch target.
     #[test]
     fn or_0x20_false_positive_guard(prefix in arb_bytes()) {
-        // Bytes that map to 'z' (0x7A) via | 0x20: 'Z' (0x5A) and 'z' (0x7A) are
-        // legitimate. But 0x5A is 'Z' (fine) and there's no non-alpha byte that
-        // maps to 'z'. However, bytes 0x40-0x5F map to 0x60-0x7F:
-        //   '@' (0x40) → '`' (0x60)
-        //   '[' (0x5B) → '{' (0x7B)
-        //   '\\' (0x5C) → '|' (0x7C)
-        //   ']' (0x5D) → '}' (0x7D)
-        //   '^' (0x5E) → '~' (0x7E)
-        //   '_' (0x5F) → DEL-ish (0x7F)
-        // None of these map to 'z'/'r'/'p', but let's verify by appending
-        // non-alpha bytes that share the lower 5 bits with our targets.
         let non_alpha_tails: &[u8] = &[
             0x00, 0x1A, 0x3A, 0x5B, 0x5C, 0x5D, 0x7B, 0x7C, 0x7D, 0xFF,
         ];

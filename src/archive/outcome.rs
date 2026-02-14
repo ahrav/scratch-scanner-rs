@@ -10,7 +10,7 @@
 //!    [`PartialReason`].
 //! 3. **Scanned** — the archive (or entry) was fully decompressed and scanned.
 //!
-//! [`ArchiveStats`] aggregates per-reason counters and a bounded sample ring
+//! [`ArchiveStats`] aggregates per-reason counters and a bounded sample buffer
 //! ([`ArchiveSampleRing`]) across all three tiers.  Stats are accumulated
 //! per-worker and merged upward, so all operations are `Copy`-friendly and
 //! allocation-free.
@@ -282,8 +282,8 @@ pub struct ArchiveSample {
     /// - `EntrySkipped`   → cast to [`EntrySkipReason`]
     /// - `ArchivePartial` / `EntryPartial` → cast to [`PartialReason`]
     pub reason: u8,
-    /// Actual byte length of the path stored in `path_prefix` (may be less
-    /// than the original path if it was truncated).
+    /// Number of valid bytes in `path_prefix`. Equal to the original path
+    /// length or [`ARCHIVE_SAMPLE_PATH_PREFIX_MAX`], whichever is smaller.
     pub path_len: u16,
     pub path_prefix: [u8; ARCHIVE_SAMPLE_PATH_PREFIX_MAX],
 }
