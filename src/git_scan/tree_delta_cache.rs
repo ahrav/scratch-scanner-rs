@@ -1,16 +1,45 @@
 //! Set-associative cache for tree delta base bytes.
 //!
-//! Stores decompressed tree payloads keyed by `(pack_id, offset)` in
+//! Stores decompressed delta-base payloads keyed by `(pack_id, offset)` in
 //! fixed-size slots backed by a pre-allocated arena. The cache is
 //! set-associative with CLOCK eviction and does not allocate on the hot
 //! path (after initialization).
 //!
-//! # Layout
-//! - `WAYS` slots per set (fixed)
-//! - Number of sets is rounded down to a power of two
-//! - Each slot owns a fixed `slot_size` byte range in the arena
+//! This is structurally identical to [`super::tree_cache::TreeCache`] but
+//! uses a composite key (`pack_id`, `offset`) instead of an OID, and each
+//! slot carries additional metadata (`kind`, `chain_len`) needed by the
+//! delta resolver.
 //!
-//! Tree payloads larger than `slot_size` are not cached.
+//! # Layout
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────┐
+//! │  Set 0           │  Set 1           │  ...      │
+//! │ [w0][w1][w2][w3] │ [w0][w1][w2][w3] │           │
+//! └─────────────────────────────────────────────────┘
+//!        ▲ each slot is `slot_size` bytes in the arena
+//! ```
+//!
+//! - `WAYS` slots per set (4-way associative)
+//! - Number of sets is rounded down to a power of two for bitmask indexing
+//! - Each slot owns a fixed `slot_size` byte range in the contiguous arena
+//!
+//! Payloads larger than `slot_size` are silently not cached.
+//!
+//! # Eviction (CLOCK)
+//!
+//! Each slot carries a 1-bit "clock" (recently-used) flag. On eviction the
+//! hand sweeps through the set, clearing clock bits it encounters. The first
+//! slot found with `clock == 0` (or an invalid slot) is chosen as the victim.
+//! Pinned slots (those with an outstanding [`TreeDeltaCacheHandle`]) are
+//! skipped unconditionally. The hand sweeps at most `2 × WAYS` positions;
+//! if every slot is either pinned or recently used, the insertion is dropped.
+//!
+//! # Pinning
+//!
+//! [`TreeDeltaCacheHandle`] increments a per-slot pin count on creation and
+//! decrements it on drop. While any pin is held the slot is immune to
+//! eviction, guaranteeing the borrowed bytes remain stable.
 //!
 //! # Invariants
 //! - `sets` is 0 (disabled) or a power of two
@@ -30,16 +59,29 @@ const MIN_SLOT_SIZE: u32 = 256;
 /// Number of ways per set.
 const WAYS: usize = 4;
 
-/// Cache slot metadata.
+/// Metadata for a single cache slot.
+///
+/// Each slot corresponds to a fixed region in the arena (`storage`). The
+/// `valid` flag distinguishes populated slots from empty ones so the cache
+/// can be initialized without sentinel keys.
 #[derive(Clone, Debug)]
 struct Slot {
+    /// Pack index that contains this delta base.
     pack_id: u16,
+    /// Byte offset of the object within the pack.
     offset: u64,
+    /// Resolved object kind of the base (e.g. Tree, Commit).
     kind: ObjectKind,
+    /// Number of delta links traversed to reach this base (0 = non-delta).
     chain_len: u8,
+    /// Actual byte length of the payload (may be less than `slot_size`).
     len: u32,
+    /// CLOCK bit: set to 1 on access, cleared during eviction sweeps.
     clock: u8,
+    /// Whether this slot holds a valid entry.
     valid: bool,
+    /// Number of outstanding [`TreeDeltaCacheHandle`]s referencing this slot.
+    /// Uses `Cell` so pin counts can be mutated through shared references.
     pins: Cell<u16>,
 }
 
@@ -61,14 +103,24 @@ impl Slot {
 
 /// Set-associative cache for tree delta base bytes.
 ///
-/// The cache is not thread-safe; callers must synchronize shared access.
+/// See the [module documentation](self) for layout, eviction, and pinning
+/// details. When `sets == 0` the cache is disabled and all operations are
+/// no-ops; this avoids special-casing callers when the budget is too small.
+///
+/// Not thread-safe; callers must synchronize shared access.
 #[derive(Debug)]
 pub struct TreeDeltaCache {
+    /// Usable capacity (rounded from the requested value to fit whole sets).
     capacity_bytes: u32,
+    /// Fixed byte size of every slot in the arena (power of two).
     slot_size: u32,
+    /// Number of sets (power of two, or 0 when disabled).
     sets: usize,
+    /// Contiguous arena: `sets * WAYS * slot_size` bytes, pre-allocated once.
     storage: Vec<u8>,
+    /// Per-slot metadata, indexed as `set * WAYS + way`.
     slots: Vec<Slot>,
+    /// Per-set CLOCK hand position (index into 0..WAYS).
     clock_hands: Vec<u8>,
 }
 

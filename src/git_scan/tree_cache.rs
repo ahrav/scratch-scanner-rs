@@ -345,6 +345,7 @@ impl TreeCache {
     }
 }
 
+/// Returns the largest power of two ≤ `val`, or 0 if `val` is 0.
 fn round_down_power_of_two_usize(val: usize) -> usize {
     if val == 0 {
         return 0;
@@ -352,6 +353,7 @@ fn round_down_power_of_two_usize(val: usize) -> usize {
     1_usize << (usize::BITS - val.leading_zeros() - 1)
 }
 
+/// Returns the largest power of two ≤ `val`, or 0 if `val` is 0.
 fn round_down_power_of_two_u32(val: u32) -> u32 {
     if val == 0 {
         return 0;
@@ -359,9 +361,11 @@ fn round_down_power_of_two_u32(val: u32) -> u32 {
     1_u32 << (u32::BITS - val.leading_zeros() - 1)
 }
 
+/// Cheap hash for set selection: interprets the first 8 OID bytes as a
+/// little-endian `u64`. Git OIDs are already uniformly distributed so no
+/// mixing is needed; collisions within a set are handled by the
+/// associative lookup.
 fn hash_oid(oid: &OidBytes) -> u64 {
-    // Use the first 8 bytes as a cheap, deterministic hash. This is
-    // sufficient for set selection; collisions are handled by the cache.
     let bytes = oid.as_slice();
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&bytes[..8]);
