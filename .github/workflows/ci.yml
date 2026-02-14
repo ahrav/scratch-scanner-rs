@@ -17,7 +17,7 @@ jobs:
     name: Format
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -30,7 +30,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -50,7 +50,7 @@ jobs:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -68,7 +68,7 @@ jobs:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: brew install boost
       - uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
       SCHEDULER_SIM_STRESS_MAX_PROGRAMS: "8"
       SCHEDULER_SIM_STRESS_MAX_TASKS: "8"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -108,7 +108,7 @@ jobs:
       # ~20s per target × 4 targets ≈ 80s total (within 60-120s budget).
       FUZZ_SECONDS: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -159,7 +159,7 @@ jobs:
     env:
       FUZZ_RUNS: 10000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -197,7 +197,7 @@ jobs:
     env:
       FUZZ_RUNS: 10000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -244,7 +244,7 @@ jobs:
         -Zmiri-preemption-rate=0.1
         -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -277,7 +277,7 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -293,7 +293,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -303,7 +303,7 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install system deps
         run: |
           sudo apt-get update
