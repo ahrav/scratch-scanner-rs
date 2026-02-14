@@ -43,6 +43,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'default_rules.yaml'
+              - '.github/**'
             fuzz:
               - 'fuzz/**'
               - 'src/**'
@@ -145,6 +146,8 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
