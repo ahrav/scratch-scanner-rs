@@ -134,7 +134,7 @@ jobs:
         run: cargo install cargo-fuzz
       - name: Restore fuzz corpus cache
         if: steps.filter.outputs.pack == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: fuzz/corpus
           key: fuzz-corpus-pack-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
@@ -171,7 +171,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: fuzz/corpus
           key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
@@ -207,7 +207,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: fuzz/corpus
           key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
