@@ -23,7 +23,7 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 libc = "0.2"
 memchr = "2.6"
 memmap2 = "0.9"
-regex = "1.10"
+regex = "1.12"
 regex-syntax = "0.8"
 vectorscan-rs-sys = "0.0.5"
 sha2 = "0.10"
