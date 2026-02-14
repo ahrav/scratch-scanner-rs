@@ -206,6 +206,20 @@ harness = false
 name = "git_scan_parse"
 harness = false
 
+[[bench]]
+name = "runner_exec_contention"
+harness = false
+
+[[bench]]
+name = "runner_exec_locality"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "runner_exec_strategy"
+harness = false
+required-features = ["bench"]
+
 [profile.dev]
 opt-level = 1
 

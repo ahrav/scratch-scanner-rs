@@ -619,7 +619,8 @@ fn estimate_locality_pressure_known_deps() {
     let plan = synthetic_locality_plan(0, 8, 700, 4);
     assert_eq!(plan.delta_deps.len(), 4, "should have 4 offset deps");
 
-    let p2 = estimate_locality_pressure(&plan, 2);
+    let exec_pos = build_exec_pos_by_need(&plan);
+    let p2 = estimate_locality_pressure(&plan, 2, exec_pos.as_deref());
     assert_eq!(p2.offset_deps, 4, "all 4 deps are offset-based");
     assert_eq!(p2.unresolved_offset_bases, 0, "all bases in need_offsets");
     // With 2 shards: positions 0..4 → shard 0, positions 4..8 → shard 1.
@@ -629,7 +630,7 @@ fn estimate_locality_pressure_known_deps() {
         "all deps cross shard boundary"
     );
 
-    let p4 = estimate_locality_pressure(&plan, 4);
+    let p4 = estimate_locality_pressure(&plan, 4, exec_pos.as_deref());
     assert_eq!(p4.offset_deps, 4);
     assert_eq!(p4.unresolved_offset_bases, 0);
     // With 4 shards: [0,1], [2,3], [4,5], [6,7].

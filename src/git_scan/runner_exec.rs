@@ -29,6 +29,7 @@ use std::mem::ManuallyDrop;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -711,31 +712,14 @@ fn shard_id_for_exec_position(pos: usize, len: usize, shards: usize) -> usize {
     }
 }
 
-/// Estimate cross-shard dependency pressure for a proposed shard count.
+/// Build the inverse map from need-index → execution position.
 ///
-/// Uses execution positions (natural order or `exec_order`) and counts how
-/// many offset-based deps would cross shard boundaries under contiguous shard
-/// partitioning.
-///
-/// The algorithm:
-/// 1. Build an inverse map from need-index → execution position (identity when
-///    no explicit `exec_order` exists).
-/// 2. For each offset-based delta dep, resolve both the dependent and its base
-///    to execution positions, then check whether they fall in different shards.
-/// 3. Count crossings and unresolved bases (where the base offset isn't in
-///    `need_offsets`, meaning it's decoded on-demand rather than planned).
-fn estimate_locality_pressure(plan: &PackPlan, shards: usize) -> LocalityPressure {
+/// When `exec_order` is present, the execution order differs from need-offset
+/// order (e.g. to decode bases before their dependents). Without it,
+/// need-index *is* the execution position and `None` is returned.
+fn build_exec_pos_by_need(plan: &PackPlan) -> Option<Vec<usize>> {
     let need_count = plan.need_offsets.len();
-    if need_count <= 1 || shards <= 1 {
-        return LocalityPressure::default();
-    }
-    let shards = shards.max(1).min(need_count);
-
-    // Inverse map: need_index → execution position.  When `exec_order` is
-    // present, the execution order differs from need-offset order (e.g. to
-    // decode bases before their dependents).  Without it, need-index *is*
-    // the execution position.
-    let exec_pos_by_need = plan.exec_order.as_ref().map(|order| {
+    plan.exec_order.as_ref().map(|order| {
         let mut pos = vec![usize::MAX; need_count];
         for (exec_pos, &need_idx_u32) in order.iter().enumerate() {
             let need_idx = need_idx_u32 as usize;
@@ -744,10 +728,38 @@ fn estimate_locality_pressure(plan: &PackPlan, shards: usize) -> LocalityPressur
             }
         }
         pos
-    });
+    })
+}
+
+/// Estimate cross-shard dependency pressure for a proposed shard count.
+///
+/// Uses execution positions (natural order or `exec_order`) and counts how
+/// many offset-based deps would cross shard boundaries under contiguous shard
+/// partitioning.
+///
+/// The algorithm:
+/// 1. Use the inverse map from need-index → execution position (identity when
+///    no explicit `exec_order` exists).
+/// 2. For each offset-based delta dep, resolve both the dependent and its base
+///    to execution positions, then check whether they fall in different shards.
+/// 3. Count crossings and unresolved bases (where the base offset isn't in
+///    `need_offsets`, meaning it's decoded on-demand rather than planned).
+///
+/// `exec_pos_by_need` should be built once via [`build_exec_pos_by_need`] and
+/// reused across calls with varying `shards` for the same plan.
+fn estimate_locality_pressure(
+    plan: &PackPlan,
+    shards: usize,
+    exec_pos_by_need: Option<&[usize]>,
+) -> LocalityPressure {
+    let need_count = plan.need_offsets.len();
+    if need_count <= 1 || shards <= 1 {
+        return LocalityPressure::default();
+    }
+    let shards = shards.max(1).min(need_count);
 
     let position_for_need_idx = |need_idx: usize| -> Option<usize> {
-        if let Some(pos) = exec_pos_by_need.as_ref() {
+        if let Some(pos) = exec_pos_by_need {
             let exec_pos = *pos.get(need_idx)?;
             (exec_pos != usize::MAX).then_some(exec_pos)
         } else {
@@ -798,8 +810,11 @@ fn estimate_locality_pressure(plan: &PackPlan, shards: usize) -> LocalityPressur
 /// [`MAX_SHARDS_WITH_DEP_PRESSURE`] is reached.
 fn apply_locality_shard_cap(plan: &PackPlan, shard_cap: usize) -> usize {
     let mut cap = shard_cap.max(1).min(plan.need_offsets.len());
+    // Build the inverse map once and reuse across iterations instead of
+    // allocating a fresh vec on every call to estimate_locality_pressure.
+    let exec_pos = build_exec_pos_by_need(plan);
     while cap > MAX_SHARDS_WITH_DEP_PRESSURE {
-        let pressure = estimate_locality_pressure(plan, cap);
+        let pressure = estimate_locality_pressure(plan, cap, exec_pos.as_deref());
         if pressure.offset_deps < MIN_LOCALITY_DEP_SAMPLES {
             break;
         }
@@ -834,14 +849,27 @@ fn apply_locality_shard_cap(plan: &PackPlan, shard_cap: usize) -> usize {
 ///    offset-based deps in execution order, reduce fan-out to improve cache locality.
 ///
 /// Returns 1 for single-worker execution or degenerate plans (≤ 1 offset).
+#[cfg(any(test, feature = "bench"))]
 #[inline(always)]
 pub(super) fn select_plan_shard_count(workers: usize, plan: &PackPlan) -> usize {
+    select_plan_shard_count_with_hint(workers, plan, &build_plan_cost_hint(plan))
+}
+
+/// [`select_plan_shard_count`] variant that accepts a pre-computed hint.
+///
+/// Use this when the caller has already computed [`PlanCostHint`] (e.g. inside
+/// [`select_pack_exec_strategy`]) to avoid redundant iteration over `delta_deps`.
+#[inline(always)]
+fn select_plan_shard_count_with_hint(
+    workers: usize,
+    plan: &PackPlan,
+    hint: &PlanCostHint,
+) -> usize {
     let workers = workers.max(1);
     if workers == 1 {
         return 1;
     }
 
-    let hint = build_plan_cost_hint(plan);
     if hint.need_count <= 1 {
         return 1;
     }
@@ -895,22 +923,25 @@ pub(super) fn select_pack_exec_strategy(workers: usize, plans: &[PackPlan]) -> P
     let workers = workers.max(1);
     if workers == 1 || plans.is_empty() {
         return PackExecStrategy::Serial;
-    } else {
-        let total_need: usize = plans
-            .iter()
-            .map(|plan| build_plan_cost_hint(plan).need_count)
-            .sum();
-        if total_need < MIN_TOTAL_NEED_FOR_PARALLEL {
-            return PackExecStrategy::Serial;
-        }
+    }
+
+    // Compute hints once — reused for both the total-need check and per-plan
+    // shard count selection, avoiding redundant delta_deps iteration.
+    let hints: Vec<PlanCostHint> = plans.iter().map(build_plan_cost_hint).collect();
+    let total_need: usize = hints.iter().map(|h| h.need_count).sum();
+    if total_need < MIN_TOTAL_NEED_FOR_PARALLEL {
+        return PackExecStrategy::Serial;
     }
 
     if plans.len() >= workers {
         PackExecStrategy::PackParallel
     } else {
         let mut shard_counts = Vec::with_capacity(plans.len());
-        for plan in plans {
-            shard_counts.push((plan.pack_id, select_plan_shard_count(workers, plan)));
+        for (plan, hint) in plans.iter().zip(&hints) {
+            shard_counts.push((
+                plan.pack_id,
+                select_plan_shard_count_with_hint(workers, plan, hint),
+            ));
         }
         PackExecStrategy::IntraPackSharded { shard_counts }
     }
@@ -1061,6 +1092,18 @@ struct SchedulerPackScratch {
 /// [`ManuallyDrop`] so they are NOT dropped by the compiler's automatic field
 /// drop order. Instead, our custom [`Drop`] impl explicitly drops borrowers
 /// before their backing storage.
+///
+/// # Safety Invariant
+///
+/// Field declaration order is load-bearing for soundness. The `Drop` impl
+/// (below) explicitly drops `adapter` and `external` (the borrowers) before
+/// the compiler's automatic drop runs on `_engine` and `_midx_bytes` (the
+/// owners). Reordering fields, adding borrowing fields, or removing the
+/// `ManuallyDrop` wrappers will create use-after-free.
+///
+/// Dependency chain:
+///   `adapter` borrows `_engine`    → drop adapter first
+///   `external` borrows `_midx_bytes` → drop external first
 struct SchedulerPackWorkerRuntime {
     // Borrowing fields — dropped explicitly in our `Drop` impl before
     // the owning storage they reference.
@@ -1501,11 +1544,13 @@ pub(super) fn execute_pack_plans_with_scheduler(
     let plan_count = plans.len();
     let plans = Arc::new(plans);
     let first_error: Arc<Mutex<Option<GitScanError>>> = Arc::new(Mutex::new(None));
+    let abort_flag = Arc::new(AtomicBool::new(false));
 
     match strategy {
         PackExecStrategy::Serial | PackExecStrategy::PackParallel => {
-            let outputs: Arc<Mutex<Vec<Option<SchedulerPackExecOutput>>>> =
-                Arc::new(Mutex::new((0..plan_count).map(|_| None).collect()));
+            type OutputSlot = Mutex<Option<SchedulerPackExecOutput>>;
+            let output_slots: Arc<Vec<OutputSlot>> =
+                Arc::new((0..plan_count).map(|_| Mutex::new(None)).collect());
             let shared = Arc::new(SchedulerPackShared {
                 engine,
                 event_sink,
@@ -1539,14 +1584,11 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 },
                 {
                     let shared = Arc::clone(&shared);
-                    let outputs = Arc::clone(&outputs);
+                    let output_slots = Arc::clone(&output_slots);
                     let first_error = Arc::clone(&first_error);
+                    let abort_flag = Arc::clone(&abort_flag);
                     move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
-                        if first_error
-                            .lock()
-                            .expect("scheduler pack error mutex poisoned")
-                            .is_some()
-                        {
+                        if abort_flag.load(Ordering::Relaxed) {
                             return;
                         }
                         let seq = match task {
@@ -1559,12 +1601,12 @@ pub(super) fn execute_pack_plans_with_scheduler(
                             &shared,
                         ) {
                             Ok(output) => {
-                                let mut slots = outputs
+                                *output_slots[seq]
                                     .lock()
-                                    .expect("scheduler pack output mutex poisoned");
-                                slots[seq] = Some(output);
+                                    .expect("scheduler pack output slot poisoned") = Some(output);
                             }
                             Err(err) => {
+                                abort_flag.store(true, Ordering::Relaxed);
                                 let mut guard = first_error
                                     .lock()
                                     .expect("scheduler pack error mutex poisoned");
@@ -1595,16 +1637,17 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 return Err(err);
             }
 
-            let mut slots = outputs
-                .lock()
-                .expect("scheduler pack output mutex poisoned");
             let mut merged = Vec::with_capacity(plan_count);
-            for (plan_idx, slot) in slots.iter_mut().enumerate() {
-                let mut output = slot.take().ok_or_else(|| {
-                    GitScanError::PackExec(PackExecError::PackRead(
-                        "missing scheduler pack output".to_string(),
-                    ))
-                })?;
+            for (plan_idx, slot) in output_slots.iter().enumerate() {
+                let mut output = slot
+                    .lock()
+                    .expect("scheduler pack output slot poisoned")
+                    .take()
+                    .ok_or_else(|| {
+                        GitScanError::PackExec(PackExecError::PackRead(
+                            "missing scheduler pack output".to_string(),
+                        ))
+                    })?;
                 // Defer skip mapping to merge time so worker tasks avoid building
                 // per-task skipped vectors in the hot path.
                 collect_skipped_candidates(
@@ -1660,13 +1703,18 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 return Ok((0..plan_count).map(|_| empty_scheduler_output()).collect());
             }
 
-            let shard_outputs: Arc<Mutex<Vec<Vec<Option<SchedulerPackExecOutput>>>>> =
-                Arc::new(Mutex::new(
-                    shard_meta
-                        .iter()
-                        .map(|meta| (0..meta.shard_ranges.len()).map(|_| None).collect())
-                        .collect(),
-                ));
+            // Pre-compute cumulative shard offsets so each (plan, shard) pair
+            // maps to a unique flat index — one Mutex per slot, zero contention.
+            let mut shard_slot_base = Vec::with_capacity(plan_count);
+            let mut total_shard_slots = 0usize;
+            for meta in &shard_meta {
+                shard_slot_base.push(total_shard_slots);
+                total_shard_slots += meta.shard_ranges.len();
+            }
+            type ShardSlot = Mutex<Option<SchedulerPackExecOutput>>;
+            let shard_slots: Arc<Vec<ShardSlot>> =
+                Arc::new((0..total_shard_slots).map(|_| Mutex::new(None)).collect());
+            let shard_slot_base = Arc::new(shard_slot_base);
             let shard_meta = Arc::new(shard_meta);
 
             let shared = Arc::new(SchedulerPackShared {
@@ -1702,14 +1750,12 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 },
                 {
                     let shared = Arc::clone(&shared);
-                    let shard_outputs = Arc::clone(&shard_outputs);
+                    let shard_slots = Arc::clone(&shard_slots);
+                    let shard_slot_base = Arc::clone(&shard_slot_base);
                     let first_error = Arc::clone(&first_error);
+                    let abort_flag = Arc::clone(&abort_flag);
                     move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
-                        if first_error
-                            .lock()
-                            .expect("scheduler pack error mutex poisoned")
-                            .is_some()
-                        {
+                        if abort_flag.load(Ordering::Relaxed) {
                             return;
                         }
                         let (plan_idx, shard_idx) = match task {
@@ -1728,12 +1774,14 @@ pub(super) fn execute_pack_plans_with_scheduler(
                             &shared,
                         ) {
                             Ok(output) => {
-                                let mut slots = shard_outputs
+                                let flat_idx = shard_slot_base[plan_idx] + shard_idx;
+                                *shard_slots[flat_idx]
                                     .lock()
-                                    .expect("scheduler shard output mutex poisoned");
-                                slots[plan_idx][shard_idx] = Some(output);
+                                    .expect("scheduler shard output slot poisoned") =
+                                    Some(output);
                             }
                             Err(err) => {
+                                abort_flag.store(true, Ordering::Relaxed);
                                 let mut guard = first_error
                                     .lock()
                                     .expect("scheduler pack error mutex poisoned");
@@ -1761,26 +1809,29 @@ pub(super) fn execute_pack_plans_with_scheduler(
                 return Err(err);
             }
 
-            let mut per_plan = shard_outputs
-                .lock()
-                .expect("scheduler shard output mutex poisoned");
             let mut merged = Vec::with_capacity(plan_count);
             for plan_idx in 0..plan_count {
-                if per_plan[plan_idx].is_empty() {
+                let base = shard_slot_base[plan_idx];
+                let shard_count = shard_meta[plan_idx].shard_ranges.len();
+                if shard_count == 0 {
                     merged.push(empty_scheduler_output());
                     continue;
                 }
 
-                let mut reports = Vec::with_capacity(per_plan[plan_idx].len());
-                let mut scanned_shards = Vec::with_capacity(per_plan[plan_idx].len());
+                let mut reports = Vec::with_capacity(shard_count);
+                let mut scanned_shards = Vec::with_capacity(shard_count);
                 let mut skipped = Vec::new();
                 let mut common_metrics = GitScanCommonMetrics::default();
-                for slot in per_plan[plan_idx].iter_mut() {
-                    let shard_output = slot.take().ok_or_else(|| {
-                        GitScanError::PackExec(PackExecError::PackRead(
-                            "missing scheduler shard output".to_string(),
-                        ))
-                    })?;
+                for s in 0..shard_count {
+                    let shard_output = shard_slots[base + s]
+                        .lock()
+                        .expect("scheduler shard output slot poisoned")
+                        .take()
+                        .ok_or_else(|| {
+                            GitScanError::PackExec(PackExecError::PackRead(
+                                "missing scheduler shard output".to_string(),
+                            ))
+                        })?;
                     reports.push(shard_output.report);
                     scanned_shards.push(shard_output.scanned);
                     common_metrics.merge_from(&shard_output.common_metrics);
@@ -1900,6 +1951,212 @@ pub(super) fn is_pack_file(name: &std::ffi::OsStr) -> bool {
 pub(super) fn is_file(path: &Path) -> bool {
     fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
+
+// ---------------------------------------------------------------------------
+// Benchmark support
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "bench")]
+mod bench_support {
+    use super::*;
+    use crate::git_scan::object_id::OidBytes;
+    use crate::git_scan::pack_candidates::PackCandidate;
+    use crate::git_scan::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};
+
+    /// Build a synthetic `PackPlan` for benchmarking strategy selection.
+    ///
+    /// Creates a plan with `need_count` evenly-spaced offsets spanning
+    /// `span_bytes`, plus `forward_deps` forward delta dependencies and
+    /// `external_deps` external (OID-based) dependencies.
+    pub fn bench_synthetic_plan(
+        pack_id: u16,
+        need_count: usize,
+        span_bytes: u64,
+        forward_deps: usize,
+        external_deps: usize,
+    ) -> PackPlan {
+        let effective_span = span_bytes.max(need_count.saturating_sub(1) as u64);
+        let step = if need_count <= 1 {
+            0
+        } else {
+            (effective_span / (need_count as u64 - 1)).max(1)
+        };
+        let need_offsets: Vec<u64> = (0..need_count)
+            .map(|idx| (idx as u64).saturating_mul(step))
+            .collect();
+
+        let mut delta_deps = Vec::with_capacity(forward_deps.saturating_add(external_deps));
+        for idx in 0..forward_deps {
+            let offset = idx as u64;
+            delta_deps.push(DeltaDep {
+                offset,
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(offset.saturating_add(1)),
+                data_start: 0,
+                delta_size: 0,
+            });
+        }
+        for idx in 0..external_deps {
+            let offset = forward_deps.saturating_add(idx) as u64;
+            delta_deps.push(DeltaDep {
+                offset,
+                kind: DeltaKind::Ref,
+                base: BaseLoc::External {
+                    oid: OidBytes::default(),
+                },
+                data_start: 0,
+                delta_size: 0,
+            });
+        }
+        delta_deps.sort_by_key(|dep| dep.offset);
+        let mut delta_dep_index = vec![NONE_U32; need_count];
+        for (dep_idx, dep) in delta_deps.iter().enumerate() {
+            if let Ok(need_idx) = need_offsets.binary_search(&dep.offset) {
+                delta_dep_index[need_idx] = dep_idx as u32;
+            }
+        }
+
+        PackPlan {
+            pack_id,
+            oid_len: 20,
+            max_delta_depth: 64,
+            candidates: Vec::<PackCandidate>::new(),
+            candidate_offsets: Vec::new(),
+            need_offsets,
+            delta_deps,
+            delta_dep_index,
+            exec_order: None,
+            stats: PackPlanStats::empty(),
+        }
+    }
+
+    /// Build a synthetic `PackPlan` with regular backward offset deps for
+    /// benchmarking locality estimation.
+    ///
+    /// Creates a plan with `need_count` offsets where every offset at index
+    /// `i >= dep_gap` depends on the offset at `i - dep_gap`.
+    pub fn bench_synthetic_locality_plan(
+        need_count: usize,
+        dep_gap: usize,
+    ) -> PackPlan {
+        let span_bytes = need_count.saturating_mul(1024) as u64;
+        let mut plan = bench_synthetic_plan(0, need_count, span_bytes, 0, 0);
+        if dep_gap == 0 || dep_gap >= need_count {
+            return plan;
+        }
+
+        let mut delta_deps = Vec::with_capacity(need_count.saturating_sub(dep_gap));
+        for dep_need_idx in dep_gap..need_count {
+            delta_deps.push(DeltaDep {
+                offset: plan.need_offsets[dep_need_idx],
+                kind: DeltaKind::Ofs,
+                base: BaseLoc::Offset(plan.need_offsets[dep_need_idx - dep_gap]),
+                data_start: 0,
+                delta_size: 0,
+            });
+        }
+        let mut delta_dep_index = vec![NONE_U32; need_count];
+        for (dep_idx, dep) in delta_deps.iter().enumerate() {
+            if let Ok(need_idx) = plan.need_offsets.binary_search(&dep.offset) {
+                delta_dep_index[need_idx] = dep_idx as u32;
+            }
+        }
+
+        plan.delta_deps = delta_deps;
+        plan.delta_dep_index = delta_dep_index;
+        plan
+    }
+
+    /// Apply locality shard cap using the current (new) code path.
+    ///
+    /// This is the production code: `build_exec_pos_by_need` is hoisted
+    /// outside the loop so the `Vec<usize>` is allocated once and reused
+    /// across all iterations.
+    pub fn bench_apply_locality_shard_cap(plan: &PackPlan, cap: usize) -> usize {
+        apply_locality_shard_cap(plan, cap)
+    }
+
+    /// Apply locality shard cap using the old (pre-optimization) code path.
+    ///
+    /// This replicates the behavior before the hoisted allocation: each call
+    /// to `estimate_locality_pressure` internally calls `build_exec_pos_by_need`,
+    /// allocating a fresh `Vec<usize>` on every iteration of the while loop.
+    pub fn bench_apply_locality_shard_cap_old(plan: &PackPlan, shard_cap: usize) -> usize {
+        let mut cap = shard_cap.max(1).min(plan.need_offsets.len());
+        while cap > MAX_SHARDS_WITH_DEP_PRESSURE {
+            // Old path: allocate exec_pos inside the loop on every iteration.
+            let exec_pos = build_exec_pos_by_need(plan);
+            let pressure = estimate_locality_pressure(plan, cap, exec_pos.as_deref());
+            if pressure.offset_deps < MIN_LOCALITY_DEP_SAMPLES {
+                break;
+            }
+            let weighted_cross = pressure
+                .cross_shard_offset_deps
+                .saturating_add(pressure.unresolved_offset_bases.saturating_mul(2));
+            if weighted_cross.saturating_mul(100)
+                <= pressure
+                    .offset_deps
+                    .saturating_mul(MAX_LOCALITY_CROSS_PERCENT)
+            {
+                break;
+            }
+            cap -= 1;
+        }
+        cap
+    }
+
+    /// Select pack execution strategy using the current (new) code path.
+    ///
+    /// Returns a discriminant tag (0 = Serial, 1 = PackParallel, 2 = Sharded)
+    /// because `PackExecStrategy` is `pub(super)`. The benchmark only measures
+    /// computation cost; the tag prevents dead-code elimination.
+    pub fn bench_select_strategy(workers: usize, plans: &[PackPlan]) -> u8 {
+        match select_pack_exec_strategy(workers, plans) {
+            PackExecStrategy::Serial => 0,
+            PackExecStrategy::PackParallel => 1,
+            PackExecStrategy::IntraPackSharded { .. } => 2,
+        }
+    }
+
+    /// Select pack execution strategy using the old (pre-optimization) code path.
+    ///
+    /// Returns a discriminant tag (same encoding as [`bench_select_strategy`]).
+    /// This replicates the behavior before hint caching: `build_plan_cost_hint`
+    /// is called twice per plan — once for `total_need` and once inside
+    /// `select_plan_shard_count`.
+    pub fn bench_select_strategy_old(workers: usize, plans: &[PackPlan]) -> u8 {
+        let workers = workers.max(1);
+        if workers == 1 || plans.is_empty() {
+            return 0;
+        }
+
+        // Old path: compute total_need by iterating need_offsets.len() directly.
+        let total_need: usize = plans.iter().map(|p| p.need_offsets.len()).sum();
+        if total_need < MIN_TOTAL_NEED_FOR_PARALLEL {
+            return 0;
+        }
+
+        if plans.len() >= workers {
+            1
+        } else {
+            let mut shard_counts = Vec::with_capacity(plans.len());
+            for plan in plans {
+                // Old path: select_plan_shard_count calls build_plan_cost_hint
+                // internally, so the hint is computed again for each plan.
+                shard_counts.push((plan.pack_id, select_plan_shard_count(workers, plan)));
+            }
+            let _ = shard_counts; // prevent elision
+            2
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+pub use bench_support::{
+    bench_apply_locality_shard_cap, bench_apply_locality_shard_cap_old,
+    bench_select_strategy, bench_select_strategy_old,
+    bench_synthetic_locality_plan, bench_synthetic_plan,
+};
 
 // ---------------------------------------------------------------------------
 // Tests

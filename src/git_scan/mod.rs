@@ -231,3 +231,11 @@ pub use runner::{
     PackMmapLimits, SkippedCandidate,
 };
 pub use work_items::WorkItems;
+
+// ── Benchmark support ───────────────────────────────────────────────────
+#[cfg(feature = "bench")]
+pub use runner_exec::{
+    bench_apply_locality_shard_cap, bench_apply_locality_shard_cap_old,
+    bench_select_strategy, bench_select_strategy_old,
+    bench_synthetic_locality_plan, bench_synthetic_plan,
+};
