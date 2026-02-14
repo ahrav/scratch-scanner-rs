@@ -133,7 +133,7 @@ fn write_diagnostic(d: &DiagnosticEvent<'_>) {
 /// 2. Replace control characters with escapes (`\xHH` or `\u{HHHH}`).
 ///    This prevents terminal/log injection and preserves the compact format's
 ///    one-line-per-finding invariant by escaping embedded newlines.
-fn sanitize_path(bytes: &[u8]) -> String {
+pub(crate) fn sanitize_path(bytes: &[u8]) -> String {
     use std::fmt::Write as FmtWrite;
 
     let lossy = String::from_utf8_lossy(bytes);
@@ -784,6 +784,84 @@ mod tests {
         // flush() calls FailWriter::flush() → PermissionDenied → must panic.
         sink.flush();
     }
+
+    // ── Realistic buffer-overflow write failure ──────────────────────────
+
+    /// A writer that accepts up to `limit` bytes, then fails with
+    /// [`ErrorKind::WriteZero`]. This simulates a realistic scenario like
+    /// a full disk or a fixed-capacity output channel.
+    ///
+    /// Unlike [`FailWriter`] (which fails on every call), this writer
+    /// succeeds for a while — long enough for `BufWriter`'s 64 KiB
+    /// internal buffer to fill and trigger a flush to the underlying
+    /// writer during a normal [`EventSink::emit`] call.
+    struct LimitedWriter {
+        remaining: usize,
+    }
+
+    impl LimitedWriter {
+        fn new(limit: usize) -> Self {
+            Self { remaining: limit }
+        }
+    }
+
+    impl std::io::Write for LimitedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "writer capacity exhausted",
+                ));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Exercises the panic-on-write-failure contract with a realistic
+    /// buffered-I/O failure scenario.
+    ///
+    /// The underlying [`LimitedWriter`] accepts 32 KiB then returns
+    /// `WriteZero`. `TextEventSink::new` wraps it in a 64 KiB
+    /// `BufWriter`, so the first ~64 KiB of findings are buffered
+    /// in-memory without hitting the underlying writer. Once the buffer
+    /// is full, `BufWriter` flushes to `LimitedWriter`. The first
+    /// 32 KiB flush succeeds, but the remaining data triggers
+    /// `WriteZero`, which propagates through [`handle_write_error`] and
+    /// panics.
+    ///
+    /// This is more realistic than [`non_broken_pipe_error_panics`]
+    /// because it exercises the path where `BufWriter`'s internal flush
+    /// during a `write_all` hits an error — the same codepath that fires
+    /// when a real output file lives on a full disk.
+    #[test]
+    #[should_panic(expected = "text event sink write failed")]
+    fn bufwriter_flush_to_failing_writer_panics() {
+        let sink = TextEventSink::new(LimitedWriter::new(32 * 1024), false);
+
+        // Each compact finding line is ~80 bytes. The 64 KiB BufWriter
+        // buffer fills after ~800 findings, at which point it flushes to
+        // LimitedWriter. The first flush writes 32 KiB successfully but
+        // the remaining data hits WriteZero → panic via handle_write_error.
+        for _ in 0..2_000 {
+            sink.emit(ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"src/secrets/very-long-path-component/nested/deep/config.env",
+                start: 0,
+                end: 128,
+                rule_id: 1,
+                rule_name: "generic-api-key",
+                commit_id: None,
+                change_kind: None,
+            }));
+        }
+        // Belt-and-suspenders: flush in case the buffer hasn't spilled yet.
+        sink.flush();
+    }
 }
 
 // ============================================================================
@@ -816,10 +894,14 @@ mod prop_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 512,
-            .. ProptestConfig::default()
-        })]
+        // Respect the PROPTEST_CASES env var set by CI (4 on PRs, 32 nightly,
+        // 64 full harness). Local runs without the env var get 512 cases.
+        #![proptest_config(ProptestConfig::with_cases(
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(512)
+        ))]
 
         // ── Compact finding always produces exactly one line ────────────
         //
