@@ -1,9 +1,10 @@
-//! Criterion benchmarks for git_scan hotspot quick wins (Q1–Q5).
+//! Criterion benchmarks for git_scan parsing: tree entry iteration, path
+//! classification, and commit header parsing.
 //!
 //! Usage:
-//!   cargo bench --bench hotspot_quick_wins -- --save-baseline before
+//!   cargo bench --bench git_scan_parse -- --save-baseline before
 //!   # ... apply changes ...
-//!   cargo bench --bench hotspot_quick_wins -- --baseline before
+//!   cargo bench --bench git_scan_parse -- --baseline before
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 

@@ -77,7 +77,7 @@ name = "scan"
 harness = false
 
 [[bench]]
-name = "structures"
+name = "bitset_fixedset"
 harness = false
 
 [[bench]]
@@ -86,7 +86,7 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
-name = "hotspots"
+name = "transform_decode"
 harness = false
 required-features = ["bench"]
 
@@ -195,7 +195,7 @@ name = "pack_inflate_perf"
 harness = false
 
 [[bench]]
-name = "hotspot_quick_wins"
+name = "git_scan_parse"
 harness = false
 
 [profile.dev]
