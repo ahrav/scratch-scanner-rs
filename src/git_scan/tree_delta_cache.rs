@@ -206,10 +206,15 @@ impl Drop for TreeDeltaCacheHandle {
 }
 
 impl TreeDeltaCache {
-    /// Creates a new cache with a byte capacity.
+    /// Creates a new cache sized to approximately `capacity_bytes`.
     ///
-    /// If the capacity is too small to hold at least one set, the cache is
-    /// initialized in a disabled state (all operations are no-ops).
+    /// The actual usable capacity may be slightly smaller: the constructor
+    /// rounds `slot_size` down to a power of two and the set count down to
+    /// a power of two so that set indexing is a simple bitmask.
+    ///
+    /// If the budget is too small for even one full set (`WAYS` ×
+    /// `MIN_SLOT_SIZE`), the cache enters a disabled state where all
+    /// operations are no-ops.
     #[must_use]
     pub fn new(capacity_bytes: u32) -> Self {
         let min_bytes = MIN_SLOT_SIZE.saturating_mul(WAYS as u32);
@@ -217,9 +222,12 @@ impl TreeDeltaCache {
             return Self::disabled(capacity_bytes);
         }
 
+        // Derive slot size: spread capacity across at least WAYS slots,
+        // cap at DEFAULT_SLOT_SIZE, then round down to a power of two.
         let mut slot_size = (capacity_bytes / WAYS as u32).min(DEFAULT_SLOT_SIZE);
         slot_size = round_down_power_of_two_u32(slot_size).max(MIN_SLOT_SIZE);
 
+        // Derive set count from remaining budget after fixing slot size.
         let slots_total = capacity_bytes / slot_size;
         let sets = round_down_power_of_two_usize((slots_total / WAYS as u32) as usize);
         if sets == 0 {
@@ -291,9 +299,14 @@ impl TreeDeltaCache {
 
     /// Inserts base bytes into the cache.
     ///
-    /// Returns true if the entry was cached. Returns false if the cache is
-    /// disabled, the payload is too large for a slot, or all candidate slots
-    /// are pinned.
+    /// If the key `(pack_id, offset)` is already present the clock bit is
+    /// refreshed and `kind`/`chain_len` are updated without copying bytes
+    /// (dedup fast path). Otherwise a victim slot is selected via the CLOCK
+    /// algorithm and overwritten.
+    ///
+    /// Returns `true` if the entry was cached (including dedup hits).
+    /// Returns `false` if the cache is disabled, the payload exceeds
+    /// `slot_size`, or all candidate slots are pinned.
     pub fn insert(
         &mut self,
         pack_id: u16,
@@ -312,6 +325,8 @@ impl TreeDeltaCache {
         let set = self.set_index(pack_id, offset);
         let base = set * WAYS;
 
+        // Dedup: if the key already lives in this set, refresh clock and
+        // update metadata without copying bytes.
         for way in 0..WAYS {
             let idx = base + way;
             if self.slots[idx].valid
@@ -332,6 +347,10 @@ impl TreeDeltaCache {
         true
     }
 
+    /// Returns a cache in the disabled state (`sets == 0`).
+    ///
+    /// All public methods early-return when `sets == 0`, so callers do not
+    /// need to check for the disabled state explicitly.
     fn disabled(capacity_bytes: u32) -> Self {
         Self {
             capacity_bytes,
@@ -343,14 +362,22 @@ impl TreeDeltaCache {
         }
     }
 
+    /// Maps a `(pack_id, offset)` key to its set index via bitmask
+    /// (requires `sets` is a power of two).
     #[inline]
     fn set_index(&self, pack_id: u16, offset: u64) -> usize {
         let hash = hash_key(pack_id, offset);
         hash as usize & (self.sets - 1)
     }
 
+    /// Selects a victim slot within the set using the CLOCK algorithm.
+    ///
+    /// The hand sweeps at most `2 × WAYS` positions. On the first pass a
+    /// recently-used slot has its clock bit cleared (second chance). On the
+    /// second pass the same slot will be evictable. Pinned slots are always
+    /// skipped. Returns `None` when every slot in the set is pinned or
+    /// recently used (all slots survived two passes).
     fn select_victim(&mut self, base: usize, set: usize) -> Option<usize> {
-        // CLOCK: pick the first slot with clock=0, clearing clock bits as we go.
         let mut hand = self.clock_hands[set] as usize % WAYS;
         for _ in 0..(WAYS * 2) {
             let idx = base + hand;
@@ -371,6 +398,10 @@ impl TreeDeltaCache {
         None
     }
 
+    /// Overwrites slot `idx` with a new entry, copying `bytes` into the arena.
+    ///
+    /// Resets the pin count to 0 (the caller ensures the slot is unpinned
+    /// before calling this).
     fn write_slot(
         &mut self,
         idx: usize,
@@ -380,7 +411,6 @@ impl TreeDeltaCache {
         chain_len: u8,
         bytes: &[u8],
     ) {
-        // Copy into the slot's fixed storage region.
         let base = idx * self.slot_size as usize;
         let end = base + bytes.len();
         self.storage[base..end].copy_from_slice(bytes);
@@ -397,6 +427,7 @@ impl TreeDeltaCache {
     }
 }
 
+/// Returns the largest power of two ≤ `val`, or 0 if `val` is 0.
 fn round_down_power_of_two_usize(val: usize) -> usize {
     if val == 0 {
         return 0;
@@ -404,6 +435,7 @@ fn round_down_power_of_two_usize(val: usize) -> usize {
     1_usize << (usize::BITS - val.leading_zeros() - 1)
 }
 
+/// Returns the largest power of two ≤ `val`, or 0 if `val` is 0.
 fn round_down_power_of_two_u32(val: u32) -> u32 {
     if val == 0 {
         return 0;
@@ -411,10 +443,14 @@ fn round_down_power_of_two_u32(val: u32) -> u32 {
     1_u32 << (u32::BITS - val.leading_zeros() - 1)
 }
 
+/// Hashes a `(pack_id, offset)` pair for set selection.
+///
+/// Unlike OID-keyed caches where the key is already uniformly distributed,
+/// pack offsets are often sequential. The function mixes `pack_id` into the
+/// high bits and applies a single round of Murmur-style finalization to
+/// scatter sequential offsets across sets.
 #[inline]
 fn hash_key(pack_id: u16, offset: u64) -> u64 {
-    // Mix pack_id into the high bits and apply a cheap avalanche to
-    // distribute sequential offsets across sets.
     let mut hash = offset ^ ((pack_id as u64) << 48);
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xff51afd7ed558ccd);
