@@ -329,34 +329,34 @@ impl<'a> BufCursor<'a> {
         Self { buf, ptr, end }
     }
 
-    /// Write a fixed-content byte slice. Debug-asserts remaining capacity.
+    /// Write a fixed-content byte slice. Asserts remaining capacity.
     ///
     /// "Static" refers to content whose length is known at the call site
     /// (JSON key literals, punctuation), not the Rust `'static` lifetime.
     #[inline(always)]
     pub(crate) fn push_static(&mut self, s: &[u8]) {
-        debug_assert!(
+        assert!(
             (self.end as usize) - (self.ptr as usize) >= s.len(),
             "BufCursor overflow: need {} bytes, have {}",
             s.len(),
             (self.end as usize) - (self.ptr as usize),
         );
         // SAFETY: Caller reserved sufficient capacity via `new()` or
-        // `resume()`. Debug-assert verifies in debug builds.
+        // `resume()`. The assert above verifies in all builds.
         unsafe {
             std::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr, s.len());
             self.ptr = self.ptr.add(s.len());
         }
     }
 
-    /// Write a single byte. Debug-asserts remaining capacity.
+    /// Write a single byte. Asserts remaining capacity.
     #[inline(always)]
     pub(crate) fn push_byte(&mut self, b: u8) {
-        debug_assert!(
+        assert!(
             self.ptr < self.end,
             "BufCursor overflow: need 1 byte, have 0",
         );
-        // SAFETY: Same invariant as push_static.
+        // SAFETY: Same invariant as push_static; assert above verifies.
         unsafe {
             *self.ptr = b;
             self.ptr = self.ptr.add(1);
@@ -365,16 +365,16 @@ impl<'a> BufCursor<'a> {
 
     /// Write a u64 as decimal ASCII directly into the cursor.
     ///
-    /// Requires at most 20 bytes of remaining capacity. Delegates to
-    /// [`format_u64_raw`] for the digit decomposition.
+    /// Requires at most 20 bytes of remaining capacity. Asserts remaining
+    /// capacity to prevent silent buffer overruns.
     #[inline(always)]
     pub(crate) fn push_u64(&mut self, n: u64) {
-        debug_assert!(
+        assert!(
             (self.end as usize) - (self.ptr as usize) >= 20,
             "BufCursor overflow: need 20 bytes for u64, have {}",
             (self.end as usize) - (self.ptr as usize),
         );
-        // SAFETY: debug_assert above guarantees >= 20 bytes of capacity.
+        // SAFETY: assert above guarantees >= 20 bytes of capacity.
         // `format_u64_raw` writes 1..=20 bytes and returns the count.
         let digits = unsafe { format_u64_raw(n, self.ptr) };
         // SAFETY: `digits` bytes were written starting at `self.ptr`.
@@ -937,81 +937,88 @@ mod sse2 {
 
 /// Write a JSON-escaped UTF-8 string (without surrounding quotes).
 ///
-/// On aarch64, uses NEON SIMD to bulk-copy runs of safe ASCII characters.
-/// On x86_64, uses SSE2 for the same 16-byte vectorized scan.
-/// Falls back to scalar per-byte escaping for short strings or when
-/// escape-worthy characters are encountered.
-#[inline]
-pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>) {
-    // No pre-reserve here: the SIMD paths and scalar path each manage
-    // their own capacity internally.
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    {
-        if s.len() >= 16 {
-            // SAFETY: NEON is guaranteed on aarch64. The function operates on
-            // a valid &str and writes only to the caller-owned Vec<u8>.
-            unsafe {
-                neon::write_json_str_neon(s, buf);
+/// Dispatch to SIMD (NEON/SSE2) or scalar JSON encoding based on platform
+/// and input length.
+///
+/// Each generated function checks whether the input is at least 16 bytes
+/// (the SIMD vector width) and dispatches accordingly. The SIMD paths are
+/// gated by `#[cfg]` — on unsupported architectures or under Miri the scalar
+/// fallback is used unconditionally.
+macro_rules! dispatch_simd_or_scalar {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($input:ident : $input_ty:ty, buf: &mut Vec<u8>);
+        neon   = $neon_fn:path;
+        sse2   = $sse2_fn:path;
+        scalar = $scalar_fn:path;
+    ) => {
+        $(#[$meta])*
+        #[inline]
+        $vis fn $name($input: $input_ty, buf: &mut Vec<u8>) {
+            // No pre-reserve: SIMD and scalar paths manage capacity internally.
+            #[cfg(all(target_arch = "aarch64", not(miri)))]
+            {
+                if $input.len() >= 16 {
+                    // SAFETY: NEON is guaranteed on all AArch64 targets.
+                    // `$input` satisfies the SIMD function's contract:
+                    //   - `&str` callers guarantee valid UTF-8 (high bytes
+                    //     are valid multi-byte continuations).
+                    //   - `&[u8]` callers pass arbitrary bytes; the SIMD
+                    //     function delegates non-ASCII tails to scalar
+                    //     UTF-8 validation.
+                    // Output goes solely to the caller-owned `buf`.
+                    unsafe { $neon_fn($input, buf); }
+                    return;
+                }
             }
-            return;
-        }
-    }
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    {
-        if s.len() >= 16 {
-            // SAFETY: SSE2 is guaranteed on x86_64. The function operates on
-            // a valid &str and writes only to the caller-owned Vec<u8>.
-            unsafe {
-                sse2::write_json_str_sse2(s, buf);
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            {
+                if $input.len() >= 16 {
+                    // SAFETY: SSE2 is guaranteed on all x86_64 targets.
+                    // Same input contract as the NEON path above.
+                    unsafe { $sse2_fn($input, buf); }
+                    return;
+                }
             }
-            return;
+            $scalar_fn($input, buf);
         }
-    }
-    write_json_str_scalar(s, buf);
+    };
 }
 
-/// Write raw bytes as a JSON string value (without surrounding quotes).
-///
-/// The algorithm walks `bytes` left-to-right:
-///
-/// 1. **ASCII control / special** (`0x00..=0x1f`, `"`, `\`) — JSON-escape.
-/// 2. **ASCII printable** (`0x20..=0x7e`) — pass through verbatim.
-/// 3. **High byte** (`0x80..=0xff`) — attempt UTF-8 validation on the
-///    *remainder* of the slice:
-///    - If the entire remainder is valid UTF-8, delegate to [`write_json_str`]
-///      (which handles escaping of control chars within valid UTF-8) and return.
-///    - Otherwise, copy the valid prefix via `write_json_str`, advance `i`
-///      past it, and escape the first invalid byte as `\u00XX`. The loop then
-///      continues from the next byte.
-///
-/// On aarch64 (NEON) and x86_64 (SSE2), a SIMD fast path scans 16 bytes at a
-/// time for safe ASCII runs.
-pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
-    // No pre-reserve here: the SIMD paths and scalar path each manage
-    // their own capacity internally.
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    {
-        if bytes.len() >= 16 {
-            // SAFETY: NEON is guaranteed on aarch64. The function reads from a
-            // valid byte slice and writes only to the caller-owned Vec<u8>.
-            unsafe {
-                neon::write_json_bytes_neon(bytes, buf);
-            }
-            return;
-        }
-    }
-    #[cfg(all(target_arch = "x86_64", not(miri)))]
-    {
-        if bytes.len() >= 16 {
-            // SAFETY: SSE2 is guaranteed on x86_64. The function reads from a
-            // valid byte slice and writes only to the caller-owned Vec<u8>.
-            unsafe {
-                sse2::write_json_bytes_sse2(bytes, buf);
-            }
-            return;
-        }
-    }
-    write_json_bytes_scalar(bytes, buf);
+dispatch_simd_or_scalar! {
+    /// Write a `&str` as a JSON string value (without surrounding quotes).
+    ///
+    /// On aarch64, uses NEON SIMD to bulk-copy runs of safe ASCII characters.
+    /// On x86_64, uses SSE2 for the same 16-byte vectorized scan.
+    /// Falls back to scalar per-byte escaping for short strings or when
+    /// escape-worthy characters are encountered.
+    pub(crate) fn write_json_str(s: &str, buf: &mut Vec<u8>);
+    neon   = neon::write_json_str_neon;
+    sse2   = sse2::write_json_str_sse2;
+    scalar = write_json_str_scalar;
+}
+
+dispatch_simd_or_scalar! {
+    /// Write raw bytes as a JSON string value (without surrounding quotes).
+    ///
+    /// The algorithm walks `bytes` left-to-right:
+    ///
+    /// 1. **ASCII control / special** (`0x00..=0x1f`, `"`, `\`) — JSON-escape.
+    /// 2. **ASCII printable** (`0x20..=0x7e`) — pass through verbatim.
+    /// 3. **High byte** (`0x80..=0xff`) — attempt UTF-8 validation on the
+    ///    *remainder* of the slice:
+    ///    - If the entire remainder is valid UTF-8, delegate to [`write_json_str`]
+    ///      (which handles escaping of control chars within valid UTF-8) and return.
+    ///    - Otherwise, copy the valid prefix via `write_json_str`, advance `i`
+    ///      past it, and escape the first invalid byte as `\u00XX`. The loop then
+    ///      continues from the next byte.
+    ///
+    /// On aarch64 (NEON) and x86_64 (SSE2), a SIMD fast path scans 16 bytes at a
+    /// time for safe ASCII runs.
+    pub(crate) fn write_json_bytes(bytes: &[u8], buf: &mut Vec<u8>);
+    neon   = neon::write_json_bytes_neon;
+    sse2   = sse2::write_json_bytes_sse2;
+    scalar = write_json_bytes_scalar;
 }
 
 #[cfg(test)]

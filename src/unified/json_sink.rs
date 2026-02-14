@@ -40,13 +40,13 @@
 //! - Broken-pipe errors are silently swallowed (for piped consumers like
 //!   `head`); all other I/O errors panic.
 
-use std::io::{BufWriter, ErrorKind, Write};
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::events::{
     encode_commit_meta, encode_diagnostic, encode_finding, encode_identity_dictionary,
-    encode_progress, encode_summary, with_format_buf, EventSink, ScanEvent,
+    encode_progress, encode_summary, handle_sink_io, with_format_buf, EventSink, ScanEvent,
 };
 
 /// Default `BufWriter` capacity (64 KiB).
@@ -84,6 +84,15 @@ impl<W: Write + Send> JsonEventSink<W> {
             first: AtomicBool::new(true),
         }
     }
+
+    #[cfg(test)]
+    fn new_with_capacity_for_test(mut writer: W, capacity: usize) -> Self {
+        let _ = writer.write_all(b"[");
+        Self {
+            writer: Mutex::new(BufWriter::with_capacity(capacity, writer)),
+            first: AtomicBool::new(true),
+        }
+    }
 }
 
 impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
@@ -108,44 +117,69 @@ impl<W: Write + Send + 'static> EventSink for JsonEventSink<W> {
                 } else {
                     b",\n"
                 };
-                if let Err(e) = writer.write_all(sep) {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        return;
-                    }
-                    panic!("json event sink write failed: {}", e);
+                if handle_sink_io(writer.write_all(sep), "json event sink write") {
+                    return;
                 }
-                if let Err(e) = writer.write_all(bytes) {
-                    if e.kind() == ErrorKind::BrokenPipe {
-                        return;
-                    }
-                    panic!("json event sink write failed: {}", e);
-                }
+                handle_sink_io(writer.write_all(bytes), "json event sink write");
             },
         );
     }
 
     fn flush(&self) {
         let mut writer = self.writer.lock().expect("json sink mutex poisoned");
-        if let Err(e) = writer.write_all(b"\n]\n") {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("json event sink write failed: {}", e);
+        if handle_sink_io(writer.write_all(b"\n]\n"), "json event sink write") {
+            return;
         }
-        if let Err(e) = writer.flush() {
-            if e.kind() == ErrorKind::BrokenPipe {
-                return;
-            }
-            panic!("json event sink flush failed: {}", e);
-        }
+        handle_sink_io(writer.flush(), "json event sink flush");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, ErrorKind, Write};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
     use crate::unified::events::{FindingEvent, ProgressEvent, SummaryEvent};
     use crate::unified::SourceKind;
+
+    /// `mode = 0`: all I/O succeeds.
+    /// `mode = 1`: first write returns BrokenPipe, subsequent writes/flush fail.
+    struct ModeWriter {
+        mode: Arc<AtomicU8>,
+        mode1_write_calls: Arc<AtomicUsize>,
+        mode1_flush_calls: Arc<AtomicUsize>,
+    }
+
+    impl Write for ModeWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.mode.load(Ordering::SeqCst) == 0 {
+                return Ok(buf.len());
+            }
+            let call = self.mode1_write_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                Err(io::Error::new(ErrorKind::BrokenPipe, "pipe closed"))
+            } else {
+                Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "write should have short-circuited after BrokenPipe",
+                ))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.mode.load(Ordering::SeqCst) == 0 {
+                return Ok(());
+            }
+            self.mode1_flush_calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "flush should not be called after BrokenPipe",
+            ))
+        }
+    }
 
     fn collect_json(events: Vec<ScanEvent<'_>>) -> String {
         let buf = Vec::new();
@@ -214,6 +248,64 @@ mod tests {
         let out = collect_json(vec![]);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn emit_short_circuits_after_broken_pipe() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let mode1_write_calls = Arc::new(AtomicUsize::new(0));
+        let mode1_flush_calls = Arc::new(AtomicUsize::new(0));
+        let sink = JsonEventSink::new_with_capacity_for_test(
+            ModeWriter {
+                mode: mode.clone(),
+                mode1_write_calls: mode1_write_calls.clone(),
+                mode1_flush_calls: mode1_flush_calls.clone(),
+            },
+            0,
+        );
+        mode.store(1, Ordering::SeqCst);
+
+        let r = catch_unwind(AssertUnwindSafe(|| sink.emit(sample_finding())));
+        assert!(r.is_ok(), "emit should swallow BrokenPipe and return");
+        assert_eq!(
+            mode1_write_calls.load(Ordering::SeqCst),
+            1,
+            "payload write must not run after BrokenPipe separator write",
+        );
+        assert_eq!(
+            mode1_flush_calls.load(Ordering::SeqCst),
+            0,
+            "emit should not call flush",
+        );
+    }
+
+    #[test]
+    fn flush_short_circuits_after_broken_pipe() {
+        let mode = Arc::new(AtomicU8::new(0));
+        let mode1_write_calls = Arc::new(AtomicUsize::new(0));
+        let mode1_flush_calls = Arc::new(AtomicUsize::new(0));
+        let sink = JsonEventSink::new_with_capacity_for_test(
+            ModeWriter {
+                mode: mode.clone(),
+                mode1_write_calls: mode1_write_calls.clone(),
+                mode1_flush_calls: mode1_flush_calls.clone(),
+            },
+            0,
+        );
+        mode.store(1, Ordering::SeqCst);
+
+        let r = catch_unwind(AssertUnwindSafe(|| sink.flush()));
+        assert!(r.is_ok(), "flush should swallow BrokenPipe and return");
+        assert_eq!(
+            mode1_write_calls.load(Ordering::SeqCst),
+            1,
+            "flush trailer write should be attempted once",
+        );
+        assert_eq!(
+            mode1_flush_calls.load(Ordering::SeqCst),
+            0,
+            "writer.flush must not run after BrokenPipe trailer write",
+        );
     }
 }
 

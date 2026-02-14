@@ -470,3 +470,27 @@ fn same_scan_raw_does_not_replace_transform_finding() {
         "original transform hash should be preserved"
     );
 }
+
+// ── DedupKey packing boundary tests ─────────────────────────────────────
+
+#[test]
+fn pack_rule_id_at_max_boundary() {
+    use super::{pack_rule_id_with_variant, DEDUP_RULE_ID_BITS, DEDUP_RULE_ID_MAX};
+
+    // Exactly at DEDUP_RULE_ID_MAX should succeed.
+    let packed = pack_rule_id_with_variant(DEDUP_RULE_ID_MAX, 0);
+    assert_eq!(packed, DEDUP_RULE_ID_MAX);
+
+    // With variant discriminator.
+    let packed = pack_rule_id_with_variant(DEDUP_RULE_ID_MAX, 2);
+    assert_eq!(packed & DEDUP_RULE_ID_MAX, DEDUP_RULE_ID_MAX);
+    assert_eq!(packed >> DEDUP_RULE_ID_BITS, 2);
+}
+
+#[test]
+#[should_panic(expected = "rule_id exceeds 24-bit dedup budget")]
+fn pack_rule_id_overflow_panics() {
+    use super::{pack_rule_id_with_variant, DEDUP_RULE_ID_MAX};
+
+    pack_rule_id_with_variant(DEDUP_RULE_ID_MAX + 1, 0);
+}

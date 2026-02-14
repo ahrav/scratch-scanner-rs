@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::api::FileId;
 use crate::archive::formats::TarCursor;
 use crate::archive::formats::TarRead;
+use crate::archive::util::write_u64_hex_lower;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult,
     EntryPathCanonicalizer, PartialReason, VirtualPathBuilder,
@@ -18,7 +19,10 @@ use crate::store::{FsFindingRecord, StoreProducer};
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_gzip::process_gzip_file;
-use super::local_fs_owner::{FileTask, LocalScratch};
+use super::local_fs_owner::{
+    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
+    FileTask, LocalScratch,
+};
 use super::local_fs_tar::{process_tar_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
 use super::metrics::WorkerMetricsLocal;
@@ -51,20 +55,6 @@ pub(super) fn alloc_virtual_file_id(next_virtual_file_id: &mut u32) -> FileId {
 /// - `z` = ZIP local file header offset (when valid)
 /// - `c` = ZIP central directory file header offset (fallback)
 pub(super) const LOCATOR_LEN: usize = 18;
-
-/// Write a `u64` as 16 lowercase hex digits into `out16`.
-#[inline(always)]
-pub(super) fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = match nyb {
-            0..=9 => b'0' + nyb,
-            _ => b'a' + (nyb - 10),
-        };
-    }
-}
 
 /// Format a locator suffix into `out` and return the full slice.
 ///
@@ -249,6 +239,90 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             abort_run: scratch.abort_run.as_ref(),
         }
     }
+
+    /// Scan a buffer chunk, drain/dedupe findings, emit events + persistence,
+    /// and update chunk metrics.
+    ///
+    /// Shared core used by archive entry scanning loops (gzip, tar, zip).
+    /// The caller is responsible for reading bytes, charging budgets, and
+    /// managing the outer loop condition — this method handles everything
+    /// from `scan_chunk_into` through carry/offset bookkeeping.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scan_and_emit_chunk(
+        &mut self,
+        buf: &[u8],
+        carry: usize,
+        offset: u64,
+        allowed: u64,
+        overlap: usize,
+        file_id: FileId,
+        display: &[u8],
+        entry_scanned: &mut bool,
+    ) -> ChunkScanResult {
+        let allowed_usize = allowed as usize;
+        let read_len = carry + allowed_usize;
+        let base_offset = offset.saturating_sub(carry as u64);
+        let data = &buf[..read_len];
+
+        self.engine
+            .scan_chunk_into(data, file_id, base_offset, self.scan_scratch);
+        let engine_dropped = self.scan_scratch.dropped_findings();
+        let before_prefix = self.scan_scratch.pending_findings_len();
+        if !*entry_scanned {
+            self.metrics.archive.record_entry_scanned();
+            *entry_scanned = true;
+        }
+
+        self.scan_scratch.drop_prefix_findings(offset);
+        let after_prefix = self.scan_scratch.pending_findings_len();
+
+        self.pending.clear();
+        self.scan_scratch.drain_findings_into(self.pending);
+
+        let before_dedupe = self.pending.len();
+        if self.dedupe && before_dedupe > 1 {
+            dedupe_findings(self.pending);
+        }
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(before_dedupe.saturating_sub(self.pending.len()));
+        account_effective_dropped_findings(self.metrics, engine_dropped, scheduler_pruned);
+
+        self.metrics.findings_emitted = self
+            .metrics
+            .findings_emitted
+            .wrapping_add(self.pending.len() as u64);
+
+        emit_persistence_batch(
+            self.store_producer,
+            self.event_sink,
+            display,
+            self.pending,
+            self.persist_batch,
+            self.metrics,
+        );
+        emit_findings(self.engine.as_ref(), self.event_sink, display, self.pending);
+
+        self.metrics.chunks_scanned = self.metrics.chunks_scanned.saturating_add(1);
+        self.metrics.bytes_scanned = self.metrics.bytes_scanned.saturating_add(allowed);
+
+        ChunkScanResult {
+            offset: offset.saturating_add(allowed),
+            have: read_len,
+            carry: overlap.min(read_len),
+        }
+    }
+}
+
+/// Loop-iteration state returned by [`ArchiveScanCtx::scan_and_emit_chunk`].
+pub(super) struct ChunkScanResult {
+    /// Byte offset for the next iteration.
+    pub offset: u64,
+    /// Number of valid bytes currently in the buffer.
+    pub have: usize,
+    /// Carry-forward overlap for the next read.
+    pub carry: usize,
 }
 
 /// Charge decompressed bytes that were read but not scanned (entry truncation).
@@ -351,4 +425,50 @@ pub(super) fn discard_remaining_payload(
         remaining = remaining.saturating_sub(n as u64);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_virtual_file_id_sequential_and_wrapping() {
+        let mut next = 0x8000_0000u32;
+
+        let id0 = alloc_virtual_file_id(&mut next);
+        assert_eq!(id0.0, 0x8000_0000);
+        assert_eq!(next, 0x8000_0001);
+
+        let id1 = alloc_virtual_file_id(&mut next);
+        assert_eq!(id1.0, 0x8000_0001);
+        assert_eq!(next, 0x8000_0002);
+    }
+
+    #[test]
+    fn alloc_virtual_file_id_wraps_at_boundary() {
+        // Just before the mask wraps.
+        let mut next = 0xFFFF_FFFFu32;
+
+        let id = alloc_virtual_file_id(&mut next);
+        assert_eq!(id.0, 0xFFFF_FFFF);
+        // After wrapping: (0xFFFF_FFFF + 1) & 0x7FFF_FFFF | 0x8000_0000
+        assert_eq!(next, 0x8000_0000);
+    }
+
+    #[test]
+    fn build_locator_format() {
+        let mut buf = [0u8; LOCATOR_LEN];
+        let loc = build_locator(&mut buf, b't', 0x0000_0000_0000_1234);
+
+        assert_eq!(loc[0], b'@');
+        assert_eq!(loc[1], b't');
+        assert_eq!(&loc[2..], b"0000000000001234");
+    }
+
+    #[test]
+    fn build_locator_zero_value() {
+        let mut buf = [0u8; LOCATOR_LEN];
+        let loc = build_locator(&mut buf, b'z', 0);
+        assert_eq!(&loc[2..], b"0000000000000000");
+    }
 }

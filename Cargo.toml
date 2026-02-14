@@ -227,6 +227,7 @@ opt-level = 1
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+overflow-checks = true
 
 [profile.bench]
 inherits = "release"

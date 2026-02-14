@@ -768,34 +768,7 @@ impl<R: ?Sized + Read> Read for LimitedRead<'_, R> {
 
 impl<R: ?Sized + Read> TarRead for LimitedRead<'_, R> {}
 
-/// Read wrapper that counts bytes read from the underlying reader.
-///
-/// Used to report compressed byte deltas for ratio/budget accounting.
-pub struct CountedRead<R> {
-    inner: R,
-    bytes: u64,
-}
-
-impl<R> CountedRead<R> {
-    #[inline]
-    pub fn new(inner: R) -> Self {
-        Self { inner, bytes: 0 }
-    }
-
-    #[inline]
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-}
-
-impl<R: Read> Read for CountedRead<R> {
-    #[inline]
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(dst)?;
-        self.bytes = self.bytes.saturating_add(n as u64);
-        Ok(n)
-    }
-}
+pub use crate::archive::util::CountedRead;
 
 fn rfind_sig_u32_le(hay: &[u8], sig: u32) -> Option<usize> {
     if hay.len() < 4 {

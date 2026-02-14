@@ -13,6 +13,7 @@
 //!   using `ArchiveConfig` limits so expected paths match production behavior.
 
 use crate::archive::formats::tar::TAR_BLOCK_LEN;
+use crate::archive::util::write_u64_hex_lower;
 use crate::archive::{
     ArchiveConfig, EntryPathCanonicalizer, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
 };
@@ -230,18 +231,6 @@ fn build_locator(kind: u8, value: u64) -> [u8; LOCATOR_LEN] {
     out[1] = kind;
     write_u64_hex_lower(value, &mut out[2..]);
     out
-}
-
-fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
-    debug_assert_eq!(out16.len(), 16);
-    for (i, out) in out16.iter_mut().enumerate().take(16) {
-        let shift = (15 - i) * 4;
-        let nyb = ((x >> shift) & 0xF) as u8;
-        *out = match nyb {
-            0..=9 => b'0' + nyb,
-            _ => b'a' + (nyb - 10),
-        };
-    }
 }
 
 #[inline(always)]
