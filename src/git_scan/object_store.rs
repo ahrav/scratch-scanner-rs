@@ -63,14 +63,15 @@ use super::errors::TreeDiffError;
 use super::midx::MidxView;
 use super::object_id::OidBytes;
 use super::pack_inflate::{
-    apply_delta, inflate_exact, inflate_limited, EntryKind, ObjectKind, PackFile, PackHeader,
+    apply_delta, inflate_exact_with, inflate_limited, inflate_limited_with, EntryKind, ObjectKind,
+    PackFile, PackHeader,
 };
 use super::perf;
 use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
 use super::spill_arena::{SpillArena, SpillArenaError, SpillSlice};
 use super::tree_cache::{TreeCache, TreeCacheHandle};
-use super::tree_delta_cache::{TreeDeltaCache, TreeDeltaCacheHandle};
+use super::tree_delta_cache::TreeDeltaCache;
 use super::tree_diff_limits::TreeDiffLimits;
 
 /// Maximum entry header bytes to parse in pack files.
@@ -280,6 +281,51 @@ impl TreeBytes {
     }
 }
 
+/// Scratch buffers reused across delta resolution hops.
+///
+/// Eliminates per-hop `Vec::new()` / `Vec::with_capacity()` allocations
+/// in [`ObjectStore::read_pack_object`]. The decompressor is reset before
+/// each inflate call so no stale state leaks between objects.
+struct TreeDecodeBufs {
+    de: flate2::Decompress,
+    inflate_buf: Vec<u8>,
+    result_buf: Vec<u8>,
+    base_buf: Vec<u8>,
+}
+
+impl std::fmt::Debug for TreeDecodeBufs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeDecodeBufs")
+            .field("inflate_buf.cap", &self.inflate_buf.capacity())
+            .field("result_buf.cap", &self.result_buf.capacity())
+            .field("base_buf.cap", &self.base_buf.capacity())
+            .finish()
+    }
+}
+
+impl TreeDecodeBufs {
+    fn new() -> Self {
+        Self {
+            de: flate2::Decompress::new(true),
+            inflate_buf: Vec::new(),
+            result_buf: Vec::new(),
+            base_buf: Vec::new(),
+        }
+    }
+}
+
+/// One frame of a pending delta chain collected during the walk-forward
+/// phase of iterative delta resolution.
+#[derive(Clone, Copy, Debug)]
+struct TreeDeltaFrame {
+    /// Pack offset of this delta entry (used as cache key during unwind).
+    offset: u64,
+    /// Byte offset where the compressed delta payload begins in the pack.
+    data_start: usize,
+    /// Expected decompressed delta size (from the entry header).
+    delta_size: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectSource {
     Pack,
@@ -360,11 +406,14 @@ impl<'a> ObjectStoreLayout<'a> {
 /// Pack/loose object store for tree loading.
 ///
 /// Holds a borrowed MIDX view (tied to the repo job's bytes view lifetime) and
-/// lazily maps pack files on demand. Pack bytes are cached so recursive delta
+/// lazily maps pack files on demand. Pack bytes are cached so iterative delta
 /// resolution can borrow pack data without aliasing `self`.
 ///
 /// The tree cache stores decompressed payloads; cache hits return pinned
 /// handles so callers can borrow the bytes without copying.
+///
+/// Delta resolution uses iterative walk-forward + unwind phases with
+/// reusable scratch buffers (`decode_bufs`) to eliminate per-hop allocations.
 #[derive(Debug)]
 pub struct ObjectStore<'a> {
     oid_len: u8,
@@ -375,6 +424,8 @@ pub struct ObjectStore<'a> {
     loose_dirs: Arc<[PathBuf]>,
     tree_cache: TreeCache,
     tree_delta_cache: TreeDeltaCache,
+    /// Reusable scratch buffers for iterative delta resolution.
+    decode_bufs: TreeDecodeBufs,
     spill: Option<SpillArena>,
     /// Minimum payload size to consider spilling (smaller payloads stay in RAM).
     spill_min_bytes: usize,
@@ -457,6 +508,7 @@ impl<'a> ObjectStore<'a> {
             loose_dirs: Arc::clone(&layout.loose_dirs),
             tree_cache,
             tree_delta_cache,
+            decode_bufs: TreeDecodeBufs::new(),
             spill: Some(spill),
             spill_min_bytes,
             spill_exhausted: false,
@@ -535,6 +587,23 @@ impl<'a> ObjectStore<'a> {
         Ok(Some(obj))
     }
 
+    /// Resolves a pack object at `offset`, iteratively unwinding any delta
+    /// chain.
+    #[allow(unused_assignments)] // base_kind/base_chain_len initializers
+    ///
+    /// **Phase 1 — Walk forward**: follows OFS delta base offsets (and delta
+    /// cache hits) without recursion, pushing one `TreeDeltaFrame` per hop.
+    /// The walk terminates when a non-delta root is reached, a delta cache
+    /// hit supplies the base bytes, or a REF delta requires a cross-pack
+    /// base loaded via [`Self::load_object_with_depth`].
+    ///
+    /// **Phase 2 — Unwind backward**: iterates the frame stack in reverse,
+    /// inflating each delta payload and applying it against the current base
+    /// in `decode_bufs`, swapping `base_buf`/`result_buf` after each step.
+    ///
+    /// Scratch buffers in `decode_bufs` are reused across calls, eliminating
+    /// per-hop `Vec::new()` / `Vec::with_capacity()` allocations that the
+    /// previous recursive implementation performed.
     fn read_pack_object(
         &mut self,
         pack_id: u16,
@@ -544,215 +613,240 @@ impl<'a> ObjectStore<'a> {
         depth: u8,
         root_oid: Option<OidBytes>,
     ) -> Result<DecodedTreeObject, TreeDiffError> {
-        // Pack objects can be delta chains; bound recursion by depth.
-        // Use the cached PackHeader to avoid re-validating the "PACK"
-        // signature and version on every recursive delta hop.
         let pack = PackFile::from_header(pack_bytes, pack_header);
-        let header = pack
-            .entry_header_at(offset, MAX_ENTRY_HEADER_BYTES)
-            .map_err(|err| TreeDiffError::ObjectStoreError {
-                detail: format!(
-                    "pack {pack_id} offset {offset}: {err}{}",
-                    format_root_oid(root_oid)
-                ),
-            })?;
+        let max_object_bytes = self.max_object_bytes;
 
-        let payload_size =
-            usize::try_from(header.size).map_err(|_| TreeDiffError::ObjectStoreError {
-                detail: format!(
-                    "pack {pack_id} offset {offset}: object size overflow{}",
-                    format_root_oid(root_oid)
-                ),
-            })?;
+        // -- Phase 1: Walk forward through the delta chain -----------------
+        let mut delta_stack: Vec<TreeDeltaFrame> = Vec::new();
+        let mut current_offset = offset;
+        let mut remaining_depth = depth;
+        let mut base_kind: ObjectKind = ObjectKind::Tree; // set below
+        let mut base_chain_len: u8 = 0; // set below
 
-        match header.kind {
-            EntryKind::NonDelta { kind } => {
-                if payload_size > self.max_object_bytes {
-                    return Err(TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: object size {payload_size} exceeds cap {}{}",
-                            self.max_object_bytes,
-                            format_root_oid(root_oid)
-                        ),
-                    });
-                }
-
-                let mut out = Vec::with_capacity(payload_size);
-                let (inflate_result, inflate_nanos) = perf::time(|| {
-                    inflate_exact(pack.slice_from(header.data_start), &mut out, payload_size)
-                });
-                inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
+        loop {
+            let header = pack
+                .entry_header_at(current_offset, MAX_ENTRY_HEADER_BYTES)
+                .map_err(|err| TreeDiffError::ObjectStoreError {
                     detail: format!(
-                        "pack {pack_id} offset {offset}: {err}{}",
+                        "pack {pack_id} offset {current_offset}: {err}{}",
                         format_root_oid(root_oid)
                     ),
                 })?;
-                perf::record_tree_inflate(out.len(), inflate_nanos);
-                let chain_len = 0;
-                perf::record_tree_delta_chain(chain_len);
-                if kind == ObjectKind::Tree {
-                    self.tree_delta_cache
-                        .insert(pack_id, offset, kind, chain_len, &out);
-                }
-                Ok(DecodedTreeObject {
-                    kind,
-                    bytes: out,
-                    chain_len,
-                })
-            }
-            EntryKind::OfsDelta { base_offset } => {
-                if payload_size > self.max_object_bytes {
-                    return Err(TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: delta payload size {payload_size} exceeds cap {}{}",
-                            self.max_object_bytes,
-                            format_root_oid(root_oid)
-                        ),
-                    });
-                }
-                if depth == 0 {
-                    return Err(TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: delta chain too deep{}",
-                            format_root_oid(root_oid)
-                        ),
-                    });
-                }
-                enum BaseSource {
-                    Cached(TreeDeltaCacheHandle),
-                    Owned(DecodedTreeObject),
-                }
 
-                let (base_result, base_nanos) = perf::time(|| {
-                    if let Some(handle) = self.tree_delta_cache.get_handle(pack_id, base_offset) {
-                        perf::record_tree_delta_cache_hit(handle.len());
-                        return Ok((BaseSource::Cached(handle), true));
-                    }
-                    perf::record_tree_delta_cache_miss();
-                    let base = self.read_pack_object(
-                        pack_id,
-                        pack_bytes,
-                        pack_header,
-                        base_offset,
-                        depth - 1,
-                        root_oid,
-                    )?;
-                    Ok((BaseSource::Owned(base), false))
-                });
-                let (base_source, cache_hit) = base_result?;
-                if cache_hit {
-                    perf::record_tree_delta_cache_hit_nanos(base_nanos);
+            let payload_size =
+                usize::try_from(header.size).map_err(|_| TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {current_offset}: object size overflow{}",
+                        format_root_oid(root_oid)
+                    ),
+                })?;
+
+            if payload_size > max_object_bytes {
+                let label = if delta_stack.is_empty() {
+                    "object size"
                 } else {
-                    perf::record_tree_delta_cache_miss_nanos(base_nanos);
-                }
-
-                let (base_kind, base_chain_len, base_bytes) = match &base_source {
-                    BaseSource::Cached(handle) => {
-                        (handle.kind(), handle.chain_len(), handle.as_slice())
-                    }
-                    BaseSource::Owned(base) => (base.kind, base.chain_len, base.bytes.as_slice()),
+                    "delta payload size"
                 };
-
-                let mut delta = Vec::with_capacity(payload_size.min(self.max_object_bytes));
-                let (inflate_result, inflate_nanos) = perf::time(|| {
-                    inflate_limited(pack.slice_from(header.data_start), &mut delta, payload_size)
+                return Err(TreeDiffError::ObjectStoreError {
+                    detail: format!(
+                        "pack {pack_id} offset {current_offset}: {label} {payload_size} exceeds cap {max_object_bytes}{}",
+                        format_root_oid(root_oid)
+                    ),
                 });
-                inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
-                    detail: format!(
-                        "pack {pack_id} offset {offset}: delta inflate failed: {err} (base offset {base_offset}){}",
-                        format_root_oid(root_oid)
-                    ),
-                })?;
-                perf::record_tree_inflate(delta.len(), inflate_nanos);
-
-                let mut out = Vec::new();
-                let (apply_result, apply_nanos) =
-                    perf::time(|| apply_delta(base_bytes, &delta, &mut out, self.max_object_bytes));
-                apply_result.map_err(|err| TreeDiffError::ObjectStoreError {
-                    detail: format!(
-                        "pack {pack_id} offset {offset}: delta apply failed: {err} (base offset {base_offset}){}",
-                        format_root_oid(root_oid)
-                    ),
-                })?;
-                perf::record_tree_delta_apply(out.len(), apply_nanos);
-
-                let chain_len = base_chain_len.saturating_add(1);
-                perf::record_tree_delta_chain(chain_len);
-                if base_kind == ObjectKind::Tree {
-                    self.tree_delta_cache
-                        .insert(pack_id, offset, base_kind, chain_len, &out);
-                }
-                Ok(DecodedTreeObject {
-                    kind: base_kind,
-                    bytes: out,
-                    chain_len,
-                })
             }
-            EntryKind::RefDelta { base_oid } => {
-                if payload_size > self.max_object_bytes {
-                    return Err(TreeDiffError::ObjectStoreError {
+
+            match header.kind {
+                EntryKind::NonDelta { kind } => {
+                    // Root of the chain: inflate directly into base_buf.
+                    let (inflate_result, inflate_nanos) = perf::time(|| {
+                        inflate_exact_with(
+                            &mut self.decode_bufs.de,
+                            pack.slice_from(header.data_start),
+                            &mut self.decode_bufs.base_buf,
+                            payload_size,
+                        )
+                    });
+                    inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
                         detail: format!(
-                            "pack {pack_id} offset {offset}: delta payload size {payload_size} exceeds cap {}{}",
-                            self.max_object_bytes,
+                            "pack {pack_id} offset {current_offset}: {err}{}",
                             format_root_oid(root_oid)
                         ),
+                    })?;
+                    perf::record_tree_inflate(self.decode_bufs.base_buf.len(), inflate_nanos);
+                    base_kind = kind;
+                    base_chain_len = 0;
+                    break;
+                }
+
+                EntryKind::OfsDelta { base_offset } => {
+                    if remaining_depth == 0 {
+                        return Err(TreeDiffError::ObjectStoreError {
+                            detail: format!(
+                                "pack {pack_id} offset {current_offset}: delta chain too deep{}",
+                                format_root_oid(root_oid)
+                            ),
+                        });
+                    }
+
+                    // Check delta cache for the base.
+                    let (cache_handle, cache_nanos) =
+                        perf::time(|| self.tree_delta_cache.get_handle(pack_id, base_offset));
+
+                    if let Some(handle) = cache_handle {
+                        perf::record_tree_delta_cache_hit(handle.len());
+                        perf::record_tree_delta_cache_hit_nanos(cache_nanos);
+
+                        // Copy cached base into base_buf, then drop the pin.
+                        self.decode_bufs.base_buf.clear();
+                        self.decode_bufs
+                            .base_buf
+                            .extend_from_slice(handle.as_slice());
+                        base_kind = handle.kind();
+                        base_chain_len = handle.chain_len();
+                        drop(handle);
+
+                        // Push this delta frame for unwind.
+                        delta_stack.push(TreeDeltaFrame {
+                            offset: current_offset,
+                            data_start: header.data_start,
+                            delta_size: payload_size,
+                        });
+                        break;
+                    }
+
+                    perf::record_tree_delta_cache_miss();
+                    perf::record_tree_delta_cache_miss_nanos(cache_nanos);
+
+                    // Push frame and follow the base offset.
+                    delta_stack.push(TreeDeltaFrame {
+                        offset: current_offset,
+                        data_start: header.data_start,
+                        delta_size: payload_size,
                     });
+                    current_offset = base_offset;
+                    remaining_depth -= 1;
                 }
-                if depth == 0 {
-                    return Err(TreeDiffError::ObjectStoreError {
-                        detail: format!(
-                            "pack {pack_id} offset {offset}: delta chain too deep{}",
-                            format_root_oid(root_oid)
-                        ),
+
+                EntryKind::RefDelta { base_oid } => {
+                    if remaining_depth == 0 {
+                        return Err(TreeDiffError::ObjectStoreError {
+                            detail: format!(
+                                "pack {pack_id} offset {current_offset}: delta chain too deep{}",
+                                format_root_oid(root_oid)
+                            ),
+                        });
+                    }
+
+                    // Push this delta frame.
+                    delta_stack.push(TreeDeltaFrame {
+                        offset: current_offset,
+                        data_start: header.data_start,
+                        delta_size: payload_size,
                     });
+
+                    // Load external base. This may re-enter read_pack_object
+                    // via load_object_with_depth, reusing decode_bufs
+                    // internally; that is safe because the inner call fully
+                    // resolves before returning an owned Vec.
+                    let loaded = self.load_object_with_depth(&base_oid, remaining_depth - 1)?;
+                    base_kind = loaded.kind;
+                    base_chain_len = loaded.chain_len;
+
+                    // Copy loaded bytes into base_buf (inner call is done).
+                    self.decode_bufs.base_buf.clear();
+                    self.decode_bufs.base_buf.extend_from_slice(&loaded.bytes);
+                    break;
                 }
-                let loaded = self.load_object_with_depth(&base_oid, depth - 1)?;
-                let base_kind = loaded.kind;
-                let base_chain_len = loaded.chain_len;
-                let base_bytes = loaded.bytes;
-
-                let mut delta = Vec::with_capacity(payload_size.min(self.max_object_bytes));
-                let (inflate_result, inflate_nanos) = perf::time(|| {
-                    inflate_limited(pack.slice_from(header.data_start), &mut delta, payload_size)
-                });
-                inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
-                    detail: format!(
-                        "pack {pack_id} offset {offset}: delta inflate failed: {err} (base oid {base_oid}){}",
-                        format_root_oid(root_oid)
-                    ),
-                })?;
-                perf::record_tree_inflate(delta.len(), inflate_nanos);
-
-                let mut out = Vec::new();
-                let (apply_result, apply_nanos) = perf::time(|| {
-                    apply_delta(
-                        base_bytes.as_slice(),
-                        &delta,
-                        &mut out,
-                        self.max_object_bytes,
-                    )
-                });
-                apply_result.map_err(|err| TreeDiffError::ObjectStoreError {
-                    detail: format!(
-                        "pack {pack_id} offset {offset}: delta apply failed: {err} (base oid {base_oid}){}",
-                        format_root_oid(root_oid)
-                    ),
-                })?;
-                perf::record_tree_delta_apply(out.len(), apply_nanos);
-
-                let chain_len = base_chain_len.saturating_add(1);
-                perf::record_tree_delta_chain(chain_len);
-                if base_kind == ObjectKind::Tree {
-                    self.tree_delta_cache
-                        .insert(pack_id, offset, base_kind, chain_len, &out);
-                }
-                Ok(DecodedTreeObject {
-                    kind: base_kind,
-                    bytes: out,
-                    chain_len,
-                })
             }
         }
+
+        // -- Fast path: non-delta object (no frames pushed) ----------------
+        if delta_stack.is_empty() {
+            perf::record_tree_delta_chain(0);
+            if base_kind == ObjectKind::Tree {
+                self.tree_delta_cache.insert(
+                    pack_id,
+                    offset,
+                    base_kind,
+                    0,
+                    &self.decode_bufs.base_buf,
+                );
+            }
+            let bytes = std::mem::take(&mut self.decode_bufs.base_buf);
+            return Ok(DecodedTreeObject {
+                kind: base_kind,
+                bytes,
+                chain_len: 0,
+            });
+        }
+
+        // -- Phase 2: Unwind the delta stack in reverse --------------------
+        for frame in delta_stack.iter().rev() {
+            // Inflate the delta payload into inflate_buf.
+            let (inflate_result, inflate_nanos) = perf::time(|| {
+                inflate_limited_with(
+                    &mut self.decode_bufs.de,
+                    pack.slice_from(frame.data_start),
+                    &mut self.decode_bufs.inflate_buf,
+                    frame.delta_size,
+                )
+            });
+            inflate_result.map_err(|err| TreeDiffError::ObjectStoreError {
+                detail: format!(
+                    "pack {pack_id} offset {}: delta inflate failed: {err}{}",
+                    frame.offset,
+                    format_root_oid(root_oid)
+                ),
+            })?;
+            perf::record_tree_inflate(self.decode_bufs.inflate_buf.len(), inflate_nanos);
+
+            // Apply delta: base_buf × inflate_buf → result_buf.
+            // Split borrow decode_bufs fields to satisfy the borrow checker.
+            let (apply_result, apply_nanos) = perf::time(|| {
+                let TreeDecodeBufs {
+                    ref base_buf,
+                    ref inflate_buf,
+                    ref mut result_buf,
+                    ..
+                } = self.decode_bufs;
+                apply_delta(base_buf, inflate_buf, result_buf, max_object_bytes)
+            });
+            apply_result.map_err(|err| TreeDiffError::ObjectStoreError {
+                detail: format!(
+                    "pack {pack_id} offset {}: delta apply failed: {err}{}",
+                    frame.offset,
+                    format_root_oid(root_oid)
+                ),
+            })?;
+            perf::record_tree_delta_apply(self.decode_bufs.result_buf.len(), apply_nanos);
+
+            // Rotate: output becomes the next base.
+            std::mem::swap(
+                &mut self.decode_bufs.base_buf,
+                &mut self.decode_bufs.result_buf,
+            );
+
+            base_chain_len = base_chain_len.saturating_add(1);
+
+            // Offer intermediate result to the delta cache.
+            if base_kind == ObjectKind::Tree {
+                self.tree_delta_cache.insert(
+                    pack_id,
+                    frame.offset,
+                    base_kind,
+                    base_chain_len,
+                    &self.decode_bufs.base_buf,
+                );
+            }
+        }
+
+        perf::record_tree_delta_chain(base_chain_len);
+        let bytes = std::mem::take(&mut self.decode_bufs.base_buf);
+        Ok(DecodedTreeObject {
+            kind: base_kind,
+            bytes,
+            chain_len: base_chain_len,
+        })
     }
 
     fn load_object_from_loose(

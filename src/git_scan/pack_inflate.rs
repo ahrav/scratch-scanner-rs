@@ -643,7 +643,7 @@ pub fn delta_sizes(delta: &[u8]) -> Result<(usize, usize), DeltaError> {
     Ok((base_size, result_size))
 }
 
-/// Apply a git delta buffer to `base`, producing the result encoded in `delta`.
+/// Apply a git delta buffer to `base`, writing directly into `out`.
 ///
 /// The caller supplies `max_out` as a hard safety cap to prevent allocating
 /// unbounded output on corrupt deltas.
@@ -651,7 +651,9 @@ pub fn delta_sizes(delta: &[u8]) -> Result<(usize, usize), DeltaError> {
 /// The delta format encodes both base size and result size as varints at the
 /// head of the stream; both are validated.
 ///
-/// The output buffer is cleared before writing.
+/// The output buffer is cleared before writing. Writes directly into
+/// pre-reserved spare capacity, eliminating per-chunk bounds checking and
+/// length updates on the hot delta-application path.
 pub fn apply_delta(
     base: &[u8],
     delta: &[u8],
@@ -659,19 +661,78 @@ pub fn apply_delta(
     max_out: usize,
 ) -> Result<(), DeltaError> {
     out.clear();
-    // Pre-read the result size from the delta header and allocate once,
-    // eliminating 2-4 reallocs during typical tree delta application.
-    // The delta_sizes() call reads only 2 varints (< 10 bytes of L1-hot data).
-    let (_, result_size) = delta_sizes(delta)?;
+
+    let mut pos = 0usize;
+    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
+    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
+    if base_size != base.len() {
+        return Err(DeltaError::BaseSizeMismatch);
+    }
     if result_size > max_out {
         return Err(DeltaError::OutputOverrun);
     }
     out.reserve(result_size);
-    let res = apply_delta_into(base, delta, max_out, |chunk| {
-        out.extend_from_slice(chunk);
-        Ok(())
-    });
-    res.map(|_| ())
+
+    let mut written = 0usize;
+    let out_ptr = out.as_mut_ptr();
+
+    while pos < delta.len() {
+        let cmd = delta[pos];
+        pos += 1;
+
+        if (cmd & 0x80) != 0 {
+            let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
+
+            let end = match off.checked_add(size) {
+                Some(end) => end,
+                None => return Err(DeltaError::CopyOutOfRange),
+            };
+            if end > base.len() {
+                return Err(DeltaError::CopyOutOfRange);
+            }
+            if written.saturating_add(size) > result_size {
+                return Err(DeltaError::OutputOverrun);
+            }
+
+            // SAFETY: `out.reserve(result_size)` guarantees capacity >= result_size.
+            // `written + size <= result_size <= capacity`. `base[off..end]` is
+            // bounds-checked above. No aliasing: `out_ptr` points to `out`'s
+            // allocation, `base` is a separate slice.
+            unsafe {
+                std::ptr::copy_nonoverlapping(base.as_ptr().add(off), out_ptr.add(written), size);
+            }
+            written += size;
+        } else if cmd != 0 {
+            let size = cmd as usize;
+            if pos + size > delta.len() {
+                return Err(DeltaError::Truncated);
+            }
+            if written.saturating_add(size) > result_size {
+                return Err(DeltaError::OutputOverrun);
+            }
+
+            // SAFETY: same capacity invariant as above. `delta[pos..pos+size]`
+            // is bounds-checked. No aliasing: `out_ptr` and `delta` are
+            // disjoint allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(delta.as_ptr().add(pos), out_ptr.add(written), size);
+            }
+            pos += size;
+            written += size;
+        } else {
+            return Err(DeltaError::BadCommandZero);
+        }
+    }
+
+    if written != result_size {
+        return Err(DeltaError::ResultSizeMismatch);
+    }
+
+    // SAFETY: exactly `written == result_size` bytes initialized above,
+    // all within reserved capacity (`out.reserve(result_size)` guarantees
+    // `capacity >= result_size`).
+    unsafe { out.set_len(written) };
+    Ok(())
 }
 
 /// Apply a git delta buffer to `base`, streaming output into a sink.
