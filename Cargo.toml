@@ -67,7 +67,7 @@ real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 [dev-dependencies]
 loom = "0.7"
 proptest = "1.4"
-criterion = "0.5"
+criterion = "0.8"
 tempfile = "3.10"
 
 [[bench]]
