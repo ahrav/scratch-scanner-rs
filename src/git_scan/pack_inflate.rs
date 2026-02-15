@@ -59,6 +59,8 @@ fn poison_spare_capacity(buf: &mut Vec<u8>) {
             slot.write(0xDE);
         }
     }
+    #[cfg(not(debug_assertions))]
+    let _ = buf;
 }
 
 /// Runs an inflate operation using per-thread scratch buffers.
@@ -1528,18 +1530,22 @@ mod tests {
         apply_delta(base, &delta, &mut out, 1024).expect("apply delta with poison");
         assert_eq!(&out[..], base.as_slice());
 
-        // Also test with mixed delta
+        // Also test with mixed copy + add-literal delta.
+        // Delta header: base_size=10, result_size=9
         let mut delta2 = Vec::new();
-        push_varint(10, &mut delta2);
-        push_varint(9, &mut delta2);
-        delta2.push(0x80 | 0x01 | 0x10);
-        delta2.push(0x00);
-        delta2.push(0x05);
-        delta2.push(0x03);
+        push_varint(10, &mut delta2); // base object size
+        push_varint(9, &mut delta2); // target result size
+                                     // Copy 5 bytes from base offset 0 -> "ABCDE"
+        delta2.push(0x80 | 0x01 | 0x10); // copy cmd: offset & size present
+        delta2.push(0x00); // offset = 0
+        delta2.push(0x05); // size = 5
+                           // Add 3 literal bytes -> "XYZ"
+        delta2.push(0x03); // add-literal cmd: length 3
         delta2.extend_from_slice(b"XYZ");
-        delta2.push(0x80 | 0x01 | 0x10);
-        delta2.push(0x09);
-        delta2.push(0x01);
+        // Copy 1 byte from base offset 9 -> "J"
+        delta2.push(0x80 | 0x01 | 0x10); // copy cmd
+        delta2.push(0x09); // offset = 9
+        delta2.push(0x01); // size = 1
 
         let mut out2 = Vec::new();
         apply_delta(base, &delta2, &mut out2, 1024).expect("apply delta mixed with poison");

@@ -1373,7 +1373,8 @@ mod tests {
 
     #[test]
     fn single_frame_ofs_delta_chain() {
-        // Pack: base tree "AAAA", then OFS delta that adds "BB".
+        // Pack: base tree "AAAA", then OFS delta whose result is "BB"
+        // (add-literal instruction only, no base copy).
         let base_data = b"AAAA";
         let delta_data = make_add_delta(base_data.len(), b"BB");
 
