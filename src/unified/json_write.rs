@@ -2001,9 +2001,7 @@ mod verification {
         let mut buf = Vec::with_capacity(20);
         let mut cur = BufCursor::new(&mut buf, 20);
         cur.push_u64(n);
-        cur.commit();
-        drop(cur);
-        assert_eq!(buf.len(), digit_count(n));
+        assert_eq!(cur.commit_to_buf().len(), digit_count(n));
     }
 
     /// Proves `BufCursor` commit/resume cycle preserves buffer contents
@@ -2019,8 +2017,6 @@ mod verification {
         assert_eq!(cur.commit_to_buf().len(), 4);
         cur.resume(extra);
         cur.push_byte(b'!');
-        cur.commit();
-        drop(cur);
-        assert_eq!(buf.len(), 5);
+        assert_eq!(cur.commit_to_buf().len(), 5);
     }
 }
