@@ -47,6 +47,20 @@ thread_local! {
     });
 }
 
+/// Fill spare capacity with `0xDE` in debug builds so that any
+/// uninitialized-read past the logical length hits a deterministic
+/// poison pattern instead of whatever the allocator left behind.
+/// No-op in release builds.
+#[inline(always)]
+fn poison_spare_capacity(buf: &mut Vec<u8>) {
+    #[cfg(debug_assertions)]
+    {
+        for slot in buf.spare_capacity_mut() {
+            slot.write(0xDE);
+        }
+    }
+}
+
 /// Runs an inflate operation using per-thread scratch buffers.
 ///
 /// This avoids per-call allocations by reusing a thread-local `Decompress`
@@ -448,6 +462,7 @@ pub fn inflate_limited_with(
     de.reset(true);
     out.clear();
     out.reserve(max_out);
+    poison_spare_capacity(out);
 
     let mut in_pos: usize = 0;
 
@@ -778,6 +793,7 @@ pub fn apply_delta(
 
     let (pos, result_size) = parse_delta_header(base, delta, max_out)?;
     out.reserve(result_size);
+    poison_spare_capacity(out);
     debug_assert!(
         out.capacity() >= result_size,
         "reserve did not allocate enough"
@@ -1542,5 +1558,68 @@ mod tests {
         let mut out = Vec::new();
         apply_delta(base, delta, &mut out, 64).unwrap();
         assert_eq!(&out, b"CDEFXYZW");
+    }
+
+    #[test]
+    fn poison_spare_capacity_writes_debug_pattern() {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        super::poison_spare_capacity(&mut buf);
+
+        // The logical content must be unchanged.
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(buf.len(), 5);
+
+        // In debug builds, spare bytes should be 0xDE.
+        // Access spare capacity directly to verify.
+        let spare = buf.spare_capacity_mut();
+        for (i, slot) in spare.iter().enumerate() {
+            // SAFETY: we just wrote 0xDE to every spare slot.
+            let val = unsafe { slot.assume_init() };
+            assert_eq!(val, 0xDE, "spare byte {i} not poisoned");
+        }
+    }
+
+    #[test]
+    fn inflate_with_poison_round_trip() {
+        // Verify that poisoning spare capacity does not break inflate.
+        let original = b"inflate with poison test payload data";
+        let compressed = zlib_compress(original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed = inflate_limited_with(&mut de, &compressed, &mut out, 1024)
+            .expect("inflate with poison");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(&out[..], original.as_slice());
+    }
+
+    #[test]
+    fn apply_delta_with_poison_round_trip() {
+        // Verify that poisoning spare capacity does not break delta application.
+        let base = b"ABCDEFGHIJ";
+        let delta = make_copy_delta(base.len(), 0, base.len());
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply delta with poison");
+        assert_eq!(&out[..], base.as_slice());
+
+        // Also test with mixed delta
+        let mut delta2 = Vec::new();
+        push_varint(10, &mut delta2);
+        push_varint(9, &mut delta2);
+        delta2.push(0x80 | 0x01 | 0x10);
+        delta2.push(0x00);
+        delta2.push(0x05);
+        delta2.push(0x03);
+        delta2.extend_from_slice(b"XYZ");
+        delta2.push(0x80 | 0x01 | 0x10);
+        delta2.push(0x09);
+        delta2.push(0x01);
+
+        let mut out2 = Vec::new();
+        apply_delta(base, &delta2, &mut out2, 1024).expect("apply delta mixed with poison");
+        assert_eq!(&out2[..], b"ABCDEXYZJ");
     }
 }
