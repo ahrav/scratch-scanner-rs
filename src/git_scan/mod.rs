@@ -53,6 +53,8 @@ pub mod commit_loader;
 pub mod commit_parse;
 pub mod commit_walk;
 pub mod commit_walk_limits;
+#[cfg(test)]
+pub(crate) mod delta_test_helpers;
 pub mod engine_adapter;
 pub mod errors;
 pub mod finalize;

@@ -1359,4 +1359,274 @@ mod tests {
         assert_eq!(bufs.base_buf.as_slice(), b"base");
         assert_eq!(bufs.base_buf.capacity(), base_cap_before);
     }
+
+    // ── Delta resolution helpers and tests ──────────────────────────────
+
+    use super::super::delta_test_helpers::{
+        make_add_delta, make_copy_delta, make_mixed_delta, SyntheticPackBuilder,
+    };
+    use super::super::pack_inflate::{
+        self, apply_delta, EntryKind as PackEntryKind, ObjectKind, PackFile,
+    };
+    use super::TreeDeltaCache;
+    use super::MAX_DELTA_DEPTH;
+
+    #[test]
+    fn single_frame_ofs_delta_chain() {
+        // Pack: base tree "AAAA", then OFS delta whose result is "BB"
+        // (add-literal instruction only, no base copy).
+        let base_data = b"AAAA";
+        let delta_data = make_add_delta(base_data.len(), b"BB");
+
+        let mut builder = SyntheticPackBuilder::new();
+        let base_idx = builder.add_non_delta(2, base_data); // type 2 = tree
+        let delta_idx = builder.add_ofs_delta(base_idx, &delta_data);
+        let (pack_bytes, offsets) = builder.build();
+
+        // Parse the pack.
+        let pack_header = PackFile::parse_header(&pack_bytes, 20).unwrap();
+        let pack = PackFile::from_header(&pack_bytes, pack_header);
+
+        // Verify the base entry header.
+        let base_header = pack.entry_header_at(offsets[base_idx], 64).unwrap();
+        assert!(matches!(
+            base_header.kind,
+            PackEntryKind::NonDelta {
+                kind: ObjectKind::Tree
+            }
+        ));
+        assert_eq!(base_header.size, base_data.len() as u64);
+
+        // Verify the delta entry header.
+        let delta_header = pack.entry_header_at(offsets[delta_idx], 64).unwrap();
+        assert!(
+            matches!(delta_header.kind, PackEntryKind::OfsDelta { base_offset } if base_offset == offsets[base_idx])
+        );
+        assert_eq!(delta_header.size, delta_data.len() as u64);
+
+        // Inflate the base and delta payloads, then apply.
+        let mut de = flate2::Decompress::new(true);
+        let mut inflated_base = Vec::new();
+        pack_inflate::inflate_limited_with(
+            &mut de,
+            pack.slice_from(base_header.data_start),
+            &mut inflated_base,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(inflated_base, base_data);
+
+        let mut inflated_delta = Vec::new();
+        pack_inflate::inflate_limited_with(
+            &mut de,
+            pack.slice_from(delta_header.data_start),
+            &mut inflated_delta,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(inflated_delta, delta_data);
+
+        // Apply the delta to get the resolved object.
+        let mut result = Vec::new();
+        apply_delta(&inflated_base, &inflated_delta, &mut result, 1024).unwrap();
+        assert_eq!(result, b"BB");
+    }
+
+    #[test]
+    fn multi_frame_delta_chain_buffer_rotation() {
+        // 4-entry chain: base "AAAA" -> +BB -> +CC -> +DD
+        let base_data = b"AAAA";
+        let delta1 = make_mixed_delta(base_data.len(), 0, 4, b"BB"); // -> "AAAABB"
+        let delta2 = make_mixed_delta(6, 0, 6, b"CC"); // -> "AAAABBCC"
+        let delta3 = make_mixed_delta(8, 0, 8, b"DD"); // -> "AAAABBCCDD"
+
+        let mut builder = SyntheticPackBuilder::new();
+        let base_idx = builder.add_non_delta(2, base_data);
+        let d1_idx = builder.add_ofs_delta(base_idx, &delta1);
+        let d2_idx = builder.add_ofs_delta(d1_idx, &delta2);
+        let d3_idx = builder.add_ofs_delta(d2_idx, &delta3);
+        let (pack_bytes, offsets) = builder.build();
+
+        let pack_header = PackFile::parse_header(&pack_bytes, 20).unwrap();
+        let pack = PackFile::from_header(&pack_bytes, pack_header);
+
+        // Walk the chain manually: inflate base, then apply each delta.
+        let mut de = flate2::Decompress::new(true);
+
+        let base_header = pack.entry_header_at(offsets[base_idx], 64).unwrap();
+        let mut current = Vec::new();
+        pack_inflate::inflate_limited_with(
+            &mut de,
+            pack.slice_from(base_header.data_start),
+            &mut current,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(current, base_data);
+
+        // Apply delta1.
+        let d1_header = pack.entry_header_at(offsets[d1_idx], 64).unwrap();
+        let mut inflated_delta = Vec::new();
+        pack_inflate::inflate_limited_with(
+            &mut de,
+            pack.slice_from(d1_header.data_start),
+            &mut inflated_delta,
+            1024,
+        )
+        .unwrap();
+        let mut result = Vec::new();
+        apply_delta(&current, &inflated_delta, &mut result, 1024).unwrap();
+        assert_eq!(result, b"AAAABB");
+
+        // Apply delta2 (swap buffers to simulate buffer rotation).
+        let d2_header = pack.entry_header_at(offsets[d2_idx], 64).unwrap();
+        pack_inflate::inflate_limited_with(
+            &mut de,
+            pack.slice_from(d2_header.data_start),
+            &mut inflated_delta,
+            1024,
+        )
+        .unwrap();
+        std::mem::swap(&mut current, &mut result);
+        apply_delta(&current, &inflated_delta, &mut result, 1024).unwrap();
+        assert_eq!(result, b"AAAABBCC");
+
+        // Apply delta3.
+        let d3_header = pack.entry_header_at(offsets[d3_idx], 64).unwrap();
+        pack_inflate::inflate_limited_with(
+            &mut de,
+            pack.slice_from(d3_header.data_start),
+            &mut inflated_delta,
+            1024,
+        )
+        .unwrap();
+        std::mem::swap(&mut current, &mut result);
+        apply_delta(&current, &inflated_delta, &mut result, 1024).unwrap();
+        assert_eq!(result, b"AAAABBCCDD");
+    }
+
+    #[test]
+    fn deep_delta_chain_entries_parse_correctly() {
+        // Build a chain deeper than MAX_DELTA_DEPTH (64) and verify every
+        // entry header is parseable. The depth limit itself is enforced
+        // during resolution in `read_pack_object_impl`, which requires a
+        // full ObjectStore and is not exercised here.
+        let base_data = b"base";
+        let mut builder = SyntheticPackBuilder::new();
+        let base_idx = builder.add_non_delta(2, base_data);
+
+        let mut prev_idx = base_idx;
+        // 66 deltas on top of the base => 67 entries total.
+        for i in 0..66 {
+            let suffix = format!("{i:02}");
+            let prev_size = base_data.len() + i * 2;
+            let delta = make_mixed_delta(prev_size, 0, prev_size, suffix.as_bytes());
+            prev_idx = builder.add_ofs_delta(prev_idx, &delta);
+        }
+
+        let (pack_bytes, offsets) = builder.build();
+        let pack_header = PackFile::parse_header(&pack_bytes, 20).unwrap();
+        let pack = PackFile::from_header(&pack_bytes, pack_header);
+
+        // Verify each entry in the chain is parseable.
+        for (i, &offset) in offsets.iter().enumerate() {
+            let header = pack.entry_header_at(offset, 64).unwrap();
+            if i == 0 {
+                assert!(matches!(
+                    header.kind,
+                    PackEntryKind::NonDelta {
+                        kind: ObjectKind::Tree
+                    }
+                ));
+            } else {
+                assert!(
+                    matches!(header.kind, PackEntryKind::OfsDelta { .. }),
+                    "entry {i} should be OFS delta"
+                );
+            }
+        }
+
+        // The chain has base + 66 deltas = 67 entries.
+        // MAX_DELTA_DEPTH is 64, so the chain exceeds the limit.
+        assert!(offsets.len() > MAX_DELTA_DEPTH as usize + 1);
+    }
+
+    #[test]
+    fn cache_hit_short_circuits_walk_forward() {
+        // Verify TreeDeltaCache stores and retrieves delta bases correctly,
+        // which is the mechanism ObjectStore uses to short-circuit walks.
+        let mut cache = TreeDeltaCache::new(64 * 1024);
+        let base_bytes = b"cached-tree-base-payload";
+
+        // Insert a cached base at pack_id=1, offset=100.
+        assert!(cache.insert(1, 100, ObjectKind::Tree, 2, base_bytes));
+
+        // Verify cache hit returns correct data.
+        let handle = cache.get_handle(1, 100).expect("cache hit");
+        assert_eq!(handle.as_slice(), base_bytes);
+        assert_eq!(handle.kind(), ObjectKind::Tree);
+        assert_eq!(handle.chain_len(), 2);
+
+        // Verify cache miss for different keys.
+        assert!(cache.get_handle(1, 200).is_none());
+        assert!(cache.get_handle(2, 100).is_none());
+
+        // Apply a copy-all delta to the cached base.
+        let delta_copy = make_copy_delta(base_bytes.len(), 0, base_bytes.len());
+        let mut result = Vec::new();
+        apply_delta(handle.as_slice(), &delta_copy, &mut result, 1024).unwrap();
+        assert_eq!(result, base_bytes);
+
+        drop(handle);
+
+        // Apply a mixed delta (partial copy + literal) to the cached base.
+        let delta_add = make_mixed_delta(base_bytes.len(), 0, 10, b"EXTRA");
+        let handle2 = cache.get_handle(1, 100).expect("cache hit after drop");
+        let mut result2 = Vec::new();
+        apply_delta(handle2.as_slice(), &delta_add, &mut result2, 1024).unwrap();
+        assert_eq!(&result2[..10], &base_bytes[..10]);
+        assert_eq!(&result2[10..], b"EXTRA");
+    }
+
+    #[test]
+    fn corrupt_delta_payload_propagates_error() {
+        // Build a pack where the delta's zlib data is corrupted.
+        let base_data = b"AAAA";
+        let mut builder = SyntheticPackBuilder::new();
+        let base_idx = builder.add_non_delta(2, base_data);
+
+        let delta_data = make_add_delta(base_data.len(), b"BB");
+        let delta_idx = builder.add_ofs_delta(base_idx, &delta_data);
+        let (mut pack_bytes, offsets) = builder.build();
+
+        // Locate the delta's zlib data start.
+        let pack_header = PackFile::parse_header(&pack_bytes, 20).unwrap();
+        let pack = PackFile::from_header(&pack_bytes, pack_header);
+        let delta_header = pack.entry_header_at(offsets[delta_idx], 64).unwrap();
+
+        // Overwrite zlib bytes with garbage.
+        let corrupt_start = delta_header.data_start;
+        for b in &mut pack_bytes[corrupt_start..corrupt_start + 4] {
+            *b = 0xFF;
+        }
+
+        // Re-parse the pack (header is still valid).
+        let pack_header2 = PackFile::parse_header(&pack_bytes, 20).unwrap();
+        let pack2 = PackFile::from_header(&pack_bytes, pack_header2);
+        let delta_header2 = pack2.entry_header_at(offsets[delta_idx], 64).unwrap();
+
+        // Inflate the corrupt data — must fail.
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let result = pack_inflate::inflate_limited_with(
+            &mut de,
+            pack2.slice_from(delta_header2.data_start),
+            &mut out,
+            1024,
+        );
+        assert!(
+            result.is_err(),
+            "corrupt zlib data should produce an inflate error"
+        );
+    }
 }

@@ -1,67 +1,11 @@
 use super::*;
 use crate::git_scan::RepoKind;
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
-use std::io::Write;
 use tempfile::tempdir;
 
+use super::super::delta_test_helpers::{
+    encode_entry_header, encode_ofs_distance, encode_varint, zlib_compress,
+};
 use super::super::midx_test_builder::MidxBuilder;
-
-fn encode_entry_header(obj_type: u8, mut size: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut first = (obj_type & 0x07) << 4;
-    first |= (size & 0x0f) as u8;
-    size >>= 4;
-    if size != 0 {
-        first |= 0x80;
-    }
-    out.push(first);
-    while size != 0 {
-        let mut byte = (size & 0x7f) as u8;
-        size >>= 7;
-        if size != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-    }
-    out
-}
-
-fn encode_varint(mut value: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let mut byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if value == 0 {
-            break;
-        }
-    }
-    out
-}
-
-fn compress(data: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
-}
-
-fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
-    assert!(dist > 0);
-    let mut bytes = Vec::new();
-    bytes.push((dist & 0x7f) as u8);
-    dist >>= 7;
-    while dist > 0 {
-        dist -= 1;
-        bytes.push(((dist & 0x7f) as u8) | 0x80);
-        dist >>= 7;
-    }
-    bytes.reverse();
-    bytes
-}
 
 fn build_pack_with_large_ofs_delta(base: &[u8], result: &[u8]) -> (Vec<u8>, u64, usize) {
     let mut delta = Vec::new();
@@ -84,13 +28,13 @@ fn build_pack_with_large_ofs_delta(base: &[u8], result: &[u8]) -> (Vec<u8>, u64,
     out.extend_from_slice(&2u32.to_be_bytes());
 
     let base_offset = out.len() as u64;
-    out.extend_from_slice(&encode_entry_header(3, base.len() as u64));
-    out.extend_from_slice(&compress(base));
+    out.extend_from_slice(&encode_entry_header(3, base.len()));
+    out.extend_from_slice(&zlib_compress(base));
 
     let delta_offset = out.len() as u64;
-    out.extend_from_slice(&encode_entry_header(6, result.len() as u64));
+    out.extend_from_slice(&encode_entry_header(6, result.len()));
     out.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-    out.extend_from_slice(&compress(&delta));
+    out.extend_from_slice(&zlib_compress(&delta));
     out.extend_from_slice(&[0u8; 20]);
 
     (out, delta_offset, delta.len())

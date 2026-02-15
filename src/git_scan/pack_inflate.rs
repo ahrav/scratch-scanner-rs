@@ -47,6 +47,22 @@ thread_local! {
     });
 }
 
+/// Fill spare capacity with `0xDE` in debug builds so that any
+/// uninitialized-read past the logical length hits a deterministic
+/// poison pattern instead of whatever the allocator left behind.
+/// No-op in release builds.
+#[inline(always)]
+fn poison_spare_capacity(buf: &mut Vec<u8>) {
+    #[cfg(debug_assertions)]
+    {
+        for slot in buf.spare_capacity_mut() {
+            slot.write(0xDE);
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = buf;
+}
+
 /// Runs an inflate operation using per-thread scratch buffers.
 ///
 /// This avoids per-call allocations by reusing a thread-local `Decompress`
@@ -448,6 +464,7 @@ pub fn inflate_limited_with(
     de.reset(true);
     out.clear();
     out.reserve(max_out);
+    poison_spare_capacity(out);
 
     let mut in_pos: usize = 0;
 
@@ -778,6 +795,7 @@ pub fn apply_delta(
 
     let (pos, result_size) = parse_delta_header(base, delta, max_out)?;
     out.reserve(result_size);
+    poison_spare_capacity(out);
     debug_assert!(
         out.capacity() >= result_size,
         "reserve did not allocate enough"
@@ -933,25 +951,12 @@ fn decode_copy_params(
 
 #[cfg(test)]
 mod tests {
+    use super::super::delta_test_helpers::{
+        make_add_delta, make_copy_delta, push_varint, push_varint_u64, zlib_compress,
+        SyntheticPackBuilder,
+    };
+    use super::super::object_id::OidBytes;
     use super::*;
-
-    fn push_varint(value: usize, out: &mut Vec<u8>) {
-        push_varint_u64(value as u64, out);
-    }
-
-    fn push_varint_u64(mut value: u64, out: &mut Vec<u8>) {
-        loop {
-            let mut b = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                b |= 0x80;
-            }
-            out.push(b);
-            if value == 0 {
-                break;
-            }
-        }
-    }
 
     #[test]
     fn decode_copy_params_reads_all_selected_fields() {
@@ -1060,61 +1065,6 @@ mod tests {
                 let _ = idx; // suppress unused warning
             }
         }
-    }
-
-    /// Build a delta buffer with a single "add literal" instruction.
-    fn make_add_delta(base_size: usize, literal: &[u8]) -> Vec<u8> {
-        assert!(literal.len() <= 127, "add instruction limited to 127 bytes");
-        let mut delta = Vec::new();
-        push_varint(base_size, &mut delta);
-        push_varint(literal.len(), &mut delta);
-        // add instruction: cmd byte = literal length (< 0x80)
-        delta.push(literal.len() as u8);
-        delta.extend_from_slice(literal);
-        delta
-    }
-
-    /// Build a delta with a single "copy from base" instruction.
-    fn make_copy_delta(base_size: usize, off: usize, size: usize) -> Vec<u8> {
-        let mut delta = Vec::new();
-        push_varint(base_size, &mut delta);
-        push_varint(size, &mut delta);
-        // copy instruction: high bit set, encode offset and size bytes.
-        let mut cmd: u8 = 0x80;
-        let mut params = Vec::new();
-        // Encode offset (little-endian, flagged)
-        if (off & 0xff) != 0 || off == 0 {
-            cmd |= 0x01;
-            params.push(off as u8);
-        }
-        if (off >> 8) & 0xff != 0 {
-            cmd |= 0x02;
-            params.push((off >> 8) as u8);
-        }
-        if (off >> 16) & 0xff != 0 {
-            cmd |= 0x04;
-            params.push((off >> 16) as u8);
-        }
-        if (off >> 24) & 0xff != 0 {
-            cmd |= 0x08;
-            params.push((off >> 24) as u8);
-        }
-        // Encode size (little-endian, flagged)
-        if (size & 0xff) != 0 {
-            cmd |= 0x10;
-            params.push(size as u8);
-        }
-        if (size >> 8) & 0xff != 0 {
-            cmd |= 0x20;
-            params.push((size >> 8) as u8);
-        }
-        if (size >> 16) & 0xff != 0 {
-            cmd |= 0x40;
-            params.push((size >> 16) as u8);
-        }
-        delta.push(cmd);
-        delta.extend_from_slice(&params);
-        delta
     }
 
     #[test]
@@ -1325,17 +1275,6 @@ mod tests {
         assert_eq!(&out, b"ABCD");
     }
 
-    /// Compress `data` using zlib (flate2).
-    fn zlib_compress(data: &[u8]) -> Vec<u8> {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
-    }
-
     #[test]
     fn inflate_limited_with_basic_round_trip() {
         let original = b"Hello, this is test data for inflate_limited_with!";
@@ -1542,5 +1481,90 @@ mod tests {
         let mut out = Vec::new();
         apply_delta(base, delta, &mut out, 64).unwrap();
         assert_eq!(&out, b"CDEFXYZW");
+    }
+
+    #[test]
+    fn poison_spare_capacity_writes_debug_pattern() {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        super::poison_spare_capacity(&mut buf);
+
+        // The logical content must be unchanged.
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(buf.len(), 5);
+
+        // In debug builds, spare bytes should be 0xDE.
+        // In release builds, poison_spare_capacity is a no-op, so the spare
+        // region is uninitialized — reading it would be UB.
+        #[cfg(debug_assertions)]
+        {
+            let spare = buf.spare_capacity_mut();
+            for (i, slot) in spare.iter().enumerate() {
+                // SAFETY: we just wrote 0xDE to every spare slot in debug mode.
+                let val = unsafe { slot.assume_init() };
+                assert_eq!(val, 0xDE, "spare byte {i} not poisoned");
+            }
+        }
+    }
+
+    #[test]
+    fn inflate_with_poison_round_trip() {
+        // Verify that poisoning spare capacity does not break inflate.
+        let original = b"inflate with poison test payload data";
+        let compressed = zlib_compress(original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed = inflate_limited_with(&mut de, &compressed, &mut out, 1024)
+            .expect("inflate with poison");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(&out[..], original.as_slice());
+    }
+
+    #[test]
+    fn apply_delta_with_poison_round_trip() {
+        // Verify that poisoning spare capacity does not break delta application.
+        let base = b"ABCDEFGHIJ";
+        let delta = make_copy_delta(base.len(), 0, base.len());
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply delta with poison");
+        assert_eq!(&out[..], base.as_slice());
+        // Mixed copy+add delta is already exercised by
+        // `apply_delta_mixed_copy_and_add`; no need to duplicate it here.
+    }
+
+    #[test]
+    fn ref_delta_entry_header_parses_oid() {
+        let base_data = b"hello base";
+        let delta_data = make_add_delta(base_data.len(), b"XY");
+
+        let base_oid = OidBytes::try_from_slice(&[0xAB; 20]).unwrap();
+
+        let mut builder = SyntheticPackBuilder::new();
+        builder.add_non_delta(3, base_data);
+        let ref_idx = builder.add_ref_delta(base_oid, &delta_data);
+
+        let (pack, offsets) = builder.build();
+        let pf = PackFile::parse(&pack, 20).expect("parse pack");
+
+        let header = pf
+            .entry_header_at(offsets[ref_idx], 64)
+            .expect("parse ref delta header");
+
+        assert_eq!(
+            header.kind,
+            EntryKind::RefDelta { base_oid },
+            "should parse REF_DELTA with correct base OID"
+        );
+        assert_eq!(header.size, delta_data.len() as u64);
+        // data_start must point past the 20-byte OID to the compressed
+        // delta payload.
+        let slice = pf.slice_from(header.data_start);
+        assert!(
+            !slice.is_empty(),
+            "data_start should point to compressed delta bytes"
+        );
     }
 }
