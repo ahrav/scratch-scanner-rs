@@ -949,25 +949,10 @@ fn decode_copy_params(
 
 #[cfg(test)]
 mod tests {
+    use super::super::delta_test_helpers::{
+        make_add_delta, make_copy_delta, push_varint, push_varint_u64, zlib_compress,
+    };
     use super::*;
-
-    fn push_varint(value: usize, out: &mut Vec<u8>) {
-        push_varint_u64(value as u64, out);
-    }
-
-    fn push_varint_u64(mut value: u64, out: &mut Vec<u8>) {
-        loop {
-            let mut b = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                b |= 0x80;
-            }
-            out.push(b);
-            if value == 0 {
-                break;
-            }
-        }
-    }
 
     #[test]
     fn decode_copy_params_reads_all_selected_fields() {
@@ -1076,61 +1061,6 @@ mod tests {
                 let _ = idx; // suppress unused warning
             }
         }
-    }
-
-    /// Build a delta buffer with a single "add literal" instruction.
-    fn make_add_delta(base_size: usize, literal: &[u8]) -> Vec<u8> {
-        assert!(literal.len() <= 127, "add instruction limited to 127 bytes");
-        let mut delta = Vec::new();
-        push_varint(base_size, &mut delta);
-        push_varint(literal.len(), &mut delta);
-        // add instruction: cmd byte = literal length (< 0x80)
-        delta.push(literal.len() as u8);
-        delta.extend_from_slice(literal);
-        delta
-    }
-
-    /// Build a delta with a single "copy from base" instruction.
-    fn make_copy_delta(base_size: usize, off: usize, size: usize) -> Vec<u8> {
-        let mut delta = Vec::new();
-        push_varint(base_size, &mut delta);
-        push_varint(size, &mut delta);
-        // copy instruction: high bit set, encode offset and size bytes.
-        let mut cmd: u8 = 0x80;
-        let mut params = Vec::new();
-        // Encode offset (little-endian, flagged)
-        if (off & 0xff) != 0 || off == 0 {
-            cmd |= 0x01;
-            params.push(off as u8);
-        }
-        if (off >> 8) & 0xff != 0 {
-            cmd |= 0x02;
-            params.push((off >> 8) as u8);
-        }
-        if (off >> 16) & 0xff != 0 {
-            cmd |= 0x04;
-            params.push((off >> 16) as u8);
-        }
-        if (off >> 24) & 0xff != 0 {
-            cmd |= 0x08;
-            params.push((off >> 24) as u8);
-        }
-        // Encode size (little-endian, flagged)
-        if (size & 0xff) != 0 {
-            cmd |= 0x10;
-            params.push(size as u8);
-        }
-        if (size >> 8) & 0xff != 0 {
-            cmd |= 0x20;
-            params.push((size >> 8) as u8);
-        }
-        if (size >> 16) & 0xff != 0 {
-            cmd |= 0x40;
-            params.push((size >> 16) as u8);
-        }
-        delta.push(cmd);
-        delta.extend_from_slice(&params);
-        delta
     }
 
     #[test]
@@ -1339,17 +1269,6 @@ mod tests {
         let mut out = Vec::from("leftover garbage data that should be cleared");
         apply_delta(base, &delta, &mut out, 1024).expect("reuse vec");
         assert_eq!(&out, b"ABCD");
-    }
-
-    /// Compress `data` using zlib (flate2).
-    fn zlib_compress(data: &[u8]) -> Vec<u8> {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
     }
 
     #[test]
@@ -1571,12 +1490,16 @@ mod tests {
         assert_eq!(buf.len(), 5);
 
         // In debug builds, spare bytes should be 0xDE.
-        // Access spare capacity directly to verify.
-        let spare = buf.spare_capacity_mut();
-        for (i, slot) in spare.iter().enumerate() {
-            // SAFETY: we just wrote 0xDE to every spare slot.
-            let val = unsafe { slot.assume_init() };
-            assert_eq!(val, 0xDE, "spare byte {i} not poisoned");
+        // In release builds, poison_spare_capacity is a no-op, so the spare
+        // region is uninitialized — reading it would be UB.
+        #[cfg(debug_assertions)]
+        {
+            let spare = buf.spare_capacity_mut();
+            for (i, slot) in spare.iter().enumerate() {
+                // SAFETY: we just wrote 0xDE to every spare slot in debug mode.
+                let val = unsafe { slot.assume_init() };
+                assert_eq!(val, 0xDE, "spare byte {i} not poisoned");
+            }
         }
     }
 
