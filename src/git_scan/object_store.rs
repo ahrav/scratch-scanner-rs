@@ -72,7 +72,7 @@ use super::repo_open::RepoJobState;
 use super::repo_paths;
 use super::spill_arena::{SpillArena, SpillArenaError, SpillSlice};
 use super::tree_cache::{TreeCache, TreeCacheHandle};
-use super::tree_delta_cache::TreeDeltaCache;
+use super::tree_delta_cache::{TreeDeltaCache, TreeDeltaCacheHandle};
 use super::tree_diff_limits::TreeDiffLimits;
 
 /// Maximum entry header bytes to parse in pack files.
@@ -173,7 +173,7 @@ impl SpillIndex {
             return None;
         }
 
-        let mut idx = (hash_oid(oid) as usize) & self.mask;
+        let mut idx = (repo_paths::hash_oid(oid) as usize) & self.mask;
         for _ in 0..self.slots.len() {
             let entry = &self.slots[idx];
             if entry.is_empty() {
@@ -195,7 +195,7 @@ impl SpillIndex {
             return false;
         }
 
-        let mut idx = (hash_oid(oid) as usize) & self.mask;
+        let mut idx = (repo_paths::hash_oid(oid) as usize) & self.mask;
         for _ in 0..self.slots.len() {
             let entry = &mut self.slots[idx];
             if entry.is_empty() || entry.matches(oid) {
@@ -301,21 +301,34 @@ impl TreeBytes {
 ///
 /// # Buffer ping-pong protocol
 ///
-/// During the unwind phase of delta resolution, `base_buf` and `result_buf`
-/// alternate roles via `std::mem::swap`:
+/// During unwind, `base_buf` and `result_buf` alternate roles:
 ///
 /// 1. Delta payload is inflated into `inflate_buf`.
 /// 2. `apply_delta(base_buf, inflate_buf, result_buf, …)` produces output.
-/// 3. `swap(&mut base_buf, &mut result_buf)` — the result becomes the base
-///    for the next frame.
+/// 3. For non-final frames, `swap(&mut base_buf, &mut result_buf)` so the
+///    result becomes the base for the next frame.
 ///
-/// After the final unwind step, the resolved object is in `base_buf`.
+/// The final frame leaves output in `result_buf`, which is moved to the
+/// caller while `base_buf` stays allocated for reuse.
 struct TreeDecodeBufs {
     de: flate2::Decompress,
     inflate_buf: Vec<u8>,
     result_buf: Vec<u8>,
     base_buf: Vec<u8>,
     delta_stack_pool: Vec<Vec<TreeDeltaFrame>>,
+}
+
+/// Owned scratch state temporarily detached across recursive REF-delta loads.
+///
+/// Holding these buffers outside [`TreeDecodeBufs`] makes the aliasing boundary
+/// explicit: recursive loads operate on a fresh scratch session and cannot
+/// mutate an outer frame's in-flight decode buffers.
+#[derive(Debug)]
+struct DetachedDecodeScratch {
+    de: flate2::Decompress,
+    inflate_buf: Vec<u8>,
+    result_buf: Vec<u8>,
+    base_buf: Vec<u8>,
 }
 
 impl std::fmt::Debug for TreeDecodeBufs {
@@ -355,6 +368,38 @@ impl TreeDecodeBufs {
     fn return_delta_stack(&mut self, mut stack: Vec<TreeDeltaFrame>) {
         stack.clear();
         self.delta_stack_pool.push(stack);
+    }
+
+    /// Detaches decode scratch so recursive loads cannot alias outer buffers.
+    fn detach_recursive_scratch(&mut self) -> DetachedDecodeScratch {
+        DetachedDecodeScratch {
+            de: std::mem::replace(&mut self.de, flate2::Decompress::new(true)),
+            inflate_buf: std::mem::take(&mut self.inflate_buf),
+            result_buf: std::mem::take(&mut self.result_buf),
+            base_buf: std::mem::take(&mut self.base_buf),
+        }
+    }
+
+    /// Restores scratch previously detached via `detach_recursive_scratch`.
+    fn restore_recursive_scratch(&mut self, detached: DetachedDecodeScratch) {
+        self.de = detached.de;
+        self.inflate_buf = detached.inflate_buf;
+        self.result_buf = detached.result_buf;
+        self.base_buf = detached.base_buf;
+    }
+
+    /// Moves caller-owned base bytes into decode scratch without copying.
+    #[inline]
+    fn swap_in_base(&mut self, incoming: &mut Vec<u8>) {
+        std::mem::swap(&mut self.base_buf, incoming);
+    }
+
+    /// Moves resolved bytes out of `result_buf`.
+    #[inline]
+    fn take_result_output(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        std::mem::swap(&mut out, &mut self.result_buf);
+        out
     }
 }
 
@@ -576,6 +621,23 @@ impl<'a> ObjectStore<'a> {
         self.oid_len
     }
 
+    /// Benchmark hook for iterative pack-offset decoding.
+    ///
+    /// This bypasses OID lookup so Criterion can isolate delta-chain
+    /// resolution costs on the object-store hot path.
+    #[cfg(feature = "bench")]
+    pub fn bench_decode_pack_offset(
+        &mut self,
+        pack_id: u16,
+        offset: u64,
+        depth: u8,
+    ) -> Result<(ObjectKind, usize, u8), TreeDiffError> {
+        let (pack, pack_header) = self.pack_data(pack_id)?;
+        let decoded =
+            self.read_pack_object(pack_id, pack.as_ref(), pack_header, offset, depth, None)?;
+        Ok((decoded.kind, decoded.bytes.len(), decoded.chain_len))
+    }
+
     /// Loads an object by OID, resolving deltas up to `MAX_DELTA_DEPTH`.
     ///
     /// This prefers pack files over loose objects.
@@ -614,6 +676,21 @@ impl<'a> ObjectStore<'a> {
             });
         }
         Err(TreeDiffError::TreeNotFound)
+    }
+
+    /// Loads an object while isolating the caller's decode scratch buffers.
+    ///
+    /// Recursive REF-delta loads use this boundary so the inner decode path
+    /// cannot alias or overwrite outer in-flight scratch state.
+    fn load_object_with_isolated_decode_scratch(
+        &mut self,
+        oid: &OidBytes,
+        depth: u8,
+    ) -> Result<LoadedObject, TreeDiffError> {
+        let detached = self.decode_bufs.detach_recursive_scratch();
+        let loaded = self.load_object_with_depth(oid, depth);
+        self.decode_bufs.restore_recursive_scratch(detached);
+        loaded
     }
 
     /// Loads an object from pack storage via MIDX lookup.
@@ -707,6 +784,7 @@ impl<'a> ObjectStore<'a> {
         let mut remaining_depth = depth;
         let mut base_kind: ObjectKind = ObjectKind::Tree; // set below
         let mut base_chain_len: u8 = 0; // set below
+        let mut cached_base: Option<TreeDeltaCacheHandle> = None;
 
         loop {
             let header = pack
@@ -742,12 +820,18 @@ impl<'a> ObjectStore<'a> {
 
             match header.kind {
                 EntryKind::NonDelta { kind } => {
-                    // Root of the chain: inflate directly into base_buf.
+                    // Root of the chain: direct decode for non-delta objects,
+                    // otherwise decode root base for pending unwind frames.
+                    let out_buf = if delta_stack.is_empty() {
+                        &mut self.decode_bufs.result_buf
+                    } else {
+                        &mut self.decode_bufs.base_buf
+                    };
                     let (inflate_result, inflate_nanos) = perf::time(|| {
                         inflate_exact_with(
                             &mut self.decode_bufs.de,
                             pack.slice_from(header.data_start),
-                            &mut self.decode_bufs.base_buf,
+                            out_buf,
                             payload_size,
                         )
                     });
@@ -757,7 +841,7 @@ impl<'a> ObjectStore<'a> {
                             format_root_oid(root_oid)
                         ),
                     })?;
-                    perf::record_tree_inflate(self.decode_bufs.base_buf.len(), inflate_nanos);
+                    perf::record_tree_inflate(out_buf.len(), inflate_nanos);
                     base_kind = kind;
                     base_chain_len = 0;
                     break;
@@ -781,14 +865,9 @@ impl<'a> ObjectStore<'a> {
                         perf::record_tree_delta_cache_hit(handle.len());
                         perf::record_tree_delta_cache_hit_nanos(cache_nanos);
 
-                        // Copy cached base into base_buf, then drop the pin.
-                        self.decode_bufs.base_buf.clear();
-                        self.decode_bufs
-                            .base_buf
-                            .extend_from_slice(handle.as_slice());
                         base_kind = handle.kind();
                         base_chain_len = handle.chain_len();
-                        drop(handle);
+                        cached_base = Some(handle);
 
                         // Push this delta frame for unwind.
                         delta_stack.push(TreeDeltaFrame {
@@ -829,25 +908,15 @@ impl<'a> ObjectStore<'a> {
                         delta_size: payload_size,
                     });
 
-                    // INVARIANT: Phase 1 must NOT use decode_bufs (inflate_buf,
-                    // result_buf, base_buf) for any inflate operations before
-                    // this point. The inner load_object_with_depth call
-                    // re-enters read_pack_object and freely overwrites
-                    // decode_bufs. Its returned Vec is independent (owned),
-                    // so copying into base_buf after the call is safe.
-                    // Violating this invariant would silently corrupt the
-                    // outer call's partially-inflated buffers.
-                    let loaded = self.load_object_with_depth(&base_oid, remaining_depth - 1)?;
+                    // Isolate outer decode scratch from recursive REF-delta
+                    // loads so nested resolution cannot alias outer buffers.
+                    let mut loaded = self
+                        .load_object_with_isolated_decode_scratch(&base_oid, remaining_depth - 1)?;
                     base_kind = loaded.kind;
                     base_chain_len = loaded.chain_len;
 
-                    // Copy loaded bytes into base_buf (inner call is done).
-                    // NOTE: The inner call may mem::take decode_bufs.base_buf,
-                    // losing its capacity. The extend_from_slice below will
-                    // re-allocate. This is acceptable for REF deltas
-                    // (cross-pack, relatively rare).
-                    self.decode_bufs.base_buf.clear();
-                    self.decode_bufs.base_buf.extend_from_slice(&loaded.bytes);
+                    // Move loaded bytes into base scratch (no base-byte copy).
+                    self.decode_bufs.swap_in_base(&mut loaded.bytes);
                     break;
                 }
             }
@@ -862,16 +931,10 @@ impl<'a> ObjectStore<'a> {
                     offset,
                     base_kind,
                     0,
-                    &self.decode_bufs.base_buf,
+                    &self.decode_bufs.result_buf,
                 );
             }
-            // NOTE: mem::take drains base_buf's capacity (replaces with
-            // Vec::new()). A swap-based approach was evaluated but does not
-            // help: the returned Vec is consumed by the caller, so there is
-            // no way to reclaim its allocation. Re-growing base_buf on the
-            // next call is cheap for typical tree sizes (< 8 KB) and dwarfed
-            // by inflate/delta-apply costs.
-            let bytes = std::mem::take(&mut self.decode_bufs.base_buf);
+            let bytes = self.decode_bufs.take_result_output();
             return Ok(DecodedTreeObject {
                 kind: base_kind,
                 bytes,
@@ -880,7 +943,10 @@ impl<'a> ObjectStore<'a> {
         }
 
         // -- Phase 2: Unwind the delta stack in reverse --------------------
-        for frame in delta_stack.iter().rev() {
+        let total_frames = delta_stack.len();
+        for (frame_idx, frame) in delta_stack.iter().rev().enumerate() {
+            let is_last_frame = frame_idx + 1 == total_frames;
+
             // Inflate the delta payload into inflate_buf.
             let (inflate_result, inflate_nanos) = perf::time(|| {
                 inflate_limited_with(
@@ -901,6 +967,7 @@ impl<'a> ObjectStore<'a> {
 
             // Apply delta: base_buf × inflate_buf → result_buf.
             // Split borrow decode_bufs fields to satisfy the borrow checker.
+            let using_cached_base = cached_base.is_some();
             let (apply_result, apply_nanos) = perf::time(|| {
                 let TreeDecodeBufs {
                     ref base_buf,
@@ -908,7 +975,12 @@ impl<'a> ObjectStore<'a> {
                     ref mut result_buf,
                     ..
                 } = self.decode_bufs;
-                apply_delta(base_buf, inflate_buf, result_buf, max_object_bytes)
+                let base_bytes = if let Some(handle) = cached_base.as_ref() {
+                    handle.as_slice()
+                } else {
+                    base_buf.as_slice()
+                };
+                apply_delta(base_bytes, inflate_buf, result_buf, max_object_bytes)
             });
             apply_result.map_err(|err| TreeDiffError::ObjectStoreError {
                 detail: format!(
@@ -919,31 +991,40 @@ impl<'a> ObjectStore<'a> {
             })?;
             perf::record_tree_delta_apply(self.decode_bufs.result_buf.len(), apply_nanos);
 
-            // Rotate: output becomes the next base.
-            std::mem::swap(
-                &mut self.decode_bufs.base_buf,
-                &mut self.decode_bufs.result_buf,
-            );
+            // Release pinned cache base before touching cache mutably below.
+            if using_cached_base {
+                cached_base = None;
+            }
+
+            if !is_last_frame {
+                // Rotate: output becomes the next base.
+                std::mem::swap(
+                    &mut self.decode_bufs.base_buf,
+                    &mut self.decode_bufs.result_buf,
+                );
+            }
 
             base_chain_len = base_chain_len.saturating_add(1);
 
             // Offer intermediate result to the delta cache.
             if base_kind == ObjectKind::Tree {
+                let resolved = if is_last_frame {
+                    self.decode_bufs.result_buf.as_slice()
+                } else {
+                    self.decode_bufs.base_buf.as_slice()
+                };
                 self.tree_delta_cache.insert(
                     pack_id,
                     frame.offset,
                     base_kind,
                     base_chain_len,
-                    &self.decode_bufs.base_buf,
+                    resolved,
                 );
             }
         }
 
         perf::record_tree_delta_chain(base_chain_len);
-        // NOTE: same capacity-loss tradeoff as the fast path above.
-        // inflate_buf and result_buf retain their capacity (only swapped,
-        // never taken), so the main per-call cost is re-growing base_buf.
-        let bytes = std::mem::take(&mut self.decode_bufs.base_buf);
+        let bytes = self.decode_bufs.take_result_output();
         Ok(DecodedTreeObject {
             kind: base_kind,
             bytes,
@@ -978,7 +1059,8 @@ impl<'a> ObjectStore<'a> {
             inflate_limited(&data, &mut out, max_out).map_err(store_error)?;
 
             // Parse and validate the loose header before returning the payload.
-            let (kind, payload) = parse_loose_object(&out, self.max_object_bytes)?;
+            let (kind, payload) = repo_paths::parse_loose_object(&out, self.max_object_bytes)
+                .map_err(map_loose_parse_error)?;
             return Ok(Some((kind, payload)));
         }
 
@@ -1154,23 +1236,42 @@ fn spill_index_entries(max_spill_bytes: u64, spill_min_bytes: usize) -> usize {
     entries.next_power_of_two()
 }
 
-/// Hashes an OID for spill-index probing.
-///
-/// OIDs are already cryptographic hashes with excellent byte distribution,
-/// so the first 8 bytes provide sufficient entropy for power-of-two table
-/// indexing. This replaces FNV-1a which created a 60-cycle serial multiply
-/// dependency chain on ARM (20 bytes × 3-cycle MUL latency).
-fn hash_oid(oid: &OidBytes) -> u64 {
-    let bytes = oid.as_slice();
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(buf)
-}
-
 /// Normalizes foreign errors into object-store context.
 fn store_error<E: std::fmt::Display>(err: E) -> TreeDiffError {
     TreeDiffError::ObjectStoreError {
         detail: err.to_string(),
+    }
+}
+
+/// Maps shared loose-object parse errors into object-store error variants.
+fn map_loose_parse_error(err: repo_paths::LooseObjectParseError) -> TreeDiffError {
+    match err {
+        repo_paths::LooseObjectParseError::MissingHeaderTerminator => TreeDiffError::CorruptTree {
+            detail: "missing object header terminator",
+        },
+        repo_paths::LooseObjectParseError::MissingKind => TreeDiffError::CorruptTree {
+            detail: "missing object kind",
+        },
+        repo_paths::LooseObjectParseError::MissingSize => TreeDiffError::CorruptTree {
+            detail: "missing object size",
+        },
+        repo_paths::LooseObjectParseError::InvalidHeader => TreeDiffError::CorruptTree {
+            detail: "invalid object header",
+        },
+        repo_paths::LooseObjectParseError::InvalidSize => TreeDiffError::CorruptTree {
+            detail: "invalid object size",
+        },
+        repo_paths::LooseObjectParseError::SizeExceedsCap { size, max_payload } => {
+            TreeDiffError::ObjectStoreError {
+                detail: format!("object size {size} exceeds cap {max_payload}"),
+            }
+        }
+        repo_paths::LooseObjectParseError::SizeMismatch => TreeDiffError::CorruptTree {
+            detail: "object size mismatch",
+        },
+        repo_paths::LooseObjectParseError::UnknownType => TreeDiffError::ObjectStoreError {
+            detail: "unknown loose object type".to_string(),
+        },
     }
 }
 
@@ -1182,82 +1283,80 @@ fn format_root_oid(root_oid: Option<OidBytes>) -> String {
     }
 }
 
-/// Parses an inflated loose object into kind + payload.
-///
-/// Expects the loose format `<type> <size>\0<payload>` and verifies that the
-/// payload size matches the header. Returns an error if the header is
-/// malformed, the size mismatches the payload, or the object kind is unknown.
-/// Payloads larger than `max_payload` are rejected.
-fn parse_loose_object(
-    bytes: &[u8],
-    max_payload: usize,
-) -> Result<(ObjectKind, Vec<u8>), TreeDiffError> {
-    // Loose object format: "<type> <size>\\0<payload>".
-    let nul = bytes
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(TreeDiffError::CorruptTree {
-            detail: "missing object header terminator",
-        })?;
+#[cfg(test)]
+mod tests {
+    use super::TreeDecodeBufs;
 
-    let header = &bytes[..nul];
-    let mut parts = header.split(|&b| b == b' ');
-    let kind_bytes = parts.next().ok_or(TreeDiffError::CorruptTree {
-        detail: "missing object kind",
-    })?;
-    let size_bytes = parts.next().ok_or(TreeDiffError::CorruptTree {
-        detail: "missing object size",
-    })?;
-    if parts.next().is_some() {
-        return Err(TreeDiffError::CorruptTree {
-            detail: "invalid object header",
-        });
+    #[test]
+    fn detached_recursive_scratch_restores_outer_buffers() {
+        let mut bufs = TreeDecodeBufs::new();
+        bufs.inflate_buf.extend_from_slice(b"inflate");
+        bufs.result_buf.extend_from_slice(b"result");
+        bufs.base_buf.extend_from_slice(b"base");
+
+        let detached = bufs.detach_recursive_scratch();
+        assert!(bufs.inflate_buf.is_empty());
+        assert!(bufs.result_buf.is_empty());
+        assert!(bufs.base_buf.is_empty());
+
+        bufs.inflate_buf.extend_from_slice(b"inner-inflate");
+        bufs.result_buf.extend_from_slice(b"inner-result");
+        bufs.base_buf.extend_from_slice(b"inner-base");
+
+        bufs.restore_recursive_scratch(detached);
+        assert_eq!(bufs.inflate_buf.as_slice(), b"inflate");
+        assert_eq!(bufs.result_buf.as_slice(), b"result");
+        assert_eq!(bufs.base_buf.as_slice(), b"base");
     }
 
-    let size = parse_decimal(size_bytes).ok_or(TreeDiffError::CorruptTree {
-        detail: "invalid object size",
-    })? as usize;
-    if size > max_payload {
-        return Err(TreeDiffError::ObjectStoreError {
-            detail: format!("object size {size} exceeds cap {max_payload}"),
-        });
+    #[test]
+    fn detached_recursive_scratch_nests_by_ownership() {
+        let mut bufs = TreeDecodeBufs::new();
+        bufs.base_buf.extend_from_slice(b"outer");
+
+        let outer = bufs.detach_recursive_scratch();
+        bufs.base_buf.extend_from_slice(b"middle");
+
+        let middle = bufs.detach_recursive_scratch();
+        bufs.base_buf.extend_from_slice(b"inner");
+
+        bufs.restore_recursive_scratch(middle);
+        assert_eq!(bufs.base_buf.as_slice(), b"middle");
+
+        bufs.restore_recursive_scratch(outer);
+        assert_eq!(bufs.base_buf.as_slice(), b"outer");
     }
 
-    let payload = &bytes[nul + 1..];
-    if payload.len() != size {
-        return Err(TreeDiffError::CorruptTree {
-            detail: "object size mismatch",
-        });
+    #[test]
+    fn swap_in_base_moves_vec_ownership_without_copy() {
+        let mut bufs = TreeDecodeBufs::new();
+        bufs.base_buf.extend_from_slice(b"outer-base");
+        let old_base_ptr = bufs.base_buf.as_ptr();
+
+        let mut incoming = Vec::from(&b"incoming-base"[..]);
+        let incoming_ptr = incoming.as_ptr();
+
+        bufs.swap_in_base(&mut incoming);
+
+        assert_eq!(bufs.base_buf.as_slice(), b"incoming-base");
+        assert_eq!(bufs.base_buf.as_ptr(), incoming_ptr);
+        assert_eq!(incoming.as_slice(), b"outer-base");
+        assert_eq!(incoming.as_ptr(), old_base_ptr);
     }
 
-    let kind = match kind_bytes {
-        b"commit" => ObjectKind::Commit,
-        b"tree" => ObjectKind::Tree,
-        b"blob" => ObjectKind::Blob,
-        b"tag" => ObjectKind::Tag,
-        _ => {
-            return Err(TreeDiffError::ObjectStoreError {
-                detail: "unknown loose object type".to_string(),
-            })
-        }
-    };
+    #[test]
+    fn take_result_output_preserves_base_capacity() {
+        let mut bufs = TreeDecodeBufs::new();
+        bufs.base_buf = Vec::with_capacity(64);
+        bufs.base_buf.extend_from_slice(b"base");
+        bufs.result_buf.extend_from_slice(b"resolved");
+        let base_cap_before = bufs.base_buf.capacity();
 
-    Ok((kind, payload.to_vec()))
-}
+        let out = bufs.take_result_output();
 
-/// Parses a non-empty ASCII decimal sequence with overflow checks.
-///
-/// Returns `None` for empty input, non-digit bytes, or arithmetic overflow.
-fn parse_decimal(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() {
-        return None;
+        assert_eq!(out.as_slice(), b"resolved");
+        assert!(bufs.result_buf.is_empty());
+        assert_eq!(bufs.base_buf.as_slice(), b"base");
+        assert_eq!(bufs.base_buf.capacity(), base_cap_before);
     }
-    let mut value: u64 = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        value = value.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-    }
-    Some(value)
 }

@@ -49,9 +49,10 @@ use super::pack_cache::PackCache;
 use super::pack_candidates::LooseCandidate;
 use super::pack_decode::PackDecodeLimits;
 use super::pack_exec::{
-    build_candidate_ranges, execute_pack_plan_with_scratch, execute_pack_plan_with_scratch_indices,
-    execute_pack_plan_with_scratch_range, merge_pack_exec_reports, CandidateRange, PackExecError,
-    PackExecReport, PackExecScratch, SkipRecord,
+    build_candidate_ranges, execute_pack_plan_with_scratch,
+    execute_pack_plan_with_scratch_indices_hot_deps, execute_pack_plan_with_scratch_range_hot_deps,
+    merge_pack_exec_reports, CandidateRange, PackExecError, PackExecReport, PackExecScratch,
+    PackPlanHotDeps, SkipRecord,
 };
 use super::pack_inflate::ObjectKind;
 use super::pack_io::{PackIo, PackIoError, PackIoLimits};
@@ -988,6 +989,7 @@ struct SchedulerPackScratch {
 /// Dependency chain:
 ///   `adapter` borrows `_engine`    → drop adapter first
 ///   `external` borrows `_midx_bytes` → drop external first
+#[repr(C)]
 struct SchedulerPackWorkerRuntime {
     // Borrowing fields — dropped explicitly in our `Drop` impl before
     // the owning storage they reference.
@@ -1052,6 +1054,8 @@ fn build_scheduler_shard_exec_plan(plan: &PackPlan) -> SchedulerShardExecPlan {
 #[derive(Clone)]
 struct SchedulerShardMeta {
     exec_plan: SchedulerShardExecPlan,
+    /// Precomputed once per plan and shared by all shards.
+    plan_hot_deps: PackPlanHotDeps,
     /// Per-offset candidate ranges for explicit exec-order sharding.
     candidate_ranges: Vec<CandidateRange>,
     /// `(start, end)` slices into `exec_plan`.
@@ -1075,13 +1079,13 @@ struct SchedulerPackShared {
     pack_paths: Arc<Vec<PathBuf>>,
     loose_dirs: Arc<Vec<PathBuf>>,
     pack_mmaps: Arc<Vec<Option<Mmap>>>,
-    path_arena: Arc<ByteArena>,
-    spill_dir: Arc<PathBuf>,
+    path_arena: ByteArena,
+    spill_dir: PathBuf,
     pack_decode: PackDecodeLimits,
     pack_io: PackIoLimits,
     adapter_cfg: EngineAdapterConfig,
-    plans: Arc<Vec<PackPlan>>,
-    shard_meta: Option<Arc<Vec<SchedulerShardMeta>>>,
+    plans: Vec<PackPlan>,
+    shard_meta: Option<Vec<SchedulerShardMeta>>,
     /// Commit-graph index for resolving `commit_id` → OID + timestamp.
     /// Cloned into each worker's `EngineAdapter` for `CommitMeta` emission.
     commit_graph: Arc<super::commit_graph::CommitGraphIndex>,
@@ -1179,9 +1183,11 @@ fn build_scheduler_worker_runtime(
 ) -> Result<SchedulerPackWorkerRuntime, GitScanError> {
     let midx_bytes = shared.midx_bytes.clone();
     let midx = MidxView::parse(midx_bytes.as_slice(), shared.object_format)?;
-    // SAFETY: `midx` borrows from `midx_bytes`, which is stored in the same
-    // runtime struct. The custom `Drop` impl on the runtime ensures `external`
-    // (which contains this midx) is dropped before `_midx_bytes`.
+    // SAFETY: Widens `midx` lifetime to `'static` to store in `SchedulerPackWorkerRuntime`.
+    // Sound because `_midx_bytes` (owner) lives in the same struct and `external` (borrower)
+    // is wrapped in `ManuallyDrop`. The custom `Drop` impl drops `external` before `_midx_bytes`.
+    // Breaks if: field reordering, removing `ManuallyDrop`, or dropping `_midx_bytes` before `external`.
+    // See `SchedulerPackWorkerRuntime` doc comment and `#[repr(C)]` guarantee.
     let midx: MidxView<'static> = unsafe { std::mem::transmute(midx) };
     let external = PackIo::from_parts(
         midx,
@@ -1192,9 +1198,11 @@ fn build_scheduler_worker_runtime(
     .map_err(GitScanError::PackIo)?;
 
     let engine = Arc::clone(&shared.engine);
-    // SAFETY: the adapter only borrows `engine` and the same runtime stores
-    // `_engine`. The custom `Drop` impl ensures `adapter` is dropped before
-    // `_engine`.
+    // SAFETY: Widens `&Engine` lifetime to `'static` to create reusable `EngineAdapter`.
+    // Sound because `_engine` (owner) lives in the same struct and `adapter` (borrower)
+    // is wrapped in `ManuallyDrop`. The custom `Drop` impl drops `adapter` before `_engine`.
+    // Breaks if: field reordering, removing `ManuallyDrop`, or dropping `_engine` before `adapter`.
+    // See `SchedulerPackWorkerRuntime` doc comment and `#[repr(C)]` guarantee.
     let engine_ref: &'static Engine = unsafe { std::mem::transmute(engine.as_ref()) };
     let adapter = EngineAdapter::new_with_event_sink(
         engine_ref,
@@ -1226,6 +1234,95 @@ fn ensure_scheduler_worker_runtime(
     Ok(())
 }
 
+/// Resolve a plan index from shared scheduler input.
+#[inline(always)]
+fn scheduler_plan_at(
+    shared: &SchedulerPackShared,
+    index: usize,
+) -> Result<&PackPlan, GitScanError> {
+    shared.plans.get(index).ok_or({
+        GitScanError::PackExec(PackExecError::SchedulerPlanIndexOutOfRange {
+            index,
+            plan_count: shared.plans.len(),
+        })
+    })
+}
+
+/// Resolve a shard plan index from shared scheduler input.
+#[inline(always)]
+fn scheduler_shard_plan_at(
+    shared: &SchedulerPackShared,
+    plan_idx: usize,
+) -> Result<&PackPlan, GitScanError> {
+    shared.plans.get(plan_idx).ok_or({
+        GitScanError::PackExec(PackExecError::SchedulerShardPlanIndexOutOfRange {
+            plan_idx,
+            plan_count: shared.plans.len(),
+        })
+    })
+}
+
+/// Resolve pack bytes for a plan from shared mapped packs.
+#[inline(always)]
+fn scheduler_pack_bytes<'a>(
+    shared: &'a SchedulerPackShared,
+    plan: &PackPlan,
+) -> Result<&'a [u8], GitScanError> {
+    let pack_id = plan.pack_id as usize;
+    shared
+        .pack_mmaps
+        .get(pack_id)
+        .and_then(|mmap| mmap.as_ref())
+        .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
+            pack_id: plan.pack_id,
+            pack_count: shared.pack_mmaps.len(),
+        }))
+        .map(Mmap::as_ref)
+}
+
+/// Run task logic with initialized worker runtime and reusable scratch.
+#[inline(always)]
+fn with_scheduler_worker_parts<T>(
+    scratch: &mut SchedulerPackScratch,
+    shared: &SchedulerPackShared,
+    mut f: impl FnMut(
+        &mut PackCache,
+        &mut PackExecScratch,
+        &mut PackIo<'static>,
+        &mut EngineAdapter<'static>,
+    ) -> Result<T, GitScanError>,
+) -> Result<T, GitScanError> {
+    ensure_scheduler_worker_runtime(&mut scratch.runtime, shared)?;
+    let runtime = scratch
+        .runtime
+        .as_mut()
+        .expect("scheduler worker runtime initialized");
+    runtime.adapter.clear_results();
+    let adapter: &mut EngineAdapter<'static> = &mut runtime.adapter;
+    let external: &mut PackIo<'static> = &mut runtime.external;
+    f(
+        &mut scratch.cache,
+        &mut scratch.exec_scratch,
+        external,
+        adapter,
+    )
+}
+
+/// Build scheduler task output from adapter-owned report/results/metrics.
+#[inline(always)]
+fn scheduler_pack_task_output(
+    adapter: &mut EngineAdapter<'_>,
+    report: PackExecReport,
+) -> SchedulerPackExecOutput {
+    let common_metrics = adapter.take_metrics();
+    SchedulerPackExecOutput {
+        report,
+        scanned: adapter.take_results(),
+        skipped: Vec::new(),
+        common_metrics,
+    }
+}
+
 /// Execute a single scheduler-dispatched pack task (plan or shard).
 ///
 /// Uses reusable per-worker runtime (`PackIo` + `EngineAdapter`) from
@@ -1243,158 +1340,482 @@ fn run_scheduler_pack_task(
     scratch: &mut SchedulerPackScratch,
     shared: &SchedulerPackShared,
 ) -> Result<SchedulerPackExecOutput, GitScanError> {
-    ensure_scheduler_worker_runtime(&mut scratch.runtime, shared)?;
-    let (cache, exec_scratch, runtime) = (
-        &mut scratch.cache,
-        &mut scratch.exec_scratch,
-        scratch
-            .runtime
-            .as_mut()
-            .expect("scheduler worker runtime initialized"),
-    );
-    runtime.adapter.clear_results();
-    let adapter: &mut EngineAdapter<'static> = &mut runtime.adapter;
-    let external: &mut PackIo<'static> = &mut runtime.external;
-
-    match task {
-        SchedulerPackTask::ExecPlan { seq } => {
-            let plan = shared.plans.get(seq).ok_or_else(|| {
-                GitScanError::PackExec(PackExecError::PackRead(
-                    "scheduler plan index out of range".to_string(),
-                ))
-            })?;
-            let pack_id = plan.pack_id as usize;
-            let pack_bytes = shared
-                .pack_mmaps
-                .get(pack_id)
-                .and_then(|mmap| mmap.as_ref())
-                .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
-                    pack_id: plan.pack_id,
-                    pack_count: shared.pack_mmaps.len(),
-                }))?
-                .as_ref();
-
-            adapter.reserve_results(plan.candidate_offsets.len());
-            let report = execute_pack_plan_with_scratch(
-                plan,
-                pack_bytes,
-                shared.path_arena.as_ref(),
-                &shared.pack_decode,
-                cache,
-                external,
-                adapter,
-                shared.spill_dir.as_ref(),
-                exec_scratch,
-            )?;
-
-            let common_metrics = adapter.take_metrics();
-            Ok(SchedulerPackExecOutput {
-                report,
-                scanned: adapter.take_results(),
-                skipped: Vec::new(),
-                common_metrics,
-            })
-        }
-        SchedulerPackTask::ExecShard {
-            plan_idx,
-            shard_idx,
-        } => {
-            let plan = shared.plans.get(plan_idx).ok_or_else(|| {
-                GitScanError::PackExec(PackExecError::PackRead(
-                    "scheduler shard plan index out of range".to_string(),
-                ))
-            })?;
-            let shard_meta = shared
-                .shard_meta
-                .as_ref()
-                .and_then(|meta| meta.get(plan_idx))
-                .ok_or_else(|| {
-                    GitScanError::PackExec(PackExecError::PackRead(
-                        "scheduler shard metadata missing".to_string(),
-                    ))
+    with_scheduler_worker_parts(scratch, shared, |cache, exec_scratch, external, adapter| {
+        let report = match task {
+            SchedulerPackTask::ExecPlan { seq } => {
+                let plan = scheduler_plan_at(shared, seq)?;
+                let pack_bytes = scheduler_pack_bytes(shared, plan)?;
+                adapter.reserve_results(plan.candidate_offsets.len());
+                execute_pack_plan_with_scratch(
+                    plan,
+                    pack_bytes,
+                    &shared.path_arena,
+                    &shared.pack_decode,
+                    cache,
+                    external,
+                    adapter,
+                    &shared.spill_dir,
+                    exec_scratch,
+                )?
+            }
+            SchedulerPackTask::ExecShard {
+                plan_idx,
+                shard_idx,
+            } => {
+                let plan = scheduler_shard_plan_at(shared, plan_idx)?;
+                let shard_meta = shared
+                    .shard_meta
+                    .as_ref()
+                    .and_then(|meta| meta.get(plan_idx))
+                    .ok_or({
+                        GitScanError::PackExec(PackExecError::SchedulerShardMetadataMissing {
+                            plan_idx,
+                        })
+                    })?;
+                let (start, end) = *shard_meta.shard_ranges.get(shard_idx).ok_or({
+                    GitScanError::PackExec(PackExecError::SchedulerShardIndexOutOfRange {
+                        plan_idx,
+                        shard_idx,
+                        shard_count: shard_meta.shard_ranges.len(),
+                    })
                 })?;
-            let (start, end) = *shard_meta.shard_ranges.get(shard_idx).ok_or_else(|| {
-                GitScanError::PackExec(PackExecError::PackRead(
-                    "scheduler shard index out of range".to_string(),
-                ))
-            })?;
+                let pack_bytes = scheduler_pack_bytes(shared, plan)?;
 
-            let pack_id = plan.pack_id as usize;
-            let pack_bytes = shared
-                .pack_mmaps
-                .get(pack_id)
-                .and_then(|mmap| mmap.as_ref())
-                .ok_or(GitScanError::PackPlan(PackPlanError::PackIdOutOfRange {
-                    pack_id: plan.pack_id,
-                    pack_count: shared.pack_mmaps.len(),
-                }))?
-                .as_ref();
-
-            let report = match &shard_meta.exec_plan {
-                SchedulerShardExecPlan::Explicit(exec_indices) => {
-                    let exec_slice = &exec_indices[start..end];
-                    reserve_results_for_exec_slice(
-                        adapter,
-                        exec_slice,
-                        &shard_meta.candidate_ranges,
-                    );
-                    execute_pack_plan_with_scratch_indices(
-                        plan,
-                        pack_bytes,
-                        shared.path_arena.as_ref(),
-                        &shared.pack_decode,
-                        cache,
-                        external,
-                        adapter,
-                        shared.spill_dir.as_ref(),
-                        exec_scratch,
-                        exec_slice,
-                        &shard_meta.candidate_ranges,
-                    )?
+                match &shard_meta.exec_plan {
+                    SchedulerShardExecPlan::Explicit(exec_indices) => {
+                        let exec_slice = &exec_indices[start..end];
+                        reserve_results_for_exec_slice(
+                            adapter,
+                            exec_slice,
+                            &shard_meta.candidate_ranges,
+                        );
+                        execute_pack_plan_with_scratch_indices_hot_deps(
+                            plan,
+                            pack_bytes,
+                            &shared.path_arena,
+                            &shared.pack_decode,
+                            cache,
+                            external,
+                            adapter,
+                            &shared.spill_dir,
+                            exec_scratch,
+                            exec_slice,
+                            &shard_meta.candidate_ranges,
+                            &shard_meta.plan_hot_deps,
+                        )?
+                    }
+                    SchedulerShardExecPlan::Natural { .. } => {
+                        reserve_results_for_need_range(adapter, plan, start, end);
+                        execute_pack_plan_with_scratch_range_hot_deps(
+                            plan,
+                            pack_bytes,
+                            &shared.path_arena,
+                            &shared.pack_decode,
+                            cache,
+                            external,
+                            adapter,
+                            &shared.spill_dir,
+                            exec_scratch,
+                            start,
+                            end,
+                            &shard_meta.plan_hot_deps,
+                        )?
+                    }
                 }
-                SchedulerShardExecPlan::Natural { .. } => {
-                    reserve_results_for_need_range(adapter, plan, start, end);
-                    execute_pack_plan_with_scratch_range(
-                        plan,
-                        pack_bytes,
-                        shared.path_arena.as_ref(),
-                        &shared.pack_decode,
-                        cache,
-                        external,
-                        adapter,
-                        shared.spill_dir.as_ref(),
-                        exec_scratch,
-                        start,
-                        end,
-                    )?
-                }
-            };
+            }
+        };
+        Ok(scheduler_pack_task_output(adapter, report))
+    })
+}
 
-            let common_metrics = adapter.take_metrics();
-            Ok(SchedulerPackExecOutput {
-                report,
-                scanned: adapter.take_results(),
-                skipped: Vec::new(),
-                common_metrics,
-            })
+struct SchedulerExecEnv {
+    engine: Arc<Engine>,
+    event_sink: Arc<dyn EventSink>,
+    midx_bytes: BytesView,
+    object_format: ObjectFormat,
+    pack_paths: Arc<Vec<PathBuf>>,
+    loose_dirs: Arc<Vec<PathBuf>>,
+    pack_mmaps: Arc<Vec<Option<Mmap>>>,
+    path_arena: Arc<ByteArena>,
+    spill_dir: Arc<PathBuf>,
+    pack_decode: PackDecodeLimits,
+    pack_io: PackIoLimits,
+    adapter_cfg: EngineAdapterConfig,
+    pack_cache_bytes: u32,
+    exec_workers: usize,
+    pin_threads: bool,
+    commit_graph: Arc<crate::git_scan::commit_graph::CommitGraphIndex>,
+    commit_meta_seen: Arc<crate::stdx::AtomicBitSet>,
+}
+
+impl SchedulerExecEnv {
+    #[inline(always)]
+    fn executor_config(&self) -> ExecutorConfig {
+        ExecutorConfig {
+            workers: self.exec_workers,
+            seed: 0x853c49e6748fea9b,
+            pin_threads: self.pin_threads,
+            ..ExecutorConfig::default()
         }
+    }
+
+    fn build_shared(
+        &self,
+        plans: Arc<Vec<PackPlan>>,
+        shard_meta: Option<Arc<Vec<SchedulerShardMeta>>>,
+    ) -> Arc<SchedulerPackShared> {
+        Arc::new(SchedulerPackShared {
+            engine: Arc::clone(&self.engine),
+            event_sink: Arc::clone(&self.event_sink),
+            midx_bytes: self.midx_bytes.clone(),
+            object_format: self.object_format,
+            pack_paths: Arc::clone(&self.pack_paths),
+            loose_dirs: Arc::clone(&self.loose_dirs),
+            pack_mmaps: Arc::clone(&self.pack_mmaps),
+            path_arena: Arc::unwrap_or_clone(Arc::clone(&self.path_arena)),
+            spill_dir: Arc::unwrap_or_clone(Arc::clone(&self.spill_dir)),
+            pack_decode: self.pack_decode,
+            pack_io: self.pack_io,
+            adapter_cfg: self.adapter_cfg,
+            plans: Arc::unwrap_or_clone(plans),
+            shard_meta: shard_meta.map(Arc::unwrap_or_clone),
+            commit_graph: Arc::clone(&self.commit_graph),
+            commit_meta_seen: Arc::clone(&self.commit_meta_seen),
+        })
     }
 }
 
-/// Execute pack plans via the scheduler `Executor` work-queue.
+#[inline(always)]
+fn scheduler_worker_scratch(pack_cache_bytes: u32) -> SchedulerPackScratch {
+    SchedulerPackScratch {
+        cache: PackCache::new(pack_cache_bytes),
+        exec_scratch: PackExecScratch::default(),
+        runtime: None,
+    }
+}
+
+#[inline(always)]
+fn store_scheduler_error(
+    first_error: &Mutex<Option<GitScanError>>,
+    abort_flag: &AtomicBool,
+    err: GitScanError,
+) {
+    abort_flag.store(true, Ordering::Release);
+    let mut guard = first_error
+        .lock()
+        .expect("scheduler pack error mutex poisoned");
+    if guard.is_none() {
+        *guard = Some(err);
+    }
+}
+
+#[inline(always)]
+fn take_scheduler_error(first_error: &Mutex<Option<GitScanError>>) -> Option<GitScanError> {
+    first_error
+        .lock()
+        .expect("scheduler pack error mutex poisoned")
+        .take()
+}
+
+#[inline(always)]
+fn scheduler_queue_rejected_error(shard_queue: bool) -> GitScanError {
+    GitScanError::PackExec(if shard_queue {
+        PackExecError::SchedulerShardQueueRejected
+    } else {
+        PackExecError::SchedulerTaskQueueRejected
+    })
+}
+
+fn collect_plan_outputs(
+    plans: &[PackPlan],
+    output_slots: &[Mutex<Option<SchedulerPackExecOutput>>],
+) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
+    let mut merged = Vec::with_capacity(plans.len());
+    for (plan_idx, slot) in output_slots.iter().enumerate() {
+        let mut output = slot
+            .lock()
+            .expect("scheduler pack output slot poisoned")
+            .take()
+            .ok_or({
+                GitScanError::PackExec(PackExecError::SchedulerPlanOutputMissing { plan_idx })
+            })?;
+        // Defer skip mapping to merge time so worker tasks avoid building
+        // per-task skipped vectors in the hot path.
+        collect_skipped_candidates(&plans[plan_idx], &output.report.skips, &mut output.skipped);
+        merged.push(output);
+    }
+    Ok(merged)
+}
+
+fn execute_plan_tasks(
+    env: SchedulerExecEnv,
+    plans: Arc<Vec<PackPlan>>,
+) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
+    let plan_count = plans.len();
+    type OutputSlot = Mutex<Option<SchedulerPackExecOutput>>;
+    let output_slots: Arc<Vec<OutputSlot>> =
+        Arc::new((0..plan_count).map(|_| Mutex::new(None)).collect());
+    let shared = env.build_shared(plans, None);
+    let first_error: Arc<Mutex<Option<GitScanError>>> = Arc::new(Mutex::new(None));
+    let abort_flag = Arc::new(AtomicBool::new(false));
+
+    let pack_cache_bytes = env.pack_cache_bytes;
+    let ex = Executor::<SchedulerPackTask>::new(
+        env.executor_config(),
+        move |_wid| scheduler_worker_scratch(pack_cache_bytes),
+        {
+            let shared = Arc::clone(&shared);
+            let output_slots = Arc::clone(&output_slots);
+            let first_error = Arc::clone(&first_error);
+            let abort_flag = Arc::clone(&abort_flag);
+            move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
+                if abort_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                let seq = match task {
+                    SchedulerPackTask::ExecPlan { seq } => seq,
+                    SchedulerPackTask::ExecShard { .. } => return,
+                };
+                match run_scheduler_pack_task(
+                    SchedulerPackTask::ExecPlan { seq },
+                    &mut ctx.scratch,
+                    &shared,
+                ) {
+                    Ok(output) => {
+                        *output_slots[seq]
+                            .lock()
+                            .expect("scheduler pack output slot poisoned") = Some(output);
+                    }
+                    Err(err) => {
+                        store_scheduler_error(first_error.as_ref(), abort_flag.as_ref(), err)
+                    }
+                }
+            }
+        },
+    );
+
+    let tasks: Vec<SchedulerPackTask> = (0..plan_count)
+        .map(|seq| SchedulerPackTask::ExecPlan { seq })
+        .collect();
+    ex.spawn_external_batch(tasks)
+        .map_err(|_| scheduler_queue_rejected_error(false))?;
+    ex.join();
+
+    if let Some(err) = take_scheduler_error(first_error.as_ref()) {
+        return Err(err);
+    }
+
+    collect_plan_outputs(shared.plans.as_slice(), output_slots.as_ref())
+}
+
+struct ShardDispatchPlan {
+    shard_meta: Vec<SchedulerShardMeta>,
+    tasks: Vec<SchedulerPackTask>,
+}
+
+fn build_shard_dispatch_plan(
+    plans: &[PackPlan],
+    shard_counts: &[(u16, usize)],
+) -> ShardDispatchPlan {
+    let mut shard_meta = Vec::with_capacity(plans.len());
+    let mut tasks = Vec::new();
+
+    for (plan_idx, plan) in plans.iter().enumerate() {
+        let exec_plan = build_scheduler_shard_exec_plan(plan);
+        let plan_hot_deps = PackPlanHotDeps::from_plan(plan);
+        let exec_len = exec_plan.len();
+        if exec_len == 0 {
+            shard_meta.push(SchedulerShardMeta {
+                exec_plan,
+                plan_hot_deps,
+                candidate_ranges: Vec::new(),
+                shard_ranges: Vec::new(),
+            });
+            continue;
+        }
+
+        let candidate_ranges = if matches!(&exec_plan, SchedulerShardExecPlan::Explicit(_)) {
+            let mut ranges = Vec::new();
+            build_candidate_ranges(plan, &mut ranges);
+            ranges
+        } else {
+            Vec::new()
+        };
+        let shard_count = shard_count_for_pack(shard_counts, plan.pack_id);
+        let shard_ranges = shard_ranges(exec_len, shard_count);
+        for shard_idx in 0..shard_ranges.len() {
+            tasks.push(SchedulerPackTask::ExecShard {
+                plan_idx,
+                shard_idx,
+            });
+        }
+
+        shard_meta.push(SchedulerShardMeta {
+            exec_plan,
+            plan_hot_deps,
+            candidate_ranges,
+            shard_ranges,
+        });
+    }
+
+    ShardDispatchPlan { shard_meta, tasks }
+}
+
+fn build_shard_slot_bases(shard_meta: &[SchedulerShardMeta]) -> Vec<usize> {
+    let mut shard_slot_base = Vec::with_capacity(shard_meta.len());
+    let mut total_shard_slots = 0usize;
+    for meta in shard_meta {
+        shard_slot_base.push(total_shard_slots);
+        total_shard_slots += meta.shard_ranges.len();
+    }
+    shard_slot_base
+}
+
+fn merge_shard_outputs(
+    plans: &[PackPlan],
+    shard_meta: &[SchedulerShardMeta],
+    shard_slots: &[Mutex<Option<SchedulerPackExecOutput>>],
+    shard_slot_base: &[usize],
+) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
+    let mut merged = Vec::with_capacity(plans.len());
+    for plan_idx in 0..plans.len() {
+        let base = shard_slot_base[plan_idx];
+        let shard_count = shard_meta[plan_idx].shard_ranges.len();
+        if shard_count == 0 {
+            merged.push(empty_scheduler_output());
+            continue;
+        }
+
+        let mut reports = Vec::with_capacity(shard_count);
+        let mut scanned_shards = Vec::with_capacity(shard_count);
+        let mut skipped = Vec::new();
+        let mut common_metrics = GitScanCommonMetrics::default();
+        for shard_idx in 0..shard_count {
+            let shard_output = shard_slots[base + shard_idx]
+                .lock()
+                .expect("scheduler shard output slot poisoned")
+                .take()
+                .ok_or({
+                    GitScanError::PackExec(PackExecError::SchedulerShardOutputMissing {
+                        plan_idx,
+                        shard_idx,
+                    })
+                })?;
+            reports.push(shard_output.report);
+            scanned_shards.push(shard_output.scanned);
+            common_metrics.merge_from(&shard_output.common_metrics);
+        }
+
+        let report = if reports.len() == 1 {
+            reports.pop().expect("len checked")
+        } else {
+            merge_pack_exec_reports(reports)
+        };
+        collect_skipped_candidates(&plans[plan_idx], &report.skips, &mut skipped);
+        let scanned = merge_scanned_blobs(scanned_shards);
+        merged.push(SchedulerPackExecOutput {
+            report,
+            scanned,
+            skipped,
+            common_metrics,
+        });
+    }
+    Ok(merged)
+}
+
+fn execute_sharded_tasks(
+    env: SchedulerExecEnv,
+    plans: Arc<Vec<PackPlan>>,
+    shard_counts: Vec<(u16, usize)>,
+) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
+    let plan_count = plans.len();
+    let ShardDispatchPlan { shard_meta, tasks } =
+        build_shard_dispatch_plan(plans.as_ref(), &shard_counts);
+
+    if tasks.is_empty() {
+        return Ok((0..plan_count).map(|_| empty_scheduler_output()).collect());
+    }
+
+    let shard_slot_base = Arc::new(build_shard_slot_bases(&shard_meta));
+    let total_shard_slots = shard_meta
+        .iter()
+        .map(|meta| meta.shard_ranges.len())
+        .sum::<usize>();
+    type ShardSlot = Mutex<Option<SchedulerPackExecOutput>>;
+    let shard_slots: Arc<Vec<ShardSlot>> =
+        Arc::new((0..total_shard_slots).map(|_| Mutex::new(None)).collect());
+    let shared = env.build_shared(plans, Some(Arc::new(shard_meta)));
+    let first_error: Arc<Mutex<Option<GitScanError>>> = Arc::new(Mutex::new(None));
+    let abort_flag = Arc::new(AtomicBool::new(false));
+
+    let pack_cache_bytes = env.pack_cache_bytes;
+    let ex = Executor::<SchedulerPackTask>::new(
+        env.executor_config(),
+        move |_wid| scheduler_worker_scratch(pack_cache_bytes),
+        {
+            let shared = Arc::clone(&shared);
+            let shard_slots = Arc::clone(&shard_slots);
+            let shard_slot_base = Arc::clone(&shard_slot_base);
+            let first_error = Arc::clone(&first_error);
+            let abort_flag = Arc::clone(&abort_flag);
+            move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
+                if abort_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                let (plan_idx, shard_idx) = match task {
+                    SchedulerPackTask::ExecShard {
+                        plan_idx,
+                        shard_idx,
+                    } => (plan_idx, shard_idx),
+                    SchedulerPackTask::ExecPlan { .. } => return,
+                };
+                match run_scheduler_pack_task(
+                    SchedulerPackTask::ExecShard {
+                        plan_idx,
+                        shard_idx,
+                    },
+                    &mut ctx.scratch,
+                    &shared,
+                ) {
+                    Ok(output) => {
+                        let flat_idx = shard_slot_base[plan_idx] + shard_idx;
+                        *shard_slots[flat_idx]
+                            .lock()
+                            .expect("scheduler shard output slot poisoned") = Some(output);
+                    }
+                    Err(err) => {
+                        store_scheduler_error(first_error.as_ref(), abort_flag.as_ref(), err)
+                    }
+                }
+            }
+        },
+    );
+
+    ex.spawn_external_batch(tasks)
+        .map_err(|_| scheduler_queue_rejected_error(true))?;
+    ex.join();
+
+    if let Some(err) = take_scheduler_error(first_error.as_ref()) {
+        return Err(err);
+    }
+
+    let shard_meta = shared.shard_meta.as_ref().ok_or(GitScanError::PackExec(
+        PackExecError::SchedulerShardMetadataUnavailable,
+    ))?;
+    merge_shard_outputs(
+        shared.plans.as_slice(),
+        shard_meta.as_slice(),
+        shard_slots.as_ref(),
+        shard_slot_base.as_ref(),
+    )
+}
+
+/// Input bundle for scheduler execution setup.
 ///
-/// Selects a [`PackExecStrategy`] based on worker count and plan structure:
-/// - **Serial / PackParallel**: each plan is one task; outputs are collected
-///   into sequence-indexed slots for deterministic reassembly.
-/// - **IntraPackSharded**: large plans are split into shards; per-shard
-///   outputs are merged (reports summed, scanned blobs rebased) before
-///   returning one output per plan.
-///
-/// On the first worker error, an abort flag prevents new tasks from starting.
-/// The function joins all workers, then returns the first error encountered.
-/// Outputs from successful plans are discarded on error.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn execute_pack_plans_with_scheduler(
+/// Grouping these fields keeps strategy selection and environment assembly
+/// in one focused context object instead of threading many discrete args
+/// through helper internals.
+struct SchedulerExecRequest {
     engine: Arc<Engine>,
     event_sink: Arc<dyn EventSink>,
     midx_bytes: BytesView,
@@ -1413,7 +1834,31 @@ pub(super) fn execute_pack_plans_with_scheduler(
     pin_threads: bool,
     commit_graph: Arc<super::commit_graph::CommitGraphIndex>,
     commit_meta_seen: Arc<crate::stdx::AtomicBitSet>,
+}
+
+fn execute_pack_plans_with_scheduler_request(
+    request: SchedulerExecRequest,
 ) -> Result<Vec<SchedulerPackExecOutput>, GitScanError> {
+    let SchedulerExecRequest {
+        engine,
+        event_sink,
+        midx_bytes,
+        object_format,
+        pack_paths,
+        loose_dirs,
+        pack_mmaps,
+        path_arena,
+        spill_dir,
+        plans,
+        pack_decode,
+        pack_io,
+        adapter_cfg,
+        pack_cache_bytes,
+        workers,
+        pin_threads,
+        commit_graph,
+        commit_meta_seen,
+    } = request;
     if plans.is_empty() {
         return Ok(Vec::new());
     }
@@ -1425,319 +1870,104 @@ pub(super) fn execute_pack_plans_with_scheduler(
         PackExecStrategy::PackParallel | PackExecStrategy::IntraPackSharded { .. } => workers,
     };
 
-    let plan_count = plans.len();
+    let env = SchedulerExecEnv {
+        engine,
+        event_sink,
+        midx_bytes,
+        object_format,
+        pack_paths,
+        loose_dirs,
+        pack_mmaps,
+        path_arena,
+        spill_dir,
+        pack_decode,
+        pack_io,
+        adapter_cfg,
+        pack_cache_bytes,
+        exec_workers,
+        pin_threads,
+        commit_graph,
+        commit_meta_seen,
+    };
+
     let plans = Arc::new(plans);
-    let first_error: Arc<Mutex<Option<GitScanError>>> = Arc::new(Mutex::new(None));
-    let abort_flag = Arc::new(AtomicBool::new(false));
-
     match strategy {
-        PackExecStrategy::Serial | PackExecStrategy::PackParallel => {
-            type OutputSlot = Mutex<Option<SchedulerPackExecOutput>>;
-            let output_slots: Arc<Vec<OutputSlot>> =
-                Arc::new((0..plan_count).map(|_| Mutex::new(None)).collect());
-            let shared = Arc::new(SchedulerPackShared {
-                engine,
-                event_sink,
-                midx_bytes,
-                object_format,
-                pack_paths,
-                loose_dirs,
-                pack_mmaps,
-                path_arena,
-                spill_dir,
-                pack_decode,
-                pack_io,
-                adapter_cfg,
-                plans: Arc::clone(&plans),
-                shard_meta: None,
-                commit_graph: Arc::clone(&commit_graph),
-                commit_meta_seen: Arc::clone(&commit_meta_seen),
-            });
-
-            let ex = Executor::<SchedulerPackTask>::new(
-                ExecutorConfig {
-                    workers: exec_workers,
-                    seed: 0x853c49e6748fea9b,
-                    pin_threads,
-                    ..ExecutorConfig::default()
-                },
-                move |_wid| SchedulerPackScratch {
-                    cache: PackCache::new(pack_cache_bytes),
-                    exec_scratch: PackExecScratch::default(),
-                    runtime: None,
-                },
-                {
-                    let shared = Arc::clone(&shared);
-                    let output_slots = Arc::clone(&output_slots);
-                    let first_error = Arc::clone(&first_error);
-                    let abort_flag = Arc::clone(&abort_flag);
-                    move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
-                        if abort_flag.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let seq = match task {
-                            SchedulerPackTask::ExecPlan { seq } => seq,
-                            SchedulerPackTask::ExecShard { .. } => return,
-                        };
-                        match run_scheduler_pack_task(
-                            SchedulerPackTask::ExecPlan { seq },
-                            &mut ctx.scratch,
-                            &shared,
-                        ) {
-                            Ok(output) => {
-                                *output_slots[seq]
-                                    .lock()
-                                    .expect("scheduler pack output slot poisoned") = Some(output);
-                            }
-                            Err(err) => {
-                                abort_flag.store(true, Ordering::Relaxed);
-                                let mut guard = first_error
-                                    .lock()
-                                    .expect("scheduler pack error mutex poisoned");
-                                if guard.is_none() {
-                                    *guard = Some(err);
-                                }
-                            }
-                        }
-                    }
-                },
-            );
-
-            let tasks: Vec<SchedulerPackTask> = (0..plan_count)
-                .map(|seq| SchedulerPackTask::ExecPlan { seq })
-                .collect();
-            ex.spawn_external_batch(tasks).map_err(|_| {
-                GitScanError::PackExec(PackExecError::PackRead(
-                    "scheduler pack task queue rejected work".to_string(),
-                ))
-            })?;
-            ex.join();
-
-            if let Some(err) = first_error
-                .lock()
-                .expect("scheduler pack error mutex poisoned")
-                .take()
-            {
-                return Err(err);
-            }
-
-            let mut merged = Vec::with_capacity(plan_count);
-            for (plan_idx, slot) in output_slots.iter().enumerate() {
-                let mut output = slot
-                    .lock()
-                    .expect("scheduler pack output slot poisoned")
-                    .take()
-                    .ok_or_else(|| {
-                        GitScanError::PackExec(PackExecError::PackRead(
-                            "missing scheduler pack output".to_string(),
-                        ))
-                    })?;
-                // Defer skip mapping to merge time so worker tasks avoid building
-                // per-task skipped vectors in the hot path.
-                collect_skipped_candidates(
-                    &plans[plan_idx],
-                    &output.report.skips,
-                    &mut output.skipped,
-                );
-                merged.push(output);
-            }
-            Ok(merged)
-        }
+        PackExecStrategy::Serial | PackExecStrategy::PackParallel => execute_plan_tasks(env, plans),
         PackExecStrategy::IntraPackSharded { shard_counts } => {
-            let mut shard_meta = Vec::with_capacity(plan_count);
-            let mut tasks = Vec::new();
-
-            for (plan_idx, plan) in plans.iter().enumerate() {
-                let exec_plan = build_scheduler_shard_exec_plan(plan);
-                let exec_len = exec_plan.len();
-                if exec_len == 0 {
-                    shard_meta.push(SchedulerShardMeta {
-                        exec_plan,
-                        candidate_ranges: Vec::new(),
-                        shard_ranges: Vec::new(),
-                    });
-                    continue;
-                }
-
-                let candidate_ranges = if matches!(&exec_plan, SchedulerShardExecPlan::Explicit(_))
-                {
-                    let mut ranges = Vec::new();
-                    build_candidate_ranges(plan, &mut ranges);
-                    ranges
-                } else {
-                    Vec::new()
-                };
-                let shard_count = shard_count_for_pack(&shard_counts, plan.pack_id);
-                let shard_ranges = shard_ranges(exec_len, shard_count);
-                for shard_idx in 0..shard_ranges.len() {
-                    tasks.push(SchedulerPackTask::ExecShard {
-                        plan_idx,
-                        shard_idx,
-                    });
-                }
-
-                shard_meta.push(SchedulerShardMeta {
-                    exec_plan,
-                    candidate_ranges,
-                    shard_ranges,
-                });
-            }
-
-            if tasks.is_empty() {
-                return Ok((0..plan_count).map(|_| empty_scheduler_output()).collect());
-            }
-
-            // Pre-compute cumulative shard offsets so each (plan, shard) pair
-            // maps to a unique flat index — one Mutex per slot, zero contention.
-            let mut shard_slot_base = Vec::with_capacity(plan_count);
-            let mut total_shard_slots = 0usize;
-            for meta in &shard_meta {
-                shard_slot_base.push(total_shard_slots);
-                total_shard_slots += meta.shard_ranges.len();
-            }
-            type ShardSlot = Mutex<Option<SchedulerPackExecOutput>>;
-            let shard_slots: Arc<Vec<ShardSlot>> =
-                Arc::new((0..total_shard_slots).map(|_| Mutex::new(None)).collect());
-            let shard_slot_base = Arc::new(shard_slot_base);
-            let shard_meta = Arc::new(shard_meta);
-
-            let shared = Arc::new(SchedulerPackShared {
-                engine,
-                event_sink,
-                midx_bytes,
-                object_format,
-                pack_paths,
-                loose_dirs,
-                pack_mmaps,
-                path_arena,
-                spill_dir,
-                pack_decode,
-                pack_io,
-                adapter_cfg,
-                plans: Arc::clone(&plans),
-                shard_meta: Some(Arc::clone(&shard_meta)),
-                commit_graph,
-                commit_meta_seen,
-            });
-
-            let ex = Executor::<SchedulerPackTask>::new(
-                ExecutorConfig {
-                    workers: exec_workers,
-                    seed: 0x853c49e6748fea9b,
-                    pin_threads,
-                    ..ExecutorConfig::default()
-                },
-                move |_wid| SchedulerPackScratch {
-                    cache: PackCache::new(pack_cache_bytes),
-                    exec_scratch: PackExecScratch::default(),
-                    runtime: None,
-                },
-                {
-                    let shared = Arc::clone(&shared);
-                    let shard_slots = Arc::clone(&shard_slots);
-                    let shard_slot_base = Arc::clone(&shard_slot_base);
-                    let first_error = Arc::clone(&first_error);
-                    let abort_flag = Arc::clone(&abort_flag);
-                    move |task, ctx: &mut WorkerCtx<SchedulerPackTask, SchedulerPackScratch>| {
-                        if abort_flag.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let (plan_idx, shard_idx) = match task {
-                            SchedulerPackTask::ExecShard {
-                                plan_idx,
-                                shard_idx,
-                            } => (plan_idx, shard_idx),
-                            SchedulerPackTask::ExecPlan { .. } => return,
-                        };
-                        match run_scheduler_pack_task(
-                            SchedulerPackTask::ExecShard {
-                                plan_idx,
-                                shard_idx,
-                            },
-                            &mut ctx.scratch,
-                            &shared,
-                        ) {
-                            Ok(output) => {
-                                let flat_idx = shard_slot_base[plan_idx] + shard_idx;
-                                *shard_slots[flat_idx]
-                                    .lock()
-                                    .expect("scheduler shard output slot poisoned") = Some(output);
-                            }
-                            Err(err) => {
-                                abort_flag.store(true, Ordering::Relaxed);
-                                let mut guard = first_error
-                                    .lock()
-                                    .expect("scheduler pack error mutex poisoned");
-                                if guard.is_none() {
-                                    *guard = Some(err);
-                                }
-                            }
-                        }
-                    }
-                },
-            );
-
-            ex.spawn_external_batch(tasks).map_err(|_| {
-                GitScanError::PackExec(PackExecError::PackRead(
-                    "scheduler pack shard queue rejected work".to_string(),
-                ))
-            })?;
-            ex.join();
-
-            if let Some(err) = first_error
-                .lock()
-                .expect("scheduler pack error mutex poisoned")
-                .take()
-            {
-                return Err(err);
-            }
-
-            let mut merged = Vec::with_capacity(plan_count);
-            for plan_idx in 0..plan_count {
-                let base = shard_slot_base[plan_idx];
-                let shard_count = shard_meta[plan_idx].shard_ranges.len();
-                if shard_count == 0 {
-                    merged.push(empty_scheduler_output());
-                    continue;
-                }
-
-                let mut reports = Vec::with_capacity(shard_count);
-                let mut scanned_shards = Vec::with_capacity(shard_count);
-                let mut skipped = Vec::new();
-                let mut common_metrics = GitScanCommonMetrics::default();
-                for s in 0..shard_count {
-                    let shard_output = shard_slots[base + s]
-                        .lock()
-                        .expect("scheduler shard output slot poisoned")
-                        .take()
-                        .ok_or_else(|| {
-                            GitScanError::PackExec(PackExecError::PackRead(
-                                "missing scheduler shard output".to_string(),
-                            ))
-                        })?;
-                    reports.push(shard_output.report);
-                    scanned_shards.push(shard_output.scanned);
-                    common_metrics.merge_from(&shard_output.common_metrics);
-                }
-
-                let report = if reports.len() == 1 {
-                    reports.pop().expect("len checked")
-                } else {
-                    merge_pack_exec_reports(reports)
-                };
-                collect_skipped_candidates(&plans[plan_idx], &report.skips, &mut skipped);
-                let scanned = merge_scanned_blobs(scanned_shards);
-                merged.push(SchedulerPackExecOutput {
-                    report,
-                    scanned,
-                    skipped,
-                    common_metrics,
-                });
-            }
-            Ok(merged)
+            execute_sharded_tasks(env, plans, shard_counts)
         }
     }
 }
+
+type ExecutePackPlansWithSchedulerFn = fn(
+    Arc<Engine>,
+    Arc<dyn EventSink>,
+    BytesView,
+    ObjectFormat,
+    Arc<Vec<PathBuf>>,
+    Arc<Vec<PathBuf>>,
+    Arc<Vec<Option<Mmap>>>,
+    Arc<ByteArena>,
+    Arc<PathBuf>,
+    Vec<PackPlan>,
+    PackDecodeLimits,
+    PackIoLimits,
+    EngineAdapterConfig,
+    u32,
+    usize,
+    bool,
+    Arc<super::commit_graph::CommitGraphIndex>,
+    Arc<crate::stdx::AtomicBitSet>,
+) -> Result<Vec<SchedulerPackExecOutput>, GitScanError>;
+
+/// Compatibility call boundary used by `runner_odb_blob` and
+/// `runner_diff_history`.
+///
+/// Scheduler setup is documented and implemented in
+/// `execute_pack_plans_with_scheduler_request`; this symbol forwards inputs
+/// into that request object while preserving the existing callable name.
+pub(super) static EXECUTE_PACK_PLANS_WITH_SCHEDULER: ExecutePackPlansWithSchedulerFn =
+    |engine,
+     event_sink,
+     midx_bytes,
+     object_format,
+     pack_paths,
+     loose_dirs,
+     pack_mmaps,
+     path_arena,
+     spill_dir,
+     plans,
+     pack_decode,
+     pack_io,
+     adapter_cfg,
+     pack_cache_bytes,
+     workers,
+     pin_threads,
+     commit_graph,
+     commit_meta_seen| {
+        execute_pack_plans_with_scheduler_request(SchedulerExecRequest {
+            engine,
+            event_sink,
+            midx_bytes,
+            object_format,
+            pack_paths,
+            loose_dirs,
+            pack_mmaps,
+            path_arena,
+            spill_dir,
+            plans,
+            pack_decode,
+            pack_io,
+            adapter_cfg,
+            pack_cache_bytes,
+            workers,
+            pin_threads,
+            commit_graph,
+            commit_meta_seen,
+        })
+    };
+
+pub(super) use EXECUTE_PACK_PLANS_WITH_SCHEDULER as execute_pack_plans_with_scheduler;
 
 /// Load loose candidate objects and scan their blob payloads.
 ///

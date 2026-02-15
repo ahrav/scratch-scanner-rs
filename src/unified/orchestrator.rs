@@ -946,6 +946,9 @@ fn format_human_bytes(bytes: u64) -> String {
 /// up to 5 skipped candidates for post-mortem diagnosis. Format is
 /// intentionally unstructured — use `--event-format jsonl` for machine
 /// consumption and reserve this output for human debugging.
+///
+/// `report.format_metrics()` always emits the same key set; in non-`git-perf`
+/// builds perf-derived values are zero.
 fn print_git_debug(report: &git_scan::GitScanReport) {
     eprintln!("commits={}", report.commit_count);
     eprintln!("tree_diff_stats={:?}", report.tree_diff_stats);

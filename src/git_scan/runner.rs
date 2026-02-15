@@ -33,14 +33,12 @@
 //! - Loose objects are decoded via `PackIo::load_loose_object`; failures are
 //!   recorded as skipped candidates.
 //! - Persistence is optional; callers can run the pipeline without a store.
-//! - Stage `mapping`/`scan` timings are sourced from perf counters when enabled.
 
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "git-perf")]
 use std::time::Instant;
 
-#[cfg(feature = "git-perf")]
 use crate::scheduler::AllocStatsDelta;
 use crate::Engine;
 
@@ -444,12 +442,13 @@ pub struct SkippedCandidate {
     pub reason: CandidateSkipReason,
 }
 
-/// Wall-clock timing per Git scan stage (nanoseconds).
+/// Per-stage nanoseconds for the git scan pipeline.
 ///
-/// Per-stage wall-clock nanoseconds for the git scan pipeline.
+/// Most fields are wall-clock durations. `mapping` and `scan` come from
+/// git-perf counters when that instrumentation is enabled.
 ///
-/// Only compiled with `git-perf`; zero-sized stub otherwise.
-#[cfg(feature = "git-perf")]
+/// Shape is stable across feature flags. In non-`git-perf` builds, all fields
+/// remain available and default to zero.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GitScanStageNanos {
     /// Tree diff stage time.
@@ -462,7 +461,7 @@ pub struct GitScanStageNanos {
     pub spill: u64,
     /// Pack candidate collection time (ODB-blob mode).
     pub pack_collect: u64,
-    /// Mapping bridge stage time (from perf counters when enabled).
+    /// Mapping bridge time.
     pub mapping: u64,
     /// Pack planning stage time.
     pub pack_plan: u64,
@@ -470,29 +469,19 @@ pub struct GitScanStageNanos {
     pub pack_exec: u64,
     /// Loose object scan time (ODB-blob mode).
     pub loose_scan: u64,
-    /// Scan stage time (from perf counters when enabled).
+    /// Scan time.
     pub scan: u64,
 }
 
-/// Zero-sized stub when `git-perf` is disabled.
-#[cfg(not(feature = "git-perf"))]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GitScanStageNanos;
-
 /// Allocation deltas captured across hot stages.
 ///
-/// Only compiled with `git-perf`; zero-sized stub otherwise.
-#[cfg(feature = "git-perf")]
+/// Shape is stable across feature flags. In non-`git-perf` builds, fields
+/// remain available and default to zero.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GitScanAllocStats {
     /// Allocation deltas for pack decode + scan.
     pub pack_exec: AllocStatsDelta,
 }
-
-/// Zero-sized stub when `git-perf` is disabled.
-#[cfg(not(feature = "git-perf"))]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GitScanAllocStats;
 
 /// Summary report for a completed scan.
 ///
@@ -538,16 +527,9 @@ pub struct GitScanReport {
 impl GitScanReport {
     /// Formats metrics as machine-parseable `key=value\n` lines.
     ///
-    /// Returns an empty string when `git-perf` is disabled.
+    /// The key set is stable across feature flags. In non-`git-perf` builds,
+    /// perf-derived values remain present and are emitted as zero.
     #[must_use]
-    #[cfg(not(feature = "git-perf"))]
-    pub fn format_metrics(&self) -> String {
-        String::new()
-    }
-
-    /// Formats metrics as machine-parseable `key=value\n` lines.
-    #[must_use]
-    #[cfg(feature = "git-perf")]
     pub fn format_metrics(&self) -> String {
         fn bytes_per_sec(bytes: u64, nanos: u64) -> u64 {
             if bytes == 0 || nanos == 0 {
@@ -1292,5 +1274,73 @@ mod tests {
             ),
             36
         );
+    }
+
+    #[test]
+    fn metrics_structs_expose_stable_fields() {
+        let stage = GitScanStageNanos {
+            tree_diff: 0,
+            commit_plan: 0,
+            blob_intro: 0,
+            spill: 0,
+            pack_collect: 0,
+            mapping: 0,
+            pack_plan: 0,
+            pack_exec: 0,
+            loose_scan: 0,
+            scan: 0,
+        };
+        assert_eq!(stage.pack_exec, 0);
+
+        let alloc = GitScanAllocStats {
+            pack_exec: AllocStatsDelta::default(),
+        };
+        assert_eq!(alloc.pack_exec.allocs, 0);
+    }
+
+    #[test]
+    fn format_metrics_emits_stable_key_set() {
+        let report = GitScanReport {
+            commit_count: 0,
+            tree_diff_stats: TreeDiffStats::default(),
+            spill_stats: SpillStats::default(),
+            mapping_stats: MappingStats::default(),
+            pack_plan_stats: Vec::new(),
+            pack_plan_config: PackPlanConfig::default(),
+            pack_plan_delta_deps_total: 0,
+            pack_plan_delta_deps_max: 0,
+            pack_exec_reports: Vec::new(),
+            skipped_candidates: Vec::new(),
+            finalize: FinalizeOutput {
+                data_ops: Vec::new(),
+                watermark_ops: Vec::new(),
+                outcome: super::super::finalize::FinalizeOutcome::Complete,
+                stats: super::super::finalize::FinalizeStats::default(),
+            },
+            common_metrics: GitScanCommonMetrics::default(),
+            stage_nanos: GitScanStageNanos::default(),
+            perf_stats: super::super::perf::GitPerfStats::default(),
+            alloc_stats: GitScanAllocStats::default(),
+            pack_cache_per_worker_bytes: 0,
+        };
+
+        let metrics = report.format_metrics();
+        assert!(
+            !metrics.is_empty(),
+            "metrics output must not disappear when git-perf is disabled"
+        );
+        for key in [
+            "stage.tree_diff.nanos",
+            "tree_load.calls",
+            "pack_inflate.bytes",
+            "scan.nanos",
+            "spill.runs",
+            "alloc.pack_exec.allocs",
+        ] {
+            assert!(
+                metrics.contains(&format!("{key}=0\n")),
+                "expected stable key in metrics output: {key}"
+            );
+        }
     }
 }

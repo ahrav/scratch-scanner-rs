@@ -161,10 +161,14 @@ Tree payloads that exceed the in-memory cache capacity are written to a
 preallocated, memory-mapped spill file (`SpillArena`). The arena uses a
 dual-mapping strategy: a `MmapMut` writer for sequential appends and a
 shared read-only `Mmap` for zero-copy reads. An open-addressing hash table
-(`SpillIndex`) with linear probing provides O(1) lookups by OID, using a
-Murmur3 fmix64 finalizer on the first 8 OID bytes to distribute sequential
-OIDs evenly across slots. The index is best-effort: once all slots are
-occupied it disables itself and lookups fall back to pack/loose reads.
+(`SpillIndex`) with linear probing provides O(1) lookups by OID. Slot count
+is power-of-two and bounded (64..1,048,576), derived from spill budget and
+spill threshold to cap RAM usage. Hashing uses the first 8 OID bytes
+interpreted as little-endian `u64` (no Murmur/fmix finalizer). This is used
+because OIDs are already cryptographic hashes with high byte entropy, so extra
+mixing is unnecessary and would add hot-path work. The index is best-effort
+and append-only: once probing can no longer find an empty slot, new spills are
+not indexed and those lookups fall back to pack/loose reads.
 
 ### Pack Execution Strategy
 

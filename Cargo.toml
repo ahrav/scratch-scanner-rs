@@ -74,6 +74,7 @@ criterion = "0.5"
 tempfile = "3.10"
 itoa = "1"
 ryu = "1"
+sha1 = "0.10"
 
 [[bench]]
 name = "scan"
@@ -207,6 +208,11 @@ name = "git_scan_parse"
 harness = false
 
 [[bench]]
+name = "object_store_iterative_delta"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "runner_exec_contention"
 harness = false
 
@@ -219,6 +225,10 @@ required-features = ["bench"]
 name = "runner_exec_strategy"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "oid_hash_quality"
+harness = false
 
 [profile.dev]
 opt-level = 1

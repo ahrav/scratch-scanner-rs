@@ -16,9 +16,8 @@ use std::time::Instant;
 
 /// Snapshot of Git scan performance counters.
 ///
-/// When the `git-perf` feature is disabled this is a zero-sized unit struct
-/// so it adds no memory cost to `GitScanReport`.
-#[cfg(feature = "git-perf")]
+/// Shape is stable across feature flags. In non-`git-perf` builds snapshots
+/// are still returned with this full structure, but every field is zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitPerfStats {
     /// Total bytes inflated from pack entries (uncompressed size).
@@ -118,11 +117,6 @@ pub struct GitPerfStats {
     /// Chunks where the hoisted prefilter bypassed reset+work-queue setup.
     pub scan_prefilter_bypass_count: u64,
 }
-
-/// Zero-sized stub when `git-perf` is disabled.
-#[cfg(not(feature = "git-perf"))]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GitPerfStats;
 
 /// Assigns a value to a perf-related struct field.
 ///
@@ -608,27 +602,21 @@ pub fn record_scan_vs_prefilter(nanos: u64) {
 }
 
 /// Record window validation timing (sort/merge + regex).
+///
+/// Only compiled when `git-perf` is enabled — all call sites are already
+/// gated behind `#[cfg(feature = "git-perf")]`.
+#[cfg(feature = "git-perf")]
 pub fn record_scan_validate(nanos: u64) {
-    #[cfg(feature = "git-perf")]
-    {
-        SCAN_VALIDATE_NANOS.fetch_add(nanos, Ordering::Relaxed);
-    }
-    #[cfg(not(feature = "git-perf"))]
-    {
-        let _ = nanos;
-    }
+    SCAN_VALIDATE_NANOS.fetch_add(nanos, Ordering::Relaxed);
 }
 
 /// Record transform decode + rescan timing.
+///
+/// Only compiled when `git-perf` is enabled — all call sites are already
+/// gated behind `#[cfg(feature = "git-perf")]`.
+#[cfg(feature = "git-perf")]
 pub fn record_scan_transform(nanos: u64) {
-    #[cfg(feature = "git-perf")]
-    {
-        SCAN_TRANSFORM_NANOS.fetch_add(nanos, Ordering::Relaxed);
-    }
-    #[cfg(not(feature = "git-perf"))]
-    {
-        let _ = nanos;
-    }
+    SCAN_TRANSFORM_NANOS.fetch_add(nanos, Ordering::Relaxed);
 }
 
 /// Record per-blob sort + dedup timing.

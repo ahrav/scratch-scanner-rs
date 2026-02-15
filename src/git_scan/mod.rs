@@ -80,7 +80,7 @@ pub mod pack_plan;
 pub mod pack_plan_model;
 pub mod pack_reader;
 pub mod path_policy;
-pub mod perf;
+pub(crate) mod perf;
 pub mod persist;
 pub mod persist_rocksdb;
 pub mod policy_hash;

@@ -75,6 +75,7 @@ use super::pack_inflate::{
     PackParseError,
 };
 use super::repo::GitRepoPaths;
+use super::repo_paths::{find_pack_path, pack_data_file_name};
 
 /// Safety allowance for loose object headers (`"commit <size>\0"`).
 const LOOSE_HEADER_MAX_BYTES: usize = 64;
@@ -470,9 +471,17 @@ pub fn resolve_pack_paths_from_midx(
 ) -> Result<Vec<PathBuf>, CommitLoadError> {
     let mut paths = Vec::with_capacity(midx.pack_count() as usize);
 
-    for pack_name in midx.pack_names() {
-        let path = find_pack_file(pack_name, pack_dirs)?;
-        paths.push(path);
+    for name in midx.pack_names() {
+        match find_pack_path(name, pack_dirs) {
+            Some(path) => paths.push(path),
+            None => {
+                let pack_name = pack_data_file_name(name);
+                return Err(CommitLoadError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("pack file not found: {pack_name}"),
+                )));
+            }
+        }
     }
 
     Ok(paths)
@@ -568,37 +577,6 @@ pub fn load_shallow_boundary_roots(
     }
 
     Ok(ShallowBoundaryRoots::from_deduped(out))
-}
-
-/// Finds a pack file by name across pack directories.
-///
-/// MIDX stores pack names with `.idx` extension (e.g., `pack-xxx.idx`).
-/// This function converts the name to `.pack` extension to find the actual
-/// pack data file.
-fn find_pack_file(name: &[u8], pack_dirs: &[PathBuf]) -> Result<PathBuf, CommitLoadError> {
-    let name_str = std::str::from_utf8(name).unwrap_or("<invalid>");
-
-    // Convert .idx to .pack extension if needed (MIDX stores .idx names)
-    let pack_name = if name_str.ends_with(".idx") {
-        name_str.replace(".idx", ".pack")
-    } else if name_str.ends_with(".pack") {
-        name_str.to_string()
-    } else {
-        // No extension; try adding .pack
-        format!("{name_str}.pack")
-    };
-
-    for dir in pack_dirs {
-        let path = dir.join(&pack_name);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-
-    Err(CommitLoadError::Io(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("pack file not found: {pack_name}"),
-    )))
 }
 
 /// Internal commit loader state.

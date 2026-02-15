@@ -30,6 +30,7 @@
 use std::fmt;
 
 use super::object_id::{ObjectFormat, OidBytes};
+use super::repo_paths;
 
 /// Errors from commit parsing.
 #[derive(Debug)]
@@ -313,10 +314,8 @@ fn parse_committer_timestamp(data: &[u8], pos: &mut usize) -> Result<u64, Commit
 
 /// Parses a Unix timestamp from ASCII decimal bytes.
 ///
-/// Git timestamps are bounded by the year-3000 check in the caller
-/// (max ~32.5 × 10^9), so at most 11 digits. We reject anything longer
-/// up front to prevent wrapping arithmetic from silently producing
-/// in-range values from overflowed inputs.
+/// Overflow is detected with checked arithmetic. Policy bounds (for example,
+/// rejecting post-year-3000 commit timestamps) are enforced by the caller.
 fn parse_unix_timestamp(bytes: &[u8]) -> Result<u64, CommitParseError> {
     if bytes.is_empty() {
         return Err(CommitParseError::InvalidTimestamp {
@@ -324,30 +323,20 @@ fn parse_unix_timestamp(bytes: &[u8]) -> Result<u64, CommitParseError> {
         });
     }
 
-    // Max valid timestamp before year 3000 is ~32.5 × 10^9 (11 digits).
-    // Reject anything longer to prevent u64 wrapping during accumulation.
-    if bytes.len() > 11 {
-        return Err(CommitParseError::InvalidTimestamp {
-            detail: "timestamp overflow",
-        });
-    }
-
-    // Validate all digits up front so the accumulation loop is branch-free.
+    let mut result: u64 = 0;
     for &b in bytes {
         if !b.is_ascii_digit() {
             return Err(CommitParseError::InvalidTimestamp {
                 detail: "non-digit in timestamp",
             });
         }
-    }
-
-    // Length ≤ 11 and all-digits validated above. The maximum 11-digit
-    // value is 99_999_999_999, well below u64::MAX (1.8 × 10^19), so
-    // wrapping_mul / wrapping_add cannot overflow. The caller further
-    // bounds accepted values to < 32_503_680_000 (year 3000).
-    let mut result: u64 = 0;
-    for &b in bytes {
-        result = result * 10 + (b - b'0') as u64;
+        let digit = (b - b'0') as u64;
+        result = result
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or(CommitParseError::InvalidTimestamp {
+                detail: "timestamp overflow",
+            })?;
     }
 
     Ok(result)
@@ -355,63 +344,19 @@ fn parse_unix_timestamp(bytes: &[u8]) -> Result<u64, CommitParseError> {
 
 /// Parses a hex-encoded OID into `OidBytes`.
 fn parse_hex_oid(hex: &[u8], format: ObjectFormat) -> Result<OidBytes, CommitParseError> {
-    let expected_len = format.hex_len() as usize;
-    if hex.len() != expected_len {
-        return Err(CommitParseError::InvalidOidLength {
-            found: hex.len(),
-            expected: expected_len,
-        });
-    }
-
-    let oid_len = format.oid_len() as usize;
-    let mut bytes = [0u8; 32];
-
-    for i in 0..oid_len {
-        let hi = hex_digit(hex[i * 2])?;
-        let lo = hex_digit(hex[i * 2 + 1])?;
-        bytes[i] = (hi << 4) | lo;
-    }
-
-    Ok(match format {
-        ObjectFormat::Sha1 => {
-            let mut arr = [0u8; 20];
-            arr.copy_from_slice(&bytes[..20]);
-            OidBytes::sha1(arr)
+    repo_paths::parse_hex_oid(hex, format).map_err(|err| match err {
+        repo_paths::HexOidParseError::InvalidHex { byte } => CommitParseError::InvalidHex { byte },
+        repo_paths::HexOidParseError::InvalidOidLength { found, expected } => {
+            CommitParseError::InvalidOidLength { found, expected }
         }
-        ObjectFormat::Sha256 => OidBytes::sha256(bytes),
     })
 }
 
-/// 256-byte lookup table for hex digit decoding.
-///
-/// Valid hex digits map to 0..=15; all other bytes map to 0xFF (sentinel).
-/// This eliminates branches in the hot OID-parsing loop — each byte decodes
-/// via a single indexed load from `.rodata`.
-static HEX_DECODE: [u8; 256] = {
-    let mut table = [0xFFu8; 256];
-    let mut i = 0u16;
-    while i < 256 {
-        let b = i as u8;
-        table[i as usize] = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => 0xFF,
-        };
-        i += 1;
-    }
-    table
-};
-
 /// Converts a hex ASCII byte to its numeric value.
 #[inline]
+#[cfg(test)]
 fn hex_digit(b: u8) -> Result<u8, CommitParseError> {
-    let v = HEX_DECODE[b as usize];
-    if v == 0xFF {
-        Err(CommitParseError::InvalidHex { byte: b })
-    } else {
-        Ok(v)
-    }
+    repo_paths::decode_hex_digit(b).ok_or(CommitParseError::InvalidHex { byte: b })
 }
 
 #[cfg(test)]
@@ -713,10 +658,7 @@ mod tests {
 
     #[test]
     fn parse_unix_timestamp_rejects_20_digit_overflow() {
-        // "18446744073709551616" is u64::MAX + 1 (20 digits, all valid ASCII
-        // digits). With wrapping arithmetic this would silently produce 0.
-        // The caller's range check (> 32_503_680_000) would then pass the
-        // wrapped value, yielding a bogus epoch timestamp.
+        // "18446744073709551616" is u64::MAX + 1.
         let overflow = b"18446744073709551616";
         let result = parse_unix_timestamp(overflow);
         assert!(
@@ -727,8 +669,7 @@ mod tests {
 
     #[test]
     fn parse_unix_timestamp_rejects_20_digit_all_nines() {
-        // 20 nines — wraps under wrapping arithmetic but must be
-        // rejected by the length guard regardless.
+        // 20 nines also overflow u64.
         let all_nines = b"99999999999999999999";
         let result = parse_unix_timestamp(all_nines);
         assert!(
@@ -738,15 +679,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_unix_timestamp_rejects_12_digit() {
-        // 12 digits (100 billion) is beyond year 3000. Must be rejected
-        // by the length guard (max 11 digits).
-        let twelve = b"100000000000";
-        let result = parse_unix_timestamp(twelve);
-        assert!(
-            result.is_err(),
-            "12-digit input must be rejected, got: {result:?}",
-        );
+    fn parse_unix_timestamp_accepts_u64_max() {
+        let max = b"18446744073709551615";
+        let result = parse_unix_timestamp(max);
+        assert_eq!(result.unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn parse_unix_timestamp_accepts_leading_zero_padding() {
+        let leading_zeros = b"000000000001";
+        let result = parse_unix_timestamp(leading_zeros);
+        assert_eq!(result.unwrap(), 1);
     }
 
     #[test]
@@ -763,6 +706,39 @@ mod tests {
         let typical = b"1700000000";
         let result = parse_unix_timestamp(typical);
         assert_eq!(result.unwrap(), 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_commit_accepts_leading_zero_committer_timestamp() {
+        let data = make_commit(
+            TREE_HEX,
+            &[],
+            "A <a@b.com> 1700000000 +0000",
+            "C <c@d.com> 000000000001 +0000",
+            "msg",
+        );
+
+        let limits = CommitParseLimits::default();
+        let commit = parse_commit(&data, ObjectFormat::Sha1, &limits).unwrap();
+        assert_eq!(commit.committer_timestamp, 1);
+    }
+
+    #[test]
+    fn parse_commit_rejects_post_year_3000_timestamp_with_leading_zeroes() {
+        let data = make_commit(
+            TREE_HEX,
+            &[],
+            "A <a@b.com> 1700000000 +0000",
+            "C <c@d.com> 00032503680001 +0000",
+            "msg",
+        );
+
+        let limits = CommitParseLimits::default();
+        let result = parse_commit(&data, ObjectFormat::Sha1, &limits);
+        assert!(matches!(
+            result,
+            Err(CommitParseError::InvalidTimestamp { .. })
+        ));
     }
 
     #[test]
