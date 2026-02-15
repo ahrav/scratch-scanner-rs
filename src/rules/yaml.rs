@@ -320,7 +320,7 @@ fn yaml_offline_to_spec(
 /// - [`RulesError::Regex`] — a rule's `regex` field fails to compile.
 ///   The error includes the rule name and pattern for diagnostics.
 pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
-    let file: YamlRulesFile = serde_yml::from_str(content).map_err(RulesError::Yaml)?;
+    let file: YamlRulesFile = serde_norway::from_str(content).map_err(RulesError::Yaml)?;
 
     let mut rules = Vec::with_capacity(file.rules.len());
     for yr in file.rules {

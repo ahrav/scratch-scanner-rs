@@ -217,7 +217,7 @@ proptest! {
     // Semantic invariant: serde round-trip through `parse_yaml_rules` preserves
     // all schema-visible fields (including optional nested structures).
     fn parse_yaml_preserves_semantic_fields(case in arb_rule_case()) {
-        let yaml = serde_yml::to_string(&YamlRulesFile {
+        let yaml = serde_norway::to_string(&YamlRulesFile {
             rules: vec![case.to_yaml_rule()],
         })
         .expect("serialize generated YAML");
@@ -300,7 +300,7 @@ proptest! {
     // Interning invariant: repeated parse of identical YAML must reuse pointers
     // for all interned atoms and interned atom slices.
     fn repeated_parse_reuses_interned_atoms(case in arb_rule_case()) {
-        let yaml = serde_yml::to_string(&YamlRulesFile {
+        let yaml = serde_norway::to_string(&YamlRulesFile {
             rules: vec![case.to_yaml_rule()],
         })
         .expect("serialize generated YAML");
