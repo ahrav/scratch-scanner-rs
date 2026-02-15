@@ -825,6 +825,7 @@ impl Engine {
             VsPrefilterDb::try_new(&rules, anchor_input, Some(&use_raw_prefilter))
                 .expect("vectorscan prefilter db build failed (fallback disabled)"),
         );
+        let vs_ms = t_vs.map(|t| t.elapsed().as_millis());
         let max_regex_width = vs
             .as_ref()
             .and_then(|db| db.max_match_width_bounded())
@@ -833,6 +834,7 @@ impl Engine {
         let max_prefilter_width = max_regex_width.unwrap_or(max_anchor_pat_len);
         let t_vs_stream = init_diag.then(Instant::now);
         let vs_stream = VsStreamDb::try_new_stream(&rules, max_decoded_cap).ok();
+        let vs_stream_ms = t_vs_stream.map(|t| t.elapsed().as_millis());
         let needs_decoded_gate = transforms
             .iter()
             .any(|tc| tc.gate == Gate::AnchorsInDecoded);
@@ -843,6 +845,7 @@ impl Engine {
             } else {
                 None
             };
+        let vs_gate_ms = t_vs_gate.map(|t| t.elapsed().as_millis());
         let max_stream_window_bytes = vs_stream
             .as_ref()
             .and_then(|db| {
@@ -884,6 +887,7 @@ impl Engine {
                 }
             }
         };
+        let vs_utf16_ms = t_vs_utf16.map(|t| t.elapsed().as_millis());
         let t_vs_utf16_stream = init_diag.then(Instant::now);
         let vs_utf16_stream = if !has_utf16_anchors {
             None
@@ -904,11 +908,15 @@ impl Engine {
                 }
             }
         };
+        let vs_utf16_stream_ms = t_vs_utf16_stream.map(|t| t.elapsed().as_millis());
         if init_diag {
-            let ms = |t: Option<Instant>| t.map_or(0, |t| t.elapsed().as_millis());
             eprintln!(
                 "init_diag: vs_ms={} vs_stream_ms={} vs_gate_ms={} vs_utf16_ms={} vs_utf16_stream_ms={}",
-                ms(t_vs), ms(t_vs_stream), ms(t_vs_gate), ms(t_vs_utf16), ms(t_vs_utf16_stream),
+                vs_ms.unwrap_or(0),
+                vs_stream_ms.unwrap_or(0),
+                vs_gate_ms.unwrap_or(0),
+                vs_utf16_ms.unwrap_or(0),
+                vs_utf16_stream_ms.unwrap_or(0),
             );
         }
         // Pre-bucket transform indices by (mode, id) so the scan-loop work-item
