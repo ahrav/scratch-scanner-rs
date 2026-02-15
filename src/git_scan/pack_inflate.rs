@@ -505,15 +505,18 @@ pub fn inflate_limited_with(
                     return Err(InflateError::Stalled);
                 }
                 if out.len() >= max_out {
+                    if in_pos >= input.len() {
+                        return Err(InflateError::TruncatedInput);
+                    }
                     return Err(InflateError::LimitExceeded);
                 }
             }
             Status::BufError => {
-                if out.len() >= max_out {
-                    return Err(InflateError::LimitExceeded);
-                }
                 if in_pos >= input.len() {
                     return Err(InflateError::TruncatedInput);
+                }
+                if out.len() >= max_out {
+                    return Err(InflateError::LimitExceeded);
                 }
             }
         }
@@ -1453,6 +1456,19 @@ mod tests {
         let err = inflate_limited_with(&mut de, &compressed, &mut out, 0).unwrap_err();
 
         assert_eq!(err, InflateError::LimitExceeded);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inflate_limited_with_zero_max_out_header_only_zlib_is_truncated() {
+        // Bare zlib header without any deflate block or trailer.
+        let malformed = b"\x78\x01";
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let err = inflate_limited_with(&mut de, malformed, &mut out, 0).unwrap_err();
+
+        assert_eq!(err, InflateError::TruncatedInput);
         assert!(out.is_empty());
     }
 

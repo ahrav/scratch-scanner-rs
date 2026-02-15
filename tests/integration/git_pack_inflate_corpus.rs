@@ -152,9 +152,9 @@ fn truncated_zlib_mid_block_returns_truncated_input() {
 /// deflate blocks.
 ///
 /// The inflate path should either succeed with an empty output or return an
-/// error (TruncatedInput, Backend, or LimitExceeded) because the zlib stream
-/// has no final block and the output cap is zero. We accept any of those
-/// outcomes as valid behavior for this degenerate input.
+/// error (TruncatedInput or Backend) because the zlib stream has no final
+/// block. We accept any of those outcomes as valid behavior for this
+/// degenerate input.
 #[test]
 fn zero_length_zlib_header_only() {
     static PACK: &[u8] = include_bytes!("../regression/git_packs/zero_length_zlib.pack");
@@ -176,7 +176,7 @@ fn zero_length_zlib_header_only() {
                 "successful inflate of zero-length should produce empty output"
             );
         }
-        Err(InflateError::TruncatedInput | InflateError::Backend | InflateError::LimitExceeded) => {
+        Err(InflateError::TruncatedInput | InflateError::Backend) => {
             // Acceptable: the bare header without a final deflate block is
             // legitimately broken input.
         }
