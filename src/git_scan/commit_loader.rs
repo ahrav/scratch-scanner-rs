@@ -75,6 +75,7 @@ use super::pack_inflate::{
     PackParseError,
 };
 use super::repo::GitRepoPaths;
+use super::repo_paths::{find_pack_path, pack_data_file_name};
 
 /// Safety allowance for loose object headers (`"commit <size>\0"`).
 const LOOSE_HEADER_MAX_BYTES: usize = 64;
@@ -470,49 +471,20 @@ pub fn resolve_pack_paths_from_midx(
 ) -> Result<Vec<PathBuf>, CommitLoadError> {
     let mut paths = Vec::with_capacity(midx.pack_count() as usize);
 
-    for pack_name in midx.pack_names() {
-        let path = find_pack_file(pack_name, pack_dirs)?;
-        paths.push(path);
+    for name in midx.pack_names() {
+        match find_pack_path(name, pack_dirs) {
+            Some(path) => paths.push(path),
+            None => {
+                let pack_name = pack_data_file_name(name);
+                return Err(CommitLoadError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("pack file not found: {pack_name}"),
+                )));
+            }
+        }
     }
 
     Ok(paths)
-}
-
-/// Collects pack directories from repo paths.
-///
-/// Includes the primary objects pack dir and alternate object pack dirs,
-/// skipping alternates that resolve to the primary objects directory.
-/// Returned order is significant and defines pack-name lookup precedence.
-pub fn collect_pack_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
-    dirs.push(repo.pack_dir.clone());
-
-    for alternate in &repo.alternate_object_dirs {
-        if alternate != &repo.objects_dir {
-            dirs.push(alternate.join("pack"));
-        }
-    }
-
-    dirs
-}
-
-/// Collects loose object directories from repo paths.
-///
-/// Returns directories in precedence order: primary objects dir first, then
-/// unique alternates.
-/// Returned paths are not canonicalized; callers should supply a coherent
-/// `GitRepoPaths` snapshot from `repo_open`.
-pub fn collect_loose_dirs(repo: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + repo.alternate_object_dirs.len());
-    dirs.push(repo.objects_dir.clone());
-
-    for alternate in &repo.alternate_object_dirs {
-        if alternate != &repo.objects_dir {
-            dirs.push(alternate.clone());
-        }
-    }
-
-    dirs
 }
 
 /// Loads shallow-boundary commit OIDs from `shallow` files.
@@ -605,37 +577,6 @@ pub fn load_shallow_boundary_roots(
     }
 
     Ok(ShallowBoundaryRoots::from_deduped(out))
-}
-
-/// Finds a pack file by name across pack directories.
-///
-/// MIDX stores pack names with `.idx` extension (e.g., `pack-xxx.idx`).
-/// This function converts the name to `.pack` extension to find the actual
-/// pack data file.
-fn find_pack_file(name: &[u8], pack_dirs: &[PathBuf]) -> Result<PathBuf, CommitLoadError> {
-    let name_str = std::str::from_utf8(name).unwrap_or("<invalid>");
-
-    // Convert .idx to .pack extension if needed (MIDX stores .idx names)
-    let pack_name = if name_str.ends_with(".idx") {
-        name_str.replace(".idx", ".pack")
-    } else if name_str.ends_with(".pack") {
-        name_str.to_string()
-    } else {
-        // No extension; try adding .pack
-        format!("{name_str}.pack")
-    };
-
-    for dir in pack_dirs {
-        let path = dir.join(&pack_name);
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-
-    Err(CommitLoadError::Io(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("pack file not found: {pack_name}"),
-    )))
 }
 
 /// Internal commit loader state.

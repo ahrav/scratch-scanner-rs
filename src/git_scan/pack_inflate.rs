@@ -30,29 +30,43 @@ const MAX_OFS_BYTES: usize = 10; // ceil(64/7)
 /// Internal inflate buffer size.
 const INFLATE_BUF_SIZE: usize = 64 * 1024;
 
+/// Combined per-thread inflate scratch state.
+///
+/// Merging `Decompress` and the scratch buffer into a single `thread_local!`
+/// halves the TLS lookup and `RefCell::borrow_mut()` overhead (1 borrow
+/// instead of 2).
+struct InflateScratch {
+    de: Decompress,
+    buf: [u8; INFLATE_BUF_SIZE],
+}
+
 thread_local! {
-    static INFLATE_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
-    static INFLATE_BUF: RefCell<[u8; INFLATE_BUF_SIZE]> =
-        const { RefCell::new([0u8; INFLATE_BUF_SIZE]) };
+    static INFLATE_SCRATCH: RefCell<InflateScratch> = RefCell::new(InflateScratch {
+        de: Decompress::new(true),
+        buf: [0u8; INFLATE_BUF_SIZE],
+    });
 }
 
 /// Runs an inflate operation using per-thread scratch buffers.
 ///
 /// This avoids per-call allocations by reusing a thread-local `Decompress`
-/// and output buffer. The scratch state is not re-entrant on the same
-/// thread; callers must not invoke inflate helpers recursively from within
-/// an `inflate_stream` callback.
+/// and output buffer.
+///
+/// # Panics
+///
+/// Panics if called reentrantly on the same thread (the `RefCell` borrow
+/// guard detects double-borrow). Callers must not invoke inflate helpers
+/// recursively from within an `inflate_stream` callback. The `_with`
+/// variants that accept a caller-owned `Decompress` bypass this TLS
+/// entirely and are safe for reentrant use.
 fn with_inflate_scratch<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Decompress, &mut [u8]) -> R,
 {
-    INFLATE_DECOMPRESS.with(|de| {
-        INFLATE_BUF.with(|buf| {
-            let mut de = de.borrow_mut();
-            de.reset(true);
-            let mut buf = buf.borrow_mut();
-            f(&mut de, &mut *buf)
-        })
+    INFLATE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let s = &mut *scratch;
+        f(&mut s.de, &mut s.buf)
     })
 }
 
@@ -250,7 +264,9 @@ impl<'a> PackFile<'a> {
 
     /// Parse and validate a pack file header for caching.
     pub fn parse_header(bytes: &[u8], oid_len: usize) -> Result<PackHeader, PackParseError> {
-        debug_assert!(oid_len == 20 || oid_len == 32, "oid_len must be 20 or 32");
+        if oid_len != 20 && oid_len != 32 {
+            return Err(PackParseError::BadOidLen(oid_len));
+        }
 
         let min_size = PACK_HEADER_SIZE + oid_len;
         if bytes.len() < min_size {
@@ -412,66 +428,112 @@ impl<'a> PackFile<'a> {
     }
 }
 
-/// Inflate a zlib stream with a hard output cap.
+/// Inflate a zlib stream with a hard output cap, using a caller-provided
+/// `Decompress`. The decompressor is reset before use.
 ///
 /// Returns the number of input bytes consumed from `input`.
 ///
-/// The output buffer is cleared before writing. Callers should reserve at
-/// least `max_out` capacity to satisfy debug assertions and avoid reallocations.
+/// Decompressed bytes are written directly into `out`'s spare capacity,
+/// avoiding an intermediate buffer copy.
 ///
 /// On error, `out` may contain a partial prefix; callers should discard it.
-/// This does not enforce that the stream ends exactly at the end of `input`;
-/// callers should use the returned byte count to advance within a pack.
-pub fn inflate_limited(
+pub fn inflate_limited_with(
+    de: &mut Decompress,
     input: &[u8],
     out: &mut Vec<u8>,
     max_out: usize,
 ) -> Result<usize, InflateError> {
     use flate2::{FlushDecompress, Status};
 
-    debug_assert!(out.capacity() >= max_out || max_out == 0);
+    de.reset(true);
     out.clear();
+    out.reserve(max_out);
 
-    with_inflate_scratch(|de, buf| {
-        let mut in_pos: usize = 0;
+    let mut in_pos: usize = 0;
 
-        loop {
-            let before_in = de.total_in() as usize;
-            let before_out = de.total_out() as usize;
+    loop {
+        let before_in = de.total_in() as usize;
+        let before_out = de.total_out() as usize;
 
-            let status = de
-                .decompress(&input[in_pos..], buf, FlushDecompress::None)
-                .map_err(|_| InflateError::Backend)?;
+        // Decompress directly into Vec spare capacity, capped so
+        // total output never exceeds max_out.
+        let remaining = max_out
+            .checked_sub(out.len())
+            .ok_or(InflateError::LimitExceeded)?;
+        let spare = out.spare_capacity_mut();
+        let buf_len = spare.len().min(remaining);
+        let out_buf = &mut spare[..buf_len];
 
-            let consumed = de.total_in() as usize - before_in;
-            let produced = de.total_out() as usize - before_out;
-            in_pos += consumed;
+        let status = de
+            .decompress_uninit(&input[in_pos..], out_buf, FlushDecompress::None)
+            .map_err(|_| InflateError::Backend)?;
 
-            if produced != 0 {
-                if out.len() + produced > max_out {
-                    return Err(InflateError::LimitExceeded);
-                }
-                out.extend_from_slice(&buf[..produced]);
+        let consumed = de.total_in() as usize - before_in;
+        let produced = de.total_out() as usize - before_out;
+        in_pos += consumed;
+
+        if produced != 0 {
+            if produced > buf_len {
+                return Err(InflateError::Backend);
             }
+            let new_len = out
+                .len()
+                .checked_add(produced)
+                .ok_or(InflateError::LimitExceeded)?;
+            if new_len > out.capacity() {
+                return Err(InflateError::Backend);
+            }
+            if new_len > max_out {
+                return Err(InflateError::LimitExceeded);
+            }
+            // SAFETY:
+            // 1. `decompress_uninit` wrote exactly `produced` initialized bytes
+            //    into the passed spare-capacity slice.
+            // 2. `new_len <= out.capacity()` and `new_len <= max_out` were
+            //    checked above in release builds.
+            // 3. `out` uniquely owns its allocation.
+            unsafe { out.set_len(new_len) };
+        }
 
-            match status {
-                Status::StreamEnd => return Ok(in_pos),
-                Status::Ok => {
-                    if consumed == 0 && produced == 0 {
-                        if in_pos >= input.len() {
-                            return Err(InflateError::TruncatedInput);
-                        }
-                        return Err(InflateError::Stalled);
-                    }
-                }
-                Status::BufError => {
+        match status {
+            Status::StreamEnd => return Ok(in_pos),
+            Status::Ok => {
+                if consumed == 0 && produced == 0 {
                     if in_pos >= input.len() {
                         return Err(InflateError::TruncatedInput);
                     }
+                    return Err(InflateError::Stalled);
+                }
+                if out.len() >= max_out {
+                    if in_pos >= input.len() {
+                        return Err(InflateError::TruncatedInput);
+                    }
+                    return Err(InflateError::LimitExceeded);
+                }
+            }
+            Status::BufError => {
+                if in_pos >= input.len() {
+                    return Err(InflateError::TruncatedInput);
+                }
+                if out.len() >= max_out {
+                    return Err(InflateError::LimitExceeded);
                 }
             }
         }
-    })
+    }
+}
+
+/// Inflate a zlib stream with a hard output cap, using the thread-local
+/// `Decompress`.
+///
+/// Convenience wrapper around [`inflate_limited_with`] for callers that
+/// don't maintain their own decompressor.
+pub fn inflate_limited(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    max_out: usize,
+) -> Result<usize, InflateError> {
+    with_inflate_scratch(|de, _buf| inflate_limited_with(de, input, out, max_out))
 }
 
 /// Inflate a zlib stream into a caller-provided sink with an exact output size.
@@ -489,6 +551,7 @@ pub fn inflate_stream(
     use flate2::{FlushDecompress, Status};
 
     with_inflate_scratch(|de, buf| {
+        de.reset(true);
         let mut in_pos: usize = 0;
         let mut out_total: usize = 0;
 
@@ -540,25 +603,31 @@ pub fn inflate_stream(
     })
 }
 
+/// Inflate a zlib stream expecting exactly `expected` output bytes, using a
+/// caller-provided `Decompress`.
+pub fn inflate_exact_with(
+    de: &mut Decompress,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    expected: usize,
+) -> Result<usize, InflateError> {
+    let consumed = inflate_limited_with(de, input, out, expected)?;
+    if out.len() != expected {
+        return Err(InflateError::TruncatedInput);
+    }
+    Ok(consumed)
+}
+
 /// Inflate a zlib stream expecting exactly `expected` output bytes.
 ///
-/// Returns the number of input bytes consumed from `input`.
-///
-/// The output buffer is cleared before writing. Callers should reserve at
-/// least `expected` capacity to satisfy debug assertions and avoid reallocations.
-///
-/// If the stream ends early or produces fewer bytes than expected, returns
-/// `TruncatedInput`.
+/// Convenience wrapper around [`inflate_exact_with`] using the thread-local
+/// `Decompress`.
 pub fn inflate_exact(
     input: &[u8],
     out: &mut Vec<u8>,
     expected: usize,
 ) -> Result<usize, InflateError> {
-    let consumed = inflate_limited(input, out, expected)?;
-    if out.len() != expected {
-        return Err(InflateError::TruncatedInput);
-    }
-    Ok(consumed)
+    with_inflate_scratch(|de, _buf| inflate_exact_with(de, input, out, expected))
 }
 
 /// Reads a Git delta varint (LEB128-like) as u64.
@@ -587,17 +656,108 @@ fn read_leb128_u64(data: &[u8], pos: &mut usize) -> Result<u64, DeltaError> {
     Err(DeltaError::VarintOverflow)
 }
 
+/// Converts a decoded delta size to `usize` with a callsite-selected overflow error.
+#[inline(always)]
+fn delta_size_to_usize(value: u64, overflow_err: DeltaError) -> Result<usize, DeltaError> {
+    usize::try_from(value).map_err(|_| overflow_err)
+}
+
 /// Parse the base and result sizes from a git delta buffer.
 ///
 /// This only reads header varints; it does not validate the remainder.
+/// Values that do not fit in `usize` fail with the caller-specific overflow
+/// error (`BaseSizeMismatch` for base size, `OutputOverrun` for result size).
 pub fn delta_sizes(delta: &[u8]) -> Result<(usize, usize), DeltaError> {
     let mut pos = 0usize;
-    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
-    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
+    let base_size = delta_size_to_usize(
+        read_leb128_u64(delta, &mut pos)?,
+        DeltaError::BaseSizeMismatch,
+    )?;
+    let result_size =
+        delta_size_to_usize(read_leb128_u64(delta, &mut pos)?, DeltaError::OutputOverrun)?;
     Ok((base_size, result_size))
 }
 
-/// Apply a git delta buffer to `base`, producing the result encoded in `delta`.
+#[inline(always)]
+fn parse_delta_header(
+    base: &[u8],
+    delta: &[u8],
+    max_out: usize,
+) -> Result<(usize, usize), DeltaError> {
+    let mut pos = 0usize;
+    let base_size = delta_size_to_usize(
+        read_leb128_u64(delta, &mut pos)?,
+        DeltaError::BaseSizeMismatch,
+    )?;
+    let result_size =
+        delta_size_to_usize(read_leb128_u64(delta, &mut pos)?, DeltaError::OutputOverrun)?;
+    if base_size != base.len() {
+        return Err(DeltaError::BaseSizeMismatch);
+    }
+    if result_size > max_out {
+        return Err(DeltaError::OutputOverrun);
+    }
+    Ok((pos, result_size))
+}
+
+/// Executes delta body opcodes and emits contiguous output chunks.
+///
+/// Shared by `apply_delta` and `apply_delta_into`; both callsites keep only
+/// sink-specific write behavior while command decoding and bounds checks stay
+/// centralized here.
+#[inline(always)]
+fn interpret_delta_body(
+    base: &[u8],
+    delta: &[u8],
+    mut pos: usize,
+    result_size: usize,
+    mut emit_chunk: impl FnMut(&[u8]) -> Result<(), DeltaError>,
+) -> Result<(), DeltaError> {
+    let mut out_len = 0usize;
+    while pos < delta.len() {
+        let cmd = delta[pos];
+        pos += 1;
+
+        if (cmd & 0x80) != 0 {
+            let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
+            let end = off.checked_add(size).ok_or(DeltaError::CopyOutOfRange)?;
+            if end > base.len() {
+                return Err(DeltaError::CopyOutOfRange);
+            }
+            let out_end = out_len.checked_add(size).ok_or(DeltaError::OutputOverrun)?;
+            if out_end > result_size {
+                return Err(DeltaError::OutputOverrun);
+            }
+
+            debug_assert!(off + size <= base.len());
+            emit_chunk(&base[off..end])?;
+            out_len = out_end;
+        } else if cmd != 0 {
+            let size = cmd as usize;
+            if delta.len() - pos < size {
+                return Err(DeltaError::Truncated);
+            }
+            let out_end = out_len.checked_add(size).ok_or(DeltaError::OutputOverrun)?;
+            if out_end > result_size {
+                return Err(DeltaError::OutputOverrun);
+            }
+
+            debug_assert!(pos + size <= delta.len());
+            emit_chunk(&delta[pos..pos + size])?;
+            pos += size;
+            out_len = out_end;
+        } else {
+            return Err(DeltaError::BadCommandZero);
+        }
+    }
+
+    if out_len != result_size {
+        return Err(DeltaError::ResultSizeMismatch);
+    }
+    Ok(())
+}
+
+/// Apply a git delta buffer to `base`, writing directly into `out`.
 ///
 /// The caller supplies `max_out` as a hard safety cap to prevent allocating
 /// unbounded output on corrupt deltas.
@@ -605,7 +765,9 @@ pub fn delta_sizes(delta: &[u8]) -> Result<(usize, usize), DeltaError> {
 /// The delta format encodes both base size and result size as varints at the
 /// head of the stream; both are validated.
 ///
-/// The output buffer is cleared before writing.
+/// The output buffer is cleared before writing. Writes directly into
+/// pre-reserved spare capacity, eliminating per-chunk bounds checking and
+/// length updates on the hot delta-application path.
 pub fn apply_delta(
     base: &[u8],
     delta: &[u8],
@@ -613,16 +775,55 @@ pub fn apply_delta(
     max_out: usize,
 ) -> Result<(), DeltaError> {
     out.clear();
+
+    let (pos, result_size) = parse_delta_header(base, delta, max_out)?;
+    out.reserve(result_size);
+    debug_assert!(
+        out.capacity() >= result_size,
+        "reserve did not allocate enough"
+    );
+
     let mut written = 0usize;
-    let res = apply_delta_into(base, delta, max_out, |chunk| {
-        written = written.saturating_add(chunk.len());
-        if out.capacity() < written {
-            out.reserve(written - out.capacity());
+    // SAFETY — pointer stability invariant:
+    // `out.reserve(result_size)` above pre-allocates all needed capacity.
+    // `out_ptr` is valid for writes up to `result_size` bytes from this
+    // point until `set_len(written)` below. NO Vec methods (push, extend,
+    // reserve, etc.) may be called on `out` in between — any such call
+    // could reallocate, invalidating `out_ptr` and causing use-after-free.
+    // The loop below uses ONLY raw pointer writes via `copy_nonoverlapping`.
+    let out_ptr = out.as_mut_ptr();
+
+    interpret_delta_body(base, delta, pos, result_size, |chunk| {
+        let size = chunk.len();
+        debug_assert!(written + size <= result_size);
+
+        // SAFETY:
+        // 1. Bounds: `interpret_delta_body` validates chunk source bounds and
+        //    enforces `written + size <= result_size` before emitting.
+        // 2. Pointer stability: `out_ptr` is valid because no Vec methods are
+        //    called between `as_mut_ptr()` and `set_len()` (see invariant above).
+        // 3. Destination: `written + size <= result_size <= capacity`.
+        // 4. No aliasing: chunks reference `base` or `delta` (both `&[u8]`),
+        //    disjoint from `out: &mut Vec<u8>` (enforced by borrow checker).
+        unsafe {
+            std::ptr::copy_nonoverlapping(chunk.as_ptr(), out_ptr.add(written), size);
         }
-        out.extend_from_slice(chunk);
+        written += size;
         Ok(())
-    });
-    res.map(|_| ())
+    })?;
+
+    debug_assert_eq!(written, result_size);
+    if written > result_size || written > out.capacity() {
+        return Err(DeltaError::OutputOverrun);
+    }
+
+    // SAFETY:
+    // 1. Initialization: exactly `written == result_size` bytes written above
+    //    via `copy_nonoverlapping` from validated source slices.
+    // 2. Bounds: `written <= result_size <= capacity` (from `out.reserve`).
+    // 3. Pointer stability: no Vec methods called since `as_mut_ptr()`.
+    unsafe { out.set_len(written) };
+    Ok(())
 }
 
 /// Apply a git delta buffer to `base`, streaming output into a sink.
@@ -636,59 +837,8 @@ pub fn apply_delta_into(
     max_out: usize,
     mut on_chunk: impl FnMut(&[u8]) -> Result<(), DeltaError>,
 ) -> Result<usize, DeltaError> {
-    let mut pos = 0usize;
-    let base_size = read_leb128_u64(delta, &mut pos)? as usize;
-    let result_size = read_leb128_u64(delta, &mut pos)? as usize;
-    if base_size != base.len() {
-        return Err(DeltaError::BaseSizeMismatch);
-    }
-    if result_size > max_out {
-        return Err(DeltaError::OutputOverrun);
-    }
-
-    let mut out_len = 0usize;
-    while pos < delta.len() {
-        let cmd = delta[pos];
-        pos += 1;
-
-        if (cmd & 0x80) != 0 {
-            let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
-
-            let end = match off.checked_add(size) {
-                Some(end) => end,
-                None => return Err(DeltaError::CopyOutOfRange),
-            };
-            if end > base.len() {
-                return Err(DeltaError::CopyOutOfRange);
-            }
-            let end = out_len.saturating_add(size);
-            if end > result_size {
-                return Err(DeltaError::OutputOverrun);
-            }
-
-            on_chunk(&base[off..off + size])?;
-            out_len = end;
-        } else if cmd != 0 {
-            let size = cmd as usize;
-            if pos + size > delta.len() {
-                return Err(DeltaError::Truncated);
-            }
-            let end = out_len.saturating_add(size);
-            if end > result_size {
-                return Err(DeltaError::OutputOverrun);
-            }
-
-            on_chunk(&delta[pos..pos + size])?;
-            pos += size;
-            out_len = end;
-        } else {
-            return Err(DeltaError::BadCommandZero);
-        }
-    }
-
-    if out_len != result_size {
-        return Err(DeltaError::ResultSizeMismatch);
-    }
+    let (pos, result_size) = parse_delta_header(base, delta, max_out)?;
+    interpret_delta_body(base, delta, pos, result_size, |chunk| on_chunk(chunk))?;
 
     Ok(result_size)
 }
@@ -720,38 +870,58 @@ fn decode_copy_params(
         return Err(DeltaError::Truncated);
     }
 
+    // SAFETY: `cursor` starts at `start` and is incremented exactly once per set bit
+    // in off_mask (4 bits) then size_mask (3 bits). Total increments =
+    // count_ones(off_mask) + count_ones(size_mask) = `needed`. The upfront check
+    // `end > delta.len()` where `end = start + needed` guarantees all accessed
+    // indices are in-bounds: at each access, cursor < start + needed = end <= delta.len().
+    // Verified by exhaustive test over all 128 mask combos and Miri.
     let mut cursor = start;
     let mut off: usize = 0;
-    if (off_mask & 0x01) != 0 {
-        off |= delta[cursor] as usize;
-        cursor += 1;
-    }
-    if (off_mask & 0x02) != 0 {
-        off |= (delta[cursor] as usize) << 8;
-        cursor += 1;
-    }
-    if (off_mask & 0x04) != 0 {
-        off |= (delta[cursor] as usize) << 16;
-        cursor += 1;
-    }
-    if (off_mask & 0x08) != 0 {
-        off |= (delta[cursor] as usize) << 24;
-        cursor += 1;
-    }
-
     let mut size: usize = 0;
-    if (size_mask & 0x01) != 0 {
-        size |= delta[cursor] as usize;
-        cursor += 1;
+    debug_assert!(
+        end <= delta.len(),
+        "decode_copy_params: end ({end}) > delta.len() ({len})",
+        len = delta.len()
+    );
+    // SAFETY: `cursor` bounds are validated above by proving
+    // `start <= cursor < end <= delta.len()` for every read in this block.
+    unsafe {
+        if (off_mask & 0x01) != 0 {
+            off |= *delta.get_unchecked(cursor) as usize;
+            cursor += 1;
+        }
+        if (off_mask & 0x02) != 0 {
+            off |= (*delta.get_unchecked(cursor) as usize) << 8;
+            cursor += 1;
+        }
+        if (off_mask & 0x04) != 0 {
+            off |= (*delta.get_unchecked(cursor) as usize) << 16;
+            cursor += 1;
+        }
+        if (off_mask & 0x08) != 0 {
+            off |= (*delta.get_unchecked(cursor) as usize) << 24;
+            cursor += 1;
+        }
+
+        if (size_mask & 0x01) != 0 {
+            size |= *delta.get_unchecked(cursor) as usize;
+            cursor += 1;
+        }
+        if (size_mask & 0x02) != 0 {
+            size |= (*delta.get_unchecked(cursor) as usize) << 8;
+            cursor += 1;
+        }
+        if (size_mask & 0x04) != 0 {
+            size |= (*delta.get_unchecked(cursor) as usize) << 16;
+            cursor += 1;
+        }
     }
-    if (size_mask & 0x02) != 0 {
-        size |= (delta[cursor] as usize) << 8;
-        cursor += 1;
-    }
-    if (size_mask & 0x04) != 0 {
-        size |= (delta[cursor] as usize) << 16;
-        cursor += 1;
-    }
+    debug_assert_eq!(
+        cursor.wrapping_sub(start),
+        needed,
+        "cursor advanced past bounds"
+    );
     *pos = cursor;
 
     if size == 0 {
@@ -765,7 +935,11 @@ fn decode_copy_params(
 mod tests {
     use super::*;
 
-    fn push_varint(mut value: usize, out: &mut Vec<u8>) {
+    fn push_varint(value: usize, out: &mut Vec<u8>) {
+        push_varint_u64(value as u64, out);
+    }
+
+    fn push_varint_u64(mut value: u64, out: &mut Vec<u8>) {
         loop {
             let mut b = (value & 0x7f) as u8;
             value >>= 7;
@@ -815,6 +989,501 @@ mod tests {
         );
     }
 
+    /// Exhaustive test covering all 128 (off_mask × size_mask) combinations.
+    ///
+    /// For each combination we build a delta payload with known byte values
+    /// and verify decode_copy_params produces the expected offset and size.
+    #[test]
+    fn decode_copy_params_all_128_mask_combos() {
+        // off_mask: 4 bits (0..16), size_mask: 3 bits (0..8) → 128 combos.
+        for off_mask in 0u8..16 {
+            for size_mask in 0u8..8 {
+                let cmd = 0x80 | off_mask | (size_mask << 4);
+                let needed = (off_mask.count_ones() + size_mask.count_ones()) as usize;
+
+                // Build payload: byte values 0x10, 0x20, 0x30, … so each is distinct.
+                let payload: Vec<u8> = (0..needed).map(|i| ((i as u8) + 1) * 0x10).collect();
+
+                let mut pos = 0usize;
+                let (off, size) = decode_copy_params(&payload, &mut pos, cmd)
+                    .unwrap_or_else(|_| panic!("off_mask={off_mask:#x} size_mask={size_mask:#x}"));
+                assert_eq!(
+                    pos, needed,
+                    "pos mismatch for off_mask={off_mask:#x} size_mask={size_mask:#x}"
+                );
+
+                // Reconstruct expected offset.
+                let mut expected_off: usize = 0;
+                let mut idx = 0;
+                if (off_mask & 0x01) != 0 {
+                    expected_off |= payload[idx] as usize;
+                    idx += 1;
+                }
+                if (off_mask & 0x02) != 0 {
+                    expected_off |= (payload[idx] as usize) << 8;
+                    idx += 1;
+                }
+                if (off_mask & 0x04) != 0 {
+                    expected_off |= (payload[idx] as usize) << 16;
+                    idx += 1;
+                }
+                if (off_mask & 0x08) != 0 {
+                    expected_off |= (payload[idx] as usize) << 24;
+                    idx += 1;
+                }
+                assert_eq!(
+                    off, expected_off,
+                    "off mismatch for off_mask={off_mask:#x} size_mask={size_mask:#x}"
+                );
+
+                // Reconstruct expected size.
+                let mut expected_size: usize = 0;
+                if (size_mask & 0x01) != 0 {
+                    expected_size |= payload[idx] as usize;
+                    idx += 1;
+                }
+                if (size_mask & 0x02) != 0 {
+                    expected_size |= (payload[idx] as usize) << 8;
+                    idx += 1;
+                }
+                if (size_mask & 0x04) != 0 {
+                    expected_size |= (payload[idx] as usize) << 16;
+                    idx += 1;
+                }
+                if expected_size == 0 {
+                    expected_size = 0x10000;
+                }
+                assert_eq!(
+                    size, expected_size,
+                    "size mismatch for off_mask={off_mask:#x} size_mask={size_mask:#x}"
+                );
+                let _ = idx; // suppress unused warning
+            }
+        }
+    }
+
+    /// Build a delta buffer with a single "add literal" instruction.
+    fn make_add_delta(base_size: usize, literal: &[u8]) -> Vec<u8> {
+        assert!(literal.len() <= 127, "add instruction limited to 127 bytes");
+        let mut delta = Vec::new();
+        push_varint(base_size, &mut delta);
+        push_varint(literal.len(), &mut delta);
+        // add instruction: cmd byte = literal length (< 0x80)
+        delta.push(literal.len() as u8);
+        delta.extend_from_slice(literal);
+        delta
+    }
+
+    /// Build a delta with a single "copy from base" instruction.
+    fn make_copy_delta(base_size: usize, off: usize, size: usize) -> Vec<u8> {
+        let mut delta = Vec::new();
+        push_varint(base_size, &mut delta);
+        push_varint(size, &mut delta);
+        // copy instruction: high bit set, encode offset and size bytes.
+        let mut cmd: u8 = 0x80;
+        let mut params = Vec::new();
+        // Encode offset (little-endian, flagged)
+        if (off & 0xff) != 0 || off == 0 {
+            cmd |= 0x01;
+            params.push(off as u8);
+        }
+        if (off >> 8) & 0xff != 0 {
+            cmd |= 0x02;
+            params.push((off >> 8) as u8);
+        }
+        if (off >> 16) & 0xff != 0 {
+            cmd |= 0x04;
+            params.push((off >> 16) as u8);
+        }
+        if (off >> 24) & 0xff != 0 {
+            cmd |= 0x08;
+            params.push((off >> 24) as u8);
+        }
+        // Encode size (little-endian, flagged)
+        if (size & 0xff) != 0 {
+            cmd |= 0x10;
+            params.push(size as u8);
+        }
+        if (size >> 8) & 0xff != 0 {
+            cmd |= 0x20;
+            params.push((size >> 8) as u8);
+        }
+        if (size >> 16) & 0xff != 0 {
+            cmd |= 0x40;
+            params.push((size >> 16) as u8);
+        }
+        delta.push(cmd);
+        delta.extend_from_slice(&params);
+        delta
+    }
+
+    #[test]
+    fn apply_delta_copy_instruction() {
+        let base = b"Hello, World!";
+        // Copy entire base
+        let delta = make_copy_delta(base.len(), 0, base.len());
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta copy");
+        assert_eq!(out, base);
+    }
+
+    #[test]
+    fn apply_delta_copy_partial() {
+        let base = b"ABCDEFGHIJ";
+        // Copy bytes 3..7 ("DEFG")
+        let delta = make_copy_delta(base.len(), 3, 4);
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta partial copy");
+        assert_eq!(&out, b"DEFG");
+    }
+
+    #[test]
+    fn apply_delta_add_literal() {
+        let base = b"unused-base";
+        let literal = b"literal data";
+        let delta = make_add_delta(base.len(), literal);
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta add");
+        assert_eq!(&out, literal);
+    }
+
+    #[test]
+    fn apply_delta_mixed_copy_and_add() {
+        let base = b"ABCDEFGHIJ";
+        let mut delta = Vec::new();
+        // Header: base_size=10, result_size=9 ("ABCDE" + "XYZ" + "J")
+        push_varint(10, &mut delta);
+        push_varint(9, &mut delta);
+        // Copy 5 bytes from offset 0 ("ABCDE")
+        delta.push(0x80 | 0x01 | 0x10); // copy, 1-byte offset, 1-byte size
+        delta.push(0x00); // offset = 0
+        delta.push(0x05); // size = 5
+                          // Add 3 literal bytes ("XYZ")
+        delta.push(0x03);
+        delta.extend_from_slice(b"XYZ");
+        // Copy 1 byte from offset 9 ("J")
+        delta.push(0x80 | 0x01 | 0x10); // copy
+        delta.push(0x09); // offset = 9
+        delta.push(0x01); // size = 1
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("apply_delta mixed");
+        assert_eq!(&out, b"ABCDEXYZJ");
+    }
+
+    #[test]
+    fn apply_delta_base_size_mismatch() {
+        let base = b"short";
+        let mut delta = Vec::new();
+        push_varint(100, &mut delta); // claims base is 100 bytes
+        push_varint(5, &mut delta);
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::BaseSizeMismatch);
+    }
+
+    #[test]
+    fn apply_delta_rejects_base_size_truncation_candidate() {
+        // 2^32 would truncate to 0 on 32-bit if converted with `as usize`.
+        let mut delta = Vec::new();
+        push_varint_u64(u64::from(u32::MAX) + 1, &mut delta);
+        push_varint(0, &mut delta);
+
+        let mut out = Vec::new();
+        let err = apply_delta(&[], &delta, &mut out, 0).unwrap_err();
+        assert_eq!(err, DeltaError::BaseSizeMismatch);
+    }
+
+    #[test]
+    fn apply_delta_rejects_result_size_truncation_candidate() {
+        // 2^32 would truncate to 0 on 32-bit if converted with `as usize`.
+        let mut delta = Vec::new();
+        push_varint(0, &mut delta);
+        push_varint_u64(u64::from(u32::MAX) + 1, &mut delta);
+
+        let mut out = Vec::new();
+        let err = apply_delta(&[], &delta, &mut out, 0).unwrap_err();
+        assert_eq!(err, DeltaError::OutputOverrun);
+    }
+
+    #[test]
+    fn delta_sizes_checks_result_size_usize_conversion() {
+        let mut delta = Vec::new();
+        push_varint(0, &mut delta);
+        let large = u64::from(u32::MAX) + 1;
+        push_varint_u64(large, &mut delta);
+
+        let parsed = delta_sizes(&delta);
+        if usize::BITS == 32 {
+            assert_eq!(parsed.unwrap_err(), DeltaError::OutputOverrun);
+        } else {
+            assert_eq!(
+                parsed.unwrap(),
+                (
+                    0,
+                    usize::try_from(large).expect("value must fit on non-32-bit targets")
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn apply_delta_result_exceeds_max_out() {
+        let base = b"base";
+        let mut delta = Vec::new();
+        push_varint(4, &mut delta);
+        push_varint(1000, &mut delta); // result_size 1000
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 100).unwrap_err(); // max_out 100
+        assert_eq!(err, DeltaError::OutputOverrun);
+    }
+
+    #[test]
+    fn apply_delta_bad_command_zero() {
+        let base = b"data";
+        let mut delta = Vec::new();
+        push_varint(4, &mut delta);
+        push_varint(4, &mut delta);
+        delta.push(0x00); // command zero is invalid
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::BadCommandZero);
+    }
+
+    #[test]
+    fn apply_delta_copy_out_of_range() {
+        let base = b"short";
+        let mut delta = Vec::new();
+        push_varint(5, &mut delta);
+        push_varint(10, &mut delta);
+        // Copy 10 bytes from offset 0, but base is only 5 bytes
+        delta.push(0x80 | 0x01 | 0x10);
+        delta.push(0x00); // offset 0
+        delta.push(0x0a); // size 10
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::CopyOutOfRange);
+    }
+
+    #[test]
+    fn apply_delta_truncated_add() {
+        let base = b"data";
+        let mut delta = Vec::new();
+        push_varint(4, &mut delta);
+        push_varint(5, &mut delta);
+        delta.push(0x05); // add 5 bytes, but supply none
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::Truncated);
+    }
+
+    #[test]
+    fn apply_delta_result_size_mismatch() {
+        let base = b"ABCDEFGHIJ";
+        let mut delta = Vec::new();
+        push_varint(10, &mut delta);
+        push_varint(10, &mut delta); // promises 10 bytes
+                                     // But only copy 5
+        delta.push(0x80 | 0x01 | 0x10);
+        delta.push(0x00);
+        delta.push(0x05);
+
+        let mut out = Vec::new();
+        let err = apply_delta(base, &delta, &mut out, 1024).unwrap_err();
+        assert_eq!(err, DeltaError::ResultSizeMismatch);
+    }
+
+    #[test]
+    fn apply_delta_empty_delta_body() {
+        // Delta with base_size=0, result_size=0, and no instructions.
+        let base: &[u8] = &[];
+        let mut delta = Vec::new();
+        push_varint(0, &mut delta);
+        push_varint(0, &mut delta);
+
+        let mut out = Vec::new();
+        apply_delta(base, &delta, &mut out, 1024).expect("empty delta");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_delta_output_reuses_vec() {
+        // Verify out is cleared and old contents don't leak.
+        let base = b"ABCD";
+        let delta = make_copy_delta(4, 0, 4);
+
+        let mut out = Vec::from("leftover garbage data that should be cleared");
+        apply_delta(base, &delta, &mut out, 1024).expect("reuse vec");
+        assert_eq!(&out, b"ABCD");
+    }
+
+    /// Compress `data` using zlib (flate2).
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn inflate_limited_with_basic_round_trip() {
+        let original = b"Hello, this is test data for inflate_limited_with!";
+        let compressed = zlib_compress(original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 1024).expect("inflate basic");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(&out, original);
+    }
+
+    #[test]
+    fn inflate_limited_with_exact_max_out() {
+        // Decompress data whose uncompressed size exactly equals max_out.
+        let original = vec![0xAB_u8; 256];
+        let compressed = zlib_compress(&original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 256).expect("inflate exact");
+
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn inflate_limited_with_exceeds_max_out() {
+        // Data decompresses to 256 bytes but max_out is 100.
+        let original = vec![0xCD_u8; 256];
+        let compressed = zlib_compress(&original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let err = inflate_limited_with(&mut de, &compressed, &mut out, 100).unwrap_err();
+
+        assert_eq!(err, InflateError::LimitExceeded);
+        // Partial output may have been written, but it must not exceed max_out.
+        assert!(out.len() <= 100);
+    }
+
+    #[test]
+    fn inflate_limited_with_empty_input() {
+        // Empty compressed data is not valid zlib — should error.
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let result = inflate_limited_with(&mut de, &[], &mut out, 1024);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn inflate_limited_with_corrupt_input() {
+        // Garbage bytes are not valid zlib.
+        let garbage = [0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let result = inflate_limited_with(&mut de, &garbage, &mut out, 1024);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn inflate_limited_with_reuses_decompress() {
+        // Call inflate_limited_with twice with the same Decompress instance.
+        // The function should reset internally.
+        let original1 = b"First payload";
+        let original2 = b"Second payload, slightly different";
+        let compressed1 = zlib_compress(original1);
+        let compressed2 = zlib_compress(original2);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+
+        inflate_limited_with(&mut de, &compressed1, &mut out, 1024).expect("inflate first");
+        assert_eq!(&out, original1);
+
+        inflate_limited_with(&mut de, &compressed2, &mut out, 1024).expect("inflate second");
+        assert_eq!(&out, original2.as_slice());
+    }
+
+    #[test]
+    fn inflate_limited_with_zero_byte_output() {
+        // Compress empty data — decompresses to 0 bytes.
+        let compressed = zlib_compress(&[]);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 1024).expect("inflate empty");
+
+        assert_eq!(consumed, compressed.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inflate_limited_with_zero_max_out_allows_empty_stream() {
+        let compressed = zlib_compress(&[]);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed =
+            inflate_limited_with(&mut de, &compressed, &mut out, 0).expect("inflate empty");
+
+        assert_eq!(consumed, compressed.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inflate_limited_with_zero_max_out_rejects_non_empty_stream() {
+        let compressed = zlib_compress(b"non-empty output");
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let err = inflate_limited_with(&mut de, &compressed, &mut out, 0).unwrap_err();
+
+        assert_eq!(err, InflateError::LimitExceeded);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inflate_limited_with_zero_max_out_header_only_zlib_is_truncated() {
+        // Bare zlib header without any deflate block or trailer.
+        let malformed = b"\x78\x01";
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let err = inflate_limited_with(&mut de, malformed, &mut out, 0).unwrap_err();
+
+        assert_eq!(err, InflateError::TruncatedInput);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn inflate_limited_with_clears_existing_output() {
+        // out has stale data; inflate_limited_with should clear it.
+        let original = b"fresh output";
+        let compressed = zlib_compress(original);
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::from("stale garbage that should be cleared");
+        inflate_limited_with(&mut de, &compressed, &mut out, 1024).expect("inflate clear");
+        assert_eq!(&out, original);
+    }
+
     #[test]
     fn apply_delta_into_copy_zero_size_round_trip() {
         let base = vec![0xa5_u8; 0x1_0000];
@@ -832,5 +1501,46 @@ mod tests {
 
         assert_eq!(written, base.len());
         assert_eq!(out, base);
+    }
+
+    /// Miri target: exercises inflate_limited_with spare-capacity write + set_len.
+    #[test]
+    fn inflate_limited_with_miri_roundtrip() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original = b"hello miri roundtrip test data";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut de = flate2::Decompress::new(true);
+        let mut out = Vec::new();
+        let consumed = inflate_limited_with(&mut de, &compressed, &mut out, 256).unwrap();
+        assert_eq!(out, original);
+        assert_eq!(consumed, compressed.len());
+    }
+
+    /// Miri target: exercises apply_delta raw-pointer copy and insert paths.
+    #[test]
+    fn apply_delta_miri_copy_and_insert() {
+        let base = b"ABCDEFGHIJ";
+        // Delta: base_size=10, result_size=8, copy 4 bytes from off=2, insert 4 literal bytes.
+        let delta: &[u8] = &[
+            10, // base_size varint
+            8,  // result_size varint
+            0x80 | 0x01 | 0x10,
+            2,
+            4, // copy: off=2, size=4 -> "CDEF"
+            4,
+            b'X',
+            b'Y',
+            b'Z',
+            b'W', // insert 4 bytes -> "XYZW"
+        ];
+        let mut out = Vec::new();
+        apply_delta(base, delta, &mut out, 64).unwrap();
+        assert_eq!(&out, b"CDEFXYZW");
     }
 }

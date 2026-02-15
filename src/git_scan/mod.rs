@@ -80,7 +80,7 @@ pub mod pack_plan;
 pub mod pack_plan_model;
 pub mod pack_reader;
 pub mod path_policy;
-pub mod perf;
+pub(crate) mod perf;
 pub mod persist;
 pub mod persist_rocksdb;
 pub mod policy_hash;
@@ -89,6 +89,7 @@ pub mod preflight_error;
 pub mod preflight_limits;
 pub mod repo;
 pub mod repo_open;
+pub(super) mod repo_paths;
 pub mod run_format;
 pub mod run_reader;
 pub mod run_writer;
@@ -142,9 +143,8 @@ pub use start_set::{StartSetConfig, StartSetId};
 pub use commit_graph::CommitGraphIndex;
 pub use commit_graph_mem::CommitGraphMem;
 pub use commit_loader::{
-    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
-    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
-    LoadedCommit,
+    load_commits_from_tips, load_commits_with_identities, load_shallow_boundary_roots,
+    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits, LoadedCommit,
 };
 pub use commit_parse::{parse_commit, CommitParseError, CommitParseLimits, ParsedCommit};
 pub use commit_walk::{
@@ -153,6 +153,7 @@ pub use commit_walk::{
 };
 pub use commit_walk_limits::CommitWalkLimits;
 pub use identity_intern::{CommitIdentityIds, IdentityInterner, SENTINEL_ID};
+pub use repo_paths::{collect_loose_dirs, collect_pack_dirs};
 
 // ── Stage 3: Tree diff & candidate extraction ───────────────────────────
 pub use blob_introducer::{BlobIntroStats, BlobIntroducer, SeenSets};
@@ -229,8 +230,14 @@ pub use run_reader::RunReader;
 pub use run_writer::RunWriter;
 pub(crate) use runner::auto_pack_exec_workers_for_in_pack;
 pub use runner::{
-    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError,
-    GitScanMetricsSnapshot, GitScanMode, GitScanReport, GitScanResult, GitScanStageNanos,
-    PackMmapLimits, SkippedCandidate,
+    run_git_scan, CandidateSkipReason, GitScanAllocStats, GitScanConfig, GitScanError, GitScanMode,
+    GitScanReport, GitScanResult, GitScanStageNanos, PackMmapLimits, SkippedCandidate,
 };
 pub use work_items::WorkItems;
+
+// ── Benchmark support ───────────────────────────────────────────────────
+#[cfg(feature = "bench")]
+pub use runner_exec::{
+    bench_apply_locality_shard_cap, bench_select_strategy, bench_synthetic_locality_plan,
+    bench_synthetic_plan,
+};

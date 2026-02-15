@@ -9,12 +9,10 @@
 //!   cache misses may trigger on-demand re-decodes into scratch buffers.
 //! - `inflate_buf`, `result_buf`, and `base_buf` are reused across offsets
 //!   to avoid repeated allocations on the hot path.
-//! - Oversized objects are decoded into spill-backed mmaps under the
-//!   caller-provided `spill_dir`, keeping RAM bounded while still scanning.
+//! - Oversized blobs and delta outputs are streamed into spill-backed mmaps
+//!   under the caller-provided `spill_dir`, keeping resident memory bounded.
 //! - When the allocation guard is enabled, per-offset decoding and sink
 //!   emission must not allocate.
-//! - Oversized blobs and delta outputs may be spilled to mmap-backed files
-//!   under a caller-provided spill directory.
 //!
 //! Execution order is driven by `PackPlan.exec_order`: when absent (no
 //! delta dependencies, or the DFS order matches the natural ascending
@@ -47,6 +45,7 @@
 use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::perf_stats;
 use crate::scheduler::AllocGuard;
@@ -57,13 +56,13 @@ use super::byte_arena::ByteArena;
 use super::object_id::OidBytes;
 use super::pack_cache::{CachedObject, PackCache};
 use super::pack_candidates::PackCandidate;
-use super::pack_decode::{inflate_entry_payload, PackDecodeError, PackDecodeLimits};
+use super::pack_decode::{inflate_entry_payload_with, PackDecodeError, PackDecodeLimits};
 use super::pack_delta::apply_delta;
 use super::pack_inflate::{
-    apply_delta_into, delta_sizes, inflate_limited, inflate_stream, DeltaError, EntryHeader,
-    EntryKind, ObjectKind, PackFile, PackParseError,
+    apply_delta_into, delta_sizes, inflate_limited_with, inflate_stream, DeltaError, EntryHeader,
+    EntryKind, ObjectKind, PackFile, PackHeader, PackParseError,
 };
-use super::pack_plan_model::{BaseLoc, DeltaDep, PackPlan, NONE_U32};
+use super::pack_plan_model::{BaseLoc, CandidateAtOffset, DeltaDep, PackPlan, NONE_U32};
 use super::pack_reader::PackReader;
 use super::perf;
 
@@ -73,7 +72,9 @@ use super::perf;
 /// the delta application base.
 #[derive(Debug)]
 pub struct ExternalBase {
+    /// Git object kind of the resolved base object.
     pub kind: ObjectKind,
+    /// Fully inflated base bytes used as delta input.
     pub bytes: Vec<u8>,
 }
 
@@ -124,6 +125,28 @@ pub enum PackExecError {
     PackParse(PackParseError),
     /// Pack bytes could not be read.
     PackRead(String),
+    /// Scheduler task referenced a plan index outside the plan list.
+    SchedulerPlanIndexOutOfRange { index: usize, plan_count: usize },
+    /// Scheduler shard task referenced a plan index outside the plan list.
+    SchedulerShardPlanIndexOutOfRange { plan_idx: usize, plan_count: usize },
+    /// Scheduler shard metadata was unexpectedly missing for a plan.
+    SchedulerShardMetadataMissing { plan_idx: usize },
+    /// Scheduler shard metadata container was unavailable after execution.
+    SchedulerShardMetadataUnavailable,
+    /// Scheduler shard task referenced a shard index outside the shard range list.
+    SchedulerShardIndexOutOfRange {
+        plan_idx: usize,
+        shard_idx: usize,
+        shard_count: usize,
+    },
+    /// Scheduler finished but did not produce a plan output slot.
+    SchedulerPlanOutputMissing { plan_idx: usize },
+    /// Scheduler finished but did not produce a shard output slot.
+    SchedulerShardOutputMissing { plan_idx: usize, shard_idx: usize },
+    /// Scheduler rejected enqueuing pack-plan tasks.
+    SchedulerTaskQueueRejected,
+    /// Scheduler rejected enqueuing pack-shard tasks.
+    SchedulerShardQueueRejected,
     /// The sink rejected an emitted blob.
     Sink(String),
     /// External base provider returned a fatal error.
@@ -137,6 +160,46 @@ impl fmt::Display for PackExecError {
         match self {
             Self::PackParse(err) => write!(f, "{err}"),
             Self::PackRead(msg) => write!(f, "pack read error: {msg}"),
+            Self::SchedulerPlanIndexOutOfRange { index, plan_count } => write!(
+                f,
+                "scheduler plan index out of range: index={index}, plan_count={plan_count}"
+            ),
+            Self::SchedulerShardPlanIndexOutOfRange {
+                plan_idx,
+                plan_count,
+            } => write!(
+                f,
+                "scheduler shard plan index out of range: plan_idx={plan_idx}, plan_count={plan_count}"
+            ),
+            Self::SchedulerShardMetadataMissing { plan_idx } => write!(
+                f,
+                "scheduler shard metadata missing: plan_idx={plan_idx}"
+            ),
+            Self::SchedulerShardMetadataUnavailable => {
+                write!(f, "scheduler shard metadata unavailable")
+            }
+            Self::SchedulerShardIndexOutOfRange {
+                plan_idx,
+                shard_idx,
+                shard_count,
+            } => write!(
+                f,
+                "scheduler shard index out of range: plan_idx={plan_idx}, shard_idx={shard_idx}, shard_count={shard_count}"
+            ),
+            Self::SchedulerPlanOutputMissing { plan_idx } => {
+                write!(f, "scheduler plan output missing: plan_idx={plan_idx}")
+            }
+            Self::SchedulerShardOutputMissing {
+                plan_idx,
+                shard_idx,
+            } => write!(
+                f,
+                "scheduler shard output missing: plan_idx={plan_idx}, shard_idx={shard_idx}"
+            ),
+            Self::SchedulerTaskQueueRejected => write!(f, "scheduler task queue rejected work"),
+            Self::SchedulerShardQueueRejected => {
+                write!(f, "scheduler shard queue rejected work")
+            }
             Self::Sink(msg) => write!(f, "sink error: {msg}"),
             Self::ExternalBase(msg) => write!(f, "external base error: {msg}"),
             Self::Spill(err) => write!(f, "spill error: {err}"),
@@ -291,12 +354,23 @@ impl PackExecHotStats {
 
     #[inline]
     fn merge_into(self, stats: &mut PackExecStats) {
-        perf_stats::sat_add_u32(&mut stats.decoded_offsets, self.decoded_offsets);
-        perf_stats::sat_add_u32(&mut stats.emitted_candidates, self.emitted_candidates);
-        perf_stats::sat_add_u32(&mut stats.skipped_offsets, self.skipped_offsets);
-        perf_stats::sat_add_u32(&mut stats.base_cache_hits, self.base_cache_hits);
-        perf_stats::sat_add_u32(&mut stats.base_cache_misses, self.base_cache_misses);
-        perf_stats::sat_add_u32(&mut stats.external_base_calls, self.external_base_calls);
+        // Exhaustiveness guard: adding a field to PackExecHotStats without
+        // handling it here will produce a compile error.
+        let PackExecHotStats {
+            decoded_offsets,
+            emitted_candidates,
+            skipped_offsets,
+            base_cache_hits,
+            base_cache_misses,
+            external_base_calls,
+        } = self;
+
+        perf_stats::sat_add_u32(&mut stats.decoded_offsets, decoded_offsets);
+        perf_stats::sat_add_u32(&mut stats.emitted_candidates, emitted_candidates);
+        perf_stats::sat_add_u32(&mut stats.skipped_offsets, skipped_offsets);
+        perf_stats::sat_add_u32(&mut stats.base_cache_hits, base_cache_hits);
+        perf_stats::sat_add_u32(&mut stats.base_cache_misses, base_cache_misses);
+        perf_stats::sat_add_u32(&mut stats.external_base_calls, external_base_calls);
     }
 }
 
@@ -306,14 +380,20 @@ pub const CACHE_REJECT_BUCKETS: usize = 32;
 /// Aggregate cache reject histogram across pack-exec reports.
 #[derive(Debug, Default, Clone)]
 pub struct CacheRejectHistogram {
+    /// Total number of rejected cache insert attempts.
     pub rejects: u64,
+    /// Total bytes across all rejected cache insert attempts.
     pub bytes_total: u64,
+    /// Largest rejected entry size (bytes).
     pub bytes_max: u32,
+    /// Log2 bucketed reject counts (`[2^i, 2^(i+1)-1]`, bucket 0 includes size 0/1).
     pub buckets: [u64; CACHE_REJECT_BUCKETS],
 }
 
 impl CacheRejectHistogram {
-    /// Formats the top-N buckets by count.
+    /// Formats the top-N buckets by count as `"[start-end:count, ...]"`.
+    ///
+    /// Ties are ordered by lower bucket index first to keep output stable.
     #[must_use]
     pub fn format_top(&self, top_n: usize) -> String {
         let mut entries: Vec<(usize, u64)> = self
@@ -359,54 +439,66 @@ impl PackExecStats {
             let _ = other;
             return;
         }
-        self.decoded_offsets = self.decoded_offsets.saturating_add(other.decoded_offsets);
-        self.emitted_candidates = self
-            .emitted_candidates
-            .saturating_add(other.emitted_candidates);
-        self.skipped_offsets = self.skipped_offsets.saturating_add(other.skipped_offsets);
-        self.base_cache_hits = self.base_cache_hits.saturating_add(other.base_cache_hits);
-        self.base_cache_misses = self
-            .base_cache_misses
-            .saturating_add(other.base_cache_misses);
-        self.external_base_calls = self
-            .external_base_calls
-            .saturating_add(other.external_base_calls);
+        // Exhaustiveness guard: adding a field to PackExecStats without
+        // handling it here will produce a compile error.
+        let PackExecStats {
+            decoded_offsets,
+            emitted_candidates,
+            skipped_offsets,
+            base_cache_hits,
+            base_cache_misses,
+            external_base_calls,
+            fallback_base_decodes,
+            fallback_chain_len_sum,
+            fallback_chain_len_max,
+            cache_insert_rejects,
+            cache_reject_bytes_total,
+            cache_reject_bytes_max,
+            ref cache_reject_size_buckets,
+            large_blob_streamed_count,
+            large_blob_spilled_count,
+            large_blob_bytes,
+            cache_lookup_nanos,
+            fallback_resolve_nanos,
+            sink_emit_nanos,
+        } = *other;
+
+        self.decoded_offsets = self.decoded_offsets.saturating_add(decoded_offsets);
+        self.emitted_candidates = self.emitted_candidates.saturating_add(emitted_candidates);
+        self.skipped_offsets = self.skipped_offsets.saturating_add(skipped_offsets);
+        self.base_cache_hits = self.base_cache_hits.saturating_add(base_cache_hits);
+        self.base_cache_misses = self.base_cache_misses.saturating_add(base_cache_misses);
+        self.external_base_calls = self.external_base_calls.saturating_add(external_base_calls);
         self.fallback_base_decodes = self
             .fallback_base_decodes
-            .saturating_add(other.fallback_base_decodes);
+            .saturating_add(fallback_base_decodes);
         self.fallback_chain_len_sum = self
             .fallback_chain_len_sum
-            .saturating_add(other.fallback_chain_len_sum);
-        self.fallback_chain_len_max = self
-            .fallback_chain_len_max
-            .max(other.fallback_chain_len_max);
+            .saturating_add(fallback_chain_len_sum);
+        self.fallback_chain_len_max = self.fallback_chain_len_max.max(fallback_chain_len_max);
         self.cache_insert_rejects = self
             .cache_insert_rejects
-            .saturating_add(other.cache_insert_rejects);
+            .saturating_add(cache_insert_rejects);
         self.cache_reject_bytes_total = self
             .cache_reject_bytes_total
-            .saturating_add(other.cache_reject_bytes_total);
-        self.cache_reject_bytes_max = self
-            .cache_reject_bytes_max
-            .max(other.cache_reject_bytes_max);
-        for (idx, count) in other.cache_reject_size_buckets.iter().enumerate() {
+            .saturating_add(cache_reject_bytes_total);
+        self.cache_reject_bytes_max = self.cache_reject_bytes_max.max(cache_reject_bytes_max);
+        for (idx, count) in cache_reject_size_buckets.iter().enumerate() {
             self.cache_reject_size_buckets[idx] =
                 self.cache_reject_size_buckets[idx].saturating_add(*count);
         }
         self.large_blob_streamed_count = self
             .large_blob_streamed_count
-            .saturating_add(other.large_blob_streamed_count);
+            .saturating_add(large_blob_streamed_count);
         self.large_blob_spilled_count = self
             .large_blob_spilled_count
-            .saturating_add(other.large_blob_spilled_count);
-        self.large_blob_bytes = self.large_blob_bytes.saturating_add(other.large_blob_bytes);
-        self.cache_lookup_nanos = self
-            .cache_lookup_nanos
-            .saturating_add(other.cache_lookup_nanos);
+            .saturating_add(large_blob_spilled_count);
+        self.large_blob_bytes = self.large_blob_bytes.saturating_add(large_blob_bytes);
+        self.cache_lookup_nanos = self.cache_lookup_nanos.saturating_add(cache_lookup_nanos);
         self.fallback_resolve_nanos = self
             .fallback_resolve_nanos
-            .saturating_add(other.fallback_resolve_nanos);
-        self.sink_emit_nanos = self.sink_emit_nanos.saturating_add(other.sink_emit_nanos);
+            .saturating_add(fallback_resolve_nanos);
+        self.sink_emit_nanos = self.sink_emit_nanos.saturating_add(sink_emit_nanos);
     }
 }
 
@@ -436,6 +528,9 @@ fn cache_reject_bucket_index(size: u32) -> usize {
     (31 - size.leading_zeros()) as usize
 }
 
+/// Returns the inclusive `(start, end)` byte range represented by bucket `idx`.
+///
+/// Bucket `0` represents both `0` and `1` bytes; bucket `31` saturates to `u32::MAX`.
 fn cache_reject_bucket_range(idx: usize) -> (u32, u32) {
     if idx == 0 {
         return (0, 1);
@@ -506,6 +601,7 @@ pub struct CandidateRange {
 }
 
 impl CandidateRange {
+    /// Returns the sentinel range used for "no candidates for this offset".
     #[inline(always)]
     pub const fn missing() -> Self {
         Self {
@@ -526,6 +622,7 @@ impl CandidateRange {
         Self { start, end }
     }
 
+    /// Encodes an optional `(start, end)` range, mapping `None` to [`Self::missing`].
     #[inline(always)]
     pub fn from_option(range: Option<(usize, usize)>) -> Self {
         if let Some((start, end)) = range {
@@ -535,6 +632,9 @@ impl CandidateRange {
         }
     }
 
+    /// Decodes this packed range into half-open bounds `[start, end)`.
+    ///
+    /// Returns `None` when the sentinel form from [`Self::missing`] is present.
     #[inline(always)]
     pub fn bounds(self) -> Option<(usize, usize)> {
         if self.start == NONE_U32 {
@@ -544,6 +644,9 @@ impl CandidateRange {
         Some((self.start as usize, self.end as usize))
     }
 
+    /// Returns the number of candidates represented by this range.
+    ///
+    /// Missing ranges report `0`.
     #[inline(always)]
     pub fn candidate_count(self) -> usize {
         if let Some((start, end)) = self.bounds() {
@@ -557,6 +660,30 @@ impl CandidateRange {
 impl Default for CandidateRange {
     fn default() -> Self {
         Self::missing()
+    }
+}
+
+/// Advances a forward-only candidate cursor to the next range for `offset`.
+///
+/// `candidate_offsets` must be sorted ascending by `offset`. `cand_idx` is
+/// updated in-place and never moves backward.
+#[inline(always)]
+fn next_candidate_range(
+    candidate_offsets: &[CandidateAtOffset],
+    offset: u64,
+    cand_idx: &mut usize,
+) -> CandidateRange {
+    while *cand_idx < candidate_offsets.len() && candidate_offsets[*cand_idx].offset < offset {
+        *cand_idx += 1;
+    }
+    if *cand_idx < candidate_offsets.len() && candidate_offsets[*cand_idx].offset == offset {
+        let start = *cand_idx;
+        while *cand_idx < candidate_offsets.len() && candidate_offsets[*cand_idx].offset == offset {
+            *cand_idx += 1;
+        }
+        CandidateRange::from_bounds(start, *cand_idx)
+    } else {
+        CandidateRange::missing()
     }
 }
 
@@ -589,21 +716,26 @@ impl Default for CandidateRange {
 /// in `candidate_offsets` via packed [`CandidateRange`] values.
 #[derive(Debug, Default)]
 pub struct PackExecScratch {
-    inflate_buf: Vec<u8>,
-    result_buf: Vec<u8>,
-    base_buf: Vec<u8>,
-    delta_stack: Vec<DeltaFrame>,
+    bufs: DecodeBufs,
     delta_deps_hot: Vec<DeltaDepHot>,
     external_base_oids: Vec<OidBytes>,
     candidate_ranges: Vec<CandidateRange>,
 }
 
-impl PackExecScratch {
-    /// Prepares scratch buffers for the given plan and decode limits.
-    ///
-    /// This only reserves capacity; it does not prefill contents. Callers
-    /// rely on this to avoid per-offset allocations on the hot path.
-    fn prepare(&mut self, plan: &PackPlan, limits: &PackDecodeLimits) {
+impl Default for DecodeBufs {
+    fn default() -> Self {
+        Self {
+            de: flate2::Decompress::new(true),
+            inflate_buf: Vec::new(),
+            result_buf: Vec::new(),
+            base_buf: Vec::new(),
+            delta_stack: Vec::new(),
+        }
+    }
+}
+
+impl DecodeBufs {
+    fn prepare(&mut self, limits: &PackDecodeLimits, max_delta_depth: u8) {
         let inflate_target = limits.max_delta_bytes.max(1024);
         if self.inflate_buf.capacity() < inflate_target {
             self.inflate_buf
@@ -625,40 +757,44 @@ impl PackExecScratch {
         }
         self.base_buf.clear();
 
-        let depth_target = plan.max_delta_depth as usize + 1;
+        let depth_target = max_delta_depth as usize + 1;
         if self.delta_stack.capacity() < depth_target {
             self.delta_stack
                 .reserve(depth_target - self.delta_stack.capacity());
         }
         self.delta_stack.clear();
-        if self.delta_deps_hot.capacity() < plan.delta_deps.len() {
-            self.delta_deps_hot
-                .reserve(plan.delta_deps.len() - self.delta_deps_hot.capacity());
-        }
-        let external_base_oids_target = plan
-            .delta_deps
-            .iter()
-            .filter(|dep| matches!(dep.base, BaseLoc::External { .. }))
-            .count();
-        if self.external_base_oids.capacity() < external_base_oids_target {
-            self.external_base_oids
-                .reserve(external_base_oids_target - self.external_base_oids.capacity());
-        }
-        self.delta_deps_hot.clear();
-        self.external_base_oids.clear();
-        for dep in &plan.delta_deps {
-            let external_oid_idx = match dep.base {
-                BaseLoc::Offset(_) => NONE_U32,
-                BaseLoc::External { oid } => {
-                    let idx = self.external_base_oids.len();
-                    self.external_base_oids.push(oid);
-                    idx as u32
-                }
-            };
-            self.delta_deps_hot
-                .push(DeltaDepHot::from_plan(dep, external_oid_idx));
-        }
+    }
+}
+
+impl fmt::Debug for DecodeBufs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodeBufs")
+            .field("inflate_buf_cap", &self.inflate_buf.capacity())
+            .field("result_buf_cap", &self.result_buf.capacity())
+            .field("base_buf_cap", &self.base_buf.capacity())
+            .field("delta_stack_cap", &self.delta_stack.capacity())
+            .finish()
+    }
+}
+
+impl PackExecScratch {
+    #[inline(always)]
+    fn prepare_bufs(&mut self, limits: &PackDecodeLimits, max_delta_depth: u8) {
+        self.bufs.prepare(limits, max_delta_depth);
         self.candidate_ranges.clear();
+    }
+
+    /// Prepares scratch buffers for the given plan and decode limits.
+    ///
+    /// This only reserves capacity; it does not prefill contents. Callers
+    /// rely on this to avoid per-offset allocations on the hot path.
+    ///
+    /// Also rebuilds `delta_deps_hot` and `external_base_oids` so that every
+    /// `DeltaDepHot::external_oid_idx` points at the matching interned OID for
+    /// this exact plan.
+    fn prepare(&mut self, plan: &PackPlan, limits: &PackDecodeLimits) {
+        self.prepare_bufs(limits, plan.max_delta_depth);
+        rebuild_delta_deps_hot(plan, &mut self.delta_deps_hot, &mut self.external_base_oids);
     }
 }
 
@@ -808,6 +944,81 @@ impl DeltaDepHot {
     }
 }
 
+fn rebuild_delta_deps_hot(
+    plan: &PackPlan,
+    delta_deps_hot: &mut Vec<DeltaDepHot>,
+    external_base_oids: &mut Vec<OidBytes>,
+) {
+    if delta_deps_hot.capacity() < plan.delta_deps.len() {
+        delta_deps_hot.reserve(plan.delta_deps.len() - delta_deps_hot.capacity());
+    }
+    let external_base_oids_target = plan
+        .delta_deps
+        .iter()
+        .filter(|dep| matches!(dep.base, BaseLoc::External { .. }))
+        .count();
+    if external_base_oids.capacity() < external_base_oids_target {
+        external_base_oids.reserve(external_base_oids_target - external_base_oids.capacity());
+    }
+    delta_deps_hot.clear();
+    external_base_oids.clear();
+    for dep in &plan.delta_deps {
+        let external_oid_idx = match dep.base {
+            BaseLoc::Offset(_) => NONE_U32,
+            BaseLoc::External { oid } => {
+                let idx = external_base_oids.len();
+                external_base_oids.push(oid);
+                idx as u32
+            }
+        };
+        delta_deps_hot.push(DeltaDepHot::from_plan(dep, external_oid_idx));
+    }
+}
+
+/// Read-only hot delta-dependency tables for one pack plan.
+///
+/// Built once per plan and shared across shard workers to avoid rebuilding
+/// `delta_deps_hot` for each shard task.
+#[derive(Clone, Debug)]
+pub(super) struct PackPlanHotDeps {
+    delta_deps_hot: Arc<[DeltaDepHot]>,
+    external_base_oids: Arc<[OidBytes]>,
+}
+
+impl PackPlanHotDeps {
+    pub(super) fn from_plan(plan: &PackPlan) -> Self {
+        let mut delta_deps_hot = Vec::new();
+        let mut external_base_oids = Vec::new();
+        rebuild_delta_deps_hot(plan, &mut delta_deps_hot, &mut external_base_oids);
+        Self {
+            delta_deps_hot: Arc::from(delta_deps_hot),
+            external_base_oids: Arc::from(external_base_oids),
+        }
+    }
+
+    #[inline(always)]
+    fn delta_deps(&self) -> &[DeltaDepHot] {
+        self.delta_deps_hot.as_ref()
+    }
+
+    #[inline(always)]
+    fn external_base_oids(&self) -> &[OidBytes] {
+        self.external_base_oids.as_ref()
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub(super) fn delta_dep_count(&self) -> usize {
+        self.delta_deps_hot.len()
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
+    pub(super) fn external_oid_count(&self) -> usize {
+        self.external_base_oids.len()
+    }
+}
+
 /// One frame in the delta chain stack during fallback base resolution.
 ///
 /// When the executor encounters a delta whose base is not cached, it
@@ -823,6 +1034,37 @@ struct DeltaFrame {
     data_start: u64,
     /// Declared uncompressed delta payload size.
     delta_size: u64,
+}
+
+/// Immutable execution environment for pack decoding.
+///
+/// Bundles plan data, decode limits, and precomputed delta-dependency views
+/// that are constant across all offsets in a single plan execution. Passed
+/// by shared reference to collapse 8 register-consuming parameters into one
+/// pointer, keeping hot decode functions within ARM's x0–x7 ABI window.
+struct DecodeEnv<'a> {
+    pack: &'a PackFile<'a>,
+    limits: &'a PackDecodeLimits,
+    spill_dir: &'a Path,
+    max_delta_depth: u8,
+    need_offsets: &'a [u64],
+    delta_deps: &'a [DeltaDepHot],
+    external_base_oids: &'a [OidBytes],
+    delta_dep_index: &'a [u32],
+}
+
+/// Mutable scratch buffers used during per-offset decoding.
+///
+/// Split from [`PackExecScratch`] so that callers can hold an immutable
+/// reference to precomputed plan data (`delta_deps_hot`, `external_base_oids`)
+/// while mutating working buffers.  Functions that need split borrows across
+/// `base_buf` and `inflate_buf`/`result_buf` destructure through field access.
+struct DecodeBufs {
+    de: flate2::Decompress,
+    inflate_buf: Vec<u8>,
+    result_buf: Vec<u8>,
+    base_buf: Vec<u8>,
+    delta_stack: Vec<DeltaFrame>,
 }
 
 /// Executes a pack plan against a `PackReader`.
@@ -866,8 +1108,7 @@ pub fn execute_pack_plan_with_reader<S: PackObjectSink, B: ExternalBaseProvider,
 ///
 /// `paths` must contain all path refs referenced by plan candidates.
 /// `cache` is updated with decoded objects when capacity allows.
-/// `spill_dir` is used for oversized blob spill files.
-/// `spill_dir` is used for spill-backed large blob or delta outputs.
+/// `spill_dir` is used for spill-backed large blob and delta outputs.
 ///
 /// The returned report includes both successful decode stats and per-offset
 /// skip reasons for non-fatal failures (decode errors, missing bases, and
@@ -905,6 +1146,85 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
     )
 }
 
+/// Parses and validates pack header metadata for a plan execution.
+///
+/// Callers executing multiple shard entry points over the same `pack_bytes`
+/// can parse once, then pass the returned header to the `*_from_header`
+/// variants to avoid redundant header validation.
+#[inline]
+pub fn parse_pack_header_for_plan(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+) -> Result<PackHeader, PackExecError> {
+    PackFile::parse_header(pack_bytes, plan.oid_len as usize).map_err(PackExecError::PackParse)
+}
+
+/// Shared execution core for pack plan entrypoints that differ only by index
+/// selection and candidate-range lookup.
+#[allow(clippy::too_many_arguments)]
+fn execute_pack_plan_with_selector_from_header<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+    I: IntoIterator<Item = usize>,
+    R: FnMut(usize) -> CandidateRange,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    bufs: &mut DecodeBufs,
+    delta_deps: &[DeltaDepHot],
+    external_base_oids: &[OidBytes],
+    expected_skip_items: usize,
+    indices: I,
+    mut range_for_idx: R,
+) -> Result<PackExecReport, PackExecError> {
+    let pack = PackFile::from_header(pack_bytes, pack_header);
+    let mut report = PackExecReport::default();
+    let skip_capacity = expected_skip_items.div_ceil(100).max(64);
+    report.skips.reserve(skip_capacity.min(u32::MAX as usize));
+
+    let alloc_guard_enabled = alloc_guard::enabled();
+    let mut hot_stats = PackExecHotStats::default();
+
+    let env = DecodeEnv {
+        pack: &pack,
+        limits,
+        spill_dir,
+        max_delta_depth: plan.max_delta_depth,
+        need_offsets: &plan.need_offsets,
+        delta_deps,
+        external_base_oids,
+        delta_dep_index: &plan.delta_dep_index,
+    };
+
+    for idx in indices {
+        execute_offset_range_with_scratch(
+            &env,
+            plan,
+            paths,
+            cache,
+            external,
+            sink,
+            bufs,
+            &mut report,
+            &mut hot_stats,
+            alloc_guard_enabled,
+            idx,
+            range_for_idx(idx),
+        )?;
+    }
+
+    sink.finish()?;
+    hot_stats.merge_into(&mut report.stats);
+    Ok(report)
+}
+
 /// Shared per-offset execution path for pack plan executors.
 ///
 /// Decodes one `need_offsets[idx]`, then emits all candidates in `range`.
@@ -922,15 +1242,13 @@ pub fn execute_pack_plan<S: PackObjectSink, B: ExternalBaseProvider>(
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn execute_offset_range_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>(
+    env: &DecodeEnv<'_>,
     plan: &PackPlan,
-    pack: &PackFile<'_>,
     paths: &ByteArena,
-    limits: &PackDecodeLimits,
     cache: &mut PackCache,
     external: &mut B,
     sink: &mut S,
-    spill_dir: &Path,
-    scratch: &mut PackExecScratch,
+    bufs: &mut DecodeBufs,
     report: &mut PackExecReport,
     hot_stats: &mut PackExecHotStats,
     alloc_guard_enabled: bool,
@@ -951,26 +1269,7 @@ fn execute_offset_range_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>
         (hit.kind, DecodedStorage::Cache, Some(hit.bytes))
     } else {
         perf::record_cache_miss();
-        let decoded = decode_offset(
-            pack,
-            offset,
-            idx,
-            &plan.need_offsets,
-            limits,
-            plan.max_delta_depth,
-            cache,
-            external,
-            &scratch.delta_deps_hot,
-            &scratch.external_base_oids,
-            &plan.delta_dep_index,
-            hot_stats,
-            report,
-            &mut scratch.inflate_buf,
-            &mut scratch.result_buf,
-            &mut scratch.base_buf,
-            &mut scratch.delta_stack,
-            spill_dir,
-        )?;
+        let decoded = decode_offset(env, offset, idx, cache, external, hot_stats, report, bufs)?;
 
         let Some(obj) = decoded else {
             return Ok(());
@@ -986,8 +1285,8 @@ fn execute_offset_range_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>
         match &storage {
             DecodedStorage::Cache => cache_get(cache, offset)
                 .map(|hit| hit.bytes)
-                .unwrap_or(scratch.result_buf.as_slice()),
-            DecodedStorage::Scratch => scratch.result_buf.as_slice(),
+                .unwrap_or(bufs.result_buf.as_slice()),
+            DecodedStorage::Scratch => bufs.result_buf.as_slice(),
             DecodedStorage::Spill(spill) => spill.as_slice(),
         }
     };
@@ -1036,79 +1335,89 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
     spill_dir: &Path,
     scratch: &mut PackExecScratch,
 ) -> Result<PackExecReport, PackExecError> {
-    let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
-    let mut report = PackExecReport::default();
-    report
-        .skips
-        .reserve(plan.candidate_offsets.len().min(u32::MAX as usize));
+    let pack_header = parse_pack_header_for_plan(plan, pack_bytes)?;
+    execute_pack_plan_with_scratch_from_header(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        scratch,
+    )
+}
 
-    let alloc_guard_enabled = alloc_guard::enabled();
-
+/// Executes a pack plan using caller-provided scratch buffers and a pre-parsed
+/// pack header.
+///
+/// `pack_header` must come from [`parse_pack_header_for_plan`] for the same
+/// `plan` and `pack_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_scratch_from_header<S: PackObjectSink, B: ExternalBaseProvider>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+) -> Result<PackExecReport, PackExecError> {
     scratch.prepare(plan, limits);
-    let mut hot_stats = PackExecHotStats::default();
-
     if let Some(order) = plan.exec_order.as_ref() {
         // Out-of-order execution: precompute exact candidate ranges by need index.
         build_candidate_ranges(plan, &mut scratch.candidate_ranges);
-        for &idx in order {
-            let idx = idx as usize;
-            let range = scratch.candidate_ranges[idx];
-            execute_offset_range_with_scratch(
-                plan,
-                &pack,
-                paths,
-                limits,
-                cache,
-                external,
-                sink,
-                spill_dir,
-                scratch,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                range,
-            )?;
-        }
+        let candidate_ranges = scratch.candidate_ranges.as_slice();
+        let bufs = &mut scratch.bufs;
+        let delta_deps = scratch.delta_deps_hot.as_slice();
+        let external_base_oids = scratch.external_base_oids.as_slice();
+        execute_pack_plan_with_selector_from_header(
+            plan,
+            pack_bytes,
+            pack_header,
+            paths,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir,
+            bufs,
+            delta_deps,
+            external_base_oids,
+            plan.candidate_offsets.len(),
+            order.iter().copied().map(|idx| idx as usize),
+            |idx| candidate_ranges[idx],
+        )
     } else {
         // Monotone execution: merge candidate offsets with need offsets.
         let cand = &plan.candidate_offsets;
         let mut cand_idx = 0usize;
-        for (idx, &offset) in plan.need_offsets.iter().enumerate() {
-            while cand_idx < cand.len() && cand[cand_idx].offset < offset {
-                cand_idx += 1;
-            }
-            let range = if cand_idx < cand.len() && cand[cand_idx].offset == offset {
-                let start = cand_idx;
-                while cand_idx < cand.len() && cand[cand_idx].offset == offset {
-                    cand_idx += 1;
-                }
-                CandidateRange::from_bounds(start, cand_idx)
-            } else {
-                CandidateRange::missing()
-            };
-            execute_offset_range_with_scratch(
-                plan,
-                &pack,
-                paths,
-                limits,
-                cache,
-                external,
-                sink,
-                spill_dir,
-                scratch,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                range,
-            )?;
-        }
+        let bufs = &mut scratch.bufs;
+        let delta_deps = scratch.delta_deps_hot.as_slice();
+        let external_base_oids = scratch.external_base_oids.as_slice();
+        execute_pack_plan_with_selector_from_header(
+            plan,
+            pack_bytes,
+            pack_header,
+            paths,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir,
+            bufs,
+            delta_deps,
+            external_base_oids,
+            plan.candidate_offsets.len(),
+            0..plan.need_offsets.len(),
+            |idx| next_candidate_range(cand, plan.need_offsets[idx], &mut cand_idx),
+        )
     }
-
-    sink.finish()?;
-    hot_stats.merge_into(&mut report.stats);
-    Ok(report)
 }
 
 /// Executes a pack plan for a subset of offsets in `exec_indices`.
@@ -1125,6 +1434,7 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
 /// - `candidate_ranges` — precomputed by [`build_candidate_ranges`],
 ///   indexed by `need_offsets` position. Must have length
 ///   `plan.need_offsets.len()`.
+/// - each entry in `exec_indices` must be `< plan.need_offsets.len()`.
 ///
 /// # Delta base resolution
 ///
@@ -1138,6 +1448,11 @@ pub fn execute_pack_plan_with_scratch<S: PackObjectSink, B: ExternalBaseProvider
 ///
 /// Same as [`execute_pack_plan_with_scratch`]: `PackParse` and `Sink`
 /// errors are fatal; decode failures are recorded as skips.
+///
+/// # Panics
+///
+/// Panics if `exec_indices` contains an out-of-bounds index for
+/// `plan.need_offsets` or `candidate_ranges`.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBaseProvider>(
     plan: &PackPlan,
@@ -1152,42 +1467,152 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
     exec_indices: &[usize],
     candidate_ranges: &[CandidateRange],
 ) -> Result<PackExecReport, PackExecError> {
+    let pack_header = parse_pack_header_for_plan(plan, pack_bytes)?;
+    execute_pack_plan_with_scratch_indices_from_header(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        scratch,
+        exec_indices,
+        candidate_ranges,
+    )
+}
+
+/// Executes shard indices using caller-provided scratch buffers and a
+/// pre-parsed pack header.
+///
+/// `pack_header` must come from [`parse_pack_header_for_plan`] for the same
+/// `plan` and `pack_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_scratch_indices_from_header<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+    exec_indices: &[usize],
+    candidate_ranges: &[CandidateRange],
+) -> Result<PackExecReport, PackExecError> {
     debug_assert_eq!(candidate_ranges.len(), plan.need_offsets.len());
-    let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
-    let mut report = PackExecReport::default();
+    scratch.prepare(plan, limits);
+    let bufs = &mut scratch.bufs;
+    execute_pack_plan_with_scratch_indices_from_header_parts(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        bufs,
+        exec_indices,
+        candidate_ranges,
+        scratch.delta_deps_hot.as_slice(),
+        scratch.external_base_oids.as_slice(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_pack_plan_with_scratch_indices_from_header_parts<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    bufs: &mut DecodeBufs,
+    exec_indices: &[usize],
+    candidate_ranges: &[CandidateRange],
+    delta_deps: &[DeltaDepHot],
+    external_base_oids: &[OidBytes],
+) -> Result<PackExecReport, PackExecError> {
     let mut expected = exec_indices.len();
     for &idx in exec_indices {
         expected = expected.saturating_add(candidate_ranges[idx].candidate_count());
     }
-    report.skips.reserve(expected.min(u32::MAX as usize));
+    execute_pack_plan_with_selector_from_header(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        bufs,
+        delta_deps,
+        external_base_oids,
+        expected,
+        exec_indices.iter().copied(),
+        |idx| candidate_ranges[idx],
+    )
+}
 
-    let alloc_guard_enabled = alloc_guard::enabled();
-
-    scratch.prepare(plan, limits);
-    let mut hot_stats = PackExecHotStats::default();
-
-    for &idx in exec_indices {
-        execute_offset_range_with_scratch(
-            plan,
-            &pack,
-            paths,
-            limits,
-            cache,
-            external,
-            sink,
-            spill_dir,
-            scratch,
-            &mut report,
-            &mut hot_stats,
-            alloc_guard_enabled,
-            idx,
-            candidate_ranges[idx],
-        )?;
-    }
-
-    sink.finish()?;
-    hot_stats.merge_into(&mut report.stats);
-    Ok(report)
+/// Executes a shard over explicit indices using precomputed plan-hot delta tables.
+///
+/// This entry point avoids rebuilding `delta_deps_hot` per shard call by
+/// reusing `hot_deps` computed once per plan.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_pack_plan_with_scratch_indices_hot_deps<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+    exec_indices: &[usize],
+    candidate_ranges: &[CandidateRange],
+    hot_deps: &PackPlanHotDeps,
+) -> Result<PackExecReport, PackExecError> {
+    let pack_header = parse_pack_header_for_plan(plan, pack_bytes)?;
+    debug_assert_eq!(candidate_ranges.len(), plan.need_offsets.len());
+    scratch.prepare_bufs(limits, plan.max_delta_depth);
+    let bufs = &mut scratch.bufs;
+    execute_pack_plan_with_scratch_indices_from_header_parts(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        bufs,
+        exec_indices,
+        candidate_ranges,
+        hot_deps.delta_deps(),
+        hot_deps.external_base_oids(),
+    )
 }
 
 /// Executes a natural-order shard over `[start_idx, end_idx)` of `need_offsets`.
@@ -1195,6 +1620,9 @@ pub fn execute_pack_plan_with_scratch_indices<S: PackObjectSink, B: ExternalBase
 /// This variant avoids materializing `exec_indices` when a plan has no
 /// `exec_order` permutation. Candidate ranges are discovered with a single
 /// forward merge cursor over `candidate_offsets`.
+///
+/// `start_idx..end_idx` must be a valid half-open range over
+/// `plan.need_offsets`.
 ///
 /// # Errors
 ///
@@ -1214,11 +1642,88 @@ pub fn execute_pack_plan_with_scratch_range<S: PackObjectSink, B: ExternalBasePr
     start_idx: usize,
     end_idx: usize,
 ) -> Result<PackExecReport, PackExecError> {
+    let pack_header = parse_pack_header_for_plan(plan, pack_bytes)?;
+    execute_pack_plan_with_scratch_range_from_header(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        scratch,
+        start_idx,
+        end_idx,
+    )
+}
+
+/// Executes a natural-order shard over `[start_idx, end_idx)` using a
+/// pre-parsed pack header.
+///
+/// `pack_header` must come from [`parse_pack_header_for_plan`] for the same
+/// `plan` and `pack_bytes`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pack_plan_with_scratch_range_from_header<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+    start_idx: usize,
+    end_idx: usize,
+) -> Result<PackExecReport, PackExecError> {
     debug_assert!(start_idx <= end_idx);
     debug_assert!(end_idx <= plan.need_offsets.len());
+    scratch.prepare(plan, limits);
+    let bufs = &mut scratch.bufs;
+    execute_pack_plan_with_scratch_range_from_header_parts(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        bufs,
+        start_idx,
+        end_idx,
+        scratch.delta_deps_hot.as_slice(),
+        scratch.external_base_oids.as_slice(),
+    )
+}
 
-    let pack = PackFile::parse(pack_bytes, plan.oid_len as usize)?;
-    let mut report = PackExecReport::default();
+#[allow(clippy::too_many_arguments)]
+fn execute_pack_plan_with_scratch_range_from_header_parts<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    pack_header: PackHeader,
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    bufs: &mut DecodeBufs,
+    start_idx: usize,
+    end_idx: usize,
+    delta_deps: &[DeltaDepHot],
+    external_base_oids: &[OidBytes],
+) -> Result<PackExecReport, PackExecError> {
     let mut expected = end_idx.saturating_sub(start_idx);
     if start_idx < end_idx {
         let first_offset = plan.need_offsets[start_idx];
@@ -1231,53 +1736,91 @@ pub fn execute_pack_plan_with_scratch_range<S: PackObjectSink, B: ExternalBasePr
             .partition_point(|cand| cand.offset <= last_offset);
         expected = expected.saturating_add(cand_end.saturating_sub(cand_start));
     }
-    report.skips.reserve(expected.min(u32::MAX as usize));
-
-    let alloc_guard_enabled = alloc_guard::enabled();
-
-    scratch.prepare(plan, limits);
-    let mut hot_stats = PackExecHotStats::default();
-
-    if start_idx < end_idx {
-        let cand = &plan.candidate_offsets;
-        let first_offset = plan.need_offsets[start_idx];
-        let mut cand_idx = cand.partition_point(|entry| entry.offset < first_offset);
-        for idx in start_idx..end_idx {
-            let offset = plan.need_offsets[idx];
-            while cand_idx < cand.len() && cand[cand_idx].offset < offset {
-                cand_idx += 1;
-            }
-            let range = if cand_idx < cand.len() && cand[cand_idx].offset == offset {
-                let start = cand_idx;
-                while cand_idx < cand.len() && cand[cand_idx].offset == offset {
-                    cand_idx += 1;
-                }
-                CandidateRange::from_bounds(start, cand_idx)
-            } else {
-                CandidateRange::missing()
-            };
-            execute_offset_range_with_scratch(
-                plan,
-                &pack,
-                paths,
-                limits,
-                cache,
-                external,
-                sink,
-                spill_dir,
-                scratch,
-                &mut report,
-                &mut hot_stats,
-                alloc_guard_enabled,
-                idx,
-                range,
-            )?;
-        }
+    if start_idx >= end_idx {
+        return execute_pack_plan_with_selector_from_header(
+            plan,
+            pack_bytes,
+            pack_header,
+            paths,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir,
+            bufs,
+            delta_deps,
+            external_base_oids,
+            expected,
+            std::iter::empty::<usize>(),
+            |_| CandidateRange::missing(),
+        );
     }
 
-    sink.finish()?;
-    hot_stats.merge_into(&mut report.stats);
-    Ok(report)
+    let cand = &plan.candidate_offsets;
+    let first_offset = plan.need_offsets[start_idx];
+    let mut cand_idx = cand.partition_point(|entry| entry.offset < first_offset);
+    execute_pack_plan_with_selector_from_header(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        bufs,
+        delta_deps,
+        external_base_oids,
+        expected,
+        start_idx..end_idx,
+        |idx| next_candidate_range(cand, plan.need_offsets[idx], &mut cand_idx),
+    )
+}
+
+/// Executes a natural-order shard using precomputed plan-hot delta tables.
+///
+/// This entry point avoids rebuilding `delta_deps_hot` per shard call by
+/// reusing `hot_deps` computed once per plan.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_pack_plan_with_scratch_range_hot_deps<
+    S: PackObjectSink,
+    B: ExternalBaseProvider,
+>(
+    plan: &PackPlan,
+    pack_bytes: &[u8],
+    paths: &ByteArena,
+    limits: &PackDecodeLimits,
+    cache: &mut PackCache,
+    external: &mut B,
+    sink: &mut S,
+    spill_dir: &Path,
+    scratch: &mut PackExecScratch,
+    start_idx: usize,
+    end_idx: usize,
+    hot_deps: &PackPlanHotDeps,
+) -> Result<PackExecReport, PackExecError> {
+    let pack_header = parse_pack_header_for_plan(plan, pack_bytes)?;
+    debug_assert!(start_idx <= end_idx);
+    debug_assert!(end_idx <= plan.need_offsets.len());
+    scratch.prepare_bufs(limits, plan.max_delta_depth);
+    let bufs = &mut scratch.bufs;
+    execute_pack_plan_with_scratch_range_from_header_parts(
+        plan,
+        pack_bytes,
+        pack_header,
+        paths,
+        limits,
+        cache,
+        external,
+        sink,
+        spill_dir,
+        bufs,
+        start_idx,
+        end_idx,
+        hot_deps.delta_deps(),
+        hot_deps.external_base_oids(),
+    )
 }
 
 /// Read the entire pack into `out`, returning a fatal error on short reads.
@@ -1302,6 +1845,7 @@ fn read_pack_bytes<R: PackReader>(reader: &mut R, out: &mut Vec<u8>) -> Result<(
 /// scans of the candidate list by leveraging sorted candidate offsets.
 ///
 /// Assumes `candidate_offsets` is sorted ascending by offset.
+/// Runs in `O(need_offsets.len() + candidate_offsets.len())`.
 pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>) {
     // Single pass over sorted offsets; each need offset maps to a contiguous
     // range in `candidate_offsets` (if any). Requires plan invariants:
@@ -1310,18 +1854,12 @@ pub fn build_candidate_ranges(plan: &PackPlan, ranges: &mut Vec<CandidateRange>)
     ranges.resize(plan.need_offsets.len(), CandidateRange::missing());
     let mut cand_idx = 0usize;
     for (need_idx, &offset) in plan.need_offsets.iter().enumerate() {
-        let start = cand_idx;
-        while cand_idx < plan.candidate_offsets.len()
-            && plan.candidate_offsets[cand_idx].offset == offset
-        {
-            cand_idx += 1;
-        }
-        if cand_idx > start {
-            ranges[need_idx] = CandidateRange::from_bounds(start, cand_idx);
-        }
+        ranges[need_idx] = next_candidate_range(&plan.candidate_offsets, offset, &mut cand_idx);
     }
 }
 
+/// Reads and validates an entry header, normalizing parse failures into
+/// `PackDecodeError::PackParse`.
 #[inline]
 fn read_entry_header(
     pack: &PackFile<'_>,
@@ -1332,6 +1870,8 @@ fn read_entry_header(
         .map_err(PackDecodeError::PackParse)
 }
 
+/// Converts an entry size to `usize` and preserves object-vs-delta overflow
+/// classification for diagnostics.
 #[inline]
 fn size_to_usize(size: u64, kind: EntryKind) -> Result<usize, PackDecodeError> {
     usize::try_from(size).map_err(|_| match kind {
@@ -1346,6 +1886,7 @@ fn size_to_usize(size: u64, kind: EntryKind) -> Result<usize, PackDecodeError> {
     })
 }
 
+/// Converts a delta payload size to `usize`, reporting overflow as `DeltaTooLarge`.
 #[inline]
 fn delta_size_to_usize(size: u64) -> Result<usize, PackDecodeError> {
     usize::try_from(size).map_err(|_| PackDecodeError::DeltaTooLarge {
@@ -1354,6 +1895,7 @@ fn delta_size_to_usize(size: u64) -> Result<usize, PackDecodeError> {
     })
 }
 
+/// Converts a pack byte offset to `usize` for slice indexing.
 #[inline]
 fn data_start_to_usize(data_start: u64) -> Result<usize, PackDecodeError> {
     usize::try_from(data_start)
@@ -1389,6 +1931,7 @@ impl DeltaPayload<'_> {
 /// slice. Otherwise the payload is streamed into a spill-backed mmap to
 /// keep resident memory bounded.
 fn inflate_delta_payload<'a>(
+    de: &mut flate2::Decompress,
     pack: &PackFile<'_>,
     data_start: u64,
     delta_size: u64,
@@ -1399,7 +1942,8 @@ fn inflate_delta_payload<'a>(
     let delta_size = delta_size_to_usize(delta_size)?;
     let data_start = data_start_to_usize(data_start)?;
     if delta_size <= limits.max_delta_bytes {
-        let consumed = inflate_limited(
+        let consumed = inflate_limited_with(
+            de,
             pack.slice_from(data_start),
             inflate_buf,
             limits.max_delta_bytes,
@@ -1424,6 +1968,7 @@ fn inflate_delta_payload<'a>(
     }
 }
 
+/// Appends a non-fatal skip and updates hot-path skip counters.
 #[inline]
 fn record_skip(
     report: &mut PackExecReport,
@@ -1435,6 +1980,7 @@ fn record_skip(
     hot_stats.inc_skipped();
 }
 
+/// Maps internal delta decode failures into external skip taxonomy.
 #[inline]
 fn skip_reason_from_delta_error(err: DeltaDecodeError) -> SkipReason {
     match err {
@@ -1499,29 +2045,98 @@ fn finalize_decoded_delta(
 /// [`DeltaDecodeError`] into the appropriate [`SkipReason`].
 #[allow(clippy::too_many_arguments)]
 fn decode_delta_against_base(
-    pack: &PackFile<'_>,
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
     data_start: u64,
     delta_size: u64,
     base_bytes: &[u8],
-    limits: &PackDecodeLimits,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
-    spill_dir: &Path,
     hot_stats: &mut PackExecHotStats,
 ) -> Result<(DecodedStorage, usize), SkipReason> {
     let (storage, out_len) = decode_delta_output(
-        pack,
+        de,
+        env,
         data_start,
         delta_size,
         base_bytes,
-        limits,
         inflate_buf,
         result_buf,
-        spill_dir,
     )
     .map_err(skip_reason_from_delta_error)?;
     hot_stats.inc_decoded();
     Ok((storage, out_len))
+}
+
+/// Resolve an external REF base, apply the delta payload, and finalize
+/// the decoded object. Returns `None` when the offset is skipped
+/// (missing/error external base or delta decode failure).
+#[allow(clippy::too_many_arguments)]
+fn resolve_external_and_apply_delta<B: ExternalBaseProvider>(
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
+    offset: u64,
+    base_oid: OidBytes,
+    data_start: u64,
+    delta_size: u64,
+    cache: &mut PackCache,
+    external: &mut B,
+    hot_stats: &mut PackExecHotStats,
+    report: &mut PackExecReport,
+    inflate_buf: &mut Vec<u8>,
+    result_buf: &mut Vec<u8>,
+) -> Result<Option<DecodedObject>, PackExecError> {
+    hot_stats.inc_external_base_call();
+    match external.load_base(&base_oid) {
+        Ok(Some(base)) => {
+            let (storage, out_len) = match decode_delta_against_base(
+                de,
+                env,
+                data_start,
+                delta_size,
+                &base.bytes,
+                inflate_buf,
+                result_buf,
+                hot_stats,
+            ) {
+                Ok(decoded) => decoded,
+                Err(reason) => {
+                    record_skip(report, hot_stats, offset, reason);
+                    return Ok(None);
+                }
+            };
+            let obj = finalize_decoded_delta(
+                offset,
+                base.kind,
+                storage,
+                out_len,
+                cache,
+                result_buf,
+                &mut report.stats,
+            );
+            Ok(Some(obj))
+        }
+        Ok(None) => {
+            record_skip(
+                report,
+                hot_stats,
+                offset,
+                SkipReason::ExternalBaseMissing { oid: base_oid },
+            );
+            Ok(None)
+        }
+        Err(err) => {
+            record_skip(
+                report,
+                hot_stats,
+                offset,
+                SkipReason::ExternalBaseError {
+                    detail: err.to_string(),
+                },
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Resolve the base for an in-pack OFS delta, apply the delta, and
@@ -1544,26 +2159,20 @@ fn decode_delta_against_base(
 /// spill-backed.
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_apply_delta<B: ExternalBaseProvider>(
-    pack: &PackFile<'_>,
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
     offset: u64,
     base_offset: u64,
     data_start: u64,
     delta_size: u64,
-    need_offsets: &[u64],
-    limits: &PackDecodeLimits,
-    max_delta_depth: u8,
     cache: &mut PackCache,
     external: &mut B,
-    delta_deps: &[DeltaDepHot],
-    external_base_oids: &[OidBytes],
-    delta_dep_index: &[u32],
     hot_stats: &mut PackExecHotStats,
     report: &mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
     base_buf: &mut Vec<u8>,
     delta_stack: &mut Vec<DeltaFrame>,
-    spill_dir: &Path,
 ) -> Result<Option<DecodedObject>, PackExecError> {
     let base = match cache_get(cache, base_offset) {
         Some(base) => {
@@ -1577,23 +2186,17 @@ fn resolve_and_apply_delta<B: ExternalBaseProvider>(
             hot_stats.inc_base_cache_miss();
             let (result, resolve_nanos) = perf::time(|| {
                 decode_base_from_pack(
-                    pack,
+                    de,
+                    env,
                     base_offset,
-                    need_offsets,
-                    limits,
-                    max_delta_depth,
                     cache,
                     external,
-                    delta_deps,
-                    external_base_oids,
-                    delta_dep_index,
                     hot_stats,
                     report,
                     inflate_buf,
                     result_buf,
                     base_buf,
                     delta_stack,
-                    spill_dir,
                 )
             });
             record_timing(&mut report.stats.fallback_resolve_nanos, resolve_nanos);
@@ -1608,14 +2211,13 @@ fn resolve_and_apply_delta<B: ExternalBaseProvider>(
     };
 
     let (storage, out_len) = match decode_delta_against_base(
-        pack,
+        de,
+        env,
         data_start,
         delta_size,
         base.bytes(),
-        limits,
         inflate_buf,
         result_buf,
-        spill_dir,
         hot_stats,
     ) {
         Ok(decoded) => decoded,
@@ -1661,32 +2263,23 @@ fn resolve_and_apply_delta<B: ExternalBaseProvider>(
 ///    an in-pack base offset first; otherwise the external provider is
 ///    queried using the OID from either the plan or the entry header.
 #[allow(clippy::too_many_arguments)]
-fn decode_offset<'a, B: ExternalBaseProvider>(
-    pack: &'a PackFile<'a>,
+fn decode_offset<B: ExternalBaseProvider>(
+    env: &DecodeEnv<'_>,
     offset: u64,
     need_idx: usize,
-    need_offsets: &'a [u64],
-    limits: &'a PackDecodeLimits,
-    max_delta_depth: u8,
-    cache: &'a mut PackCache,
-    external: &'a mut B,
-    delta_deps: &'a [DeltaDepHot],
-    external_base_oids: &'a [OidBytes],
-    delta_dep_index: &'a [u32],
-    hot_stats: &'a mut PackExecHotStats,
-    report: &'a mut PackExecReport,
-    inflate_buf: &'a mut Vec<u8>,
-    result_buf: &'a mut Vec<u8>,
-    base_buf: &'a mut Vec<u8>,
-    delta_stack: &'a mut Vec<DeltaFrame>,
-    spill_dir: &'a Path,
+    cache: &mut PackCache,
+    external: &mut B,
+    hot_stats: &mut PackExecHotStats,
+    report: &mut PackExecReport,
+    bufs: &mut DecodeBufs,
 ) -> Result<Option<DecodedObject>, PackExecError> {
-    let planned_dep = delta_dep_at_index(delta_deps, delta_dep_index, need_idx);
+    let planned_dep = delta_dep_at_index(env.delta_deps, env.delta_dep_index, need_idx);
 
     // Fast path: use plan-time persisted delta metadata when available.
     if let Some(dep) = planned_dep.filter(|dep| dep.has_header_meta()) {
         if dep.is_external() {
-            let Some(base_oid) = external_base_oids
+            let Some(base_oid) = env
+                .external_base_oids
                 .get(dep.external_oid_idx as usize)
                 .copied()
             else {
@@ -1698,85 +2291,42 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 );
                 return Ok(None);
             };
-            hot_stats.inc_external_base_call();
-            match external.load_base(&base_oid) {
-                Ok(Some(base)) => match decode_delta_against_base(
-                    pack,
-                    dep.data_start,
-                    dep.delta_size,
-                    &base.bytes,
-                    limits,
-                    inflate_buf,
-                    result_buf,
-                    spill_dir,
-                    hot_stats,
-                ) {
-                    Ok((storage, out_len)) => {
-                        let obj = finalize_decoded_delta(
-                            offset,
-                            base.kind,
-                            storage,
-                            out_len,
-                            cache,
-                            result_buf,
-                            &mut report.stats,
-                        );
-                        return Ok(Some(obj));
-                    }
-                    Err(reason) => {
-                        record_skip(report, hot_stats, offset, reason);
-                        return Ok(None);
-                    }
-                },
-                Ok(None) => {
-                    record_skip(
-                        report,
-                        hot_stats,
-                        offset,
-                        SkipReason::ExternalBaseMissing { oid: base_oid },
-                    );
-                    return Ok(None);
-                }
-                Err(err) => {
-                    record_skip(
-                        report,
-                        hot_stats,
-                        offset,
-                        SkipReason::ExternalBaseError {
-                            detail: err.to_string(),
-                        },
-                    );
-                    return Ok(None);
-                }
-            }
+            return resolve_external_and_apply_delta(
+                &mut bufs.de,
+                env,
+                offset,
+                base_oid,
+                dep.data_start,
+                dep.delta_size,
+                cache,
+                external,
+                hot_stats,
+                report,
+                &mut bufs.inflate_buf,
+                &mut bufs.result_buf,
+            );
         }
 
         return resolve_and_apply_delta(
-            pack,
+            &mut bufs.de,
+            env,
             offset,
             dep.base_offset,
             dep.data_start,
             dep.delta_size,
-            need_offsets,
-            limits,
-            max_delta_depth,
             cache,
             external,
-            delta_deps,
-            external_base_oids,
-            delta_dep_index,
             hot_stats,
             report,
-            inflate_buf,
-            result_buf,
-            base_buf,
-            delta_stack,
-            spill_dir,
+            &mut bufs.inflate_buf,
+            &mut bufs.result_buf,
+            &mut bufs.base_buf,
+            &mut bufs.delta_stack,
         );
     }
 
     // Fallback path for synthetic/manual plans without persisted metadata.
-    let header = match read_entry_header(pack, offset, limits.max_header_bytes) {
+    let header = match read_entry_header(env.pack, offset, env.limits.max_header_bytes) {
         Ok(header) => header,
         Err(err) => {
             record_skip(report, hot_stats, offset, SkipReason::Decode(err));
@@ -1794,37 +2344,45 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 }
             };
 
-            if size <= limits.max_object_bytes {
-                result_buf.clear();
-                if result_buf.capacity() < size {
-                    result_buf.reserve(size - result_buf.capacity());
+            if size <= env.limits.max_object_bytes {
+                bufs.result_buf.clear();
+                if bufs.result_buf.capacity() < size {
+                    bufs.result_buf.reserve(size - bufs.result_buf.capacity());
                 }
-                let (inflate_res, nanos) =
-                    perf::time(|| inflate_entry_payload(pack, &header, result_buf, limits));
+                let (inflate_res, nanos) = perf::time(|| {
+                    inflate_entry_payload_with(
+                        &mut bufs.de,
+                        env.pack,
+                        &header,
+                        &mut bufs.result_buf,
+                        env.limits,
+                    )
+                });
                 if let Err(err) = inflate_res {
                     record_skip(report, hot_stats, offset, SkipReason::Decode(err));
                     return Ok(None);
                 }
-                perf::record_pack_inflate(result_buf.len(), nanos);
+                perf::record_pack_inflate(bufs.result_buf.len(), nanos);
                 hot_stats.inc_decoded();
 
-                if cache.insert(offset, kind, result_buf) {
+                if cache.insert(offset, kind, &bufs.result_buf) {
                     Ok(Some(DecodedObject {
                         kind,
                         storage: DecodedStorage::Cache,
                     }))
                 } else {
-                    report.stats.record_cache_reject(result_buf.len());
+                    report.stats.record_cache_reject(bufs.result_buf.len());
                     Ok(Some(DecodedObject {
                         kind,
                         storage: DecodedStorage::Scratch,
                     }))
                 }
             } else {
-                let mut spill = BlobSpill::new(spill_dir, size).map_err(PackExecError::Spill)?;
+                let mut spill =
+                    BlobSpill::new(env.spill_dir, size).map_err(PackExecError::Spill)?;
                 let mut writer = spill.writer();
                 let (inflate_res, nanos) = perf::time(|| {
-                    inflate_stream(pack.slice_from(header.data_start), size, |chunk| {
+                    inflate_stream(env.pack.slice_from(header.data_start), size, |chunk| {
                         writer
                             .write(chunk)
                             .map_err(|_| super::pack_inflate::InflateError::Backend)
@@ -1853,51 +2411,39 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
             }
         }
         EntryKind::OfsDelta { base_offset } => resolve_and_apply_delta(
-            pack,
+            &mut bufs.de,
+            env,
             offset,
             base_offset,
             header.data_start as u64,
             header.size,
-            need_offsets,
-            limits,
-            max_delta_depth,
             cache,
             external,
-            delta_deps,
-            external_base_oids,
-            delta_dep_index,
             hot_stats,
             report,
-            inflate_buf,
-            result_buf,
-            base_buf,
-            delta_stack,
-            spill_dir,
+            &mut bufs.inflate_buf,
+            &mut bufs.result_buf,
+            &mut bufs.base_buf,
+            &mut bufs.delta_stack,
         ),
         EntryKind::RefDelta { base_oid } => {
             if let Some(dep) = planned_dep {
                 if !dep.is_external() {
                     return resolve_and_apply_delta(
-                        pack,
+                        &mut bufs.de,
+                        env,
                         offset,
                         dep.base_offset,
                         header.data_start as u64,
                         header.size,
-                        need_offsets,
-                        limits,
-                        max_delta_depth,
                         cache,
                         external,
-                        delta_deps,
-                        external_base_oids,
-                        delta_dep_index,
                         hot_stats,
                         report,
-                        inflate_buf,
-                        result_buf,
-                        base_buf,
-                        delta_stack,
-                        spill_dir,
+                        &mut bufs.inflate_buf,
+                        &mut bufs.result_buf,
+                        &mut bufs.base_buf,
+                        &mut bufs.delta_stack,
                     );
                 }
             }
@@ -1906,64 +2452,27 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
                 .and_then(|dep| {
                     dep.is_external()
                         .then(|| {
-                            external_base_oids
+                            env.external_base_oids
                                 .get(dep.external_oid_idx as usize)
                                 .copied()
                         })
                         .flatten()
                 })
                 .unwrap_or(base_oid);
-            hot_stats.inc_external_base_call();
-            match external.load_base(&resolved_oid) {
-                Ok(Some(base)) => match decode_delta_against_base(
-                    pack,
-                    header.data_start as u64,
-                    header.size,
-                    &base.bytes,
-                    limits,
-                    inflate_buf,
-                    result_buf,
-                    spill_dir,
-                    hot_stats,
-                ) {
-                    Ok((storage, out_len)) => {
-                        let obj = finalize_decoded_delta(
-                            offset,
-                            base.kind,
-                            storage,
-                            out_len,
-                            cache,
-                            result_buf,
-                            &mut report.stats,
-                        );
-                        Ok(Some(obj))
-                    }
-                    Err(reason) => {
-                        record_skip(report, hot_stats, offset, reason);
-                        Ok(None)
-                    }
-                },
-                Ok(None) => {
-                    record_skip(
-                        report,
-                        hot_stats,
-                        offset,
-                        SkipReason::ExternalBaseMissing { oid: resolved_oid },
-                    );
-                    Ok(None)
-                }
-                Err(err) => {
-                    record_skip(
-                        report,
-                        hot_stats,
-                        offset,
-                        SkipReason::ExternalBaseError {
-                            detail: err.to_string(),
-                        },
-                    );
-                    Ok(None)
-                }
-            }
+            resolve_external_and_apply_delta(
+                &mut bufs.de,
+                env,
+                offset,
+                resolved_oid,
+                header.data_start as u64,
+                header.size,
+                cache,
+                external,
+                hot_stats,
+                report,
+                &mut bufs.inflate_buf,
+                &mut bufs.result_buf,
+            )
         }
     }
 }
@@ -1978,28 +2487,39 @@ fn decode_offset<'a, B: ExternalBaseProvider>(
 ///
 /// `inflate_buf` is used as scratch for the raw delta payload; it may be
 /// overwritten regardless of the outcome.
-#[allow(clippy::too_many_arguments)]
 fn decode_delta_output(
-    pack: &PackFile<'_>,
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
     data_start: u64,
     delta_size: u64,
     base_bytes: &[u8],
-    limits: &PackDecodeLimits,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
-    spill_dir: &Path,
 ) -> Result<(DecodedStorage, usize), DeltaDecodeError> {
     let (payload_res, inflate_nanos) = perf::time(|| {
-        inflate_delta_payload(pack, data_start, delta_size, limits, spill_dir, inflate_buf)
+        inflate_delta_payload(
+            de,
+            env.pack,
+            data_start,
+            delta_size,
+            env.limits,
+            env.spill_dir,
+            inflate_buf,
+        )
     });
     let payload = payload_res.map_err(DeltaDecodeError::Decode)?;
     let delta_bytes = payload.as_slice();
     perf::record_pack_inflate(delta_bytes.len(), inflate_nanos);
 
     let (_, result_size) = delta_sizes(delta_bytes).map_err(DeltaDecodeError::Delta)?;
-    if result_size <= limits.max_object_bytes {
+    if result_size <= env.limits.max_object_bytes {
         let (apply_res, apply_nanos) = perf::time(|| {
-            apply_delta(base_bytes, delta_bytes, result_buf, limits.max_object_bytes)
+            apply_delta(
+                base_bytes,
+                delta_bytes,
+                result_buf,
+                env.limits.max_object_bytes,
+            )
         });
         if let Err(err) = apply_res {
             return Err(DeltaDecodeError::Delta(err));
@@ -2007,7 +2527,7 @@ fn decode_delta_output(
         perf::record_delta_apply(result_buf.len(), apply_nanos);
         Ok((DecodedStorage::Scratch, result_buf.len()))
     } else {
-        let mut spill = BlobSpill::new(spill_dir, result_size)
+        let mut spill = BlobSpill::new(env.spill_dir, result_size)
             .map_err(|_| DeltaDecodeError::Delta(DeltaError::OutputOverrun))?;
         let mut writer = spill.writer();
         let (apply_res, apply_nanos) = perf::time(|| {
@@ -2027,6 +2547,9 @@ fn decode_delta_output(
 }
 
 /// Lookup the delta dependency by `need_offsets` index using the dense index.
+///
+/// `delta_dep_index` stores either a real index into `delta_deps` or
+/// [`NONE_U32`] for "no dependency metadata".
 #[inline]
 fn delta_dep_at_index(
     delta_deps: &[DeltaDepHot],
@@ -2059,16 +2582,15 @@ fn delta_dep_at_index(
 /// `base_buf`.
 #[allow(clippy::too_many_arguments)]
 fn unwind_delta_stack(
-    pack: &PackFile<'_>,
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
     delta_stack: &[DeltaFrame],
     base_kind: ObjectKind,
     base_spill: &mut Option<BlobSpill>,
-    limits: &PackDecodeLimits,
     cache: &mut PackCache,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
     base_buf: &mut Vec<u8>,
-    spill_dir: &Path,
     hot_stats: &mut PackExecHotStats,
     stats: &mut PackExecStats,
 ) -> Result<(), DeltaDecodeError> {
@@ -2078,14 +2600,13 @@ fn unwind_delta_stack(
             .map(|spill| spill.as_slice())
             .unwrap_or_else(|| base_buf.as_slice());
         let (storage, out_len) = decode_delta_output(
-            pack,
+            de,
+            env,
             frame.data_start,
             frame.delta_size,
             base_bytes,
-            limits,
             inflate_buf,
             result_buf,
-            spill_dir,
         )?;
 
         hot_stats.inc_decoded();
@@ -2115,12 +2636,10 @@ fn unwind_delta_stack(
 ///
 /// Errors from the provider or spill I/O are converted to `SkipReason`
 /// so the caller can record a non-fatal skip for the affected offset.
-#[allow(clippy::too_many_arguments)]
 fn load_external_root_base<B: ExternalBaseProvider>(
+    env: &DecodeEnv<'_>,
     oid: OidBytes,
     external: &mut B,
-    limits: &PackDecodeLimits,
-    spill_dir: &Path,
     base_buf: &mut Vec<u8>,
     hot_stats: &mut PackExecHotStats,
     stats: &mut PackExecStats,
@@ -2129,7 +2648,7 @@ fn load_external_root_base<B: ExternalBaseProvider>(
     match external.load_base(&oid) {
         Ok(Some(base)) => {
             let base_len = base.bytes.len();
-            if base_len <= limits.max_object_bytes {
+            if base_len <= env.limits.max_object_bytes {
                 base_buf.clear();
                 if base_buf.capacity() < base_len {
                     base_buf.reserve(base_len - base_buf.capacity());
@@ -2138,7 +2657,7 @@ fn load_external_root_base<B: ExternalBaseProvider>(
                 hot_stats.inc_decoded();
                 Ok((base.kind, None))
             } else {
-                let mut spill = BlobSpill::new(spill_dir, base_len).map_err(|e| {
+                let mut spill = BlobSpill::new(env.spill_dir, base_len).map_err(|e| {
                     SkipReason::ExternalBaseError {
                         detail: format!("spill create: {e}"),
                     }
@@ -2172,30 +2691,28 @@ fn load_external_root_base<B: ExternalBaseProvider>(
 /// fallback chain metric, and constructs the return value.
 #[allow(clippy::too_many_arguments)]
 fn unwind_and_build_base<'b>(
-    pack: &PackFile<'_>,
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
     delta_stack: &[DeltaFrame],
     base_kind: ObjectKind,
     mut base_spill: Option<BlobSpill>,
-    limits: &PackDecodeLimits,
     cache: &mut PackCache,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
     base_buf: &'b mut Vec<u8>,
-    spill_dir: &Path,
     hot_stats: &mut PackExecHotStats,
     stats: &mut PackExecStats,
 ) -> Result<BaseBytes<'b>, SkipReason> {
     if let Err(err) = unwind_delta_stack(
-        pack,
+        de,
+        env,
         delta_stack,
         base_kind,
         &mut base_spill,
-        limits,
         cache,
         inflate_buf,
         result_buf,
         base_buf,
-        spill_dir,
         hot_stats,
         stats,
     ) {
@@ -2212,6 +2729,250 @@ fn unwind_and_build_base<'b>(
         kind: base_kind,
         storage,
     })
+}
+
+/// Root base discovered while walking a fallback delta chain.
+#[derive(Clone, Copy, Debug)]
+enum ChainRoot {
+    /// Root is a non-delta entry in the current pack.
+    Pack {
+        offset: u64,
+        kind: ObjectKind,
+        size: u64,
+        data_start: usize,
+    },
+    /// Root is a REF-delta base resolved via external provider.
+    External { oid: OidBytes },
+}
+
+/// Walk delta links from `offset` to the root base, collecting frames.
+///
+/// The walk follows persisted delta metadata when available, falling back to
+/// header parsing for synthetic/manual plans. It returns the resolved root
+/// descriptor while `delta_stack` accumulates intermediate deltas in walk order.
+fn walk_delta_chain_to_root(
+    env: &DecodeEnv<'_>,
+    offset: u64,
+    delta_stack: &mut Vec<DeltaFrame>,
+    stats: &mut PackExecStats,
+) -> Result<ChainRoot, SkipReason> {
+    let mut current_offset = offset;
+    loop {
+        if delta_stack.len() >= env.max_delta_depth as usize {
+            record_fallback_chain(stats, delta_stack.len());
+            return Err(SkipReason::BaseMissing {
+                base_offset: current_offset,
+            });
+        }
+
+        // Fast path: follow persisted delta metadata when available.
+        if let Ok(need_idx) = env.need_offsets.binary_search(&current_offset) {
+            if let Some(dep) = delta_dep_at_index(env.delta_deps, env.delta_dep_index, need_idx)
+                .filter(|dep| dep.has_header_meta())
+            {
+                if dep.is_external() {
+                    let Some(base_oid) = env
+                        .external_base_oids
+                        .get(dep.external_oid_idx as usize)
+                        .copied()
+                    else {
+                        record_fallback_chain(stats, delta_stack.len());
+                        return Err(SkipReason::Decode(PackDecodeError::PackParse(
+                            PackParseError::Truncated,
+                        )));
+                    };
+                    delta_stack.push(DeltaFrame {
+                        offset: current_offset,
+                        data_start: dep.data_start,
+                        delta_size: dep.delta_size,
+                    });
+                    return Ok(ChainRoot::External { oid: base_oid });
+                }
+
+                if dep.base_offset == current_offset {
+                    return Err(SkipReason::BaseMissing {
+                        base_offset: dep.base_offset,
+                    });
+                }
+                delta_stack.push(DeltaFrame {
+                    offset: current_offset,
+                    data_start: dep.data_start,
+                    delta_size: dep.delta_size,
+                });
+                current_offset = dep.base_offset;
+                continue;
+            }
+        }
+
+        let header = match read_entry_header(env.pack, current_offset, env.limits.max_header_bytes)
+        {
+            Ok(header) => header,
+            Err(err) => {
+                record_fallback_chain(stats, delta_stack.len());
+                return Err(SkipReason::Decode(err));
+            }
+        };
+
+        match header.kind {
+            EntryKind::NonDelta { kind } => {
+                return Ok(ChainRoot::Pack {
+                    offset: current_offset,
+                    kind,
+                    size: header.size,
+                    data_start: header.data_start,
+                });
+            }
+            EntryKind::OfsDelta { base_offset } => {
+                if base_offset == current_offset {
+                    return Err(SkipReason::BaseMissing { base_offset });
+                }
+                delta_stack.push(DeltaFrame {
+                    offset: current_offset,
+                    data_start: header.data_start as u64,
+                    delta_size: header.size,
+                });
+                current_offset = base_offset;
+            }
+            EntryKind::RefDelta { base_oid } => {
+                let dep = env
+                    .need_offsets
+                    .binary_search(&current_offset)
+                    .ok()
+                    .and_then(|idx| delta_dep_at_index(env.delta_deps, env.delta_dep_index, idx));
+                match dep {
+                    Some(dep) if !dep.is_external() => {
+                        delta_stack.push(DeltaFrame {
+                            offset: current_offset,
+                            data_start: if dep.has_header_meta() {
+                                dep.data_start
+                            } else {
+                                header.data_start as u64
+                            },
+                            delta_size: if dep.has_header_meta() {
+                                dep.delta_size
+                            } else {
+                                header.size
+                            },
+                        });
+                        current_offset = dep.base_offset;
+                    }
+                    _ => {
+                        delta_stack.push(DeltaFrame {
+                            offset: current_offset,
+                            data_start: header.data_start as u64,
+                            delta_size: header.size,
+                        });
+                        let base_oid = dep
+                            .and_then(|dep| {
+                                dep.is_external()
+                                    .then(|| {
+                                        env.external_base_oids
+                                            .get(dep.external_oid_idx as usize)
+                                            .copied()
+                                    })
+                                    .flatten()
+                            })
+                            .unwrap_or(base_oid);
+                        return Ok(ChainRoot::External { oid: base_oid });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Inflate a pack-local non-delta root base into memory or spill storage.
+#[allow(clippy::too_many_arguments)]
+fn materialize_pack_root_base(
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
+    root_offset: u64,
+    kind: ObjectKind,
+    size_u64: u64,
+    data_start: usize,
+    cache: &mut PackCache,
+    base_buf: &mut Vec<u8>,
+    hot_stats: &mut PackExecHotStats,
+    stats: &mut PackExecStats,
+) -> Result<(ObjectKind, Option<BlobSpill>), SkipReason> {
+    let size = size_to_usize(size_u64, EntryKind::NonDelta { kind }).map_err(SkipReason::Decode)?;
+
+    // Keep oversized bases in a spill-backed mmap instead of RAM.
+    if size <= env.limits.max_object_bytes {
+        base_buf.clear();
+        if base_buf.capacity() < size {
+            base_buf.reserve(size - base_buf.capacity());
+        }
+        let header = EntryHeader {
+            size: size_u64,
+            data_start,
+            kind: EntryKind::NonDelta { kind },
+        };
+        let (inflate_res, nanos) =
+            perf::time(|| inflate_entry_payload_with(de, env.pack, &header, base_buf, env.limits));
+        if let Err(err) = inflate_res {
+            return Err(SkipReason::Decode(err));
+        }
+        perf::record_pack_inflate(base_buf.len(), nanos);
+        hot_stats.inc_decoded();
+        if !cache.insert(root_offset, kind, base_buf) {
+            stats.record_cache_reject(base_buf.len());
+        }
+        Ok((kind, None))
+    } else {
+        let mut spill = BlobSpill::new(env.spill_dir, size).map_err(|_| {
+            SkipReason::Decode(PackDecodeError::Inflate(
+                super::pack_inflate::InflateError::Backend,
+            ))
+        })?;
+        let mut writer = spill.writer();
+        let (inflate_res, nanos) = perf::time(|| {
+            inflate_stream(env.pack.slice_from(data_start), size, |chunk| {
+                writer
+                    .write(chunk)
+                    .map_err(|_| super::pack_inflate::InflateError::Backend)
+            })
+        });
+        if let Err(err) = inflate_res {
+            return Err(SkipReason::Decode(PackDecodeError::Inflate(err)));
+        }
+        if writer.finish().is_err() {
+            return Err(SkipReason::Decode(PackDecodeError::Inflate(
+                super::pack_inflate::InflateError::Backend,
+            )));
+        }
+        perf::record_pack_inflate(size, nanos);
+        hot_stats.inc_decoded();
+        stats.record_cache_reject(size);
+        Ok((kind, Some(spill)))
+    }
+}
+
+/// Materialize the resolved chain root into base bytes for unwind.
+#[allow(clippy::too_many_arguments)]
+fn materialize_root_base<B: ExternalBaseProvider>(
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
+    root: ChainRoot,
+    cache: &mut PackCache,
+    external: &mut B,
+    base_buf: &mut Vec<u8>,
+    hot_stats: &mut PackExecHotStats,
+    stats: &mut PackExecStats,
+) -> Result<(ObjectKind, Option<BlobSpill>), SkipReason> {
+    match root {
+        ChainRoot::Pack {
+            offset,
+            kind,
+            size,
+            data_start,
+        } => materialize_pack_root_base(
+            de, env, offset, kind, size, data_start, cache, base_buf, hot_stats, stats,
+        ),
+        ChainRoot::External { oid } => {
+            load_external_root_base(env, oid, external, base_buf, hot_stats, stats)
+        }
+    }
 }
 
 /// Decode a base object on demand by walking the delta chain from `offset`.
@@ -2240,282 +3001,59 @@ fn unwind_and_build_base<'b>(
 /// skip on the *original* dependent offset, not on intermediate chain
 /// entries.
 #[allow(clippy::too_many_arguments)]
-fn decode_base_from_pack<'a, 'b, B: ExternalBaseProvider>(
-    pack: &'a PackFile<'a>,
+fn decode_base_from_pack<'b, B: ExternalBaseProvider>(
+    de: &mut flate2::Decompress,
+    env: &DecodeEnv<'_>,
     offset: u64,
-    need_offsets: &'a [u64],
-    limits: &'a PackDecodeLimits,
-    max_delta_depth: u8,
-    cache: &'a mut PackCache,
-    external: &'a mut B,
-    delta_deps: &'a [DeltaDepHot],
-    external_base_oids: &'a [OidBytes],
-    delta_dep_index: &'a [u32],
-    hot_stats: &'a mut PackExecHotStats,
-    report: &'a mut PackExecReport,
+    cache: &mut PackCache,
+    external: &mut B,
+    hot_stats: &mut PackExecHotStats,
+    report: &mut PackExecReport,
     inflate_buf: &mut Vec<u8>,
     result_buf: &mut Vec<u8>,
     base_buf: &'b mut Vec<u8>,
     delta_stack: &mut Vec<DeltaFrame>,
-    spill_dir: &Path,
 ) -> Result<BaseBytes<'b>, SkipReason> {
-    if max_delta_depth == 0 {
+    if env.max_delta_depth == 0 {
         return Err(SkipReason::BaseMissing {
             base_offset: offset,
         });
     }
 
     delta_stack.clear();
-    let mut current_offset = offset;
     perf_stats::sat_add_u32(&mut report.stats.fallback_base_decodes, 1);
 
-    loop {
-        if delta_stack.len() >= max_delta_depth as usize {
+    let root = walk_delta_chain_to_root(env, offset, delta_stack, &mut report.stats)?;
+    let (base_kind, base_spill) = match materialize_root_base(
+        de,
+        env,
+        root,
+        cache,
+        external,
+        base_buf,
+        hot_stats,
+        &mut report.stats,
+    ) {
+        Ok(root) => root,
+        Err(reason) => {
             record_fallback_chain(&mut report.stats, delta_stack.len());
-            return Err(SkipReason::BaseMissing {
-                base_offset: current_offset,
-            });
+            return Err(reason);
         }
+    };
 
-        // Fast path: follow persisted delta metadata when available.
-        if let Ok(need_idx) = need_offsets.binary_search(&current_offset) {
-            if let Some(dep) = delta_dep_at_index(delta_deps, delta_dep_index, need_idx)
-                .filter(|dep| dep.has_header_meta())
-            {
-                if dep.is_external() {
-                    let Some(base_oid) = external_base_oids
-                        .get(dep.external_oid_idx as usize)
-                        .copied()
-                    else {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        return Err(SkipReason::Decode(PackDecodeError::PackParse(
-                            PackParseError::Truncated,
-                        )));
-                    };
-                    delta_stack.push(DeltaFrame {
-                        offset: current_offset,
-                        data_start: dep.data_start,
-                        delta_size: dep.delta_size,
-                    });
-
-                    let (base_kind, base_spill) = match load_external_root_base(
-                        base_oid,
-                        external,
-                        limits,
-                        spill_dir,
-                        base_buf,
-                        hot_stats,
-                        &mut report.stats,
-                    ) {
-                        Ok(root) => root,
-                        Err(reason) => {
-                            record_fallback_chain(&mut report.stats, delta_stack.len());
-                            return Err(reason);
-                        }
-                    };
-
-                    return unwind_and_build_base(
-                        pack,
-                        delta_stack,
-                        base_kind,
-                        base_spill,
-                        limits,
-                        cache,
-                        inflate_buf,
-                        result_buf,
-                        base_buf,
-                        spill_dir,
-                        hot_stats,
-                        &mut report.stats,
-                    );
-                }
-
-                if dep.base_offset == current_offset {
-                    return Err(SkipReason::BaseMissing {
-                        base_offset: dep.base_offset,
-                    });
-                }
-                delta_stack.push(DeltaFrame {
-                    offset: current_offset,
-                    data_start: dep.data_start,
-                    delta_size: dep.delta_size,
-                });
-                current_offset = dep.base_offset;
-                continue;
-            }
-        }
-
-        let header = match read_entry_header(pack, current_offset, limits.max_header_bytes) {
-            Ok(header) => header,
-            Err(err) => {
-                record_fallback_chain(&mut report.stats, delta_stack.len());
-                return Err(SkipReason::Decode(err));
-            }
-        };
-
-        match header.kind {
-            EntryKind::NonDelta { kind } => {
-                let size = match size_to_usize(header.size, header.kind) {
-                    Ok(size) => size,
-                    Err(err) => {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        return Err(SkipReason::Decode(err));
-                    }
-                };
-
-                // Keep oversized bases in a spill-backed mmap instead of RAM.
-                let mut base_spill: Option<BlobSpill> = None;
-                if size <= limits.max_object_bytes {
-                    base_buf.clear();
-                    if base_buf.capacity() < size {
-                        base_buf.reserve(size - base_buf.capacity());
-                    }
-                    let (inflate_res, nanos) =
-                        perf::time(|| inflate_entry_payload(pack, &header, base_buf, limits));
-                    if let Err(err) = inflate_res {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        return Err(SkipReason::Decode(err));
-                    }
-                    perf::record_pack_inflate(base_buf.len(), nanos);
-                    hot_stats.inc_decoded();
-                    if !cache.insert(current_offset, kind, base_buf) {
-                        report.stats.record_cache_reject(base_buf.len());
-                    }
-                } else {
-                    let mut spill = match BlobSpill::new(spill_dir, size) {
-                        Ok(spill) => spill,
-                        Err(_) => {
-                            record_fallback_chain(&mut report.stats, delta_stack.len());
-                            return Err(SkipReason::Decode(PackDecodeError::Inflate(
-                                super::pack_inflate::InflateError::Backend,
-                            )));
-                        }
-                    };
-                    let mut writer = spill.writer();
-                    let (inflate_res, nanos) = perf::time(|| {
-                        inflate_stream(pack.slice_from(header.data_start), size, |chunk| {
-                            writer
-                                .write(chunk)
-                                .map_err(|_| super::pack_inflate::InflateError::Backend)
-                        })
-                    });
-                    if let Err(err) = inflate_res {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        return Err(SkipReason::Decode(PackDecodeError::Inflate(err)));
-                    }
-                    if writer.finish().is_err() {
-                        record_fallback_chain(&mut report.stats, delta_stack.len());
-                        return Err(SkipReason::Decode(PackDecodeError::Inflate(
-                            super::pack_inflate::InflateError::Backend,
-                        )));
-                    }
-                    perf::record_pack_inflate(size, nanos);
-                    hot_stats.inc_decoded();
-                    report.stats.record_cache_reject(size);
-                    base_spill = Some(spill);
-                }
-
-                return unwind_and_build_base(
-                    pack,
-                    delta_stack,
-                    kind,
-                    base_spill,
-                    limits,
-                    cache,
-                    inflate_buf,
-                    result_buf,
-                    base_buf,
-                    spill_dir,
-                    hot_stats,
-                    &mut report.stats,
-                );
-            }
-            EntryKind::OfsDelta { base_offset } => {
-                if base_offset == current_offset {
-                    return Err(SkipReason::BaseMissing { base_offset });
-                }
-                delta_stack.push(DeltaFrame {
-                    offset: current_offset,
-                    data_start: header.data_start as u64,
-                    delta_size: header.size,
-                });
-                current_offset = base_offset;
-            }
-            EntryKind::RefDelta { base_oid } => {
-                let dep = need_offsets
-                    .binary_search(&current_offset)
-                    .ok()
-                    .and_then(|idx| delta_dep_at_index(delta_deps, delta_dep_index, idx));
-                match dep {
-                    Some(dep) if !dep.is_external() => {
-                        delta_stack.push(DeltaFrame {
-                            offset: current_offset,
-                            data_start: if dep.has_header_meta() {
-                                dep.data_start
-                            } else {
-                                header.data_start as u64
-                            },
-                            delta_size: if dep.has_header_meta() {
-                                dep.delta_size
-                            } else {
-                                header.size
-                            },
-                        });
-                        current_offset = dep.base_offset;
-                    }
-                    _ => {
-                        delta_stack.push(DeltaFrame {
-                            offset: current_offset,
-                            data_start: header.data_start as u64,
-                            delta_size: header.size,
-                        });
-                        let base_oid = dep
-                            .and_then(|dep| {
-                                dep.is_external()
-                                    .then(|| {
-                                        external_base_oids
-                                            .get(dep.external_oid_idx as usize)
-                                            .copied()
-                                    })
-                                    .flatten()
-                            })
-                            .unwrap_or(base_oid);
-
-                        let (base_kind, base_spill) = match load_external_root_base(
-                            base_oid,
-                            external,
-                            limits,
-                            spill_dir,
-                            base_buf,
-                            hot_stats,
-                            &mut report.stats,
-                        ) {
-                            Ok(root) => root,
-                            Err(reason) => {
-                                record_fallback_chain(&mut report.stats, delta_stack.len());
-                                return Err(reason);
-                            }
-                        };
-
-                        return unwind_and_build_base(
-                            pack,
-                            delta_stack,
-                            base_kind,
-                            base_spill,
-                            limits,
-                            cache,
-                            inflate_buf,
-                            result_buf,
-                            base_buf,
-                            spill_dir,
-                            hot_stats,
-                            &mut report.stats,
-                        );
-                    }
-                }
-            }
-        }
-    }
+    unwind_and_build_base(
+        de,
+        env,
+        delta_stack,
+        base_kind,
+        base_spill,
+        cache,
+        inflate_buf,
+        result_buf,
+        base_buf,
+        hot_stats,
+        &mut report.stats,
+    )
 }
 
 /// Non-fatal delta decode failure.
@@ -2747,6 +3285,70 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn exec_plan_indices_hot_deps<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+        scratch: &mut PackExecScratch,
+        exec_indices: &[usize],
+        candidate_ranges: &[CandidateRange],
+        hot_deps: &PackPlanHotDeps,
+    ) -> PackExecReport {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        execute_pack_plan_with_scratch_indices_hot_deps(
+            plan,
+            pack,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+            scratch,
+            exec_indices,
+            candidate_ranges,
+            hot_deps,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_plan_indices_from_header<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        pack_header: PackHeader,
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+        scratch: &mut PackExecScratch,
+        exec_indices: &[usize],
+        candidate_ranges: &[CandidateRange],
+    ) -> PackExecReport {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        execute_pack_plan_with_scratch_indices_from_header(
+            plan,
+            pack,
+            pack_header,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+            scratch,
+            exec_indices,
+            candidate_ranges,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn exec_plan_range<S: PackObjectSink, B: ExternalBaseProvider>(
         plan: &PackPlan,
         pack: &[u8],
@@ -2763,6 +3365,70 @@ mod tests {
         execute_pack_plan_with_scratch_range(
             plan,
             pack,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+            scratch,
+            start_idx,
+            end_idx,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_plan_range_hot_deps<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+        scratch: &mut PackExecScratch,
+        start_idx: usize,
+        end_idx: usize,
+        hot_deps: &PackPlanHotDeps,
+    ) -> PackExecReport {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        execute_pack_plan_with_scratch_range_hot_deps(
+            plan,
+            pack,
+            arena,
+            limits,
+            cache,
+            external,
+            sink,
+            spill_dir.path(),
+            scratch,
+            start_idx,
+            end_idx,
+            hot_deps,
+        )
+        .unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_plan_range_from_header<S: PackObjectSink, B: ExternalBaseProvider>(
+        plan: &PackPlan,
+        pack: &[u8],
+        pack_header: PackHeader,
+        arena: &ByteArena,
+        limits: &PackDecodeLimits,
+        cache: &mut PackCache,
+        external: &mut B,
+        sink: &mut S,
+        scratch: &mut PackExecScratch,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> PackExecReport {
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        execute_pack_plan_with_scratch_range_from_header(
+            plan,
+            pack,
+            pack_header,
             arena,
             limits,
             cache,
@@ -3437,6 +4103,131 @@ mod tests {
     }
 
     #[test]
+    fn shard_hot_deps_paths_match_existing_shard_paths() {
+        let (pack, offsets) = build_pack(&[
+            (ObjectKind::Blob, b"first"),
+            (ObjectKind::Blob, b"second"),
+            (ObjectKind::Blob, b"third"),
+        ]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = vec![
+            PackCandidate {
+                oid: OidBytes::sha1([0x31; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[0],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x32; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[1],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x33; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[2],
+            },
+        ];
+
+        let plan = build_plan(
+            vec![offsets[0], offsets[1], offsets[2]],
+            candidates,
+            vec![
+                CandidateAtOffset {
+                    offset: offsets[0],
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset: offsets[1],
+                    cand_idx: 1,
+                },
+                CandidateAtOffset {
+                    offset: offsets[2],
+                    cand_idx: 2,
+                },
+            ],
+            None,
+        );
+
+        let mut candidate_ranges = Vec::new();
+        build_candidate_ranges(&plan, &mut candidate_ranges);
+        let hot_deps = PackPlanHotDeps::from_plan(&plan);
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+        let exec_indices = [1usize, 2usize];
+
+        let mut cache_baseline = PackCache::new(0);
+        let mut external_baseline = NoExternal;
+        let mut sink_baseline = TestSink::default();
+        let mut scratch_baseline = PackExecScratch::default();
+        let report_baseline = exec_plan_indices(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_baseline,
+            &mut external_baseline,
+            &mut sink_baseline,
+            &mut scratch_baseline,
+            &exec_indices,
+            &candidate_ranges,
+        );
+
+        let mut cache_hot_idx = PackCache::new(0);
+        let mut external_hot_idx = NoExternal;
+        let mut sink_hot_idx = TestSink::default();
+        let mut scratch_hot_idx = PackExecScratch::default();
+        let report_hot_idx = exec_plan_indices_hot_deps(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_hot_idx,
+            &mut external_hot_idx,
+            &mut sink_hot_idx,
+            &mut scratch_hot_idx,
+            &exec_indices,
+            &candidate_ranges,
+            &hot_deps,
+        );
+
+        let mut cache_hot_range = PackCache::new(0);
+        let mut external_hot_range = NoExternal;
+        let mut sink_hot_range = TestSink::default();
+        let mut scratch_hot_range = PackExecScratch::default();
+        let report_hot_range = exec_plan_range_hot_deps(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache_hot_range,
+            &mut external_hot_range,
+            &mut sink_hot_range,
+            &mut scratch_hot_range,
+            1,
+            3,
+            &hot_deps,
+        );
+
+        assert_eq!(
+            report_hot_idx.stats.emitted_candidates,
+            report_baseline.stats.emitted_candidates
+        );
+        assert_eq!(report_hot_idx.skips.len(), report_baseline.skips.len());
+        assert_eq!(sink_hot_idx.emitted, sink_baseline.emitted);
+
+        assert_eq!(
+            report_hot_range.stats.emitted_candidates,
+            report_baseline.stats.emitted_candidates
+        );
+        assert_eq!(report_hot_range.skips.len(), report_baseline.skips.len());
+        assert_eq!(sink_hot_range.emitted, sink_baseline.emitted);
+    }
+
+    #[test]
     fn shard_range_exec_matches_index_exec_for_natural_order() {
         let (pack, offsets) = build_pack(&[
             (ObjectKind::Blob, b"first"),
@@ -3531,6 +4322,195 @@ mod tests {
         );
         assert_eq!(report_range.skips.len(), report_idx.skips.len());
         assert_eq!(sink_range.emitted, sink_idx.emitted);
+    }
+
+    #[test]
+    fn shard_indices_from_header_reuses_preparsed_header() {
+        let (mut pack, offsets) =
+            build_pack(&[(ObjectKind::Blob, b"first"), (ObjectKind::Blob, b"second")]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = vec![
+            PackCandidate {
+                oid: OidBytes::sha1([0x41; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[0],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x42; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[1],
+            },
+        ];
+        let plan = build_plan(
+            vec![offsets[0], offsets[1]],
+            candidates,
+            vec![
+                CandidateAtOffset {
+                    offset: offsets[0],
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset: offsets[1],
+                    cand_idx: 1,
+                },
+            ],
+            None,
+        );
+
+        let mut candidate_ranges = Vec::new();
+        build_candidate_ranges(&plan, &mut candidate_ranges);
+
+        let pack_header = parse_pack_header_for_plan(&plan, &pack).expect("pack header");
+        pack[0] = b'X'; // force legacy entry points to fail if they re-parse
+
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+        let mut emitted = Vec::new();
+        for exec_indices in [&[0usize][..], &[1usize][..]] {
+            let mut cache = PackCache::new(0);
+            let mut external = NoExternal;
+            let mut sink = TestSink::default();
+            let mut scratch = PackExecScratch::default();
+            let report = exec_plan_indices_from_header(
+                &plan,
+                &pack,
+                pack_header,
+                &arena,
+                &limits,
+                &mut cache,
+                &mut external,
+                &mut sink,
+                &mut scratch,
+                exec_indices,
+                &candidate_ranges,
+            );
+            assert_perf_u32(report.stats.emitted_candidates, 1);
+            emitted.extend(sink.emitted);
+        }
+        assert_eq!(
+            emitted,
+            vec![OidBytes::sha1([0x41; 20]), OidBytes::sha1([0x42; 20])]
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+        let mut scratch = PackExecScratch::default();
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        let err = execute_pack_plan_with_scratch_indices(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache,
+            &mut external,
+            &mut sink,
+            spill_dir.path(),
+            &mut scratch,
+            &[0usize],
+            &candidate_ranges,
+        )
+        .expect_err("legacy shard entry point should re-parse pack header");
+        assert!(matches!(
+            err,
+            PackExecError::PackParse(PackParseError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn shard_range_from_header_reuses_preparsed_header() {
+        let (mut pack, offsets) =
+            build_pack(&[(ObjectKind::Blob, b"first"), (ObjectKind::Blob, b"second")]);
+
+        let mut arena = ByteArena::with_capacity(64);
+        let path_ref = arena.intern(b"file.txt").unwrap();
+        let candidates = vec![
+            PackCandidate {
+                oid: OidBytes::sha1([0x51; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[0],
+            },
+            PackCandidate {
+                oid: OidBytes::sha1([0x52; 20]),
+                ctx: ctx(path_ref),
+                pack_id: 0,
+                offset: offsets[1],
+            },
+        ];
+        let plan = build_plan(
+            vec![offsets[0], offsets[1]],
+            candidates,
+            vec![
+                CandidateAtOffset {
+                    offset: offsets[0],
+                    cand_idx: 0,
+                },
+                CandidateAtOffset {
+                    offset: offsets[1],
+                    cand_idx: 1,
+                },
+            ],
+            None,
+        );
+
+        let pack_header = parse_pack_header_for_plan(&plan, &pack).expect("pack header");
+        pack[0] = b'X'; // force legacy entry points to fail if they re-parse
+
+        let limits = PackDecodeLimits::new(64, 1024, 1024);
+        let mut emitted = Vec::new();
+        for (start_idx, end_idx) in [(0usize, 1usize), (1usize, 2usize)] {
+            let mut cache = PackCache::new(0);
+            let mut external = NoExternal;
+            let mut sink = TestSink::default();
+            let mut scratch = PackExecScratch::default();
+            let report = exec_plan_range_from_header(
+                &plan,
+                &pack,
+                pack_header,
+                &arena,
+                &limits,
+                &mut cache,
+                &mut external,
+                &mut sink,
+                &mut scratch,
+                start_idx,
+                end_idx,
+            );
+            assert_perf_u32(report.stats.emitted_candidates, 1);
+            emitted.extend(sink.emitted);
+        }
+        assert_eq!(
+            emitted,
+            vec![OidBytes::sha1([0x51; 20]), OidBytes::sha1([0x52; 20])]
+        );
+
+        let mut cache = PackCache::new(0);
+        let mut external = NoExternal;
+        let mut sink = TestSink::default();
+        let mut scratch = PackExecScratch::default();
+        let spill_dir = tempfile::tempdir().expect("spill dir");
+        let err = execute_pack_plan_with_scratch_range(
+            &plan,
+            &pack,
+            &arena,
+            &limits,
+            &mut cache,
+            &mut external,
+            &mut sink,
+            spill_dir.path(),
+            &mut scratch,
+            0,
+            1,
+        )
+        .expect_err("legacy shard entry point should re-parse pack header");
+        assert!(matches!(
+            err,
+            PackExecError::PackParse(PackParseError::BadSignature)
+        ));
     }
 
     #[test]

@@ -110,6 +110,7 @@ impl Log2Hist {
             return;
         }
         let b = bucket_index(v);
+        debug_assert!(b < 64, "bucket_index returned {b}, expected 0..63");
         // SAFETY: bucket_index always returns 0..63 (see its implementation).
         // The index is derived from leading_zeros which is 0..64 for u64,
         // and our formula maps that to 0..63.
@@ -135,6 +136,7 @@ impl Log2Hist {
             return;
         }
         let b = bucket_index(v);
+        debug_assert!(b < 64, "bucket_index returned {b}, expected 0..63");
         // SAFETY: same as record() - bucket_index guarantees 0..63
         unsafe {
             let slot = self.buckets.get_unchecked_mut(b);

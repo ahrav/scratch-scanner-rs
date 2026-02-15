@@ -1,4 +1,6 @@
 use super::*;
+use std::path::Path;
+
 use crate::git_scan::object_id::OidBytes;
 use crate::git_scan::pack_decode::PackDecodeLimits;
 use crate::git_scan::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};
@@ -215,6 +217,103 @@ fn build_scheduler_shard_exec_plan_uses_indices_for_exec_ordered_plans() {
 }
 
 #[test]
+fn build_shard_dispatch_plan_precomputes_hot_deps_per_plan() {
+    let plans = vec![synthetic_plan(7, 8, 32 * 1024 * 1024, 3, 2)];
+    let dispatch = build_shard_dispatch_plan(&plans, &[(7, 3)]);
+    let meta = &dispatch.shard_meta[0];
+
+    assert_eq!(meta.shard_ranges.len(), 3);
+    assert_eq!(
+        meta.plan_hot_deps.delta_dep_count(),
+        plans[0].delta_deps.len()
+    );
+    assert_eq!(
+        meta.plan_hot_deps.external_oid_count(),
+        plans[0]
+            .delta_deps
+            .iter()
+            .filter(|dep| matches!(dep.base, BaseLoc::External { .. }))
+            .count()
+    );
+}
+
+#[test]
+fn scheduler_plan_lookup_errors_are_typed() {
+    let shared = scheduler_pack_shared_for_runtime(Vec::new());
+
+    let plan_err = scheduler_plan_at(&shared, 1).expect_err("plan lookup should fail");
+    assert!(matches!(
+        plan_err,
+        GitScanError::PackExec(PackExecError::SchedulerPlanIndexOutOfRange {
+            index: 1,
+            plan_count: 0,
+        })
+    ));
+
+    let shard_plan_err =
+        scheduler_shard_plan_at(&shared, 2).expect_err("shard plan lookup should fail");
+    assert!(matches!(
+        shard_plan_err,
+        GitScanError::PackExec(PackExecError::SchedulerShardPlanIndexOutOfRange {
+            plan_idx: 2,
+            plan_count: 0,
+        })
+    ));
+}
+
+#[test]
+fn scheduler_queue_rejections_are_typed() {
+    assert!(matches!(
+        scheduler_queue_rejected_error(false),
+        GitScanError::PackExec(PackExecError::SchedulerTaskQueueRejected)
+    ));
+    assert!(matches!(
+        scheduler_queue_rejected_error(true),
+        GitScanError::PackExec(PackExecError::SchedulerShardQueueRejected)
+    ));
+}
+
+#[test]
+fn collect_plan_outputs_missing_slot_is_typed() {
+    let plans = vec![synthetic_plan(0, 1, 1, 0, 0)];
+    let output_slots: Vec<std::sync::Mutex<Option<SchedulerPackExecOutput>>> =
+        vec![std::sync::Mutex::new(None)];
+
+    match collect_plan_outputs(&plans, &output_slots) {
+        Ok(_) => panic!("missing output must fail"),
+        Err(err) => assert!(matches!(
+            err,
+            GitScanError::PackExec(PackExecError::SchedulerPlanOutputMissing { plan_idx: 0 })
+        )),
+    }
+}
+
+#[test]
+fn merge_shard_outputs_missing_slot_is_typed() {
+    let plans = vec![synthetic_plan(0, 1, 1, 0, 0)];
+    let shard_meta = vec![SchedulerShardMeta {
+        exec_plan: SchedulerShardExecPlan::Natural { len: 1 },
+        plan_hot_deps: PackPlanHotDeps::from_plan(&plans[0]),
+        candidate_ranges: Vec::new(),
+        shard_ranges: vec![(0, 1)],
+    }];
+    let shard_slots: Vec<std::sync::Mutex<Option<SchedulerPackExecOutput>>> =
+        vec![std::sync::Mutex::new(None)];
+    let shard_slot_base = vec![0usize];
+
+    match merge_shard_outputs(&plans, &shard_meta, &shard_slots, &shard_slot_base) {
+        Ok(_) => panic!("missing shard output must fail"),
+        Err(err) => assert!(matches!(
+            err,
+            GitScanError::PackExec(PackExecError::SchedulerShardOutputMissing {
+                plan_idx: 0,
+                shard_idx: 0,
+            })
+        )),
+    }
+}
+
+#[test]
 fn auto_tree_delta_cache_bytes_small_repo() {
     let bytes = auto_tree_delta_cache_bytes(3_000, 128 * 1024 * 1024);
     assert_eq!(bytes, 8 * 1024 * 1024, "small repos clamp to floor");
@@ -340,12 +439,12 @@ fn scheduler_pack_shared_for_runtime(pack_paths: Vec<PathBuf>) -> SchedulerPackS
         pack_paths: Arc::new(pack_paths),
         loose_dirs: Arc::new(Vec::new()),
         pack_mmaps: Arc::new(Vec::new()),
-        path_arena: Arc::new(ByteArena::with_capacity(16)),
-        spill_dir: Arc::new(PathBuf::from(".")),
+        path_arena: ByteArena::with_capacity(16),
+        spill_dir: PathBuf::from("."),
         pack_decode: decode,
         pack_io: PackIoLimits::new(decode, 2),
         adapter_cfg: EngineAdapterConfig::default(),
-        plans: Arc::new(Vec::new()),
+        plans: Vec::new(),
         shard_meta: None,
         commit_graph: Arc::new(crate::git_scan::commit_graph::CommitGraphIndex::empty()),
         commit_meta_seen: Arc::new(crate::stdx::AtomicBitSet::empty(1)),
@@ -527,7 +626,8 @@ fn estimate_locality_pressure_known_deps() {
     let plan = synthetic_locality_plan(0, 8, 700, 4);
     assert_eq!(plan.delta_deps.len(), 4, "should have 4 offset deps");
 
-    let p2 = estimate_locality_pressure(&plan, 2);
+    let exec_pos = build_exec_pos_by_need(&plan);
+    let p2 = estimate_locality_pressure(&plan, 2, exec_pos.as_deref());
     assert_eq!(p2.offset_deps, 4, "all 4 deps are offset-based");
     assert_eq!(p2.unresolved_offset_bases, 0, "all bases in need_offsets");
     // With 2 shards: positions 0..4 → shard 0, positions 4..8 → shard 1.
@@ -537,7 +637,7 @@ fn estimate_locality_pressure_known_deps() {
         "all deps cross shard boundary"
     );
 
-    let p4 = estimate_locality_pressure(&plan, 4);
+    let p4 = estimate_locality_pressure(&plan, 4, exec_pos.as_deref());
     assert_eq!(p4.offset_deps, 4);
     assert_eq!(p4.unresolved_offset_bases, 0);
     // With 4 shards: [0,1], [2,3], [4,5], [6,7].
@@ -546,4 +646,86 @@ fn estimate_locality_pressure_known_deps() {
         p4.cross_shard_offset_deps, 4,
         "all deps cross shard boundaries"
     );
+}
+
+#[test]
+fn scheduler_worker_runtime_field_order_borrowers_before_owners() {
+    // SchedulerPackWorkerRuntime relies on ManuallyDrop with field-order-dependent
+    // drop: borrowing fields (adapter, external) must precede owning fields
+    // (_engine, _midx_bytes) so the custom Drop impl drops borrowers first.
+    // This test catches accidental field reordering at compile/test time.
+    use std::mem::offset_of;
+    assert!(
+        offset_of!(SchedulerPackWorkerRuntime, adapter)
+            < offset_of!(SchedulerPackWorkerRuntime, _engine),
+        "adapter (borrower) must be declared before _engine (owner)"
+    );
+    assert!(
+        offset_of!(SchedulerPackWorkerRuntime, external)
+            < offset_of!(SchedulerPackWorkerRuntime, _midx_bytes),
+        "external (borrower) must be declared before _midx_bytes (owner)"
+    );
+}
+
+/// Exercises the full lifecycle of `SchedulerPackWorkerRuntime`:
+/// construction (with the same `transmute` pattern used in production),
+/// borrowing field access, and destruction via the custom `Drop` impl.
+///
+/// Under normal `cargo test` this validates that the construction and drop
+/// logic compiles and runs without panics. The real value is under
+/// `cargo miri test` where Miri's Stacked Borrows / Tree Borrows checker
+/// will flag any use-after-free caused by incorrect drop ordering between
+/// the `ManuallyDrop` borrowing fields (`adapter`, `external`) and their
+/// backing owning fields (`_engine`, `_midx_bytes`).
+#[test]
+fn scheduler_worker_runtime_miri_drop_order() {
+    // Build a minimal but valid MIDX so MidxView::parse succeeds.
+    let mut builder = MidxBuilder::new();
+    builder.add_pack(b"pack-test0000");
+    builder.add_object([0xAA; 20], 0, 64);
+    let midx_data = builder.build();
+
+    // Loop a few times to give Miri more coverage over allocation patterns
+    // and increase the chance of detecting stale-pointer reads.
+    for _ in 0..4 {
+        // --- owning storage ---
+        let midx_bytes = BytesView::from_vec(midx_data.clone());
+        let engine = Arc::new(test_engine());
+
+        // --- borrowing fields (lifetime-widened, same pattern as production) ---
+        let midx = MidxView::parse(midx_bytes.as_slice(), ObjectFormat::Sha1)
+            .expect("MidxBuilder output must parse");
+        // SAFETY: same transmute as `build_scheduler_worker_runtime`. Sound
+        // because `_midx_bytes` in the runtime struct outlives `external`,
+        // and the custom `Drop` drops `external` first.
+        let midx: MidxView<'static> = unsafe { std::mem::transmute(midx) };
+
+        // PackIo::from_parts needs one path per pack in the MIDX.
+        let external = PackIo::from_parts(
+            midx,
+            vec![PathBuf::from("/dev/null")],
+            Vec::new(),
+            PackIoLimits::new(PackDecodeLimits::new(256, 1 << 20, 1 << 20), 10),
+        )
+        .expect("from_parts with matching pack count must succeed");
+
+        // SAFETY: same transmute as `build_scheduler_worker_runtime`. Sound
+        // because `_engine` in the runtime struct outlives `adapter`, and
+        // the custom `Drop` drops `adapter` first.
+        let engine_ref: &'static Engine = unsafe { std::mem::transmute(engine.as_ref()) };
+        let adapter = EngineAdapter::new(engine_ref, EngineAdapterConfig::default());
+
+        // Assemble the self-referential runtime struct.
+        let runtime = SchedulerPackWorkerRuntime {
+            adapter: ManuallyDrop::new(adapter),
+            external: ManuallyDrop::new(external),
+            _engine: engine,
+            _midx_bytes: midx_bytes,
+        };
+
+        // Explicit drop exercises the custom Drop impl which calls
+        // ManuallyDrop::drop on the borrowing fields before the compiler
+        // drops the owning fields.
+        drop(runtime);
+    }
 }

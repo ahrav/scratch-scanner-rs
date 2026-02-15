@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use super::bytes::BytesView;
 use super::commit_graph_mem::CommitGraphMem;
 use super::commit_loader::{
-    collect_loose_dirs, collect_pack_dirs, load_commits_from_tips, load_commits_with_identities,
-    load_shallow_boundary_roots, resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
+    load_commits_from_tips, load_commits_with_identities, load_shallow_boundary_roots,
+    resolve_pack_paths_from_midx, CommitLoadError, CommitLoadLimits,
 };
 use super::errors::{CommitPlanError, RepoOpenError};
 use super::identity_intern::IdentityInterner;
@@ -36,6 +36,7 @@ use super::midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
 use super::midx_error::MidxError;
 use super::object_id::OidBytes;
 use super::repo_open::{repo_has_reachable_refs, RepoArtifactFingerprint, RepoJobState};
+use super::repo_paths::{collect_loose_dirs, collect_pack_dirs};
 
 /// Limits for in-memory artifact construction.
 ///

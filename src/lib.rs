@@ -125,6 +125,12 @@ pub use engine::{
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, NormHash, ScanScratch};
 
+#[cfg(feature = "bench")]
+pub use git_scan::{
+    bench_apply_locality_shard_cap, bench_select_strategy, bench_synthetic_locality_plan,
+    bench_synthetic_plan,
+};
+
 pub use runtime::{
     read_file_chunks, BufferHandle, BufferPool, Chunk, FileTable, ScannerConfig, ScannerRuntime,
     BUFFER_ALIGN, BUFFER_LEN_MAX, FILE_FLAG_BINARY, FILE_FLAG_SKIPPED,

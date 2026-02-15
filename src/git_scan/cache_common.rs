@@ -16,6 +16,7 @@
 //! - `slot_size` is a power of two >= `MIN_SLOT_SIZE`, or 0 when disabled
 //! - `storage.len() == sets * WAYS * slot_size` (0 when disabled)
 //! - Pinned slots are never evicted; handles must be dropped to release pins
+//! - In debug builds, stale handles panic if used or dropped after cache drop
 //!
 //! # Why raw pointers in `CacheHandle`?
 //!
@@ -49,6 +50,8 @@
 
 use std::cell::Cell;
 use std::fmt::Debug;
+#[cfg(debug_assertions)]
+use std::rc::Rc;
 
 /// Default slot size for cached payloads.
 const DEFAULT_SLOT_SIZE: u32 = 4096;
@@ -56,6 +59,40 @@ const DEFAULT_SLOT_SIZE: u32 = 4096;
 pub(super) const MIN_SLOT_SIZE: u32 = 256;
 /// Number of ways per set.
 pub(super) const WAYS: usize = 4;
+
+#[cfg(debug_assertions)]
+#[derive(Debug)]
+struct HandleEpoch {
+    generation: Cell<u64>,
+    alive: Cell<bool>,
+}
+
+#[cfg(debug_assertions)]
+impl HandleEpoch {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            generation: Cell::new(1),
+            alive: Cell::new(true),
+        }
+    }
+
+    #[inline]
+    fn snapshot(&self) -> u64 {
+        self.generation.get()
+    }
+
+    #[inline]
+    fn is_live_generation(&self, generation: u64) -> bool {
+        self.alive.get() && self.generation.get() == generation
+    }
+
+    #[inline]
+    fn invalidate(&self) {
+        self.alive.set(false);
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+}
 
 /// Common fields shared by every cache slot.
 #[derive(Clone, Debug)]
@@ -124,6 +161,8 @@ pub(super) struct SetAssociativeCache<S: CacheSlot> {
     storage: Vec<u8>,
     slots: Vec<S>,
     clock_hands: Vec<u8>,
+    #[cfg(debug_assertions)]
+    handle_epoch: Rc<HandleEpoch>,
 }
 
 /// Handle to a pinned payload stored in the cache.
@@ -145,6 +184,9 @@ pub(super) struct SetAssociativeCache<S: CacheSlot> {
 /// Callers must ensure the [`SetAssociativeCache`] outlives every handle
 /// obtained from it. In practice this is enforced structurally: handles
 /// are created and consumed within the same tree-walk scope.
+///
+/// In debug builds, each handle snapshots a cache generation token.
+/// `as_slice()` and `drop` panic if the cache has already been dropped.
 pub(super) struct CacheHandle<S: CacheSlot> {
     /// Pointer to the start of this slot's byte range in the storage arena.
     data: *const u8,
@@ -152,6 +194,10 @@ pub(super) struct CacheHandle<S: CacheSlot> {
     pins: *const Cell<u16>,
     len: usize,
     extra: S::HandleExtra,
+    #[cfg(debug_assertions)]
+    handle_epoch: Rc<HandleEpoch>,
+    #[cfg(debug_assertions)]
+    handle_generation: u64,
     _marker: std::marker::PhantomData<S>,
 }
 
@@ -165,9 +211,20 @@ impl<S: CacheSlot> std::fmt::Debug for CacheHandle<S> {
 }
 
 impl<S: CacheSlot> CacheHandle<S> {
+    #[cfg(debug_assertions)]
+    #[inline]
+    fn debug_assert_live(&self, op: &'static str) {
+        if !self.handle_epoch.is_live_generation(self.handle_generation) {
+            panic!("stale cache handle used in {op}");
+        }
+    }
+
     /// Returns the cached bytes.
     #[must_use]
     pub(super) fn as_slice(&self) -> &[u8] {
+        #[cfg(debug_assertions)]
+        self.debug_assert_live("as_slice");
+
         // SAFETY: `data` points into the cache's heap-allocated storage
         // arena. The arena is never reallocated after construction, and
         // the pinned slot prevents the cache from overwriting these bytes.
@@ -199,15 +256,31 @@ impl<S: CacheSlot> CacheHandle<S> {
 
 impl<S: CacheSlot> Drop for CacheHandle<S> {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        if !self.handle_epoch.is_live_generation(self.handle_generation) {
+            // Avoid a double panic if a stale-handle panic is already unwinding.
+            if std::thread::panicking() {
+                return;
+            }
+            panic!("stale cache handle dropped after cache invalidation");
+        }
+
         // SAFETY: `pins` points into the cache's heap-allocated slot vec.
         // The slot vec is never reallocated after construction, and callers
         // ensure the cache outlives the handle.
         unsafe {
             let pins = &*self.pins;
             let count = pins.get();
-            debug_assert!(count > 0, "cache pin count underflow");
+            assert!(count > 0, "cache pin count underflow");
             pins.set(count.saturating_sub(1));
         }
+    }
+}
+
+impl<S: CacheSlot> Drop for SetAssociativeCache<S> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.handle_epoch.invalidate();
     }
 }
 
@@ -242,6 +315,8 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
             storage: vec![0u8; storage_len],
             slots: vec![S::empty(); total_slots],
             clock_hands: vec![0u8; sets],
+            #[cfg(debug_assertions)]
+            handle_epoch: Rc::new(HandleEpoch::new()),
         }
     }
 
@@ -279,6 +354,8 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
                 let extra = slot.handle_extra();
                 let len = slot.base().len as usize;
                 let offset = idx * self.slot_size as usize;
+                #[cfg(debug_assertions)]
+                let handle_generation = self.handle_epoch.snapshot();
                 // SAFETY: `storage` and `slots` are heap-allocated Vecs
                 // that are never resized after construction. The raw
                 // pointers point directly into these heap buffers.
@@ -289,6 +366,10 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
                     pins,
                     len,
                     extra,
+                    #[cfg(debug_assertions)]
+                    handle_epoch: Rc::clone(&self.handle_epoch),
+                    #[cfg(debug_assertions)]
+                    handle_generation,
                     _marker: std::marker::PhantomData,
                 });
             }
@@ -338,6 +419,8 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
             storage: Vec::new(),
             slots: Vec::new(),
             clock_hands: Vec::new(),
+            #[cfg(debug_assertions)]
+            handle_epoch: Rc::new(HandleEpoch::new()),
         }
     }
 
@@ -585,5 +668,35 @@ mod tests {
         );
 
         drop(handle);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn stale_handle_slice_panics_after_cache_drop() {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cache = SetAssociativeCache::<TestSlot>::new(MIN_SLOT_SIZE * WAYS as u32);
+            assert!(cache.insert(&7, &(), b"data"));
+            let handle = cache.get_handle(&7).unwrap();
+            drop(cache);
+            let _ = handle.as_slice();
+        }));
+        assert!(
+            panic.is_err(),
+            "using a stale handle should panic in debug builds"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn stale_handle_drop_panics_after_cache_drop() {
+        let mut cache = SetAssociativeCache::<TestSlot>::new(MIN_SLOT_SIZE * WAYS as u32);
+        assert!(cache.insert(&8, &(), b"data"));
+        let handle = cache.get_handle(&8).unwrap();
+        drop(cache);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(handle)));
+        assert!(
+            panic.is_err(),
+            "dropping a stale handle should panic in debug builds"
+        );
     }
 }

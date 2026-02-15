@@ -809,6 +809,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
 /// - [`DebugLevel::Stats`]: verbose stage stats (`--debug`).
 /// - [`DebugLevel::Perf`]: stage stats **and** pack execution timing
 ///   breakdown (`--debug=perf`).
+#[cfg_attr(not(feature = "git-perf"), allow(unused_variables))]
 fn print_git_report(
     report: &git_scan::GitScanReport,
     config: &GitScanConfig,
@@ -822,6 +823,7 @@ fn print_git_report(
         }
         DebugLevel::Perf => {
             print_git_debug(report);
+            #[cfg(feature = "git-perf")]
             print_git_perf_breakdown(report, config);
         }
     }
@@ -944,6 +946,9 @@ fn format_human_bytes(bytes: u64) -> String {
 /// up to 5 skipped candidates for post-mortem diagnosis. Format is
 /// intentionally unstructured — use `--event-format jsonl` for machine
 /// consumption and reserve this output for human debugging.
+///
+/// `report.format_metrics()` always emits the same key set; in non-`git-perf`
+/// builds perf-derived values are zero.
 fn print_git_debug(report: &git_scan::GitScanReport) {
     eprintln!("commits={}", report.commit_count);
     eprintln!("tree_diff_stats={:?}", report.tree_diff_stats);
@@ -987,6 +992,7 @@ fn print_git_debug(report: &git_scan::GitScanReport) {
 ///
 /// Shows decode, cache lookup, fallback resolve, and scan sub-stage
 /// percentages relative to total pack_exec wall time.
+#[cfg(feature = "git-perf")]
 fn print_git_perf_breakdown(report: &git_scan::GitScanReport, config: &GitScanConfig) {
     let mut total_cache_lookup_nanos = 0u64;
     let mut total_fallback_resolve_nanos = 0u64;

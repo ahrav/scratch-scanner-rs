@@ -13,8 +13,13 @@
 
 use std::fmt;
 
-use super::pack_inflate::{inflate_exact, inflate_limited, EntryHeader, EntryKind, PackFile};
+use super::pack_inflate::{
+    inflate_exact, inflate_exact_with, inflate_limited, inflate_limited_with, EntryHeader,
+    EntryKind, PackFile,
+};
 use super::pack_inflate::{InflateError, PackParseError};
+
+use flate2::Decompress;
 
 /// Limits for pack object decoding.
 ///
@@ -132,15 +137,92 @@ pub fn entry_header_at(
     Ok(header)
 }
 
-/// Inflates the payload for an entry header.
+/// Inflates the payload for an entry header using a caller-provided
+/// `Decompress`, bypassing TLS.
 ///
-/// For non-delta entries, this inflates exactly `header.size` bytes.
-/// For delta entries, this inflates the delta stream up to `max_delta_bytes`.
+/// Callers are expected to pass a header parsed from `pack` (typically via
+/// [`entry_header_at`]) so `data_start`, `kind`, and `size` match the bytes at
+/// that offset.
 ///
-/// Returns the number of compressed bytes consumed from the pack slice.
+/// Non-delta entries (`EntryKind::NonDelta`) are inflated with an exact-size
+/// contract of `header.size` bytes. Delta entries (`EntryKind::OfsDelta` and
+/// `EntryKind::RefDelta`) are inflated as raw delta streams with a hard cap of
+/// `limits.max_delta_bytes`.
+///
+/// This function does not enforce `limits.max_object_bytes` for non-delta
+/// entries and does not parse delta varints/result sizes; those checks happen
+/// in higher-level decode/resolve paths.
+///
+/// # Returns
+/// - `Ok(consumed)` where `consumed` is the number of compressed bytes read
+///   from `pack.slice_from(header.data_start)` until zlib stream end.
+/// - `out` is cleared and then filled with inflated bytes:
+///   - Non-delta: full object payload (`header.size` bytes).
+///   - Delta: delta payload bytes (not the resolved base+delta result object).
 ///
 /// # Errors
-/// - `PackDecodeError::Inflate` on zlib errors or limit overruns.
+/// - `PackDecodeError::Inflate(InflateError::LimitExceeded)` if:
+///   - non-delta output grows beyond `header.size`, or
+///   - delta output grows beyond `limits.max_delta_bytes`.
+/// - `PackDecodeError::Inflate(InflateError::TruncatedInput)` for truncated
+///   zlib streams.
+/// - `PackDecodeError::Inflate(InflateError::Stalled)` when inflate makes no
+///   progress before reaching stream end.
+/// - `PackDecodeError::Inflate(InflateError::Backend)` on backend/zlib errors.
+///
+/// # Panics
+/// Panics if `header.data_start` is out of bounds for `pack` (assertion in
+/// `PackFile::slice_from`).
+pub fn inflate_entry_payload_with(
+    de: &mut Decompress,
+    pack: &PackFile<'_>,
+    header: &EntryHeader,
+    out: &mut Vec<u8>,
+    limits: &PackDecodeLimits,
+) -> Result<usize, PackDecodeError> {
+    match header.kind {
+        EntryKind::NonDelta { .. } => {
+            let expected = header.size as usize;
+            let consumed =
+                inflate_exact_with(de, pack.slice_from(header.data_start), out, expected)?;
+            Ok(consumed)
+        }
+        EntryKind::OfsDelta { .. } | EntryKind::RefDelta { .. } => {
+            let consumed = inflate_limited_with(
+                de,
+                pack.slice_from(header.data_start),
+                out,
+                limits.max_delta_bytes,
+            )?;
+            Ok(consumed)
+        }
+    }
+}
+
+/// Inflates the payload for an entry header using the thread-local
+/// `Decompress`.
+///
+/// Header and behavior contracts are identical to
+/// [`inflate_entry_payload_with`]:
+/// - Non-delta entries inflate exactly `header.size` bytes.
+/// - Delta entries inflate a raw delta stream capped by
+///   `limits.max_delta_bytes`.
+///
+/// # Returns
+/// - `Ok(consumed)` where `consumed` is the number of compressed bytes read
+///   from `pack.slice_from(header.data_start)` until zlib stream end.
+/// - `out` is cleared and then filled with inflated payload bytes for the
+///   selected entry kind.
+///
+/// # Errors
+/// - Propagates `PackDecodeError::Inflate(...)` from
+///   [`inflate_entry_payload_with`] with the same variants and conditions.
+///
+/// # Panics
+/// - Panics if `header.data_start` is out of bounds for `pack` (assertion in
+///   `PackFile::slice_from`).
+/// - May panic if called reentrantly on the same thread because the
+///   thread-local inflate scratch uses `RefCell` borrowing.
 pub fn inflate_entry_payload(
     pack: &PackFile<'_>,
     header: &EntryHeader,

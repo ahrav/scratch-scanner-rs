@@ -74,13 +74,14 @@ criterion = "0.5"
 tempfile = "3.10"
 itoa = "1"
 ryu = "1"
+sha1 = "0.10"
 
 [[bench]]
 name = "scan"
 harness = false
 
 [[bench]]
-name = "structures"
+name = "bitset_fixedset"
 harness = false
 
 [[bench]]
@@ -89,7 +90,7 @@ harness = false
 required-features = ["bench"]
 
 [[bench]]
-name = "hotspots"
+name = "transform_decode"
 harness = false
 required-features = ["bench"]
 
@@ -197,6 +198,37 @@ harness = false
 name = "event_encoding"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "pack_inflate_perf"
+harness = false
+
+[[bench]]
+name = "git_scan_parse"
+harness = false
+
+[[bench]]
+name = "object_store_iterative_delta"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "runner_exec_contention"
+harness = false
+
+[[bench]]
+name = "runner_exec_locality"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "runner_exec_strategy"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "oid_hash_quality"
+harness = false
 
 [profile.dev]
 opt-level = 1

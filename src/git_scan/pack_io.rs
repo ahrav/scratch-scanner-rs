@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -39,8 +39,8 @@ use super::pack_decode::{
 use super::pack_delta::{apply_delta, DeltaError};
 use super::pack_exec::{ExternalBase, ExternalBaseProvider, PackExecError};
 use super::pack_inflate::{inflate_limited, EntryKind, ObjectKind, PackFile, PackParseError};
-use super::repo::GitRepoPaths;
 use super::repo_open::RepoJobState;
+use super::repo_paths;
 
 /// Safety allowance for loose object headers (`"blob <size>\\0"`).
 const LOOSE_HEADER_MAX_BYTES: usize = 64;
@@ -189,12 +189,12 @@ impl<'a> PackIo<'a> {
         let midx_bytes = repo.mmaps.midx.as_ref().ok_or(PackIoError::MissingMidx)?;
         let midx = MidxView::parse(midx_bytes.as_slice(), repo.object_format)?;
 
-        let pack_dirs = collect_pack_dirs(&repo.paths);
-        let pack_names = list_pack_files(&pack_dirs)?;
+        let pack_dirs = repo_paths::collect_pack_dirs(&repo.paths);
+        let pack_names = repo_paths::list_pack_files(&pack_dirs)?;
         midx.verify_completeness(pack_names.iter().map(|n| n.as_slice()))?;
 
-        let pack_paths = resolve_pack_paths(&midx, &pack_dirs)?;
-        let loose_dirs = collect_loose_dirs(&repo.paths);
+        let pack_paths = repo_paths::resolve_pack_paths(&midx, &pack_dirs)?;
+        let loose_dirs = repo_paths::collect_loose_dirs(&repo.paths);
         Self::from_parts(midx, pack_paths, loose_dirs, limits)
     }
 
@@ -264,7 +264,7 @@ impl<'a> PackIo<'a> {
             });
         }
 
-        let hex = oid_to_hex(oid);
+        let hex = repo_paths::oid_to_hex(oid);
         let (dir, file) = hex.split_at(2);
         let dir_name = String::from_utf8_lossy(dir);
         let file_name = String::from_utf8_lossy(file);
@@ -467,103 +467,6 @@ fn apply_delta_entry(
     Ok(out)
 }
 
-fn collect_pack_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
-    dirs.push(paths.pack_dir.clone());
-    for alternate in &paths.alternate_object_dirs {
-        if alternate == &paths.objects_dir {
-            continue;
-        }
-        dirs.push(alternate.join("pack"));
-    }
-    dirs
-}
-
-fn collect_loose_dirs(paths: &GitRepoPaths) -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(1 + paths.alternate_object_dirs.len());
-    dirs.push(paths.objects_dir.clone());
-    for alternate in &paths.alternate_object_dirs {
-        if alternate == &paths.objects_dir {
-            continue;
-        }
-        dirs.push(alternate.clone());
-    }
-    dirs
-}
-
-fn list_pack_files(pack_dirs: &[PathBuf]) -> Result<Vec<Vec<u8>>, PackIoError> {
-    let mut names = Vec::new();
-
-    for dir in pack_dirs {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(PackIoError::Io(err)),
-        };
-
-        for entry in entries {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                continue;
-            }
-
-            let file_name = entry.file_name();
-            if is_pack_file(&file_name) {
-                names.push(file_name.to_string_lossy().as_bytes().to_vec());
-            }
-        }
-    }
-
-    Ok(names)
-}
-
-fn resolve_pack_paths(
-    midx: &MidxView<'_>,
-    pack_dirs: &[PathBuf],
-) -> Result<Vec<PathBuf>, PackIoError> {
-    let mut paths = Vec::with_capacity(midx.pack_count() as usize);
-
-    for name in midx.pack_names() {
-        let mut base = strip_pack_suffix(name);
-        base.extend_from_slice(b".pack");
-        let file_name = String::from_utf8_lossy(&base).into_owned();
-
-        let mut found = None;
-        for dir in pack_dirs {
-            let candidate = dir.join(&file_name);
-            if is_file(&candidate) {
-                found = Some(candidate);
-                break;
-            }
-        }
-
-        match found {
-            Some(path) => paths.push(path),
-            None => {
-                return Err(PackIoError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("pack file not found for {}", String::from_utf8_lossy(name)),
-                )))
-            }
-        }
-    }
-
-    Ok(paths)
-}
-
-fn strip_pack_suffix(name: &[u8]) -> Vec<u8> {
-    if name.ends_with(b".pack") || name.ends_with(b".idx") {
-        let mut base = name.to_vec();
-        if let Some(idx) = base.iter().rposition(|&b| b == b'.') {
-            base.truncate(idx);
-        }
-        base
-    } else {
-        name.to_vec()
-    }
-}
-
 fn parse_loose_object(
     bytes: &[u8],
     max_payload: usize,
@@ -635,37 +538,13 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
     Some(value)
 }
 
-fn oid_to_hex(oid: &OidBytes) -> Vec<u8> {
-    let mut out = Vec::with_capacity(oid.len() as usize * 2);
-    for &b in oid.as_slice() {
-        out.push(hex_digit(b >> 4));
-        out.push(hex_digit(b & 0x0f));
-    }
-    out
-}
-
-fn hex_digit(val: u8) -> u8 {
-    match val {
-        0..=9 => b'0' + val,
-        10..=15 => b'a' + (val - 10),
-        _ => b'?',
-    }
-}
-
-fn is_pack_file(name: &std::ffi::OsStr) -> bool {
-    Path::new(name).extension().is_some_and(|ext| ext == "pack")
-}
-
-fn is_file(path: &Path) -> bool {
-    fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
+    use std::path::Path;
     use tempfile::tempdir;
 
     use super::super::object_id::{ObjectFormat, OidBytes};
