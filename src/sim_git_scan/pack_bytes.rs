@@ -116,6 +116,9 @@ fn collect_packs(packs: &[GitPackBytes]) -> Result<Vec<BytesView>, SimGitError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_scan::delta_test_helpers::{
+        encode_entry_header_kind, zlib_compress as compress,
+    };
     use crate::git_scan::pack_inflate::ObjectKind;
     use crate::git_scan::pack_plan_model::CandidateAtOffset;
     use crate::git_scan::{
@@ -123,9 +126,6 @@ mod tests {
         PackCandidate, PackDecodeLimits, PackExecError, PackObjectSink, PackPlan, PackPlanStats,
     };
     use crate::git_scan::{ExternalBase, ExternalBaseProvider};
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
 
     #[derive(Default)]
     struct CollectingSink {
@@ -155,38 +155,6 @@ mod tests {
         }
     }
 
-    fn encode_entry_header(kind: ObjectKind, size: usize) -> Vec<u8> {
-        let obj_type = match kind {
-            ObjectKind::Commit => 1u8,
-            ObjectKind::Tree => 2u8,
-            ObjectKind::Blob => 3u8,
-            ObjectKind::Tag => 4u8,
-        };
-        let mut out = Vec::new();
-        let mut remaining = size as u64;
-        let mut first = ((obj_type & 0x07) << 4) | ((remaining & 0x0f) as u8);
-        remaining >>= 4;
-        if remaining != 0 {
-            first |= 0x80;
-        }
-        out.push(first);
-        while remaining != 0 {
-            let mut byte = (remaining & 0x7f) as u8;
-            remaining >>= 7;
-            if remaining != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-        }
-        out
-    }
-
-    fn compress(data: &[u8]) -> Vec<u8> {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
-    }
-
     fn build_pack(entries: &[(ObjectKind, &[u8])]) -> (Vec<u8>, Vec<u64>) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"PACK");
@@ -196,7 +164,7 @@ mod tests {
         let mut offsets = Vec::with_capacity(entries.len());
         for (kind, data) in entries {
             offsets.push(bytes.len() as u64);
-            bytes.extend_from_slice(&encode_entry_header(*kind, data.len()));
+            bytes.extend_from_slice(&encode_entry_header_kind(*kind, data.len()));
             bytes.extend_from_slice(&compress(data));
         }
 
