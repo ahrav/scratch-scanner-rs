@@ -63,7 +63,7 @@ pub(crate) enum RulesError {
     /// I/O error reading the rules file.
     Io(std::io::Error),
     /// YAML parsing error.
-    Yaml(serde_yml::Error),
+    Yaml(serde_norway::Error),
     /// Regex compilation failure for a specific rule.
     Regex {
         rule_name: String,

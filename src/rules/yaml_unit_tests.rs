@@ -116,13 +116,13 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
 
 /// Assert that a YAML mapping section contains only known field names.
 fn assert_no_unknown_nested_fields(
-    map: &serde_yml::Mapping,
+    map: &serde_norway::Mapping,
     section: &str,
     allowed: &[&str],
     rule_idx: usize,
     rule_name: &str,
 ) {
-    if let Some(val) = map.get(serde_yml::Value::String(section.into())) {
+    if let Some(val) = map.get(serde_norway::Value::String(section.into())) {
         if let Some(sm) = val.as_mapping() {
             for key in sm.keys() {
                 let k = key.as_str().unwrap_or("");
@@ -397,7 +397,7 @@ fn roundtrip_builtin_rules() {
     // Convert to YAML and back.
     let yaml_rules: Vec<YamlRule> = original_rules.iter().map(rulespec_to_yaml).collect();
     let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_yml::to_string(&file).expect("serialize to YAML");
+    let yaml_str = serde_norway::to_string(&file).expect("serialize to YAML");
     let parsed_rules = parse_yaml_rules(&yaml_str).expect("parse YAML rules");
     assert_rules_equal(&original_rules, &parsed_rules);
 }
@@ -640,7 +640,8 @@ fn discord_client_secret_allows_real_value() {
 /// typos that serde would silently ignore.
 fn default_rules_yaml_has_no_unknown_fields() {
     let yaml_str = include_str!("../../default_rules.yaml");
-    let raw: serde_yml::Value = serde_yml::from_str(yaml_str).expect("parse default_rules.yaml");
+    let raw: serde_norway::Value =
+        serde_norway::from_str(yaml_str).expect("parse default_rules.yaml");
 
     let rule_fields: &[&str] = &[
         "name",
@@ -675,7 +676,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
     for (i, rule) in rules.iter().enumerate() {
         let map = rule.as_mapping().unwrap();
         let name = map
-            .get(serde_yml::Value::String("name".into()))
+            .get(serde_norway::Value::String("name".into()))
             .and_then(|v| v.as_str())
             .unwrap_or("<unnamed>");
         for key in map.keys() {
@@ -1611,7 +1612,7 @@ rules:
     let original = parse_yaml_rules(yaml).expect("parse");
     let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
     let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_yml::to_string(&file).expect("serialize");
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
     let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
     assert_eq!(original[0].offline_validation, parsed[0].offline_validation);
 }
@@ -1648,7 +1649,7 @@ rules:
     let original = parse_yaml_rules(yaml).expect("parse");
     let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
     let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_yml::to_string(&file).expect("serialize");
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
     let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
 
     for (orig, reparsed) in original.iter().zip(parsed.iter()) {

@@ -33,7 +33,7 @@ blake3 = "1.5"
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yml = "0.0.12"
+serde_norway = "0.9.42"
 rusqlite = { version = "0.38", features = ["bundled"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 gix-commitgraph = "0.29"
