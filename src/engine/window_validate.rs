@@ -14,8 +14,8 @@
 //! 1. Apply cheap byte gates (must-contain, confirm-all, keyword gate).
 //! 2. For UTF-16 variants, decode with per-window and total-output budgets.
 //! 3. Run regex with reusable capture locations to access capture groups.
-//! 4. Apply entropy gates on the *full match* (group 0).
-//! 5. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
+//! 4. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
+//! 5. Apply entropy gates on the *extracted secret*.
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
 //! 8. Apply root-context safelist suppression for root emit paths.
@@ -462,17 +462,26 @@ impl Engine {
                     .take()
                     .expect("capture locations missing for rule");
                 for_each_capture_match(&rule.re, &mut locs, search_window, |locs, start, end| {
-                    // Get full match for entropy gating and anchor hint.
+                    // Get full match span for anchor hint.
                     let match_start = search_start + start;
                     let match_end = search_start + end;
 
+                    // Extract secret span first so entropy is evaluated on the
+                    // secret itself, not the full match which includes non-secret
+                    // context (key names, assignment operators, quotes).
+                    let (secret_start, secret_end) = extract_secret_span_locs_raw(
+                        locs,
+                        secret_group_raw,
+                        has_secret_group_override,
+                    );
+                    let secret_start = search_start + secret_start;
+                    let secret_end = search_start + secret_end;
+                    let secret_bytes = &window[secret_start..secret_end];
+
                     let entropy_ok = if let Some(ent) = entropy {
-                        let mbytes = &window[match_start..match_end];
-                        // Entropy is evaluated on the *matched* bytes, not the whole window.
-                        // This keeps the signal tied to the candidate token itself.
                         entropy_gate_passes(
                             &ent,
-                            mbytes,
+                            secret_bytes,
                             scratch.ensure_entropy_scratch(),
                             &self.entropy_log2,
                         )
@@ -481,16 +490,6 @@ impl Engine {
                     };
 
                     if entropy_ok {
-                        // Extract secret span using capture group logic.
-                        let (secret_start, secret_end) = extract_secret_span_locs_raw(
-                            locs,
-                            secret_group_raw,
-                            has_secret_group_override,
-                        );
-                        let secret_start = search_start + secret_start;
-                        let secret_end = search_start + secret_end;
-                        let secret_bytes = &window[secret_start..secret_end];
-
                         // Value suppressor gate: discard findings whose extracted
                         // secret contains a known placeholder/example pattern.
                         if let Some(vs) = value_suppressors {
@@ -744,13 +743,16 @@ impl Engine {
         for_each_capture_match(&rule.re, &mut locs, decoded, |locs, start, end| {
             let span = start..end;
 
+            // Extract secret span first so entropy is evaluated on the
+            // secret itself, not the full match (see raw-path comment).
+            let (secret_start, secret_end) =
+                extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
+            let secret_bytes = &decoded[secret_start..secret_end];
+
             let entropy_ok = if let Some(ent) = entropy {
-                let mbytes = &decoded[span.clone()];
-                // Entropy gate runs on UTF-8 decoded bytes because the regex
-                // is evaluated there; this keeps thresholds consistent.
                 entropy_gate_passes(
                     &ent,
-                    mbytes,
+                    secret_bytes,
                     scratch.ensure_entropy_scratch(),
                     &self.entropy_log2,
                 )
@@ -759,11 +761,6 @@ impl Engine {
             };
 
             if entropy_ok {
-                // Extract secret span using capture group logic.
-                let (secret_start, secret_end) =
-                    extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
-                let secret_bytes = &decoded[secret_start..secret_end];
-
                 // Value suppressor gate (see raw-path comment for rationale).
                 if let Some(vs) = value_suppressors {
                     if contains_any_memmem(secret_bytes, vs) {
@@ -920,11 +917,19 @@ impl Engine {
             let match_start = search_start + start;
             let match_end = search_start + end;
 
+            // Extract secret span first so entropy is evaluated on the
+            // secret itself, not the full match (see raw-path comment in
+            // run_rule_on_window for rationale).
+            let (secret_start, secret_end) =
+                extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
+            let secret_start = search_start + secret_start;
+            let secret_end = search_start + secret_end;
+            let secret_bytes = &window[secret_start..secret_end];
+
             let entropy_ok = if let Some(ent) = entropy {
-                let mbytes = &window[match_start..match_end];
                 entropy_gate_passes(
                     &ent,
-                    mbytes,
+                    secret_bytes,
                     scratch.ensure_entropy_scratch(),
                     &self.entropy_log2,
                 )
@@ -933,13 +938,6 @@ impl Engine {
             };
 
             if entropy_ok {
-                // Extract secret span using capture group logic.
-                let (secret_start, secret_end) =
-                    extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
-                let secret_start = search_start + secret_start;
-                let secret_end = search_start + secret_end;
-                let secret_bytes = &window[secret_start..secret_end];
-
                 // Value suppressor gate (see raw-path comment for rationale).
                 if let Some(vs) = value_suppressors {
                     if contains_any_memmem(secret_bytes, vs) {
@@ -1145,11 +1143,16 @@ impl Engine {
         for_each_capture_match(&rule.re, &mut locs, decoded, |locs, start, end| {
             let span = start..end;
 
+            // Extract secret span first so entropy is evaluated on the
+            // secret itself, not the full match (see raw-path comment).
+            let (secret_start, secret_end) =
+                extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
+            let secret_bytes = &decoded[secret_start..secret_end];
+
             let entropy_ok = if let Some(ent) = entropy {
-                let mbytes = &decoded[span.clone()];
                 entropy_gate_passes(
                     &ent,
-                    mbytes,
+                    secret_bytes,
                     scratch.ensure_entropy_scratch(),
                     &self.entropy_log2,
                 )
@@ -1158,11 +1161,6 @@ impl Engine {
             };
 
             if entropy_ok {
-                // Extract secret span using capture group logic.
-                let (secret_start, secret_end) =
-                    extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
-                let secret_bytes = &decoded[secret_start..secret_end];
-
                 // Value suppressor gate (see raw-path comment for rationale).
                 if let Some(vs) = value_suppressors {
                     if contains_any_memmem(secret_bytes, vs) {

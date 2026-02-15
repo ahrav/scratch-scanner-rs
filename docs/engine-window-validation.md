@@ -41,9 +41,9 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 4] Run regex with capture groups
   ↓
-[Gate 5] Check entropy on full match
+[Gate 5] Extract secret span from capture groups
   ↓
-[Gate 6] Extract secret span from capture groups
+[Gate 6] Check entropy on extracted secret
   ↓
 [Gate 7] Apply value suppressors on extracted secret bytes (when configured)
   ↓
