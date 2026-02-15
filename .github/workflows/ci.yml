@@ -165,6 +165,8 @@ jobs:
     name: Loom Concurrency Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes]
     env:
       RUSTC_WRAPPER: ""
     steps:
