@@ -34,8 +34,8 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         id: filter
         with:
           filters: |
@@ -62,9 +62,10 @@ jobs:
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
+          toolchain: stable
           components: rustfmt
       # No cache needed — fmt does not compile
       - run: cargo fmt --all -- --check
@@ -75,7 +76,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -93,7 +94,7 @@ jobs:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -109,7 +110,7 @@ jobs:
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -126,7 +127,7 @@ jobs:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -151,7 +152,7 @@ jobs:
       SCHEDULER_SIM_STRESS_MAX_PROGRAMS: "8"
       SCHEDULER_SIM_STRESS_MAX_TASKS: "8"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -167,7 +168,7 @@ jobs:
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -190,8 +191,8 @@ jobs:
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -208,7 +209,7 @@ jobs:
       FUZZ_SECONDS: 20
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -219,7 +220,7 @@ jobs:
       - uses: ./.github/actions/setup-cargo-fuzz
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus
           key: fuzz-corpus-pack-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
@@ -246,7 +247,7 @@ jobs:
       FUZZ_RUNS: 10000
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -257,7 +258,7 @@ jobs:
       - uses: ./.github/actions/setup-cargo-fuzz
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus
           key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/**') }}
@@ -290,7 +291,7 @@ jobs:
       FUZZ_RUNS: 10000
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -300,7 +301,7 @@ jobs:
       - uses: ./.github/actions/setup-cargo-fuzz
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus
           key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/**') }}
@@ -339,7 +340,7 @@ jobs:
         -Zmiri-preemption-rate=0.1
         -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -374,7 +375,7 @@ jobs:
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -382,7 +383,7 @@ jobs:
           save-cache: "false"
 
       - name: Install Kani
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           kani-version: "0.67.0"
 
@@ -400,7 +401,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -410,7 +411,7 @@ jobs:
         run: cargo bench --features bench --bench event_encoding -- --output-format bencher | tee output.txt
 
       - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1
         with:
           tool: cargo
           output-file-path: output.txt
