@@ -1224,7 +1224,6 @@ mod kani_proofs {
     #[kani::proof]
     fn verify_is_zero_block_bounds() {
         let block = [0u8; TAR_BLOCK_LEN];
-        let base = block.as_ptr() as usize;
 
         // Walk the same loop structure as is_zero_block and verify every
         // access offset.

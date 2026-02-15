@@ -330,7 +330,7 @@ impl HitAccPool {
     ///
     /// Once the per-pair cap is exceeded, all hits are coalesced into a single
     /// span that conservatively covers every hit seen so far.
-    #[cfg(any(test, feature = "bench", feature = "tiger-harness", feature = "kani"))]
+    #[cfg(any(test, feature = "bench", feature = "tiger-harness", kani))]
     #[inline(always)]
     pub(super) fn push_span(
         &mut self,
