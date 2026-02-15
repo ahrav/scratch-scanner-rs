@@ -13,6 +13,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
@@ -25,13 +28,14 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     if: github.event_name == 'pull_request'
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
         id: filter
         with:
           filters: |
@@ -54,12 +58,14 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
+          toolchain: stable
           components: rustfmt
       # No cache needed — fmt does not compile
       - run: cargo fmt --all -- --check
@@ -67,9 +73,10 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: [fmt]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -81,12 +88,13 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     needs: [clippy]
     env:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -98,40 +106,33 @@ jobs:
   clippy-aarch64:
     name: Clippy (aarch64)
     runs-on: macos-15
+    timeout-minutes: 20
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install system deps
-        run: brew install boost
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: stable
           components: clippy
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
-        with:
           shared-key: stable-macos
-          cache-all-crates: "true"
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test-aarch64:
     name: Test (aarch64)
     runs-on: macos-15
+    timeout-minutes: 30
     needs: [clippy-aarch64]
     env:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Install system deps
-        run: brew install boost
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: stable
           shared-key: stable-macos
-          cache-all-crates: "true"
-          save-if: "false"
+          save-cache: "false"
       - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
 
   # ---------------------------------------------------------------------------
@@ -141,6 +142,7 @@ jobs:
     name: Test (Scheduled, Full Harness)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     needs: [clippy]
     env:
       PROPTEST_CASES: "64"
@@ -150,7 +152,7 @@ jobs:
       SCHEDULER_SIM_STRESS_MAX_PROGRAMS: "8"
       SCHEDULER_SIM_STRESS_MAX_TASKS: "8"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -161,19 +163,16 @@ jobs:
 
   loom:
     name: Loom Concurrency Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libboost-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          key: ubuntu-22.04-loom
+          toolchain: stable
+          shared-key: loom-linux
       - name: Run loom tests
         env:
           RUSTFLAGS: "--cfg loom"
@@ -185,14 +184,15 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       checks: write
       contents: read
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -203,12 +203,13 @@ jobs:
     name: Fuzz Pack Smoke (PR)
     if: github.event_name == 'pull_request' && needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs: [changes]
     env:
       FUZZ_SECONDS: 20
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -216,15 +217,10 @@ jobs:
           extra-apt: "clang llvm"
           cache-workspaces: "fuzz -> target"
 
-      - name: Install cargo-fuzz
-        run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf \
-            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
-            | bash
-          cargo binstall --no-confirm --force cargo-fuzz
+      - uses: ./.github/actions/setup-cargo-fuzz
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus
           key: fuzz-corpus-pack-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
@@ -246,11 +242,12 @@ jobs:
     name: Fuzz (Scheduled, Nightly Only, Linux)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       FUZZ_RUNS: 10000
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -258,18 +255,13 @@ jobs:
           extra-apt: "clang llvm"
           cache-workspaces: "fuzz -> target"
 
-      - name: Install cargo-fuzz
-        run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf \
-            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
-            | bash
-          cargo binstall --no-confirm --force cargo-fuzz
+      - uses: ./.github/actions/setup-cargo-fuzz
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
+          key: fuzz-corpus-nightly-linux-${{ hashFiles('fuzz/corpus/**') }}
           restore-keys: |
             fuzz-corpus-nightly-linux-
 
@@ -294,33 +286,25 @@ jobs:
     name: Fuzz (Scheduled, Nightly Only, macOS)
     if: github.event_name == 'schedule'
     runs-on: macos-15
+    timeout-minutes: 60
     env:
       FUZZ_RUNS: 10000
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-rust
         with:
+          toolchain: nightly
           shared-key: nightly-macos-fuzz
-          cache-all-crates: "true"
+          cache-workspaces: "fuzz -> target"
 
-      - name: Install system deps
-        run: brew install boost
-
-      - name: Install cargo-fuzz
-        run: |
-          curl -L --proto '=https' --tlsv1.2 -sSf \
-            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
-            | bash
-          cargo binstall --no-confirm --force cargo-fuzz
+      - uses: ./.github/actions/setup-cargo-fuzz
 
       - name: Restore fuzz corpus cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/fuzz_pack_*/**') }}
+          key: fuzz-corpus-nightly-macos-${{ hashFiles('fuzz/corpus/**') }}
           restore-keys: |
             fuzz-corpus-nightly-macos-
 
@@ -347,6 +331,7 @@ jobs:
     name: Miri (Scheduled, Nightly)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       RUSTC_WRAPPER: ""
       MIRIFLAGS: >-
@@ -355,7 +340,7 @@ jobs:
         -Zmiri-preemption-rate=0.1
         -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -386,17 +371,19 @@ jobs:
     name: Kani Verification (Scheduled)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libboost-dev
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: kani-linux
+          save-cache: "false"
 
       - name: Install Kani
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           kani-version: "0.67.0"
 
@@ -410,8 +397,11 @@ jobs:
     name: Benchmark (Scheduled)
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
@@ -421,7 +411,7 @@ jobs:
         run: cargo bench --features bench --bench event_encoding -- --output-format bencher | tee output.txt
 
       - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@4bdcce38c94cec68da58d012ac24b7b1155efe8b # v1
         with:
           tool: cargo
           output-file-path: output.txt
@@ -429,3 +419,19 @@ jobs:
           fail-on-alert: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: ${{ github.event_name == 'schedule' }}
+
+  # ---------------------------------------------------------------------------
+  # Nightly summary — surfaces failures via GitHub's default email notifications
+  # ---------------------------------------------------------------------------
+  nightly-summary:
+    name: Nightly Summary
+    if: always() && github.event_name == 'schedule'
+    needs: [test-full-harness, loom, fuzz-linux, fuzz-macos, miri, kani, benchmark]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check for failures
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::One or more nightly jobs failed. Check the workflow run for details."
+          exit 1

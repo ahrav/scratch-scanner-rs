@@ -1,0 +1,16 @@
+name: "Setup cargo-fuzz"
+description: "Install cargo-fuzz via cargo-binstall"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install cargo-binstall
+      shell: bash
+      run: |
+        curl -L --proto '=https' --tlsv1.2 -sSf \
+          https://raw.githubusercontent.com/cargo-bins/cargo-binstall/v1.17.5/install-from-binstall-release.sh \
+          | bash
+
+    - name: Install cargo-fuzz
+      shell: bash
+      run: cargo binstall --no-confirm --force cargo-fuzz

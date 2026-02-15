@@ -1,5 +1,5 @@
 name: "Setup Rust"
-description: "Install system deps, Rust toolchain, and configure caching for Linux CI jobs"
+description: "Install system deps, Rust toolchain, and configure caching for CI jobs"
 
 inputs:
   toolchain:
@@ -21,6 +21,10 @@ inputs:
     description: "Additional apt packages to install (space-separated)"
     required: false
     default: ""
+  extra-brew:
+    description: "Additional Homebrew packages to install (space-separated)"
+    required: false
+    default: ""
   cache-workspaces:
     description: "Workspaces for rust-cache (e.g. 'fuzz -> target')"
     required: false
@@ -33,24 +37,31 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install system deps
+    - name: Install system deps (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y libboost-dev ${{ inputs.extra-apt }}
 
+    - name: Install system deps (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install boost ${{ inputs.extra-brew }}
+
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
       with:
         toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
     - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
     - name: Configure Rust cache
-      uses: Swatinem/rust-cache@v2
+      uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       with:
         shared-key: ${{ inputs.shared-key }}
         save-if: ${{ inputs.save-cache }}
