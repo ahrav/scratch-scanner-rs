@@ -953,7 +953,9 @@ fn decode_copy_params(
 mod tests {
     use super::super::delta_test_helpers::{
         make_add_delta, make_copy_delta, push_varint, push_varint_u64, zlib_compress,
+        SyntheticPackBuilder,
     };
+    use super::super::object_id::OidBytes;
     use super::*;
 
     #[test]
@@ -1529,26 +1531,40 @@ mod tests {
         let mut out = Vec::new();
         apply_delta(base, &delta, &mut out, 1024).expect("apply delta with poison");
         assert_eq!(&out[..], base.as_slice());
+        // Mixed copy+add delta is already exercised by
+        // `apply_delta_mixed_copy_and_add`; no need to duplicate it here.
+    }
 
-        // Also test with mixed copy + add-literal delta.
-        // Delta header: base_size=10, result_size=9
-        let mut delta2 = Vec::new();
-        push_varint(10, &mut delta2); // base object size
-        push_varint(9, &mut delta2); // target result size
-                                     // Copy 5 bytes from base offset 0 -> "ABCDE"
-        delta2.push(0x80 | 0x01 | 0x10); // copy cmd: offset & size present
-        delta2.push(0x00); // offset = 0
-        delta2.push(0x05); // size = 5
-                           // Add 3 literal bytes -> "XYZ"
-        delta2.push(0x03); // add-literal cmd: length 3
-        delta2.extend_from_slice(b"XYZ");
-        // Copy 1 byte from base offset 9 -> "J"
-        delta2.push(0x80 | 0x01 | 0x10); // copy cmd
-        delta2.push(0x09); // offset = 9
-        delta2.push(0x01); // size = 1
+    #[test]
+    fn ref_delta_entry_header_parses_oid() {
+        let base_data = b"hello base";
+        let delta_data = make_add_delta(base_data.len(), b"XY");
 
-        let mut out2 = Vec::new();
-        apply_delta(base, &delta2, &mut out2, 1024).expect("apply delta mixed with poison");
-        assert_eq!(&out2[..], b"ABCDEXYZJ");
+        let base_oid = OidBytes::try_from_slice(&[0xAB; 20]).unwrap();
+
+        let mut builder = SyntheticPackBuilder::new();
+        builder.add_non_delta(3, base_data);
+        let ref_idx = builder.add_ref_delta(base_oid, &delta_data);
+
+        let (pack, offsets) = builder.build();
+        let pf = PackFile::parse(&pack, 20).expect("parse pack");
+
+        let header = pf
+            .entry_header_at(offsets[ref_idx], 64)
+            .expect("parse ref delta header");
+
+        assert_eq!(
+            header.kind,
+            EntryKind::RefDelta { base_oid },
+            "should parse REF_DELTA with correct base OID"
+        );
+        assert_eq!(header.size, delta_data.len() as u64);
+        // data_start must point past the 20-byte OID to the compressed
+        // delta payload.
+        let slice = pf.slice_from(header.data_start);
+        assert!(
+            !slice.is_empty(),
+            "data_start should point to compressed delta bytes"
+        );
     }
 }

@@ -3071,14 +3071,15 @@ enum DeltaDecodeError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::delta_test_helpers::{
+        encode_entry_header, encode_entry_header_kind, encode_ofs_distance, encode_varint,
+        zlib_compress,
+    };
     use super::*;
     use crate::git_scan::byte_arena::{ByteArena, ByteRef};
     use crate::git_scan::pack_plan_model::{CandidateAtOffset, DeltaKind, PackPlanStats};
     use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
     use std::collections::HashMap;
-    use std::io::Write;
 
     #[derive(Default)]
     struct TestSink {
@@ -3134,40 +3135,6 @@ mod tests {
         }
     }
 
-    fn encode_entry_header(kind: ObjectKind, size: usize) -> Vec<u8> {
-        let obj_type = match kind {
-            ObjectKind::Commit => 1u8,
-            ObjectKind::Tree => 2u8,
-            ObjectKind::Blob => 3u8,
-            ObjectKind::Tag => 4u8,
-        };
-        encode_header_bytes(obj_type, size)
-    }
-
-    fn encode_delta_header(obj_type: u8, size: usize) -> Vec<u8> {
-        encode_header_bytes(obj_type, size)
-    }
-
-    fn encode_header_bytes(obj_type: u8, size: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut remaining = size as u64;
-        let mut first = ((obj_type & 0x07) << 4) | ((remaining & 0x0f) as u8);
-        remaining >>= 4;
-        if remaining != 0 {
-            first |= 0x80;
-        }
-        out.push(first);
-        while remaining != 0 {
-            let mut byte = (remaining & 0x7f) as u8;
-            remaining >>= 7;
-            if remaining != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-        }
-        out
-    }
-
     #[test]
     fn cache_reject_bucket_index_maps_log2() {
         assert_eq!(cache_reject_bucket_index(0), 0);
@@ -3177,36 +3144,6 @@ mod tests {
         assert_eq!(cache_reject_bucket_index(4), 2);
         assert_eq!(cache_reject_bucket_index(7), 2);
         assert_eq!(cache_reject_bucket_index(8), 3);
-    }
-
-    fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
-        assert!(dist > 0);
-        let mut bytes = Vec::new();
-        bytes.push((dist & 0x7f) as u8);
-        dist >>= 7;
-        while dist > 0 {
-            dist -= 1;
-            bytes.push(((dist & 0x7f) as u8) | 0x80);
-            dist >>= 7;
-        }
-        bytes.reverse();
-        bytes
-    }
-
-    fn encode_varint(mut value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
-        out
     }
 
     fn build_insert_delta(result: &[u8], base_len: usize) -> Vec<u8> {
@@ -3223,12 +3160,6 @@ mod tests {
         }
 
         delta
-    }
-
-    fn compress(data: &[u8]) -> Vec<u8> {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
     }
 
     fn exec_plan<S: PackObjectSink, B: ExternalBaseProvider>(
@@ -3451,8 +3382,8 @@ mod tests {
         let mut offsets = Vec::with_capacity(entries.len());
         for (kind, data) in entries {
             offsets.push(bytes.len() as u64);
-            bytes.extend_from_slice(&encode_entry_header(*kind, data.len()));
-            bytes.extend_from_slice(&compress(data));
+            bytes.extend_from_slice(&encode_entry_header_kind(*kind, data.len()));
+            bytes.extend_from_slice(&zlib_compress(data));
         }
 
         bytes.extend_from_slice(&[0u8; 20]);
@@ -3780,13 +3711,16 @@ mod tests {
         pack.extend_from_slice(&2u32.to_be_bytes());
 
         let base_offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
-        pack.extend_from_slice(&compress(base_bytes));
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, delta_payload.len());
+        let mut delta_entry = encode_entry_header(6, delta_payload.len());
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-        delta_entry.extend_from_slice(&compress(&delta_payload));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
         pack.extend_from_slice(&[0u8; 20]);
 
@@ -4525,13 +4459,16 @@ mod tests {
         pack.extend_from_slice(&2u32.to_be_bytes());
 
         let base_offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
-        pack.extend_from_slice(&compress(base_bytes));
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, delta_payload.len());
+        let mut delta_entry = encode_entry_header(6, delta_payload.len());
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-        delta_entry.extend_from_slice(&compress(&delta_payload));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
         pack.extend_from_slice(&[0u8; 20]);
 
@@ -4612,11 +4549,14 @@ mod tests {
         pack.extend_from_slice(&2u32.to_be_bytes());
 
         let base_offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
-        pack.extend_from_slice(&compress(base_bytes));
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, 4);
+        let mut delta_entry = encode_entry_header(6, 4);
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
         delta_entry.extend_from_slice(&[0x78]); // truncated zlib stream
         pack.extend_from_slice(&delta_entry);
@@ -4697,13 +4637,16 @@ mod tests {
         pack.extend_from_slice(&2u32.to_be_bytes());
 
         let base_offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
-        pack.extend_from_slice(&compress(base_bytes));
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, delta_payload.len());
+        let mut delta_entry = encode_entry_header(6, delta_payload.len());
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-        delta_entry.extend_from_slice(&compress(&delta_payload));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
         pack.extend_from_slice(&[0u8; 20]);
 
@@ -4782,13 +4725,16 @@ mod tests {
         pack.extend_from_slice(&2u32.to_be_bytes());
 
         let base_offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
-        pack.extend_from_slice(&compress(base_bytes));
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, delta_payload.len());
+        let mut delta_entry = encode_entry_header(6, delta_payload.len());
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-        delta_entry.extend_from_slice(&compress(&delta_payload));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
         pack.extend_from_slice(&[0u8; 20]);
 
@@ -4869,9 +4815,9 @@ mod tests {
         pack.extend_from_slice(&1u32.to_be_bytes());
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(7, delta_payload.len());
+        let mut delta_entry = encode_entry_header(7, delta_payload.len());
         delta_entry.extend_from_slice(base_oid.as_slice());
-        delta_entry.extend_from_slice(&compress(&delta_payload));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
         pack.extend_from_slice(&[0u8; 20]);
 
@@ -4967,7 +4913,7 @@ mod tests {
         pack.extend_from_slice(&1u32.to_be_bytes());
 
         let offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, 4));
+        pack.extend_from_slice(&encode_entry_header_kind(ObjectKind::Blob, 4));
         pack.extend_from_slice(&[0x78]); // truncated zlib stream
         pack.extend_from_slice(&[0u8; 20]);
 
@@ -5199,13 +5145,16 @@ run with --test-threads=1 to enable"
         pack.extend_from_slice(&2u32.to_be_bytes());
 
         let base_offset = pack.len() as u64;
-        pack.extend_from_slice(&encode_entry_header(ObjectKind::Blob, base_bytes.len()));
-        pack.extend_from_slice(&compress(base_bytes));
+        pack.extend_from_slice(&encode_entry_header_kind(
+            ObjectKind::Blob,
+            base_bytes.len(),
+        ));
+        pack.extend_from_slice(&zlib_compress(base_bytes));
 
         let delta_offset = pack.len() as u64;
-        let mut delta_entry = encode_delta_header(6, delta_payload.len());
+        let mut delta_entry = encode_entry_header(6, delta_payload.len());
         delta_entry.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-        delta_entry.extend_from_slice(&compress(&delta_payload));
+        delta_entry.extend_from_slice(&zlib_compress(&delta_payload));
         pack.extend_from_slice(&delta_entry);
         pack.extend_from_slice(&[0u8; 20]);
 

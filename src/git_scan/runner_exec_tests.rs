@@ -1,6 +1,7 @@
 use super::*;
 use std::path::Path;
 
+use crate::git_scan::delta_test_helpers::zlib_compress;
 use crate::git_scan::object_id::OidBytes;
 use crate::git_scan::pack_decode::PackDecodeLimits;
 use crate::git_scan::pack_plan_model::{BaseLoc, DeltaDep, DeltaKind, PackPlanStats, NONE_U32};
@@ -9,10 +10,7 @@ use crate::{
     demo_tuning, AnchorPolicy, Engine, Gate, RuleSpec, TransformConfig, TransformId, TransformMode,
     ValidatorKind,
 };
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use regex::bytes::Regex;
-use std::io::Write;
 use tempfile::tempdir;
 
 use crate::git_scan::engine_adapter::{EngineAdapter, EngineAdapterConfig};
@@ -383,12 +381,6 @@ fn test_engine() -> Engine {
     )
 }
 
-fn compress(data: &[u8]) -> Vec<u8> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).unwrap();
-    encoder.finish().unwrap()
-}
-
 fn oid_to_hex(oid: &OidBytes) -> String {
     let mut out = String::with_capacity(oid.len() as usize * 2);
     for &b in oid.as_slice() {
@@ -404,7 +396,7 @@ fn write_loose_blob(objects_dir: &Path, oid: OidBytes, payload: &[u8]) {
     header.push(0);
     header.extend_from_slice(payload);
 
-    let compressed = compress(&header);
+    let compressed = zlib_compress(&header);
     let hex = oid_to_hex(&oid);
     let (dir, file) = hex.split_at(2);
     let dir_path = objects_dir.join(dir);

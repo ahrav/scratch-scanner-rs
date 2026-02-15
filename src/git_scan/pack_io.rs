@@ -541,71 +541,15 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
     use std::path::Path;
     use tempfile::tempdir;
 
+    use super::super::delta_test_helpers::{
+        encode_entry_header, encode_ofs_distance, encode_varint, zlib_compress,
+    };
     use super::super::object_id::{ObjectFormat, OidBytes};
 
     use super::super::midx_test_builder::MidxBuilder;
-
-    fn encode_entry_header(obj_type: u8, mut size: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut first = (obj_type & 0x07) << 4;
-        first |= (size & 0x0f) as u8;
-        size >>= 4;
-        if size != 0 {
-            first |= 0x80;
-        }
-        out.push(first);
-        while size != 0 {
-            let mut byte = (size & 0x7f) as u8;
-            size >>= 7;
-            if size != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-        }
-        out
-    }
-
-    fn encode_varint(mut value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
-        out
-    }
-
-    fn compress(data: &[u8]) -> Vec<u8> {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    fn encode_ofs_distance(mut dist: u64) -> Vec<u8> {
-        assert!(dist > 0);
-        let mut bytes = Vec::new();
-        bytes.push((dist & 0x7f) as u8);
-        dist >>= 7;
-        while dist > 0 {
-            dist -= 1;
-            bytes.push(((dist & 0x7f) as u8) | 0x80);
-            dist >>= 7;
-        }
-        bytes.reverse();
-        bytes
-    }
 
     fn oid_to_hex(oid: &OidBytes) -> String {
         let mut out = String::with_capacity(oid.len() as usize * 2);
@@ -623,7 +567,7 @@ mod tests {
         header.push(0);
         header.extend_from_slice(payload);
 
-        let compressed = compress(&header);
+        let compressed = zlib_compress(&header);
         let hex = oid_to_hex(&oid);
         let (dir, file) = hex.split_at(2);
         let dir_path = objects_dir.join(dir);
@@ -636,8 +580,8 @@ mod tests {
         out.extend_from_slice(b"PACK");
         out.extend_from_slice(&2u32.to_be_bytes());
         out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(&encode_entry_header(3, data.len() as u64));
-        out.extend_from_slice(&compress(data));
+        out.extend_from_slice(&encode_entry_header(3, data.len()));
+        out.extend_from_slice(&zlib_compress(data));
         out.extend_from_slice(&[0u8; 20]);
         out
     }
@@ -653,9 +597,9 @@ mod tests {
         out.extend_from_slice(b"PACK");
         out.extend_from_slice(&2u32.to_be_bytes());
         out.extend_from_slice(&1u32.to_be_bytes());
-        out.extend_from_slice(&encode_entry_header(7, result.len() as u64));
+        out.extend_from_slice(&encode_entry_header(7, result.len()));
         out.extend_from_slice(&base_oid);
-        out.extend_from_slice(&compress(&delta));
+        out.extend_from_slice(&zlib_compress(&delta));
         out.extend_from_slice(&[0u8; 20]);
         out
     }
@@ -673,12 +617,12 @@ mod tests {
         out.extend_from_slice(&2u32.to_be_bytes());
 
         out.extend_from_slice(&encode_entry_header(3, 0));
-        out.extend_from_slice(&compress(&[]));
+        out.extend_from_slice(&zlib_compress(&[]));
 
         let delta_offset = out.len() as u64;
-        out.extend_from_slice(&encode_entry_header(6, result.len() as u64));
+        out.extend_from_slice(&encode_entry_header(6, result.len()));
         out.extend_from_slice(&encode_ofs_distance(delta_offset - base_offset));
-        out.extend_from_slice(&compress(&delta));
+        out.extend_from_slice(&zlib_compress(&delta));
         out.extend_from_slice(&[0u8; 20]);
         out
     }
@@ -799,7 +743,7 @@ mod tests {
         let mut builder = MidxBuilder::default();
         builder.add_pack(b"pack-depth");
         builder.add_object(base_oid, 0, 12);
-        builder.add_object(delta_oid, 0, 12 + 1 + compress(&[]).len() as u64);
+        builder.add_object(delta_oid, 0, 12 + 1 + zlib_compress(&[]).len() as u64);
         let midx_bytes = builder.build();
         let midx = MidxView::parse(&midx_bytes, ObjectFormat::Sha1).unwrap();
 

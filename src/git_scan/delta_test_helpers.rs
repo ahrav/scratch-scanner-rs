@@ -5,6 +5,9 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::io::Write;
 
+use super::object_id::OidBytes;
+use super::pack_inflate::ObjectKind;
+
 /// Compress `data` using zlib (flate2).
 pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -151,13 +154,44 @@ pub fn encode_ofs_offset(negative_offset: u64) -> Vec<u8> {
     out
 }
 
-/// Builder for synthetic pack files containing non-delta and OFS_DELTA
-/// entries. Entry offsets are resolved automatically during `build()`.
+/// Encode a LEB128 varint into a new `Vec` (convenience for callers that
+/// use `extend_from_slice(&encode_varint(...))` patterns).
+pub fn encode_varint(value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_varint_u64(value, &mut out);
+    out
+}
+
+/// Encode an OFS_DELTA backward distance. Identical to [`encode_ofs_offset`]
+/// but asserts the distance is non-zero, matching the pack format invariant.
+pub fn encode_ofs_distance(dist: u64) -> Vec<u8> {
+    assert!(dist > 0, "OFS_DELTA distance must be > 0");
+    encode_ofs_offset(dist)
+}
+
+/// Encode a pack entry header using an [`ObjectKind`] enum instead of a raw
+/// type byte.
+pub fn encode_entry_header_kind(kind: ObjectKind, size: usize) -> Vec<u8> {
+    let obj_type = match kind {
+        ObjectKind::Commit => 1u8,
+        ObjectKind::Tree => 2u8,
+        ObjectKind::Blob => 3u8,
+        ObjectKind::Tag => 4u8,
+    };
+    encode_entry_header(obj_type, size)
+}
+
+/// Builder for synthetic pack files containing non-delta, OFS_DELTA, and
+/// REF_DELTA entries. Entry offsets are resolved automatically during
+/// `build()`.
 pub struct SyntheticPackBuilder {
     entries: Vec<Vec<u8>>,
     /// Stores `Some((base_idx, delta_uncompressed_size, compressed_delta))`
     /// for OFS_DELTA entries, `None` for non-delta entries.
     ofs_delta_info: Vec<Option<(usize, usize, Vec<u8>)>>,
+    /// Stores `Some((base_oid, delta_uncompressed_size, compressed_delta))`
+    /// for REF_DELTA entries, `None` otherwise.
+    ref_delta_info: Vec<Option<(OidBytes, usize, Vec<u8>)>>,
 }
 
 impl SyntheticPackBuilder {
@@ -165,6 +199,7 @@ impl SyntheticPackBuilder {
         Self {
             entries: Vec::new(),
             ofs_delta_info: Vec::new(),
+            ref_delta_info: Vec::new(),
         }
     }
 
@@ -176,6 +211,7 @@ impl SyntheticPackBuilder {
         entry.extend_from_slice(&compressed);
         self.entries.push(entry);
         self.ofs_delta_info.push(None);
+        self.ref_delta_info.push(None);
         idx
     }
 
@@ -187,6 +223,18 @@ impl SyntheticPackBuilder {
         self.entries.push(Vec::new());
         self.ofs_delta_info
             .push(Some((base_idx, delta_data.len(), compressed)));
+        self.ref_delta_info.push(None);
+        idx
+    }
+
+    /// Add a REF_DELTA entry referencing `base_oid`.
+    pub fn add_ref_delta(&mut self, base_oid: OidBytes, delta_data: &[u8]) -> usize {
+        let idx = self.entries.len();
+        let compressed = zlib_compress(delta_data);
+        self.entries.push(Vec::new()); // placeholder
+        self.ofs_delta_info.push(None);
+        self.ref_delta_info
+            .push(Some((base_oid, delta_data.len(), compressed)));
         idx
     }
 
@@ -208,6 +256,12 @@ impl SyntheticPackBuilder {
                     let ofs_bytes = encode_ofs_offset(negative_offset);
                     current_offset +=
                         header.len() as u64 + ofs_bytes.len() as u64 + compressed.len() as u64;
+                } else if let Some((ref base_oid, delta_size, ref compressed)) =
+                    self.ref_delta_info[i]
+                {
+                    let header = encode_entry_header(7, delta_size);
+                    current_offset +=
+                        header.len() as u64 + base_oid.len() as u64 + compressed.len() as u64;
                 } else {
                     current_offset += entry.len() as u64;
                 }
@@ -232,6 +286,12 @@ impl SyntheticPackBuilder {
                 let ofs_bytes = encode_ofs_offset(negative_offset);
                 pack.extend_from_slice(&header);
                 pack.extend_from_slice(&ofs_bytes);
+                pack.extend_from_slice(compressed);
+            } else if let Some((ref base_oid, delta_size, ref compressed)) = self.ref_delta_info[i]
+            {
+                let header = encode_entry_header(7, delta_size);
+                pack.extend_from_slice(&header);
+                pack.extend_from_slice(base_oid.as_slice());
                 pack.extend_from_slice(compressed);
             } else {
                 pack.extend_from_slice(entry);
