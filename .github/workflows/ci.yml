@@ -188,6 +188,7 @@ jobs:
     permissions:
       checks: write
       contents: read
+      issues: write
     env:
       RUSTC_WRAPPER: ""
     steps:
