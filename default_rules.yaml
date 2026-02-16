@@ -1278,7 +1278,7 @@ rules:
   - DROPBOX
   entropy:
     min_bits_per_byte: 2.0
-    min_len: 16
+    min_len: 15
     max_len: 256
   two_phase: null
   local_context: null

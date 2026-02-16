@@ -1802,3 +1802,16 @@ fn default_rules_offline_validators_reject_bad_tokens() {
         OfflineVerdict::Invalid,
     );
 }
+
+/// The dropbox-api-token regex captures exactly `[a-z0-9]{15}` (15 bytes).
+/// The entropy gate should reject low-entropy tokens like "aaaaaaaaaaaaaaa".
+#[test]
+fn dropbox_api_token_entropy_gate_rejects_low_entropy() {
+    // "aaaaaaaaaaaaaaa" is 15 chars of zero entropy — should be rejected.
+    let low_entropy = b"dropbox_key = aaaaaaaaaaaaaaa\n";
+    let hits = scan_single_builtin_rule("dropbox-api-token", low_entropy);
+    assert!(
+        !hits.iter().any(|h| h.rule == "dropbox-api-token"),
+        "low-entropy dropbox token should be filtered by entropy gate"
+    );
+}
