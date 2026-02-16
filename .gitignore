@@ -35,9 +35,8 @@ fuzz/Cargo.lock
 
 perf.data
 
-# Linux only ignores
-build.rs
-config.toml
+# Machine-local cargo config (compiler overrides, BOOST_ROOT, etc.)
+/.cargo/config.toml
 
 # Internal design docs (scanner harness planning)
 docs/test_harness.md
@@ -70,3 +69,8 @@ proptest-regressions/
 .beads/.bv.lock
 
 .bench/*
+
+# Benchmark raw data (keep only the high-level .md reports)
+tools/bench-compare/results/raw/
+tools/bench-compare/results/perf_raw/
+tools/bench-compare/results/*.csv
