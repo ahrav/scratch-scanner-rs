@@ -34,7 +34,8 @@
 //! - ASCII output avoids terminal / control-byte issues in logs.
 //! - FNV-1a is chosen for speed and simplicity -- collision resistance is not
 //!   a security goal here; the hash exists only to distinguish truncated paths.
-//! - Both public types reuse an internal `Vec<u8>` buffer and are intended to
+//! - `EntryPathCanonicalizer` uses two internal buffers (component ranges + output bytes);
+//!   `VirtualPathBuilder` uses a single `Vec<u8>` output buffer. Both are intended to
 //!   be allocated once per worker thread for steady-state zero allocation.
 
 use crate::archive::util;
@@ -68,7 +69,9 @@ pub struct CanonicalPath<'a> {
     pub truncated: bool,
     /// True if component cap was exceeded. Output will be a placeholder.
     pub component_cap_exceeded: bool,
-    /// 64-bit deterministic hash of the full (untruncated) canonical display bytes.
+    /// 64-bit deterministic hash. For normal paths, hashes the canonical display bytes.
+    /// When `component_cap_exceeded` is true, hashes the raw input bytes with
+    /// separator normalization instead.
     pub hash64: u64,
 }
 

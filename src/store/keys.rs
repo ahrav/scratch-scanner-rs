@@ -2,8 +2,9 @@
 //!
 //! This module owns persistence identity key material. It loads the optional
 //! `SCANNER_SECRET_KEY` environment variable and always returns derived subkeys:
-//! - `identity_key` — used by [`identity::rule_fingerprint`](super::identity::rule_fingerprint)
-//!   and [`identity::occurrence_id`](super::identity::occurrence_id).
+//! - `identity_key` — used by [`identity::occurrence_id`](super::identity::occurrence_id),
+//!   [`identity::root_id`](super::identity::root_id), and
+//!   [`identity::path_id`](super::identity::path_id) for keyed hashing.
 //! - `secret_key` — used by [`identity::secret_hash`](super::identity::secret_hash).
 //! - `metadata_key` — available for run metadata authentication/derivation.
 //!
@@ -224,7 +225,8 @@ impl StoreKeys {
         self.run_mode
     }
 
-    /// Key for rule fingerprint and occurrence-id derivation.
+    /// Key for occurrence-id, root-id, and path-id derivation (keyed hashing).
+    /// Note: `rule_fingerprint` uses unkeyed hashing and does not consume this key.
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn identity_key(&self) -> &[u8; 32] {

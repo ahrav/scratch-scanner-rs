@@ -79,7 +79,7 @@ fn validate_core(core: usize) -> io::Result<()> {
 /// - `core >= CPU_SET_CAPACITY` (would cause undefined behavior)
 /// - The core is not in the process's allowed CPU set (cgroups/cpuset)
 /// - Permission is denied
-/// - The platform doesn't support thread affinity (macOS, Windows)
+/// - The platform is not supported by this library (macOS, Windows)
 ///
 /// # Platform Notes
 ///
@@ -330,8 +330,8 @@ impl CoreAssigner {
 
 /// CPU affinity mask.
 ///
-/// On Linux, wraps `cpu_set_t`. On other platforms, this is a stub that
-/// tracks requested cores but cannot apply them.
+/// On Linux, wraps `cpu_set_t`. On other platforms, this is a zero-sized
+/// stub; `set()` and `clear()` are no-ops.
 #[derive(Clone, Debug)]
 pub struct CpuSet {
     #[cfg(target_os = "linux")]

@@ -470,6 +470,7 @@ classDiagram
         <<trait>>
         +emit_fs_batch(batch) Result
         +record_fs_run_loss(loss) Result
+        +end_run(had_coverage_limits) Result
     }
 
     class NullStoreProducer {
@@ -594,7 +595,7 @@ Verified against: `src/store/keys.rs`, `src/store/identity.rs`.
 
 | Function | Input | Output | Key Used |
 |---|---|---|---|
-| `rule_fingerprint(rule, keys)` | `RuleSpec` | `RuleFingerprint` (`[u8; 32]`) | `identity_key` |
+| `rule_fingerprint(rule, keys)` | `RuleSpec` | `RuleFingerprint` (`[u8; 32]`) | _(unkeyed)_ |
 | `secret_hash(norm_hash, keys)` | `[u8; 32]` | `SecretHash` (`[u8; 32]`) | `secret_key` |
 | `occurrence_id(input, keys)` | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`) | `identity_key` |
 

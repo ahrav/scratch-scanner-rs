@@ -74,9 +74,11 @@ pub(crate) enum WorkerStepResult<Tag> {
     ExitPanicked,
 }
 
-/// Structured trace events emitted by the step engine.
+/// Structured trace events for the step engine.
 ///
-/// This is serializable so sim traces can be persisted as JSON repro cases.
+/// Not all variants are emitted in the current implementation; some exist
+/// for simulation/test-harness use. Serializable so sim traces can be
+/// persisted as JSON repro cases.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ExecTraceEvent<Tag> {
     Pop {

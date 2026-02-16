@@ -12,7 +12,7 @@
 //!
 //! # Why Typed Tasks Over `Box<dyn FnOnce()>`
 //!
-//! 1. **Size**: Task enum is 64-80 bytes; boxed closure is 16 bytes + heap alloc
+//! 1. **Size**: Task enum is ~56 bytes; boxed closure is 16 bytes + heap alloc
 //! 2. **Locality**: Tasks packed in deques without indirection
 //! 3. **Introspection**: Can inspect pending work for metrics/debugging
 //!
@@ -170,7 +170,8 @@ pub type ObjectRef = Arc<ObjectCtx>;
 /// # Size Budget
 ///
 /// PathBuf is 24 bytes (ptr + len + cap) on 64-bit.
-/// Total: 24 + 8 + 4 + 4 = 40 bytes.
+/// ObjectId is u64 (8 bytes), SourceId is u32 (4 bytes).
+/// Total: 24 + 8 + 8 + 4 = 44 bytes (48 with padding).
 #[derive(Clone, Debug)]
 pub struct ObjectDescriptor {
     /// Path or URI to fetch from

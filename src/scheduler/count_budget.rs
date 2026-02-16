@@ -19,7 +19,7 @@
 //! |----------------|-------------------------|
 //! | try_acquire()  | Lock + check + unlock   |
 //! | acquire()      | Lock + condvar wait     |
-//! | release()      | Lock + notify_one       |
+//! | release()      | Lock + notify_all       |
 //!
 //! This is appropriate for file-level backpressure (thousands/sec),
 //! NOT for chunk-level (millions/sec). For chunk-level, use lock-free
@@ -358,7 +358,8 @@ impl CountPermit {
     ///
     /// # Panics
     ///
-    /// Panics if `count > self.n` or `count == 0`.
+    /// Panics if `count > self.n`, `count == 0`, or the permit is inactive
+    /// (i.e., already consumed via [`forget`](Self::forget)).
     pub fn split(&mut self, count: usize) -> CountPermit {
         assert!(count > 0, "cannot split 0 permits");
         assert!(

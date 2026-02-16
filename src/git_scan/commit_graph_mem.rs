@@ -1,9 +1,8 @@
 //! In-memory commit graph for use when file-based commit-graph is unavailable.
 //!
 //! This module provides `CommitGraphMem`, an in-memory commit graph built from
-//! loaded commit objects. It implements the same `CommitGraph` trait as
-//! `CommitGraphView`, enabling transparent substitution when disk artifacts
-//! are missing.
+//! loaded commit objects. It implements the `CommitGraph` trait, enabling
+//! transparent substitution when on-disk commit-graph files are missing.
 //!
 //! # Layout
 //! Uses Struct-of-Arrays (SoA) for cache-friendly access:
@@ -45,8 +44,8 @@ use super::object_id::{ObjectFormat, OidBytes};
 
 /// In-memory commit graph built from loaded commits.
 ///
-/// Provides equivalent functionality to `CommitGraphView` for repos without
-/// pre-built commit-graph files. All per-commit data uses Struct-of-Arrays
+/// Provides equivalent functionality to file-backed commit graphs for repos
+/// without pre-built commit-graph files. All per-commit data uses Struct-of-Arrays
 /// layout for cache-friendly sequential access during generation-ordered
 /// traversal.
 ///

@@ -22,8 +22,9 @@ use rusqlite::{params, Connection};
 ///
 /// Fields are pre-formatted for CLI output: `run_id` is hex-encoded,
 /// timestamps are raw epoch milliseconds (formatted by the caller).
-/// `status` uses the integer codes from [`super::schema`]:
-/// 0 = active, 1 = complete, 2 = limited, 3 = incomplete, 4 = failed.
+/// `status` uses the integer codes from [`super::writer::RunStatus`]:
+/// 0 = in-progress, 1 = complete, 2 = complete-with-coverage-limits,
+/// 3 = incomplete, 4 = failed.
 #[derive(Clone, Debug)]
 pub struct RunSummary {
     pub run_pk: i64,
@@ -128,7 +129,8 @@ fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
 
 /// List findings for a given run, with optional LIKE filters on rule name and path.
 ///
-/// Filters use SQL `LIKE '%pattern%'` (substring match, case-sensitive).
+/// Filters use SQL `LIKE '%pattern%'` (substring match, case-insensitive for ASCII
+/// per SQLite default).
 /// Results are ordered by `(object_path, start_byte)` for stable output.
 pub fn list_findings(
     conn: &Connection,
