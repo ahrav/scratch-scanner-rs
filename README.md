@@ -21,6 +21,8 @@ total configurations, each on an ARM Graviton3 (16 vCPUs, 61 GiB RAM).
 
 ### Speedups vary — a lot
 
+![Speedup vs other scanners](docs/assets/charts/speedup.svg)
+
 Warm-cache git mode, showing how many times slower each scanner is
 vs scanner-rs:
 
@@ -66,6 +68,8 @@ A few patterns we noticed:
 
 ### Cold vs warm: what the page cache reveals
 
+![Cold vs warm cache ratio](docs/assets/charts/cold-warm-ratio.svg)
+
 Filesystem mode shows the starkest cold/warm contrast. The ratio of
 cold-cache to warm-cache wall time tells you whether a scanner is
 I/O-bound (large ratio: slow when data isn't in memory, fast when it
@@ -105,6 +109,8 @@ local SSDs.
 
 ### Throughput across repository sizes
 
+![Throughput comparison](docs/assets/charts/throughput.svg)
+
 A selection of throughput numbers showing how performance scales:
 
 | Repo    | Mode  | Cache  |  scanner-rs |  Kingfisher |  TruffleHog |   Gitleaks |
@@ -122,6 +128,8 @@ the decompression and object-traversal overhead. scanner-rs showed
 the highest throughput in every configuration we tested.
 
 ### The memory cost
+
+![Peak memory usage](docs/assets/charts/memory-rss.svg)
 
 This is the part we can't hand-wave away. scanner-rs uses substantially
 more RSS than every other scanner:
