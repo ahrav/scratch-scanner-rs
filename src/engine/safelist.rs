@@ -210,7 +210,8 @@ impl SafelistFilter {
     /// extracted secret values (typically 10–150 bytes). Unlike [`matcher`],
     /// which targets the surrounding context window of root findings only, this
     /// set is intended for **all** findings — including decoded and
-    /// transform-derived values — where no surrounding context is available.
+    /// transform-derived values — because placeholder values are equally fake
+    /// regardless of their surrounding context or encoding layer.
     ///
     /// Context-anchored patterns and short substrings that risk false
     /// suppression are excluded. See [`SECRET_BYTES_PATTERNS`] for the full

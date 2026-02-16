@@ -610,11 +610,12 @@ impl Engine {
     /// # Behavior
     /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
     /// assignment-shape, regex, entropy, value suppressor, local context,
-    /// safelist suppression, offline validation) while enforcing UTF-16 decode
-    /// budgets. Safelist suppression uses the emitted finding step
-    /// (`utf16_step_id`, checked as `step_id == STEP_ROOT`), while offline
-    /// validation uses the parent `step_id` so root-level UTF-16 findings are
-    /// correctly identified as root-semantic.
+    /// context-window safelist, secret-bytes safelist, offline validation) while
+    /// enforcing UTF-16 decode budgets. Context-window safelist suppression uses
+    /// the emitted finding step (`utf16_step_id`, checked as
+    /// `step_id == STEP_ROOT`); the secret-bytes safelist runs on all findings.
+    /// Offline validation uses the parent `step_id` so root-level UTF-16
+    /// findings are correctly identified as root-semantic.
     ///
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
@@ -848,10 +849,13 @@ impl Engine {
     ///   match start. Regex search starts near this position with a back-scan margin.
     ///
     /// # Effects
-    /// - Sets `found_any` when any match passes gates.
-    /// - Findings may be suppressed by emit-time safelist when emitted
-    ///   `step_id == STEP_ROOT`, and by offline structural validation for
-    ///   root-semantic findings (`parent_step_id == STEP_ROOT`).
+    /// - Sets `found_any` when any match passes gates AND emit-time policy.
+    ///   Suppressed findings do not set `found_any`, ensuring
+    ///   `IfNoFindingsInThisBuffer` transforms can still run.
+    /// - Findings may be suppressed by the context-window safelist when emitted
+    ///   `step_id == STEP_ROOT`, by the secret-bytes safelist (all findings),
+    ///   and by offline structural validation for root-semantic findings
+    ///   (`parent_step_id == STEP_ROOT`).
     /// - Appends into staging buffers (`tmp_findings`, `tmp_drop_hint_end`,
     ///   `tmp_norm_hash`) only; caller decides when to commit to output.
     #[allow(clippy::too_many_arguments)]
@@ -953,8 +957,6 @@ impl Engine {
                 };
 
                 if context_ok {
-                    *found_any = true;
-
                     let span_start = window_start.saturating_add(secret_start as u64) as usize;
                     let span_end = window_start.saturating_add(secret_end as u64) as usize;
                     let span_in_buf = span_start..span_end;
@@ -985,6 +987,11 @@ impl Engine {
                     ) else {
                         return;
                     };
+                    // Set found_any only after emit-time policy confirms
+                    // the finding will be emitted. Suppressed findings
+                    // (safelist, secret-bytes, offline validation) must not
+                    // prevent IfNoFindingsInThisBuffer transforms from running.
+                    *found_any = true;
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1017,9 +1024,12 @@ impl Engine {
     ///   between raw UTF-16 bytes and decoded UTF-8.
     ///
     /// # Effects
-    /// - Sets `found_any` when any match passes gates.
-    /// - Emit-time safelist suppression checks the emitted step
-    ///   (`utf16_step_id`), so UTF-16 emissions bypass root-only safelist checks.
+    /// - Sets `found_any` when any match passes gates AND emit-time policy.
+    ///   Suppressed findings do not set `found_any` (see raw-path comment).
+    /// - Context-window safelist suppression checks the emitted step
+    ///   (`utf16_step_id`), so UTF-16 emissions bypass root-only context checks.
+    ///   The secret-bytes safelist still applies to all findings regardless of
+    ///   step, catching placeholder values in decoded UTF-16 buffers.
     /// - Findings may be suppressed by offline structural validation using the
     ///   parent `step_id` (not `utf16_step_id`) for root-semantic detection.
     /// - Appends into staging buffers only; commit vs rollback is handled by
@@ -1176,8 +1186,6 @@ impl Engine {
                 };
 
                 if context_ok {
-                    *found_any = true;
-
                     // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
                     // lift into decoded-stream coordinates and (when available) map
                     // through the transform root-span context.
@@ -1219,6 +1227,9 @@ impl Engine {
                     ) else {
                         return;
                     };
+                    // Set found_any only after emit-time policy confirms
+                    // the finding will be emitted (see raw-path comment).
+                    *found_any = true;
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1288,8 +1299,10 @@ impl Engine {
 
     /// Applies emit-time safelist/offline gates and computes finding sidecars.
     ///
-    /// `emitted_step_id` controls root-step safelist suppression and dedupe-key
-    /// span inclusion. `parent_step_id` controls root-semantic offline validation.
+    /// `emitted_step_id` controls root-step context-window safelist suppression
+    /// and dedupe-key span inclusion; the secret-bytes safelist runs
+    /// unconditionally on all surviving findings. `parent_step_id` controls
+    /// root-semantic offline validation.
     /// These differ for UTF-16 findings (`emitted_step_id` is `Utf16Window`,
     /// `parent_step_id` may still be `STEP_ROOT`).
     ///
@@ -1300,7 +1313,8 @@ impl Engine {
     /// 3. Offline structural validation (root-semantic findings only).
     ///
     /// Returns `None` when the finding is suppressed. In that case suppression
-    /// counters are incremented here so callers do not duplicate bookkeeping.
+    /// counters are incremented here (when `perf-stats` + `debug_assertions`
+    /// are enabled) so callers do not duplicate bookkeeping.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn apply_emit_time_policy(

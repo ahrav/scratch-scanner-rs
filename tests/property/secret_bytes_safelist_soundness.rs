@@ -82,7 +82,7 @@ proptest! {
         prop_assume!(!secret_str.contains("EXAMPLE"));
         prop_assume!(!secret_str.contains("placeholder") && !secret_str.contains("PLACEHOLDER"));
         prop_assume!(!secret_str.contains("0123456789"));
-        prop_assume!(!secret_str.contains("abcdefghij"));
+        prop_assume!(!secret_str.to_ascii_lowercase().contains("abcdefghij"));
 
         // Build an engine with a rule that extracts the secret via capture group.
         let re_pattern = format!(r"SEC_([A-Za-z0-9]{{{secret_len}}})");
