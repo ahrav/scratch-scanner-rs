@@ -1939,6 +1939,45 @@ fn secret_bytes_suppression_does_not_block_child_transforms() {
 }
 
 #[test]
+fn secret_bytes_safelist_does_not_suppress_composite_secret_with_placeholder_segment() {
+    // Regression: composite secrets like "key-null-safety-9xK2mB" must not be
+    // suppressed. Before the \b → ^...$ anchoring fix, the `\b(?:null|...)\b`
+    // pattern would match "null" at the hyphen-delimited segment boundary.
+    let rule = RuleSpec {
+        name: "secret-bytes-composite",
+        anchors: &[b"SECRET_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"SECRET_([A-Za-z0-9._-]+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"config SECRET_key-null-safety-9xK2mB end";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        1,
+        "composite secret with 'null' segment must NOT be suppressed by secret-bytes safelist"
+    );
+}
+
+#[test]
 fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
     let rule = RuleSpec {
         name: "value-suppressor-b64-raw",

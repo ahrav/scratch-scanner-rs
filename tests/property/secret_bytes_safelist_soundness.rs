@@ -120,4 +120,85 @@ proptest! {
             &secret_str[..secret_str.len().min(40)]
         );
     }
+
+    /// Composite secrets built from random alphanumeric segments joined by
+    /// hyphens and dots must never be suppressed, even when individual
+    /// segments happen to match placeholder words. The `^...$` anchoring
+    /// on SECRET_BYTES_PATTERNS prevents this.
+    #[test]
+    fn composite_secret_with_separators_never_suppressed(
+        segment_count in 2usize..=5,
+        segment_len in 4usize..=10,
+        seed in any::<u64>(),
+    ) {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let separators = b"-.";
+        let mut rng = seed;
+
+        // Build composite secret: seg1-seg2.seg3-seg4
+        let mut secret = Vec::with_capacity(segment_count * (segment_len + 1));
+        for i in 0..segment_count {
+            if i > 0 {
+                let sep = separators[(lcg(&mut rng) >> 33) as usize % separators.len()];
+                secret.push(sep);
+            }
+            for _ in 0..segment_len {
+                let v = lcg(&mut rng);
+                secret.push(alphabet[(v >> 33) as usize % alphabet.len()]);
+            }
+        }
+
+        let entropy = shannon_entropy(&secret);
+        // Lower threshold than the main test because separators reduce entropy.
+        prop_assume!(entropy > 3.5);
+
+        let secret_str = std::str::from_utf8(&secret).unwrap();
+
+        // Filter out secrets that are exact placeholder matches (the only
+        // cases the anchored patterns should catch). With segment_count >= 2
+        // and separators, this is practically impossible for length 10+.
+        let lower = secret_str.to_ascii_lowercase();
+        prop_assume!(lower != "null" && lower != "changeme" && lower != "todo" && lower != "fixme");
+        prop_assume!(lower != "hunter2");
+        prop_assume!(lower != "0123456789" && lower != "abcdefghij");
+        prop_assume!(!secret_str.contains("EXAMPLE"));
+
+        // Regex matches the composite secret including hyphens and dots.
+        let total_len = secret.len();
+        let re_pattern = format!(r"SEC_([A-Za-z0-9.\-]{{{total_len}}})");
+        let rule = RuleSpec {
+            name: "proptest-composite-secret",
+            anchors: &[b"SEC_"],
+            radius: 64,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: Some(1),
+            offline_validation: None,
+            re: Regex::new(&re_pattern).unwrap(),
+        };
+
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let hay = format!("prefix SEC_{secret_str} suffix");
+        let hits = scan_findings(&engine, hay.as_bytes());
+        prop_assert!(
+            hits.iter().any(|h| h.rule == "proptest-composite-secret"),
+            "composite secret (entropy={:.2}, len={}, segments={}) should NOT be \
+             suppressed by secret-bytes safelist: {:?}",
+            entropy,
+            total_len,
+            segment_count,
+            &secret_str[..secret_str.len().min(40)]
+        );
+    }
 }

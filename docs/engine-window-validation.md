@@ -260,7 +260,10 @@ check, the extracted secret bytes are matched against a curated 9-pattern
 subset of the safelist. This tier runs on **all** findings, including
 decoded/transform-derived values, because placeholder values like `"hunter2"`,
 `"0123456789"`, or base64 example literals are equally fake regardless of
-their encoding layer.
+their encoding layer. Patterns for known placeholder values use `^...$`
+anchoring instead of `\b` word boundaries, preventing false suppression of
+composite secrets that contain placeholder words as hyphen- or dot-separated
+segments (e.g., `key-null-safety-9xK2mB`).
 
 - Suppressed findings increment `ScanScratch::secret_bytes_safelist_suppressed`.
 - Context-anchored patterns and short substrings (e.g., "mock") that risk

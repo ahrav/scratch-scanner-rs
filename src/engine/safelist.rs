@@ -25,7 +25,11 @@
 //!    extracted secret value directly (10–150 bytes typically). Only patterns
 //!    that are meaningful on bare values are included — context-anchored
 //!    patterns and short substrings ("mock") that risk false suppression of
-//!    real secrets are excluded.
+//!    real secrets are excluded. Patterns for known placeholder values use
+//!    `^...$` anchoring to prevent false suppression of composite secrets
+//!    containing placeholder words as hyphen/dot-separated segments (e.g.,
+//!    `key-null-safety-9xK2mB`). Structural markers (redaction runs,
+//!    template variables, base64 literals) remain as substring matches.
 //!
 //! Both tiers are checked during `apply_emit_time_policy`. The context tier
 //! runs first (root findings only); the secret-bytes tier runs on all findings
@@ -130,6 +134,17 @@ const SECRET_BYTES_PATTERN_COUNT: usize = 9;
 /// matching. Context anchors (`[:=]\s*`, `(?m)^`, URL structure) are stripped
 /// because extracted secret bytes lack surrounding assignment or line context.
 ///
+/// # Anchoring strategy
+///
+/// Patterns for known placeholder values (indices 0, 1, 3, 4, 5, 7) use
+/// `^...$` anchoring instead of `\b` word boundaries. The `\b` assertion
+/// treats hyphens, dots, and underscores as non-word characters, which means
+/// composite secrets like `key-null-safety-9xK2mB` would falsely trigger the
+/// `null` pattern at the segment boundary. Full-value anchoring ensures only
+/// exact matches suppress. Structural markers (redaction runs `\*{3,}`,
+/// template vars, base64 literals) remain as substring matches because their
+/// delimiters are reliable.
+///
 /// # Safety against false suppression
 ///
 /// Pattern 16 ("mock"/"fixture") is deliberately excluded: the short word
@@ -140,21 +155,24 @@ const SECRET_BYTES_PATTERN_COUNT: usize = 9;
 /// AWS credentials.
 const SECRET_BYTES_PATTERNS: &[&str] = &[
     // [from idx 0] Placeholder markers plus key/token/secret nouns.
-    r"(?i)\b(?:placeholder|dummy|fake|sample|example|test)[-_ ]{0,3}(?:key|token|secret|password)\b|\b(?:key|token|secret|password)[-_ ]{0,3}(?:placeholder|dummy|fake|sample|example|test)\b",
+    // Anchored with ^...$ because the input is the extracted secret value.
+    r"(?i)^(?:placeholder|dummy|fake|sample|example|test)[-_ ]{0,3}(?:key|token|secret|password)$|^(?:key|token|secret|password)[-_ ]{0,3}(?:placeholder|dummy|fake|sample|example|test)$",
     // [from idx 1] AWS example key IDs (AKIA...EXAMPLE).
-    r"\bAKIA[0-9A-Z]{9}EXAMPLE\b",
+    r"^AKIA[0-9A-Z]{9}EXAMPLE$",
     // [from idx 2] Redaction marker runs (***).
     r"\*{3,}",
     // [from idx 5] Metadata marker values — prefix-free variant for bare values.
-    r"(?i)\b(?:null|changeme|todo|fixme)\b",
+    // Anchored: must be the entire extracted value, not a segment in a composite key.
+    r"(?i)^(?:null|changeme|todo|fixme)$",
     // [from idx 6] Known fake sample value hunter2.
-    r"(?i)\bhunter2\b",
+    r"(?i)^hunter2$",
     // [from idx 7] Sequential demo strings (0123456789, abcdefghij).
-    r"(?i)\b(?:0123456789|abcdefghij)\b",
+    r"(?i)^(?:0123456789|abcdefghij)$",
     // [from idx 9] Template vars (${FOO}, {{FOO}}).
     r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\{\{[A-Za-z_][A-Za-z0-9_]*\}\})",
     // [from idx 13] INSERT_YOUR / REPLACE_WITH style markers.
-    r"(?i)\b(?:INSERT[_\s-]?YOUR|REPLACE[_\s-]?WITH)[A-Z0-9_\s-]*\b",
+    // Anchored: must be the entire extracted value.
+    r"(?i)^(?:INSERT[_\s-]?YOUR|REPLACE[_\s-]?WITH)[A-Z0-9_\s-]*$",
     // [from idx 14] Base64 for example/test/sample literals.
     r"(?:ZXhhbXBsZQ==|c2FtcGxl={0,2}|dGVzdA==)",
 ];
@@ -389,9 +407,9 @@ mod tests {
     fn secret_bytes_mock_substring_does_not_suppress_real_key() {
         let filter = SafelistFilter::new();
         // Pattern 16 ("mock") is excluded from the secret-bytes set.
-        // A real API key that happens to contain "mock" as a substring
+        // A realistic hyphenated API key containing "mock" as a segment
         // must NOT be suppressed.
-        let key_with_mock_substring = b"aMockR7tN9xQ2wE4yU6iO8pA0sD3fG5h";
+        let key_with_mock_substring = b"api-mock-service-9xK2mB4qR1tV6xZ0";
         assert!(
             !filter
                 .secret_bytes_matcher()
@@ -425,6 +443,80 @@ mod tests {
         assert!(
             filter.secret_bytes_matcher().is_match(b"{{SECRET_TOKEN}}"),
             "double-brace template should match"
+        );
+    }
+
+    #[test]
+    fn secret_bytes_composite_secrets_with_placeholder_segments_not_suppressed() {
+        let filter = SafelistFilter::new();
+        // Composite secrets containing placeholder words as hyphen/dot-separated
+        // segments must NOT be suppressed. Before anchoring, `\b` would fire at
+        // hyphens/dots and match the embedded placeholder word.
+        let cases: &[(&str, &[u8])] = &[
+            ("null segment", b"key-null-safety-9xK2mB"),
+            ("test segment", b"prod-test_key-v2-abc123"),
+            ("changeme segment", b"app-changeme-rotate-7fGh2k"),
+            ("example segment", b"api.example.region-us-3nPq8w"),
+            ("fixme segment", b"svc-fixme-config-2rTy6v"),
+            ("todo segment", b"build-todo-tracker-8mLw4x"),
+            ("hunter2 segment", b"db-hunter2-proxy-5cNj9e"),
+            ("placeholder segment", b"auth-placeholder-init-4bKp7r"),
+            ("fake segment", b"deploy-fake-canary-6wXt3m"),
+            ("dummy segment", b"cache-dummy-warmup-1qRs5d"),
+            ("EXAMPLE in longer key", b"AKIA123456789EXAMPLE_us_east_1"),
+        ];
+
+        for (label, value) in cases {
+            assert!(
+                !filter.secret_bytes_matcher().is_match(value),
+                "composite secret with placeholder segment should NOT be suppressed: {label}"
+            );
+        }
+    }
+
+    // -- Provenance enforcement tests --
+    //
+    // These verify the mapping between SAFELIST_PATTERNS indices and the
+    // SECRET_BYTES_PATTERNS subset stays consistent as patterns evolve.
+
+    /// Indices from `SAFELIST_PATTERNS` that are included in `SECRET_BYTES_PATTERNS`.
+    const SECRET_BYTES_INCLUDED_INDICES: &[usize] = &[0, 1, 2, 5, 6, 7, 9, 13, 14];
+
+    /// Indices from `SAFELIST_PATTERNS` that are excluded from `SECRET_BYTES_PATTERNS`.
+    const SECRET_BYTES_EXCLUDED_INDICES: &[usize] = &[3, 4, 8, 10, 11, 12, 15, 16, 17];
+
+    #[test]
+    fn all_context_patterns_have_secret_bytes_provenance() {
+        let mut all: Vec<usize> = SECRET_BYTES_INCLUDED_INDICES
+            .iter()
+            .chain(SECRET_BYTES_EXCLUDED_INDICES.iter())
+            .copied()
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        let expected: Vec<usize> = (0..SAFELIST_PATTERN_COUNT).collect();
+        assert_eq!(
+            all, expected,
+            "union of included + excluded must cover 0..SAFELIST_PATTERN_COUNT"
+        );
+    }
+
+    #[test]
+    fn secret_bytes_provenance_lists_are_disjoint() {
+        for &idx in SECRET_BYTES_INCLUDED_INDICES {
+            assert!(
+                !SECRET_BYTES_EXCLUDED_INDICES.contains(&idx),
+                "index {idx} appears in both included and excluded lists"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_bytes_included_count_matches_pattern_count() {
+        assert_eq!(
+            SECRET_BYTES_INCLUDED_INDICES.len(),
+            SECRET_BYTES_PATTERN_COUNT,
+            "included indices length must equal SECRET_BYTES_PATTERN_COUNT"
         );
     }
 }
