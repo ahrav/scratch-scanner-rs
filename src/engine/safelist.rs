@@ -132,10 +132,12 @@ const SECRET_BYTES_PATTERN_COUNT: usize = 9;
 ///
 /// # Safety against false suppression
 ///
-/// Pattern 16 ("mock"/"fixture") is deliberately excluded: the 4-character
-/// substring "mock" would match inside real high-entropy API keys. See
-/// TruffleHog #2620 for a real-world incident where over-broad value filtering
-/// suppressed valid AWS credentials.
+/// Pattern 16 ("mock"/"fixture") is deliberately excluded: the short word
+/// "mock" would match at word boundaries in keys containing separators
+/// (e.g., `abc-mock-xyz`), and "fixture"/"__test__" are context-dependent
+/// markers unsuitable for bare-value matching. See TruffleHog #2620 for a
+/// real-world incident where over-broad value filtering suppressed valid
+/// AWS credentials.
 const SECRET_BYTES_PATTERNS: &[&str] = &[
     // [from idx 0] Placeholder markers plus key/token/secret nouns.
     r"(?i)\b(?:placeholder|dummy|fake|sample|example|test)[-_ ]{0,3}(?:key|token|secret|password)\b|\b(?:key|token|secret|password)[-_ ]{0,3}(?:placeholder|dummy|fake|sample|example|test)\b",
