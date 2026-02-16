@@ -2273,6 +2273,88 @@ fn entropy_gate_filters_low_entropy_matches() {
     assert!(hits.iter().any(|h| h.rule == "entropy-gate"));
 }
 
+/// Verify that the entropy gate is evaluated on the *extracted secret*
+/// (via `secret_group`) rather than on the full regex match.
+///
+/// Two sub-cases exercise both sides of the distinction:
+///   (a) Full match has high entropy but the captured secret is all-X → reject.
+///   (b) Full match has low entropy (dominated by repeated A) but the captured
+///       secret is high-entropy alphanumeric → accept.
+///
+/// Both cases would produce wrong results if entropy were evaluated on the
+/// full match instead of the extracted secret.
+#[test]
+fn entropy_gate_evaluated_on_extracted_secret() {
+    let entropy = Some(EntropySpec {
+        min_bits_per_byte: 2.5,
+        min_len: 4,
+        max_len: 64,
+    });
+
+    // --- (a) Reject: full match high entropy, secret zero entropy ----------
+    const ANCHORS_A: &[&[u8]] = &[b"pfx_"];
+    let rule_reject = RuleSpec {
+        name: "ent-on-secret-reject",
+        anchors: ANCHORS_A,
+        radius: 40,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: entropy.clone(),
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"pfx_[a-z0-9]{8}:([X]{8})").unwrap(),
+    };
+
+    // --- (b) Accept: full match low entropy, secret high entropy -----------
+    const ANCHORS_B: &[&[u8]] = &[b"REP_"];
+    let rule_accept = RuleSpec {
+        name: "ent-on-secret-accept",
+        anchors: ANCHORS_B,
+        radius: 40,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: entropy.clone(),
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"REP_[A]{20}_([a-z0-9]{8})").unwrap(),
+    };
+
+    let eng = Engine::new_with_anchor_policy(
+        vec![rule_reject, rule_accept],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // (a) Full match "pfx_a1b2c3d4:XXXXXXXX" (~3.2 bits/byte) passes 2.5,
+    //     but secret "XXXXXXXX" (0 bits/byte) fails → no finding.
+    let hay_reject = b"pfx_a1b2c3d4:XXXXXXXX";
+    let hits = scan_chunk_findings(&eng, hay_reject);
+    assert!(
+        !hits.iter().any(|h| h.rule == "ent-on-secret-reject"),
+        "entropy evaluated on extracted secret should reject zero-entropy secret \
+         even when full match has high entropy"
+    );
+
+    // (b) Full match "REP_AAAA…_x7k9m2p4" (~2.4 bits/byte) fails 2.5,
+    //     but secret "x7k9m2p4" (3.0 bits/byte) passes → finding emitted.
+    let hay_accept = b"REP_AAAAAAAAAAAAAAAAAAAA_x7k9m2p4";
+    let hits = scan_chunk_findings(&eng, hay_accept);
+    assert!(
+        hits.iter().any(|h| h.rule == "ent-on-secret-accept"),
+        "entropy evaluated on extracted secret should accept high-entropy secret \
+         even when full match has low entropy"
+    );
+}
+
 #[test]
 fn offline_validation_gate_pooled_round_trip() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
@@ -3473,26 +3555,28 @@ fn scan_rules_reference(
                     for w in windows {
                         let window = &buf[w.clone()];
                         for caps in rule.re.captures_iter(window) {
-                            let full_match = caps.get(0).expect("group 0 always exists");
+                            let _full_match = caps.get(0).expect("group 0 always exists");
+                            // Extract secret span first so entropy is evaluated
+                            // on the secret itself, not the full match (matches
+                            // production ordering in window_validate.rs).
+                            let (secret_start, secret_end) =
+                                extract_secret_span(&caps, rule.secret_group);
                             if let Some(spec) = rule.entropy.as_ref() {
                                 let ent = EntropyCompiled {
                                     min_bits_per_byte: spec.min_bits_per_byte,
                                     min_len: spec.min_len,
                                     max_len: spec.max_len,
                                 };
-                                let mbytes = &window[full_match.start()..full_match.end()];
+                                let secret_bytes = &window[secret_start..secret_end];
                                 if !entropy_gate_passes(
                                     &ent,
-                                    mbytes,
+                                    secret_bytes,
                                     entropy_scratch,
                                     &engine.entropy_log2,
                                 ) {
                                     continue;
                                 }
                             }
-                            // Extract secret span to match production behavior.
-                            let (secret_start, secret_end) =
-                                extract_secret_span(&caps, rule.secret_group);
                             // Offline validation: suppress structurally invalid
                             // tokens (bad CRC32, etc.) for root-level findings,
                             // matching engine emit-time policy.
@@ -3579,27 +3663,28 @@ fn scan_rules_reference(
                             });
 
                             for caps in rule.re.captures_iter(&decoded) {
-                                let full_match = caps.get(0).expect("group 0 always exists");
+                                let _full_match = caps.get(0).expect("group 0 always exists");
+                                // Extract secret span first so entropy is evaluated
+                                // on the secret itself, not the full match (matches
+                                // production ordering in window_validate.rs).
+                                let (secret_start, secret_end) =
+                                    extract_secret_span(&caps, rule.secret_group);
                                 if let Some(spec) = rule.entropy.as_ref() {
                                     let ent = EntropyCompiled {
                                         min_bits_per_byte: spec.min_bits_per_byte,
                                         min_len: spec.min_len,
                                         max_len: spec.max_len,
                                     };
-                                    let span = full_match.start()..full_match.end();
-                                    let mbytes = &decoded[span];
+                                    let secret_bytes = &decoded[secret_start..secret_end];
                                     if !entropy_gate_passes(
                                         &ent,
-                                        mbytes,
+                                        secret_bytes,
                                         entropy_scratch,
                                         &engine.entropy_log2,
                                     ) {
                                         continue;
                                     }
                                 }
-                                // Extract secret span to match production behavior.
-                                let (secret_start, secret_end) =
-                                    extract_secret_span(&caps, rule.secret_group);
                                 // Offline validation: suppress structurally invalid
                                 // tokens for root-level findings (parent steps empty),
                                 // matching engine emit-time policy.
