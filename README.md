@@ -21,7 +21,7 @@ total configurations, each on an ARM Graviton3 (16 vCPUs, 61 GiB RAM).
 
 ### Speedups vary — a lot
 
-Warm-cache git mode, showing how many times slower each competitor is
+Warm-cache git mode, showing how many times slower each scanner is
 vs scanner-rs:
 
 | Repo        |  vs Kingfisher |  vs TruffleHog |  vs Gitleaks |
@@ -35,7 +35,7 @@ vs scanner-rs:
 | gcc         |           1.9x |          12.4x |        60.0x |
 | jdk         |           1.7x |          18.3x |        16.1x |
 
-The range is wide. Against Kingfisher (our closest competitor), the
+The range is wide. Against Kingfisher (the closest Rust scanner), the
 advantage is 1.3x on Babylon.js and 5.8x on node. Against the Go
 scanners, 6.7x to 60x. The variance matters — it tells us the
 advantage depends on workload characteristics, not a single trick.
@@ -124,7 +124,7 @@ the highest throughput in every configuration we tested.
 ### The memory cost
 
 This is the part we can't hand-wave away. scanner-rs uses substantially
-more RSS than every competitor:
+more RSS than every other scanner:
 
 | Repo        |  scanner-rs |  Kingfisher |  TruffleHog |  Gitleaks |
 | ----------- | ----------: | ----------: | ----------: | --------: |
@@ -145,7 +145,7 @@ on this in [The Memory Tradeoff](#the-memory-tradeoff) below.
 Finding counts diverge wildly across scanners on the same repo — scanner-rs
 reports 98,584 findings on vscode git mode while Gitleaks reports 116.
 scanner-rs's counts are inflated because it currently lacks several
-false-positive reduction filters that competitors ship: entropy gates on
+false-positive reduction filters that other scanners ship: entropy gates on
 rule matches (checking the secret span, not the full match window),
 safelists for known-benign patterns, and confidence scoring. These
 filters are planned but not yet implemented. Once entropy gating and
@@ -264,7 +264,7 @@ This is also the primary driver of the memory cost discussed earlier.
 The cold/warm ratios above hint that scanner-rs handles I/O
 differently. One concrete difference: scanner-rs calls
 `posix_fadvise(POSIX_FADV_SEQUENTIAL)` on every file descriptor and
-`madvise(MADV_SEQUENTIAL)` on every mmap'd region. No competitor does
+`madvise(MADV_SEQUENTIAL)` on every mmap'd region. No other scanner does
 this (verified by searching the Kingfisher, TruffleHog, and Gitleaks
 codebases for `posix_fadvise`, `madvise`, `fadvise`, and `MADV_`).
 
@@ -348,7 +348,7 @@ data told us where our mental models were wrong.
 - **Conditional compilation**: `perf_stats` feature gate enables
   per-operation instrumentation without runtime cost in production
 - **Side-by-side code analysis**: every design decision mapped to
-  competitor code excerpts
+  other scanners' code excerpts
   ([architecture-comparison.md](tools/bench-compare/results/architecture-comparison.md))
 
 ## Design Decisions Summary
