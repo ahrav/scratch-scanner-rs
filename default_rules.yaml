@@ -154,7 +154,7 @@ rules:
   - "test_"
   - "TEST_"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -171,7 +171,7 @@ rules:
   - p8e-
   - P8E-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -220,7 +220,7 @@ rules:
   keywords_any:
   - airtable
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -283,7 +283,7 @@ rules:
   - ltai
   - LTAI
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -300,7 +300,7 @@ rules:
   - alibaba
   - ALIBABA
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -377,7 +377,7 @@ rules:
   - asana
   - ASANA
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 2.5
     min_len: 16
     max_len: 256
   two_phase: null
@@ -485,7 +485,7 @@ rules:
   - authress_
   - AUTHRESS_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -700,7 +700,7 @@ rules:
   - clojars_
   - CLOJARS_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -717,7 +717,7 @@ rules:
   - cloudflare
   - CLOUDFLARE
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -734,7 +734,7 @@ rules:
   - cloudflare
   - CLOUDFLARE
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -751,7 +751,7 @@ rules:
   - cloudflare
   - v1.0-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1021,7 +1021,7 @@ rules:
   - "user:pass"
   - "username:password"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1117,7 +1117,7 @@ rules:
   - dor_v1_
   - DOR_V1_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1163,7 +1163,7 @@ rules:
   - "test_"
   - "TEST_"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1180,7 +1180,7 @@ rules:
   - discord
   - DISCORD
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 2.5
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1226,7 +1226,7 @@ rules:
   - "test_"
   - "TEST_"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1243,7 +1243,7 @@ rules:
   - dp.pt.
   - DP.PT.
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1277,7 +1277,7 @@ rules:
   - dropbox
   - DROPBOX
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 15
     max_len: 256
   two_phase: null
@@ -1294,7 +1294,7 @@ rules:
   - dropbox
   - DROPBOX
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1328,7 +1328,7 @@ rules:
   - duffel_
   - DUFFEL_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1362,7 +1362,7 @@ rules:
   - ezak
   - EZAK
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1379,7 +1379,7 @@ rules:
   - eztk
   - EZTK
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1481,7 +1481,7 @@ rules:
   - finicity
   - FINICITY
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1549,7 +1549,7 @@ rules:
   - flwseck_test
   - FLWSECK_TEST
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1566,7 +1566,7 @@ rules:
   - flwpubk_test
   - FLWPUBK_TEST
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -1583,7 +1583,7 @@ rules:
   - flwseck_test
   - FLWSECK_TEST
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2286,7 +2286,7 @@ rules:
   - "_FAKE"
   - "admin123"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2332,7 +2332,7 @@ rules:
   - "test_"
   - "TEST_"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2367,7 +2367,7 @@ rules:
   - hubspot
   - HUBSPOT
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2382,7 +2382,7 @@ rules:
   keywords_any:
   - hf_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2397,7 +2397,7 @@ rules:
   keywords_any:
   - api_org_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2542,7 +2542,7 @@ rules:
   keywords_any:
   - zxlk
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2590,7 +2590,7 @@ rules:
   - kucoin
   - KUCOIN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2607,7 +2607,7 @@ rules:
   - kucoin
   - KUCOIN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2642,7 +2642,7 @@ rules:
   - LIN_API_
   # Prefix-structured token; skip placeholder suppressors for this strict format.
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2688,7 +2688,7 @@ rules:
   - "test_"
   - "TEST_"
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2713,7 +2713,7 @@ rules:
   - linked-in
   - LINKED-IN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 14
     max_len: 256
   two_phase: null
@@ -2738,7 +2738,7 @@ rules:
   - linked-in
   - LINKED-IN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2759,7 +2759,7 @@ rules:
   - live_
   - LIVE_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2784,7 +2784,7 @@ rules:
   - _pub
   - _PUB
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2835,7 +2835,7 @@ rules:
   - mailchimp
   - MAILCHIMP
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2852,7 +2852,7 @@ rules:
   - mailgun
   - MAILGUN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2869,7 +2869,7 @@ rules:
   - mailgun
   - MAILGUN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2886,7 +2886,7 @@ rules:
   - mailgun
   - MAILGUN
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -2985,7 +2985,7 @@ rules:
   - message_bird
   - MESSAGE_BIRD
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3035,7 +3035,7 @@ rules:
   - nrjs-
   - NRJS-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3126,7 +3126,7 @@ rules:
   - npm_
   - NPM_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3287,7 +3287,7 @@ rules:
   - plaid
   - PLAID
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3402,7 +3402,7 @@ rules:
   keywords_any:
   - pnu_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3454,7 +3454,7 @@ rules:
   keywords_any:
   - pul-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3501,7 +3501,7 @@ rules:
   keywords_any:
   - rdme_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3516,7 +3516,7 @@ rules:
   keywords_any:
   - rubygems_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3531,7 +3531,7 @@ rules:
   keywords_any:
   - tk-us-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3548,7 +3548,7 @@ rules:
   - sendbird
   - SENDBIRD
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3565,7 +3565,7 @@ rules:
   - sendbird
   - SENDBIRD
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3580,7 +3580,7 @@ rules:
   keywords_any:
   - SG.
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3597,7 +3597,7 @@ rules:
   - xkeysib-
   - XKEYSIB-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3706,7 +3706,7 @@ rules:
   keywords_any:
   - shippo_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3721,7 +3721,7 @@ rules:
   keywords_any:
   - shpat_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3736,7 +3736,7 @@ rules:
   keywords_any:
   - shpca_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3751,7 +3751,7 @@ rules:
   keywords_any:
   - shppa_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3766,7 +3766,7 @@ rules:
   keywords_any:
   - shpss_
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3787,7 +3787,7 @@ rules:
   - bundle_gems__contribsys__com
   - BUNDLE_GEMS__CONTRIBSYS__COM
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3808,7 +3808,7 @@ rules:
   - enterprise.contribsys.com
   - ENTERPRISE.CONTRIBSYS.COM
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3825,7 +3825,7 @@ rules:
   - xapp
   - XAPP
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 512
   two_phase: null
@@ -3861,7 +3861,7 @@ rules:
   - xoxe.xoxp-
   - XOXE.XOXP-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3878,7 +3878,7 @@ rules:
   - xoxe-
   - XOXE-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3893,7 +3893,7 @@ rules:
   keywords_any:
   - xoxb
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3910,7 +3910,7 @@ rules:
   - xoxo
   - xoxs
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 512
   two_phase: null
@@ -3927,7 +3927,7 @@ rules:
   - xoxa
   - xoxr
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3944,7 +3944,7 @@ rules:
   - xoxp-
   - xoxe-
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3973,7 +3973,7 @@ rules:
   - snyk
   - SNYK
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -4026,7 +4026,7 @@ rules:
   - eaaa
   - EAAA
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -4043,7 +4043,7 @@ rules:
   - squarespace
   - SQUARESPACE
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
@@ -4068,7 +4068,7 @@ rules:
   - rk_live
   - rk_prod
   entropy:
-    min_bits_per_byte: 2.0
+    min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
   two_phase: null
