@@ -1,6 +1,6 @@
 # scanner-rs
 
-A secret scanner for git repositories and filesystems.
+A secret scanner for git repositories and filesystems (for now).
 
 This started as a question: how much faster can a secret scanner get if
 you design it around the CPU instead of around programmer ergonomics?
