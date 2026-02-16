@@ -24,13 +24,13 @@ CONFIGS_DIR="$SCRIPT_DIR/configs"
 CSV="$RESULTS_DIR/perf_metrics.csv"
 
 # ── Scanner binaries ─────────────────────────────────────────────────
-SCANNER_RS="/local/home/ahrav/scratch/scratch-scanner-rs/target/release/scanner-rs"
-KINGFISHER="/local/home/ahrav/scratch/kingfisher/target/release/kingfisher"
-TRUFFLEHOG_BIN="/local/home/ahrav/scratch/trufflehog/trufflehog"
-GITLEAKS_BIN="/local/home/ahrav/scratch/gitleaks/gitleaks"
+SCANNER_RS="${SCANNER_RS_BIN:-$SCRIPT_DIR/../../target/release/scanner-rs}"
+KINGFISHER="${KINGFISHER_BIN:-/local/home/ahrav/scratch/kingfisher/target/release/kingfisher}"
+TRUFFLEHOG_BIN="${TRUFFLEHOG_BIN:-/local/home/ahrav/scratch/trufflehog/trufflehog}"
+GITLEAKS_BIN="${GITLEAKS_BIN:-/local/home/ahrav/scratch/gitleaks/gitleaks}"
 
 # ── Repo ─────────────────────────────────────────────────────────────
-REPO_BASE="/local/home/ahrav/scratch"
+REPO_BASE="${BENCHMARK_REPO_BASE:-/local/home/ahrav/scratch}"
 REPO="vscode"
 REPO_PATH="$REPO_BASE/$REPO"
 

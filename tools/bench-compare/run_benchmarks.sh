@@ -18,13 +18,13 @@ CONFIGS_DIR="$SCRIPT_DIR/configs"
 CSV="$RESULTS_DIR/metrics.csv"
 
 # ── Scanner binaries ─────────────────────────────────────────────────
-SCANNER_RS="/local/home/ahrav/scratch/scratch-scanner-rs/target/release/scanner-rs"
-KINGFISHER="/local/home/ahrav/scratch/kingfisher/target/release/kingfisher"
-TRUFFLEHOG_BIN="/local/home/ahrav/scratch/trufflehog/trufflehog"
-GITLEAKS_BIN="/local/home/ahrav/scratch/gitleaks/gitleaks"
+SCANNER_RS="${SCANNER_RS_BIN:-$SCRIPT_DIR/../../target/release/scanner-rs}"
+KINGFISHER="${KINGFISHER_BIN:-/local/home/ahrav/scratch/kingfisher/target/release/kingfisher}"
+TRUFFLEHOG_BIN="${TRUFFLEHOG_BIN:-/local/home/ahrav/scratch/trufflehog/trufflehog}"
+GITLEAKS_BIN="${GITLEAKS_BIN:-/local/home/ahrav/scratch/gitleaks/gitleaks}"
 
 # ── Repos ────────────────────────────────────────────────────────────
-REPO_BASE="/local/home/ahrav/scratch"
+REPO_BASE="${BENCHMARK_REPO_BASE:-/local/home/ahrav/scratch}"
 ALL_REPOS=(node vscode linux rocksdb tensorflow Babylon.js gcc jdk)
 SMOKE_REPOS=(rocksdb)
 
@@ -82,10 +82,10 @@ capture_environment() {
         go version 2>/dev/null || echo "go: not found"
         echo ""
         echo "--- Scanner versions ---"
-        echo "scanner-rs: $(cd /local/home/ahrav/scratch/scratch-scanner-rs && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-        echo "kingfisher: $(cd /local/home/ahrav/scratch/kingfisher && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-        echo "trufflehog: $(cd /local/home/ahrav/scratch/trufflehog && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-        echo "gitleaks:   $(cd /local/home/ahrav/scratch/gitleaks && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+        echo "scanner-rs: $(cd "$(dirname "$SCANNER_RS")/../.." && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+        echo "kingfisher: $(cd "$(dirname "$KINGFISHER")/../.." && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+        echo "trufflehog: $(cd "$(dirname "$TRUFFLEHOG_BIN")/.." && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+        echo "gitleaks:   $(cd "$(dirname "$GITLEAKS_BIN")/.." && git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
     } > "$env_file"
     echo "Environment captured → $env_file"
 }
@@ -113,7 +113,11 @@ count_findings() {
     case "$scanner" in
         scanner-rs)
             # Count lines with "type":"finding" or "type": "finding"
-            grep -c '"type"[[:space:]]*:[[:space:]]*"finding"' "$output_file" 2>/dev/null || echo 0
+            # Use a variable to avoid grep -c (exit 1 on zero matches) + || echo 0
+            # producing "0\n0" and corrupting the CSV.
+            local n
+            n=$(grep -c '"type"[[:space:]]*:[[:space:]]*"finding"' "$output_file" 2>/dev/null) || true
+            echo "${n:-0}"
             ;;
         kingfisher)
             # JSON objects, one per line
@@ -359,7 +363,7 @@ for repo in "${REPOS[@]}"; do
                     run_scanner "$scanner" "$REPO_PATH" "$mode" || true
                     # Remove warmup artifacts + the CSV row it appended
                     rm -f "$RAW_DIR/$scanner/"*__warmup__* 2>/dev/null
-                    sed -i '/__warmup__/d' "$CSV" 2>/dev/null
+                    sed -i.bak '/__warmup__/d' "$CSV" 2>/dev/null && rm -f "$CSV.bak"
                     CURRENT_CACHE="$cache"
                 fi
 
