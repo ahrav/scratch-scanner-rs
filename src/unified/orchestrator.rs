@@ -1303,7 +1303,7 @@ fn load_rules_for_scan(rules_file: Option<&Path>) -> Vec<RuleSpec> {
         RuleSource::BuiltInFallback => {
             let rules = demo_rules();
             let built_in_hash = crate::rules::builtin_rules_hash64();
-            eprintln!("warning: no usable default_rules.yaml found; using compiled-in fallback");
+            eprintln!("info: no default_rules.yaml next to binary; using compiled-in rules");
             eprintln!(
                 "info: using compiled-in rule set ({} rules, source: {}, rule_hash: {built_in_hash:016x})",
                 rules.len(),
