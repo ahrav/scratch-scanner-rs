@@ -51,7 +51,9 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 9] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
   ↓
-[Gate 10] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+[Gate 10] Apply secret-bytes safelist suppression (all findings, including decoded)
+  ↓
+[Gate 11] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -239,8 +241,11 @@ They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
 ### 7. Emit-Time Safelist Suppression
 
-Before recording a finding, emit paths run a safelist check only when the
-finding's `step_id == STEP_ROOT`, using the root-context slice derived from
+Emit-time safelist operates in two tiers:
+
+**Tier 1 — Context-window safelist** (root findings only): Before recording a
+finding, emit paths run a safelist check only when the finding's
+`step_id == STEP_ROOT`, using the root-context slice derived from
 `root_hint_start..root_hint_end`.
 
 - Step-root findings matching safelist patterns are suppressed immediately.
@@ -249,6 +254,20 @@ finding's `step_id == STEP_ROOT`, using the root-context slice derived from
 - Root-semantic UTF-16 findings carry a `Utf16Window` step as their own
   `step_id`, so they bypass safelist but still participate in offline
   validation via their parent step.
+
+**Tier 2 — Secret-bytes safelist** (all findings): After the context-window
+check, the extracted secret bytes are matched against a curated 9-pattern
+subset of the safelist. This tier runs on **all** findings, including
+decoded/transform-derived values, because placeholder values like `"hunter2"`,
+`"0123456789"`, or base64 example literals are equally fake regardless of
+their encoding layer. Patterns for known placeholder values use `^...$`
+anchoring instead of `\b` word boundaries, preventing false suppression of
+composite secrets that contain placeholder words as hyphen- or dot-separated
+segments (e.g., `key-null-safety-9xK2mB`).
+
+- Suppressed findings increment `ScanScratch::secret_bytes_safelist_suppressed`.
+- Context-anchored patterns and short substrings (e.g., "mock") that risk
+  false suppression of real secrets are excluded from this tier.
 
 ### 8. Offline Structural Validation
 
@@ -665,4 +684,4 @@ Findings are written to scratch buffers (not directly to materialized results) b
 6. All early returns occur before findings are recorded
 7. Findings are appended or replaced in-place for dedupe preference (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Root safelist suppression, offline structural validation, and cap checks are applied before finding insertion
+9. Root safelist suppression, secret-bytes safelist suppression, offline structural validation, and cap checks are applied before finding insertion

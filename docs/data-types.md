@@ -77,6 +77,7 @@ classDiagram
     class SafelistFilter {
         +new() SafelistFilter
         +matcher() RegexSet
+        +secret_bytes_matcher() RegexSet
     }
 
     class Target {
@@ -133,6 +134,7 @@ classDiagram
         -usize work_head
         -DecodeSlab slab
         -usize offline_suppressed
+        -usize secret_bytes_safelist_suppressed
         -FixedSet128 seen_findings_scan
         -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
@@ -303,7 +305,7 @@ classDiagram
   suppressed finding is never inserted, so `findings`, `norm_hashes`, and
   `drop_hint_end` stay aligned 1:1 without a post-scan compaction pass.
 - Offline validation runs inline at finding emission time in `window_validate`
-  as Gate 10. Each root-semantic finding (parent `step_id == STEP_ROOT`) whose
+  as Gate 11. Each root-semantic finding (parent `step_id == STEP_ROOT`) whose
   rule has an `OfflineValidationSpec` gate is checked against the extracted
   secret bytes. `Valid` and `Indeterminate` verdicts keep the finding;
   `Invalid` suppresses it before the finding occupies a cap slot. Non-root
