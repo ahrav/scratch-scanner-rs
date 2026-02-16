@@ -855,4 +855,24 @@ mod tests {
             assert_eq!(mapped, expected, "decoded_offset={decoded_offset}");
         }
     }
+
+    // Sidekiq secrets are `[a-f0-9]{8}:[a-f0-9]{8}` (17 bytes). The embedded
+    // colon and short length make Shannon entropy noisy — random hex pairs can
+    // dip below 3.0 bits/byte. The gate is set to 2.5 to avoid false negatives.
+    #[test]
+    fn sidekiq_hex_pair_entropy_above_gate() {
+        let secret = b"76609006:7d494d19";
+        let table = build_log2_table(secret.len());
+        let mut scratch = EntropyScratch::new();
+        let e = shannon_entropy_bits_per_byte(secret, &mut scratch, &table);
+        // Should pass the 2.5 gate but would fail a 3.0 gate.
+        assert!(
+            e >= 2.5,
+            "sidekiq hex-pair secret has entropy {e:.3} bits/byte, below the 2.5 gate"
+        );
+        assert!(
+            e < 3.0,
+            "expected entropy below 3.0 for this hex-pair, got {e:.3}"
+        );
+    }
 }

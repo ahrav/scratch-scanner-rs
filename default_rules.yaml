@@ -3787,7 +3787,7 @@ rules:
   - bundle_gems__contribsys__com
   - BUNDLE_GEMS__CONTRIBSYS__COM
   entropy:
-    min_bits_per_byte: 3.0
+    min_bits_per_byte: 2.5
     min_len: 16
     max_len: 256
   two_phase: null
@@ -3808,7 +3808,7 @@ rules:
   - enterprise.contribsys.com
   - ENTERPRISE.CONTRIBSYS.COM
   entropy:
-    min_bits_per_byte: 3.0
+    min_bits_per_byte: 2.5
     min_len: 16
     max_len: 256
   two_phase: null
