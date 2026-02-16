@@ -2344,7 +2344,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
          even when full match has high entropy"
     );
 
-    // (b) Full match "REP_AAAA…_x7k9m2p4" (~2.4 bits/byte) fails 2.5,
+    // (b) Full match "REP_AAAA…_x7k9m2p4" (below 2.5 bits/byte) fails 2.5,
     //     but secret "x7k9m2p4" (3.0 bits/byte) passes → finding emitted.
     let hay_accept = b"REP_AAAAAAAAAAAAAAAAAAAA_x7k9m2p4";
     let hits = scan_chunk_findings(&eng, hay_accept);
@@ -3555,7 +3555,6 @@ fn scan_rules_reference(
                     for w in windows {
                         let window = &buf[w.clone()];
                         for caps in rule.re.captures_iter(window) {
-                            let _full_match = caps.get(0).expect("group 0 always exists");
                             // Extract secret span first so entropy is evaluated
                             // on the secret itself, not the full match (matches
                             // production ordering in window_validate.rs).
@@ -3663,7 +3662,6 @@ fn scan_rules_reference(
                             });
 
                             for caps in rule.re.captures_iter(&decoded) {
-                                let _full_match = caps.get(0).expect("group 0 always exists");
                                 // Extract secret span first so entropy is evaluated
                                 // on the secret itself, not the full match (matches
                                 // production ordering in window_validate.rs).
