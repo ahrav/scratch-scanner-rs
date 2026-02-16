@@ -584,8 +584,8 @@ impl TreeDiffWalker {
     ///
     /// Implements the four-way kind matrix:
     /// - **tree / tree**: recurse if OIDs differ, skip if identical.
-    /// - **non-tree / tree**: emit the new blob as `Add`.
-    /// - **tree / non-tree**: treat new subtree as entirely added.
+    /// - **non-tree / tree**: treat new subtree as entirely added.
+    /// - **tree / non-tree**: emit the new blob as `Add`.
     /// - **non-tree / non-tree**: emit `Modify` if OIDs differ, skip if equal.
     ///
     /// Gitlinks on either side are handled implicitly: a gitlink-to-blob
