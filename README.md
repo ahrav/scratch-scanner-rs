@@ -21,7 +21,7 @@ total configurations, each on an ARM Graviton3 (16 vCPUs, 61 GiB RAM).
 
 ### Speedups vary — a lot
 
-![Speedup vs other scanners](docs/assets/charts/speedup.svg)
+![Scan time comparison](docs/assets/charts/scan-time.svg)
 
 Warm-cache git mode, showing how many times slower each scanner is
 vs scanner-rs:

@@ -103,29 +103,65 @@ def _grouped_horizontal_bar(ax, repos, scanners, data, colors, xlabel,
     )
 
 
-# ── Chart 1: Speedup ───────────────────────────────────────────────
+# ── Chart 1: Scan time (wall clock) ─────────────────────────────────
+# Warm-cache git mode wall_time_s from metrics.csv.
 
-SPEEDUP_REPOS = ["node", "vscode", "linux", "rocksdb",
-                 "tensorflow", "Babylon.js", "gcc", "jdk"]
-SPEEDUP_DATA = {
-    "Kingfisher":  [5.8, 2.3, 2.3, 2.3, 2.4, 1.3, 1.9, 1.7],
-    "TruffleHog":  [35.6, 13.1, 10.6, 10.8, 16.0, 11.6, 12.4, 18.3],
-    "Gitleaks":    [30.0, 8.3, 7.8, 6.7, 10.5, 11.1, 60.0, 16.1],
+SCAN_TIME_REPOS = ["node", "vscode", "linux", "rocksdb",
+                   "tensorflow", "Babylon.js", "gcc", "jdk"]
+SCAN_TIME_DATA = {
+    "scanner-rs":  [13.30, 13.65, 158.05, 3.14, 20.98, 10.93, 145.47, 19.83],
+    "Kingfisher":  [76.93, 31.06, 357.49, 7.22, 50.66, 14.56, 273.78, 33.77],
+    "TruffleHog":  [474.02, 178.53, 1677.49, 33.83, 335.66, 127.17, 1804.12, 363.65],
+    "Gitleaks":    [399.08, 113.66, 1227.29, 21.03, 219.70, 121.00, 8721.00, 319.49],
 }
 
 
-def make_speedup_chart():
+def _fmt_duration(secs):
+    """Format seconds as a human-readable duration."""
+    if secs >= 60:
+        m, s = divmod(secs, 60)
+        return f"{int(m)}m {s:.0f}s"
+    return f"{secs:.1f}s"
+
+
+def make_scan_time_chart():
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    fig.subplots_adjust(left=0.14, right=0.88, top=0.95, bottom=0.12)
-    scanners = ["Kingfisher", "TruffleHog", "Gitleaks"]
-    colors = {s: SCANNER_COLORS[s] for s in scanners}
-    _grouped_horizontal_bar(
-        ax, SPEEDUP_REPOS, scanners, SPEEDUP_DATA, colors,
-        xlabel="Times slower than scanner-rs",
-        log_scale=True,
-        value_fmt="{:.1f}x",
-    )
+    fig.subplots_adjust(left=0.14, right=0.86, top=0.95, bottom=0.12)
+    scanners = ["scanner-rs", "Kingfisher", "TruffleHog", "Gitleaks"]
+
+    n_repos = len(SCAN_TIME_REPOS)
+    n_scanners = len(scanners)
+    bar_height = 0.7 / n_scanners
+    y_positions = np.arange(n_repos)
+
+    for i, scanner in enumerate(scanners):
+        offset = (i - n_scanners / 2 + 0.5) * bar_height
+        vals = SCAN_TIME_DATA[scanner]
+        bars = ax.barh(
+            y_positions + offset,
+            vals,
+            height=bar_height,
+            color=SCANNER_COLORS[scanner],
+            label=scanner,
+            edgecolor="white",
+            linewidth=0.3,
+        )
+        for bar, val in zip(bars, vals):
+            ax.text(
+                bar.get_width(), bar.get_y() + bar.get_height() / 2,
+                f"  {_fmt_duration(val)}", va="center", ha="left",
+                fontsize=7, fontfamily="sans-serif", color="#444444",
+            )
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(SCAN_TIME_REPOS, fontfamily="sans-serif")
+    ax.invert_yaxis()
+    _apply_style(ax, "Wall-clock time (seconds, log scale)", log_scale=True)
     ax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%g"))
+    ax.legend(
+        fontsize=8, frameon=True, framealpha=0.9, edgecolor="#cccccc",
+        loc="lower right",
+    )
     return fig
 
 
@@ -247,7 +283,7 @@ def make_memory_chart():
 # ── Main ────────────────────────────────────────────────────────────
 
 CHARTS = [
-    ("speedup.svg",         make_speedup_chart),
+    ("scan-time.svg",       make_scan_time_chart),
     ("cold-warm-ratio.svg", make_cold_warm_chart),
     ("throughput.svg",      make_throughput_chart),
     ("memory-rss.svg",      make_memory_chart),
