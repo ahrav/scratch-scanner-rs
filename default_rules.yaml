@@ -107,7 +107,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -184,7 +187,10 @@ rules:
   keywords_any:
   - age-secret-key-1
   - AGE-SECRET-KEY-1
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -198,7 +204,10 @@ rules:
   keywords_any:
   - airtable
   - AIRTABLE
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -210,7 +219,10 @@ rules:
   must_contain: null
   keywords_any:
   - airtable
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -253,7 +265,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -299,7 +314,10 @@ rules:
   must_contain: null
   keywords_any:
   - sk-ant-admin01
-  entropy: null
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -311,7 +329,10 @@ rules:
   must_contain: null
   keywords_any:
   - sk-ant-api03
-  entropy: null
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -355,7 +376,10 @@ rules:
   keywords_any:
   - asana
   - ASANA
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -369,7 +393,10 @@ rules:
   keywords_any:
   - asana
   - ASANA
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -555,7 +582,10 @@ rules:
   keywords_any:
   - beamer
   - BEAMER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -569,7 +599,10 @@ rules:
   keywords_any:
   - bitbucket
   - BITBUCKET
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -583,7 +616,10 @@ rules:
   keywords_any:
   - bitbucket
   - BITBUCKET
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -597,7 +633,10 @@ rules:
   keywords_any:
   - bittrex
   - BITTREX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -611,7 +650,10 @@ rules:
   keywords_any:
   - bittrex
   - BITTREX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -725,7 +767,10 @@ rules:
   keywords_any:
   - codecov
   - CODECOV
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -758,7 +803,10 @@ rules:
   keywords_any:
   - coinbase
   - COINBASE
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -801,7 +849,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -844,7 +895,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -858,7 +912,10 @@ rules:
   keywords_any:
   - contentful
   - CONTENTFUL
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -995,7 +1052,10 @@ rules:
   keywords_any:
   - datadog
   - DATADOG
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1009,7 +1069,10 @@ rules:
   keywords_any:
   - dnkey
   - DNKEY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1053,7 +1116,10 @@ rules:
   keywords_any:
   - dor_v1_
   - DOR_V1_
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1096,7 +1162,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1190,7 +1259,10 @@ rules:
   keywords_any:
   - droneci
   - DRONECI
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1204,7 +1276,10 @@ rules:
   keywords_any:
   - dropbox
   - DROPBOX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 15
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1218,7 +1293,10 @@ rules:
   keywords_any:
   - dropbox
   - DROPBOX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1232,7 +1310,10 @@ rules:
   keywords_any:
   - dropbox
   - DROPBOX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1382,7 +1463,10 @@ rules:
   keywords_any:
   - fastly
   - FASTLY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1396,7 +1480,10 @@ rules:
   keywords_any:
   - finicity
   - FINICITY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1410,7 +1497,10 @@ rules:
   keywords_any:
   - finicity
   - FINICITY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1424,7 +1514,10 @@ rules:
   keywords_any:
   - finnhub
   - FINNHUB
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1438,7 +1531,10 @@ rules:
   keywords_any:
   - flickr
   - FLICKR
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1522,7 +1618,10 @@ rules:
   keywords_any:
   - fio-u-
   - FIO-U-
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1536,7 +1635,10 @@ rules:
   keywords_any:
   - secret_key
   - SECRET_KEY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -1550,7 +1652,10 @@ rules:
   keywords_any:
   - freshbooks
   - FRESHBOOKS
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2016,7 +2121,10 @@ rules:
   keywords_any:
   - gitter
   - GITTER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2034,7 +2142,10 @@ rules:
   - LIVE_
   - gocardless
   - GOCARDLESS
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2101,7 +2212,10 @@ rules:
   keywords_any:
   - pat.
   - sat.
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2217,7 +2331,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2249,7 +2366,10 @@ rules:
   keywords_any:
   - hubspot
   - HUBSPOT
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2308,7 +2428,10 @@ rules:
   keywords_any:
   - intercom
   - INTERCOM
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2359,7 +2482,10 @@ rules:
   - BINTRAY
   - xray
   - XRAY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2385,7 +2511,10 @@ rules:
   - BINTRAY
   - xray
   - XRAY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2429,7 +2558,10 @@ rules:
   keywords_any:
   - kraken
   - KRAKEN
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2457,7 +2589,10 @@ rules:
   keywords_any:
   - kucoin
   - KUCOIN
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2471,7 +2606,10 @@ rules:
   keywords_any:
   - kucoin
   - KUCOIN
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2485,7 +2623,10 @@ rules:
   keywords_any:
   - launchdarkly
   - LAUNCHDARKLY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2573,7 +2714,7 @@ rules:
   - LINKED-IN
   entropy:
     min_bits_per_byte: 2.0
-    min_len: 16
+    min_len: 14
     max_len: 256
   two_phase: null
   local_context: null
@@ -2617,7 +2758,10 @@ rules:
   - TEST_
   - live_
   - LIVE_
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2639,7 +2783,10 @@ rules:
   - LIVE_PUB
   - _pub
   - _PUB
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2653,7 +2800,10 @@ rules:
   keywords_any:
   - looker
   - LOOKER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2667,7 +2817,10 @@ rules:
   keywords_any:
   - looker
   - LOOKER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2681,7 +2834,10 @@ rules:
   keywords_any:
   - mailchimp
   - MAILCHIMP
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2695,7 +2851,10 @@ rules:
   keywords_any:
   - mailgun
   - MAILGUN
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2709,7 +2868,10 @@ rules:
   keywords_any:
   - mailgun
   - MAILGUN
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2723,7 +2885,10 @@ rules:
   keywords_any:
   - mailgun
   - MAILGUN
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2737,7 +2902,10 @@ rules:
   keywords_any:
   - mapbox
   - MAPBOX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2751,7 +2919,10 @@ rules:
   keywords_any:
   - mattermost
   - MATTERMOST
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2788,7 +2959,10 @@ rules:
   - MESSAGE-BIRD
   - message_bird
   - MESSAGE_BIRD
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2810,7 +2984,10 @@ rules:
   - MESSAGE-BIRD
   - message_bird
   - MESSAGE_BIRD
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2840,7 +3017,10 @@ rules:
   keywords_any:
   - netlify
   - NETLIFY
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2854,7 +3034,10 @@ rules:
   keywords_any:
   - nrjs-
   - NRJS-
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2868,7 +3051,10 @@ rules:
   keywords_any:
   - nrii-
   - NRII-
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2890,7 +3076,10 @@ rules:
   - NEWRELIC
   - new_relic
   - NEW_RELIC
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2904,7 +3093,10 @@ rules:
   keywords_any:
   - nrak
   - NRAK
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -2980,7 +3172,10 @@ rules:
   - NEW-YORK-TIMES
   - newyorktimes
   - NEWYORKTIMES
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3091,7 +3286,10 @@ rules:
   keywords_any:
   - plaid
   - PLAID
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3287,7 +3485,10 @@ rules:
   keywords_any:
   - rapidapi
   - RAPIDAPI
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3346,7 +3547,10 @@ rules:
   keywords_any:
   - sendbird
   - SENDBIRD
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3360,7 +3564,10 @@ rules:
   keywords_any:
   - sendbird
   - SENDBIRD
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3579,7 +3786,10 @@ rules:
   - BUNDLE_ENTERPRISE__CONTRIBSYS__COM
   - bundle_gems__contribsys__com
   - BUNDLE_GEMS__CONTRIBSYS__COM
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3597,7 +3807,10 @@ rules:
   - GEMS.CONTRIBSYS.COM
   - enterprise.contribsys.com
   - ENTERPRISE.CONTRIBSYS.COM
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3759,7 +3972,10 @@ rules:
   keywords_any:
   - snyk
   - SNYK
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3773,7 +3989,10 @@ rules:
   keywords_any:
   - sonar
   - SONAR
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: 2
@@ -3823,7 +4042,10 @@ rules:
   keywords_any:
   - squarespace
   - SQUARESPACE
-  entropy: null
+  entropy:
+    min_bits_per_byte: 2.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3864,7 +4086,7 @@ rules:
   - SUMO
   entropy:
     min_bits_per_byte: 3.0
-    min_len: 16
+    min_len: 14
     max_len: 256
   two_phase: null
   local_context: null
@@ -3896,7 +4118,10 @@ rules:
   keywords_any:
   - telegr
   - TELEGR
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3910,7 +4135,10 @@ rules:
   keywords_any:
   - travis
   - TRAVIS
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3960,7 +4188,10 @@ rules:
   keywords_any:
   - twitch
   - TWITCH
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3974,7 +4205,10 @@ rules:
   keywords_any:
   - twitter
   - TWITTER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -3988,7 +4222,10 @@ rules:
   keywords_any:
   - twitter
   - TWITTER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4002,7 +4239,10 @@ rules:
   keywords_any:
   - twitter
   - TWITTER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4016,7 +4256,10 @@ rules:
   keywords_any:
   - twitter
   - TWITTER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4030,7 +4273,10 @@ rules:
   keywords_any:
   - twitter
   - TWITTER
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4044,7 +4290,10 @@ rules:
   keywords_any:
   - tfp_
   - TFP_
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4111,7 +4360,10 @@ rules:
   keywords_any:
   - yandex
   - YANDEX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4125,7 +4377,10 @@ rules:
   keywords_any:
   - yandex
   - YANDEX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4139,7 +4394,10 @@ rules:
   keywords_any:
   - yandex
   - YANDEX
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
@@ -4182,7 +4440,10 @@ rules:
   - "FAKE_"
   - "test_"
   - "TEST_"
-  entropy: null
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
   two_phase: null
   local_context: null
   secret_group: null
