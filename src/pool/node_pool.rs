@@ -29,8 +29,8 @@ use crate::stdx::DynamicBitSet;
 /// Fixed-size node memory pool.
 ///
 /// Implementations must return properly aligned raw storage and enforce that
-/// each acquired node is released exactly once. The API is intentionally
-/// fail-fast: exhaustion or double-free is treated as a fatal bug.
+/// each acquired node is released exactly once. Exhaustion panics
+/// unconditionally; double-free is caught by `debug_assert` only.
 pub trait NodePool {
     /// Node size in bytes. Must be power of two and multiple of `NODE_ALIGNMENT`.
     const NODE_SIZE: usize;
@@ -43,8 +43,8 @@ pub trait NodePool {
 
 /// Pre-allocated node pool backed by a contiguous buffer and bitset.
 ///
-/// The bitset tracks free slots (set bit = available), enabling O(1)
-/// first-fit allocation via "find first set". `drop` panics if any nodes
+/// The bitset tracks free slots (set bit = available), enabling O(N/64)
+/// first-fit allocation via linear scan for the first set bit. `drop` panics if any nodes
 /// weren't released, providing leak detection during development.
 pub struct NodePoolType<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> {
     buffer: NonNull<u8>,

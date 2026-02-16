@@ -41,7 +41,8 @@
 //! due to cache-line bouncing. Counters are cache-padded to reduce false sharing.
 //!
 //! This module is intended for debugging and benchmarking, not production use.
-//! Feature-gate it with `#[cfg(feature = "alloc-tracking")]`.
+//! It is compiled unconditionally; callers opt in by setting the
+//! `CountingAllocator` as the global allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -408,7 +409,7 @@ fn update_peak(current: u64) {
 // This implementation delegates to `System` which upholds these invariants.
 // The atomic counter operations are safe because:
 // - All counters use relaxed ordering (no synchronization guarantees needed)
-// - Counter updates are performed after successful allocation/before deallocation
+// - Counter updates are performed after successful allocation/after deallocation
 // - Wrapping/overflow is handled gracefully (counters are monotonic or approximate)
 //
 // # Why No `# Safety` on Methods?

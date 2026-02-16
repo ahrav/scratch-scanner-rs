@@ -36,9 +36,10 @@
 //!
 //! - **String types**: length-prefixed content is appended to the output
 //!   buffer, one line per string.
-//! - **Fixed-size types** (`int`, `float`, `complex`, `ref`, etc.): skipped
-//!   by their known byte sizes.
-//! - **Container types** (`tuple`, `list`, `set`, `dict`): we skip only the
+//! - **Fixed-size types** (`int`, `ref`, `True`, `False`, etc.): skipped
+//!   by their known byte sizes. Note: `float` and `complex` are variable-length
+//!   (length-prefixed) and handled separately.
+//! - **Container types** (`tuple`, `list`, `set`, `frozenset`, `dict`): we skip only the
 //!   element-count prefix; the contained objects follow inline and will be
 //!   picked up by subsequent iterations. Dict key/value pairs are terminated
 //!   by `TYPE_NULL` (`'0'`), which we treat as a zero-size sentinel.

@@ -52,7 +52,7 @@ pub enum IdxError {
     },
     /// Large offset index out of bounds.
     LargeOffsetOutOfBounds { index: u32, count: u32 },
-    /// Computed object count inconsistent with file size.
+    /// Fanout-derived object count inconsistent with computed count from section sizes.
     ObjectCountMismatch {
         fanout_count: u32,
         computed_count: u32,
@@ -280,7 +280,7 @@ impl<'a> IdxView<'a> {
     /// Returns the OID bytes at the given index.
     ///
     /// # Panics
-    /// Panics in debug builds if `idx` is out of range.
+    /// Panics if `idx` is out of range (debug_assert on index; slice bounds in all builds).
     #[inline]
     pub fn oid_at(&self, idx: u32) -> &[u8] {
         debug_assert!(idx < self.object_count, "OID index out of bounds");
@@ -295,7 +295,8 @@ impl<'a> IdxView<'a> {
     /// offset table. Offsets are raw pack offsets (not validated).
     ///
     /// # Errors
-    /// Returns `LargeOffsetOutOfBounds` if the large offset indirection is invalid.
+    /// Returns `LargeOffsetOutOfBounds` if the large offset indirection is invalid,
+    /// or `Corrupt` if the large offset flag is set but no large offset table exists.
     pub fn offset_at(&self, idx: u32) -> Result<u64, IdxError> {
         debug_assert!(idx < self.object_count, "offset index out of bounds");
 
@@ -388,7 +389,7 @@ impl<'a> IdxView<'a> {
 
 /// Iterator over OIDs in a pack index.
 ///
-/// Yields OID byte slices in lexicographic order (pre-sorted by Git).
+/// Yields `(oid_bytes, index)` tuples in lexicographic order (pre-sorted by Git).
 #[derive(Debug, Clone)]
 pub struct IdxOidIter<'a> {
     oid_table: &'a [u8],

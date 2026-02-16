@@ -11,8 +11,8 @@
 //!
 //! # Complexity
 //! - `find_oid` is `O(log N)` via fanout-bucketed binary search.
-//! - `find_oid_sorted` is `O(k)` over the traversed fanout bucket with
-//!   galloping search, reusing a cursor for sorted input.
+//! - `find_oid_sorted` is `O(k log(N/k))` via galloping search over
+//!   fanout-bucketed ranges, reusing a cursor for sorted input.
 //! - `offset_at` is `O(1)` and may follow a LOFF indirection.
 
 use std::collections::HashSet;
@@ -239,7 +239,7 @@ impl<'a> MidxView<'a> {
     /// Returns the OID bytes at the given OIDL index.
     ///
     /// # Panics
-    /// Panics in debug builds if `idx` is out of range.
+    /// Panics if `idx` is out of range (debug_assert on index; slice bounds in all builds).
     #[inline]
     pub fn oid_at(&self, idx: u32) -> &[u8] {
         debug_assert!(idx < self.object_count, "OID index out of bounds");
@@ -255,7 +255,8 @@ impl<'a> MidxView<'a> {
     /// is resolved.
     ///
     /// # Errors
-    /// Returns `LoffIndexOutOfBounds` if the LOFF indirection is invalid.
+    /// Returns `LoffIndexOutOfBounds` if the LOFF indirection is invalid,
+    /// or `PackPosOutOfBounds` if the pack position exceeds the pack count.
     pub fn offset_at(&self, idx: u32) -> Result<(u16, u64), MidxError> {
         debug_assert!(idx < self.object_count, "offset index out of bounds");
 

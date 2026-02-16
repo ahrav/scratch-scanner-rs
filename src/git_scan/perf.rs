@@ -3,8 +3,8 @@
 //! When enabled, counters cover pack decode/scan, mapping, and tree-load
 //! operations to isolate bottlenecks in commit-walk pipelines.
 //!
-//! Enable with the `git-perf` feature. When disabled, all functions are
-//! no-ops and counters return zeroed snapshots.
+//! Enable with the `git-perf` feature. When disabled, counter functions
+//! are either no-ops or compiled out entirely, and snapshots return zeroed values.
 //!
 //! Counters use relaxed atomics for low overhead; snapshots are best-effort
 //! and intended for coarse diagnostics rather than exact accounting.
@@ -98,7 +98,7 @@ pub struct GitPerfStats {
     pub scan_transform_nanos: u64,
     /// Wall-clock nanoseconds in per-blob `sort_unstable()` + `dedup()`.
     pub scan_sort_dedup_nanos: u64,
-    /// Wall-clock nanoseconds in `scratch.reset_for_scan()`.
+    /// Wall-clock nanoseconds in scratch reset (`reset_for_scan` / `reset_for_scan_after_prefilter`).
     pub scan_reset_nanos: u64,
     /// Total blobs scanned via `scan_blob_chunked_with_chunker`.
     pub scan_blob_count: u64,

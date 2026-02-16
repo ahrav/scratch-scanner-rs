@@ -200,9 +200,10 @@ impl ByteBudget {
 ///
 /// # Thread Safety
 ///
-/// `BytePermit` is `Send` but not `Sync`. You can move it to another thread,
-/// but you cannot share references across threads. This is the intended design:
-/// a permit represents exclusive ownership of budget capacity.
+/// `BytePermit` is both `Send` and `Sync` (all fields are `Sync`).
+/// You can move it to another thread or share references.
+/// In practice, a permit represents exclusive ownership of budget capacity,
+/// so sharing is unusual.
 ///
 /// # Ownership Transfer
 ///
@@ -400,8 +401,8 @@ impl TokenBudget {
 ///
 /// # Thread Safety
 ///
-/// `TokenPermit` is `Send` but not `Sync`, mirroring `BytePermit` semantics.
-/// Move the permit to transfer ownership; don't share references.
+/// `TokenPermit` is both `Send` and `Sync`, mirroring `BytePermit` semantics.
+/// In practice, move the permit to transfer ownership.
 #[derive(Debug)]
 pub struct TokenPermit<'a> {
     budget: &'a TokenBudget,

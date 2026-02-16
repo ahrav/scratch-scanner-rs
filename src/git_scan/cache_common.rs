@@ -320,7 +320,10 @@ impl<S: CacheSlot> SetAssociativeCache<S> {
         }
     }
 
-    /// Returns the configured capacity (rounded to usable bytes).
+    /// Returns the configured capacity in bytes.
+    ///
+    /// When the cache is enabled, this is rounded to a multiple of the slot size.
+    /// When disabled, this returns the raw input capacity.
     #[must_use]
     pub(super) const fn capacity_bytes(&self) -> u32 {
         self.capacity_bytes

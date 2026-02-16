@@ -198,10 +198,10 @@ flowchart LR
         Encode["encode_policy()<br/>(deterministic, order-invariant)"]
     end
 
-    subgraph Hash["Keyed Hash"]
+    subgraph Hash["Unkeyed Hash"]
         Domain["domain: scanner.store.identity.v1.rule_fingerprint"]
-        Key["key: identity_key"]
-        BLAKE3["BLAKE3 keyed hash"]
+        Key["(unkeyed — must be comparable across operators)"]
+        BLAKE3["BLAKE3 hash"]
     end
 
     Output["RuleFingerprint<br/>[u8; 32]"]
@@ -408,7 +408,7 @@ old and new hashes can never collide silently.
 
 | Contract | Domain String | Key |
 |---|---|---|
-| Rule fingerprint | `scanner.store.identity.v1.rule_fingerprint` | `identity_key` |
+| Rule fingerprint | `scanner.store.identity.v1.rule_fingerprint` | _(unkeyed)_ |
 | Secret hash | `scanner.store.identity.v1.secret_hash` | `secret_key` |
 | Occurrence ID | `scanner.store.identity.v1.occurrence_id` | `identity_key` |
 
