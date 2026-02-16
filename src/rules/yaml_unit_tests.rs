@@ -1935,3 +1935,296 @@ fn entropy_min_len_does_not_exceed_capture_maximum() {
         failures.join("\n  "),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Boundary-aware entropy threshold tests
+//
+// These test that specific entropy values between the old (2.0) and new (3.0
+// or 2.5) thresholds are correctly rejected, and high-entropy strings are
+// accepted. This closes the gap where the existing zero-entropy tests (all
+// `a`s) would pass at any positive threshold.
+// ---------------------------------------------------------------------------
+
+/// Boundary test: sendgrid-api-token with body below 3.0 bits/byte threshold.
+///
+/// The capture `SG.` + (`abcd` × 16 + `ab`) has 7 distinct bytes in 69
+/// positions ≈ 2.24 bits/byte — above the old 2.0 threshold, below the new 3.0.
+#[test]
+fn sendgrid_api_token_entropy_rejects_below_threshold() {
+    let body = "abcd".repeat(16) + "ab"; // 66 chars
+    let hay = format!("secret = SG.{body}\n");
+    let hits = scan_single_builtin_rule("sendgrid-api-token", hay.as_bytes());
+    assert!(
+        !hits.iter().any(|h| h.rule == "sendgrid-api-token"),
+        "sendgrid token with ~2.24 bits/byte should be rejected by 3.0 threshold"
+    );
+}
+
+/// Boundary test: sendgrid-api-token with body above 3.0 bits/byte threshold.
+///
+/// The capture `SG.` + 32 distinct `[a-z0-9]` chars repeated to 66 has 35
+/// distinct bytes in 69 positions ≈ 5.1 bits/byte.
+#[test]
+fn sendgrid_api_token_entropy_accepts_above_threshold() {
+    let base = "abcdefghijklmnopqrstuvwxyz012345"; // 32 distinct chars
+    let body = base.repeat(2) + &base[..2]; // 66 chars
+    let hay = format!("secret = SG.{body}\n");
+    let hits = scan_single_builtin_rule("sendgrid-api-token", hay.as_bytes());
+    assert!(
+        hits.iter().any(|h| h.rule == "sendgrid-api-token"),
+        "sendgrid token with ~5.1 bits/byte should pass the 3.0 threshold"
+    );
+}
+
+/// Boundary test: adobe-client-secret with body below 3.0 bits/byte threshold.
+///
+/// The capture `p8e-` + (`abcd` × 8) has 8 distinct bytes in 36 positions
+/// ≈ 2.50 bits/byte — below the 3.0 threshold.
+#[test]
+fn adobe_client_secret_entropy_rejects_below_threshold() {
+    let body = "abcd".repeat(8); // 32 chars
+    let hay = format!("secret = p8e-{body}\n");
+    let hits = scan_single_builtin_rule("adobe-client-secret", hay.as_bytes());
+    assert!(
+        !hits.iter().any(|h| h.rule == "adobe-client-secret"),
+        "adobe token with ~2.50 bits/byte should be rejected by 3.0 threshold"
+    );
+}
+
+/// Boundary test: adobe-client-secret with body above 3.0 bits/byte threshold.
+///
+/// The capture `p8e-` + 32 distinct `[a-z0-9]` chars has 35 distinct bytes
+/// in 36 positions ≈ 5.1 bits/byte.
+#[test]
+fn adobe_client_secret_entropy_accepts_above_threshold() {
+    let body = "abcdefghijklmnopqrstuvwxyz012345"; // 32 distinct chars
+    let hay = format!("secret = p8e-{body}\n");
+    let hits = scan_single_builtin_rule("adobe-client-secret", hay.as_bytes());
+    assert!(
+        hits.iter().any(|h| h.rule == "adobe-client-secret"),
+        "adobe token with ~5.1 bits/byte should pass the 3.0 threshold"
+    );
+}
+
+/// Boundary test: alibaba-access-key-id with body below 3.0 bits/byte threshold.
+///
+/// The capture `LTAI` + (`abcd` × 5) has 8 distinct bytes in 24 positions
+/// ≈ 2.65 bits/byte — below the 3.0 threshold.
+#[test]
+fn alibaba_access_key_id_entropy_rejects_below_threshold() {
+    let body = "abcd".repeat(5); // 20 chars
+    let hay = format!("secret = LTAI{body}\n");
+    let hits = scan_single_builtin_rule("alibaba-access-key-id", hay.as_bytes());
+    assert!(
+        !hits.iter().any(|h| h.rule == "alibaba-access-key-id"),
+        "alibaba key with ~2.65 bits/byte should be rejected by 3.0 threshold"
+    );
+}
+
+/// Boundary test: alibaba-access-key-id with body above 3.0 bits/byte threshold.
+///
+/// The capture `LTAI` + 20 distinct lowercase chars has 24 distinct bytes
+/// in 24 positions ≈ 4.58 bits/byte.
+#[test]
+fn alibaba_access_key_id_entropy_accepts_above_threshold() {
+    let body = "abcdefghijklmnopqrst"; // 20 distinct chars
+    let hay = format!("secret = LTAI{body}\n");
+    let hits = scan_single_builtin_rule("alibaba-access-key-id", hay.as_bytes());
+    assert!(
+        hits.iter().any(|h| h.rule == "alibaba-access-key-id"),
+        "alibaba key with ~4.58 bits/byte should pass the 3.0 threshold"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Boundary tests for digit-only rules at threshold 2.5
+// ---------------------------------------------------------------------------
+
+/// Boundary test: asana-client-id (digit-only, threshold 2.5) rejects
+/// degenerate input. All-same digits have 0.0 bits/byte entropy.
+#[test]
+fn asana_client_id_entropy_rejects_degenerate() {
+    let hay = b"asana_key = 1111111111111111\n";
+    let hits = scan_single_builtin_rule("asana-client-id", hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "asana-client-id"),
+        "asana id with 0.0 bits/byte should be rejected by 2.5 threshold"
+    );
+}
+
+/// Boundary test: asana-client-id rejects low-entropy digits.
+///
+/// `1234` × 4 = 4 distinct digits, each appearing 4 times in 16 bytes
+/// → 2.0 bits/byte, below the 2.5 threshold.
+#[test]
+fn asana_client_id_entropy_rejects_low_entropy() {
+    let hay = b"asana_key = 1234123412341234\n";
+    let hits = scan_single_builtin_rule("asana-client-id", hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "asana-client-id"),
+        "asana id with 2.0 bits/byte should be rejected by 2.5 threshold"
+    );
+}
+
+/// Boundary test: asana-client-id accepts high-entropy digits.
+///
+/// 8 distinct digits, each appearing twice in 16 bytes → 3.0 bits/byte,
+/// above the 2.5 threshold.
+#[test]
+fn asana_client_id_entropy_accepts_high_entropy() {
+    let hay = b"asana_key = 1122334455667788\n";
+    let hits = scan_single_builtin_rule("asana-client-id", hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "asana-client-id"),
+        "asana id with 3.0 bits/byte should pass the 2.5 threshold"
+    );
+}
+
+/// Boundary test: discord-client-id (digit-only, threshold 2.5) rejects
+/// degenerate input. All-same digits have 0.0 bits/byte entropy.
+#[test]
+fn discord_client_id_entropy_rejects_degenerate() {
+    let hay = b"discord_id = 111111111111111111\n";
+    let hits = scan_single_builtin_rule("discord-client-id", hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "discord-client-id"),
+        "discord id with 0.0 bits/byte should be rejected by 2.5 threshold"
+    );
+}
+
+/// Boundary test: discord-client-id rejects low-entropy digits.
+///
+/// `1234` repeated to 18 chars = 4 distinct digits with uneven distribution
+/// → ~2.0 bits/byte, below the 2.5 threshold.
+#[test]
+fn discord_client_id_entropy_rejects_low_entropy() {
+    let hay = b"discord_id = 123412341234123412\n";
+    let hits = scan_single_builtin_rule("discord-client-id", hay);
+    assert!(
+        !hits.iter().any(|h| h.rule == "discord-client-id"),
+        "discord id with ~2.0 bits/byte should be rejected by 2.5 threshold"
+    );
+}
+
+/// Boundary test: discord-client-id accepts high-entropy digits.
+///
+/// 9 distinct digits, each appearing twice in 18 bytes → 3.17 bits/byte,
+/// above the 2.5 threshold.
+#[test]
+fn discord_client_id_entropy_accepts_high_entropy() {
+    let hay = b"discord_id = 112233445566778899\n";
+    let hits = scan_single_builtin_rule("discord-client-id", hay);
+    assert!(
+        hits.iter().any(|h| h.rule == "discord-client-id"),
+        "discord id with 3.17 bits/byte should pass the 2.5 threshold"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CI guardrail: entropy threshold sanity bounds
+// ---------------------------------------------------------------------------
+
+/// CI guard: for every builtin rule with an entropy gate, the
+/// `min_bits_per_byte` threshold must be within sane bounds.
+///
+/// 1. General: 1.0 ≤ threshold ≤ 5.0 for all entropy-gated rules.
+/// 2. Digit-only ceiling: rules whose capture group matches only `[0-9]`
+///    must not exceed `log2(10) ≈ 3.322` (the theoretical maximum entropy
+///    for decimal digits).
+#[test]
+fn entropy_min_bits_per_byte_within_sane_bounds() {
+    use regex_syntax::hir::{Class, HirKind};
+
+    /// Recursively check if a HIR subtree can only match ASCII digits.
+    fn is_digit_only(hir: &regex_syntax::hir::Hir) -> bool {
+        match hir.kind() {
+            HirKind::Literal(lit) => lit.0.iter().all(|&b| b.is_ascii_digit()),
+            HirKind::Class(class) => match class {
+                Class::Unicode(uc) => uc
+                    .ranges()
+                    .iter()
+                    .all(|r| r.start() >= '0' && r.end() <= '9'),
+                Class::Bytes(bc) => bc
+                    .ranges()
+                    .iter()
+                    .all(|r| r.start() >= b'0' && r.end() <= b'9'),
+            },
+            HirKind::Concat(subs) | HirKind::Alternation(subs) => subs.iter().all(is_digit_only),
+            HirKind::Repetition(rep) => is_digit_only(&rep.sub),
+            HirKind::Capture(cap) => is_digit_only(&cap.sub),
+            HirKind::Empty => true,
+            _ => false,
+        }
+    }
+
+    /// Find the capture group by index and check if its content is digit-only.
+    fn capture_is_digit_only(hir: &regex_syntax::hir::Hir, target: u32) -> Option<bool> {
+        match hir.kind() {
+            HirKind::Capture(cap) => {
+                if cap.index == target {
+                    return Some(is_digit_only(&cap.sub));
+                }
+                capture_is_digit_only(&cap.sub, target)
+            }
+            HirKind::Concat(subs) | HirKind::Alternation(subs) => {
+                for sub in subs {
+                    if let Some(result) = capture_is_digit_only(sub, target) {
+                        return Some(result);
+                    }
+                }
+                None
+            }
+            HirKind::Repetition(rep) => capture_is_digit_only(&rep.sub, target),
+            _ => None,
+        }
+    }
+
+    // Maximum entropy possible with only decimal digits: log2(10).
+    const LOG2_10: f64 = std::f64::consts::LOG2_10;
+
+    let rules = builtin_rules();
+    let mut failures = Vec::new();
+
+    for rule in &rules {
+        let entropy = match &rule.entropy {
+            Some(e) => e,
+            None => continue,
+        };
+
+        let threshold = f64::from(entropy.min_bits_per_byte);
+
+        // Check 1: general bounds.
+        if !(1.0..=5.0).contains(&threshold) {
+            failures.push(format!(
+                "{}: min_bits_per_byte ({}) outside sane range [1.0, 5.0]",
+                rule.name, entropy.min_bits_per_byte,
+            ));
+            continue;
+        }
+
+        // Check 2: digit-only ceiling.
+        let group_index = rule.secret_group.map_or(1u32, |g| g as u32);
+
+        let hir = regex_syntax::ParserBuilder::new()
+            .utf8(false)
+            .build()
+            .parse(rule.re.as_str())
+            .unwrap_or_else(|e| panic!("failed to parse regex for {}: {e}", rule.name));
+
+        let digit_only = capture_is_digit_only(&hir, group_index).unwrap_or(false);
+        if digit_only && threshold > LOG2_10 {
+            failures.push(format!(
+                "{}: min_bits_per_byte ({}) exceeds log2(10) = {LOG2_10:.3} \
+                 for digit-only capture group {group_index}",
+                rule.name, entropy.min_bits_per_byte,
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "entropy min_bits_per_byte invariant violated for {} rule(s):\n  {}",
+        failures.len(),
+        failures.join("\n  "),
+    );
+}
