@@ -2714,7 +2714,7 @@ rules:
   - LINKED-IN
   entropy:
     min_bits_per_byte: 2.0
-    min_len: 16
+    min_len: 14
     max_len: 256
   two_phase: null
   local_context: null
@@ -4086,7 +4086,7 @@ rules:
   - SUMO
   entropy:
     min_bits_per_byte: 3.0
-    min_len: 16
+    min_len: 14
     max_len: 256
   two_phase: null
   local_context: null

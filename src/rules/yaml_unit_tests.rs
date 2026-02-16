@@ -1815,3 +1815,123 @@ fn dropbox_api_token_entropy_gate_rejects_low_entropy() {
         "low-entropy dropbox token should be filtered by entropy gate"
     );
 }
+
+/// The linkedin-client-id regex captures exactly `[a-z0-9]{14}` (14 bytes).
+/// The entropy gate should reject low-entropy tokens like "aaaaaaaaaaaaaa".
+#[test]
+fn linkedin_client_id_entropy_gate_rejects_low_entropy() {
+    // "aaaaaaaaaaaaaa" is 14 chars of zero entropy — should be rejected.
+    let low_entropy = b"linkedin_key = aaaaaaaaaaaaaa\n";
+    let hits = scan_single_builtin_rule("linkedin-client-id", low_entropy);
+    assert!(
+        !hits.iter().any(|h| h.rule == "linkedin-client-id"),
+        "low-entropy linkedin client id should be filtered by entropy gate"
+    );
+}
+
+/// The sumologic-access-id regex captures exactly `su[a-zA-Z0-9]{12}` (14 bytes).
+/// The entropy gate should reject low-entropy tokens like "suaaaaaaaaaaaa".
+#[test]
+fn sumologic_access_id_entropy_gate_rejects_low_entropy() {
+    // "suaaaaaaaaaaaa" is 14 bytes with near-zero entropy — should be rejected.
+    let low_entropy = b"sumo_key = suaaaaaaaaaaaa\n";
+    let hits = scan_single_builtin_rule("sumologic-access-id", low_entropy);
+    assert!(
+        !hits.iter().any(|h| h.rule == "sumologic-access-id"),
+        "low-entropy sumologic access id should be filtered by entropy gate"
+    );
+}
+
+/// CI guard: for every builtin rule with an entropy gate, the capture group's
+/// maximum possible length must be >= `entropy.min_len`. When the longest
+/// possible capture is shorter than `min_len`, the gate is silently bypassed
+/// for ALL matches — the same bug class as dropbox-api-token (commit 9f7a293),
+/// linkedin-client-id, and sumologic-access-id.
+///
+/// Variable-length captures (e.g., `{8,}`) where the minimum is below `min_len`
+/// but longer matches can reach it are fine — the gate fires on those longer
+/// matches by design.
+#[test]
+fn entropy_min_len_does_not_exceed_capture_maximum() {
+    use regex_syntax::hir::HirKind;
+
+    /// Recursively find capture group `target` and return its `maximum_len()`.
+    /// Returns `None` if the group is not found; returns `Some(None)` if the
+    /// group exists but has no upper bound.
+    fn capture_max_len(hir: &regex_syntax::hir::Hir, target: u32) -> Option<Option<usize>> {
+        match hir.kind() {
+            HirKind::Capture(cap) => {
+                if cap.index == target {
+                    return Some(cap.sub.properties().maximum_len());
+                }
+                capture_max_len(&cap.sub, target)
+            }
+            HirKind::Concat(subs) | HirKind::Alternation(subs) => {
+                for sub in subs {
+                    if let Some(len) = capture_max_len(sub, target) {
+                        return Some(len);
+                    }
+                }
+                None
+            }
+            HirKind::Repetition(rep) => capture_max_len(&rep.sub, target),
+            _ => None,
+        }
+    }
+
+    // jwt-base64 uses only named capture groups in an alternation — group 1
+    // is the `alg` field which is short (10 bytes), but the engine falls back
+    // to group 0 (full match, 40+ bytes) when group 1 doesn't participate.
+    // The entropy gate effectively fires on the fallback span.
+    let skip: &[&str] = &["jwt-base64"];
+
+    let rules = builtin_rules();
+    let mut failures = Vec::new();
+
+    for rule in &rules {
+        if skip.contains(&rule.name) {
+            continue;
+        }
+
+        let entropy = match &rule.entropy {
+            Some(e) => e,
+            None => continue,
+        };
+
+        let group_index = rule.secret_group.map_or(1u32, |g| g as u32);
+
+        let hir = regex_syntax::ParserBuilder::new()
+            .utf8(false)
+            .build()
+            .parse(rule.re.as_str())
+            .unwrap_or_else(|e| panic!("failed to parse regex for {}: {e}", rule.name));
+
+        // Get the maximum capture length. `None` (unbounded) means the gate
+        // will fire on sufficiently long matches, which is fine.
+        let max_capture = match capture_max_len(&hir, group_index) {
+            Some(Some(max)) => max,
+            Some(None) => continue, // unbounded — gate can fire
+            None => {
+                // No explicit capture group; fall back to full pattern maximum.
+                match hir.properties().maximum_len() {
+                    Some(max) => max,
+                    None => continue,
+                }
+            }
+        };
+
+        if entropy.min_len > max_capture {
+            failures.push(format!(
+                "{}: entropy.min_len ({}) > capture group {} maximum length ({})",
+                rule.name, entropy.min_len, group_index, max_capture,
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "entropy min_len exceeds capture maximum for {} rule(s):\n  {}",
+        failures.len(),
+        failures.join("\n  "),
+    );
+}
