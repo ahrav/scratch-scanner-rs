@@ -1,0 +1,41 @@
+=== Benchmark Environment ===
+Date: 2026-02-14T22:43:33Z
+Hostname: dev-dsk-ahrav-2b-40416d90.us-west-2.amazon.com
+
+--- CPU ---
+Architecture:        aarch64
+CPU(s):              16
+Thread(s) per core:  1
+Socket(s):           1
+L1d cache:           64K
+L1i cache:           64K
+L2 cache:            1024K
+L3 cache:            32768K
+Flags:               fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm paca pacg dcpodp svei8mm svebf16 i8mm bf16 dgh rng
+
+--- Memory ---
+              total        used        free      shared  buff/cache   available
+Mem:            61G        5.1G         53G        816K        2.8G         55G
+Swap:            0B          0B          0B
+
+--- Kernel ---
+Linux dev-dsk-ahrav-2b-40416d90.us-west-2.amazon.com 5.10.247-247.992.amzn2int.aarch64 #1 SMP Mon Jan 26 19:28:10 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+
+--- Storage ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p1  552G  341G  211G  62% /
+
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+nvme0n1 259:0    0  560G  0 disk 
+
+[none] mq-deadline kyber bfq 
+
+--- Compilers ---
+rustc 1.90.0 (1159e78c4 2025-09-14)
+go version go1.23.3 linux/arm64
+
+--- Scanner versions ---
+scanner-rs: e5d217c
+kingfisher: 88d3f78
+trufflehog: 6961f2bac
+gitleaks:   ca20267

@@ -1,0 +1,65 @@
+# Rules from scanner-rs with no match in at least one scanner
+# Total scanner-rs rules: 223
+# Matched in TruffleHog: 98
+# Matched in Gitleaks: 222
+# Kingfisher: superset (277 rules), runs with defaults
+
+1password-secret-key: missing in trufflehog
+1password-service-account-token: missing in trufflehog
+age-secret-key: missing in trufflehog
+atlassian-api-token: missing in trufflehog
+authress-service-client-access-key: missing in trufflehog
+aws-amazon-bedrock-api-key-long-lived: missing in trufflehog
+aws-amazon-bedrock-api-key-short-lived: missing in trufflehog
+bittrex-access-key: missing in trufflehog
+bittrex-secret-key: missing in trufflehog
+cisco-meraki-api-key: missing in trufflehog
+clickhouse-cloud-api-secret-key: missing in trufflehog
+clojars-api-token: missing in trufflehog
+codecov-access-token: missing in trufflehog
+cohere-api-token: missing in trufflehog
+curl-auth-header: missing in trufflehog
+curl-auth-user: missing in trufflehog
+defined-networking-api-token: missing in trufflehog
+discord-client-id: missing in trufflehog
+discord-client-secret: missing in trufflehog
+duffel-api-token: missing in trufflehog
+dynatrace-api-token: missing in trufflehog
+easypost-api-token: missing in trufflehog
+easypost-test-api-token: missing in trufflehog
+finicity-api-token: missing in trufflehog
+finicity-client-secret: missing in trufflehog
+freemius-secret-key: missing in trufflehog
+generic-api-key: missing in trufflehog
+infracost-api-token: missing in trufflehog
+jfrog-api-key: missing in trufflehog
+jfrog-identity-token: missing in trufflehog
+jwt-base64: missing in trufflehog
+jwt: missing in trufflehog
+kubernetes-secret-yaml: missing in trufflehog
+linkedin-client-id: missing in trufflehog
+linkedin-client-secret: missing in trufflehog
+looker-client-id: missing in trufflehog
+looker-client-secret: missing in trufflehog
+nuget-config-password: missing in trufflehog
+octopus-deploy-api-key: missing in trufflehog
+openshift-user-token: missing in trufflehog
+perplexity-api-key: missing in trufflehog
+pkcs12-file: missing in trufflehog
+privateai-api-token: missing in trufflehog
+scalingo-api-token: missing in trufflehog
+settlemint-application-access-token: missing in trufflehog
+settlemint-personal-access-token: missing in trufflehog
+settlemint-service-access-token: missing in trufflehog
+shippo-api-token: missing in trufflehog
+sidekiq-secret: missing in trufflehog
+sidekiq-sensitive-url: missing in trufflehog
+twitter-access-secret: missing in trufflehog
+twitter-access-token: missing in trufflehog
+twitter-api-key: missing in trufflehog
+twitter-api-secret: missing in trufflehog
+twitter-bearer-token: missing in trufflehog
+vault-service-token-legacy: missing in gitleaks
+yandex-access-token: missing in trufflehog
+yandex-api-key: missing in trufflehog
+yandex-aws-access-token: missing in trufflehog
