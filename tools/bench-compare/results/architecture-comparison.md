@@ -935,7 +935,7 @@ Each `detectRule` runs `r.Regex.FindAllStringIndex(currentRaw, -1)` — regex ov
 
 scanner-rs skips most of the input buffer entirely. The Vectorscan DFA identifies candidate regions in a single pass; only narrow windows around hits enter the regex engine. Competitors run regex over the full input for each matched rule/detector:
 
-- Kingfisher: 3.5x more instructions (Aho-Corasick + per-rule regex, no window narrowing)
+- Kingfisher: 3.5x more instructions (Vectorscan + per-rule regex, no window narrowing)
 - TruffleHog: 4.1x more instructions (per-detector regex on full chunks)
 - Gitleaks: 26x more instructions (all rules x full input, Go NFA regex)
 

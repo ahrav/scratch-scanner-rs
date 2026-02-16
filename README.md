@@ -206,7 +206,7 @@ doesn't need to speculate about which rule will match next.
 
 The counters show 4.2x fewer branch mispredictions than TruffleHog
 (which dispatches to per-detector regex engines) and 4.4x fewer than
-Kingfisher (Aho-Corasick + per-rule regex). On Graviton3, each
+Kingfisher (Vectorscan + per-rule regex). On Graviton3, each
 misprediction costs ~10-15 cycles of pipeline flush, so 6 billion
 fewer misses adds up.
 
@@ -232,9 +232,9 @@ correlated contention, with a tiered idle strategy (spin → yield → park
 with 200us timeout).
 
 Contrast this with Go's goroutine scheduler (used by TruffleHog and
-Gitleaks), which may migrate goroutines between OS threads, or Tokio
-(used by Kingfisher), which is optimized for async I/O rather than
-CPU-bound work.
+Gitleaks), which may migrate goroutines between OS threads, or Rayon
+(used by Kingfisher), which provides work-stealing parallelism but
+without the LIFO-local scheduling or tiered idle strategy.
 
 How much of the 77 billion fewer stall cycles is scheduling vs just
 doing less work? Hard to say definitively. But the warm-cache

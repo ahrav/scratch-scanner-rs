@@ -89,7 +89,7 @@ approach taken by Go-based competitors.
 - `src/engine/vectorscan_prefilter.rs:89-100` — `RawPatternMeta`: 12-byte `#[repr(C)]` per-pattern metadata for the match callback
 - `src/engine/core.rs:30-44` — Scan phase algorithm: prefilter → window → validate
 
-**Contrast:** TruffleHog and Gitleaks are written in Go. TruffleHog uses a per-detector regex scan loop — each detector runs its own regex engine against every matched span. Gitleaks iterates all rules sequentially with Go's `regexp` package. Both approaches create unpredictable branching as the CPU must speculate which rule will match next. Kingfisher (also Rust) uses Aho-Corasick + per-rule regex, which is closer but still requires separate regex validation per matched keyword.
+**Contrast:** TruffleHog and Gitleaks are written in Go. TruffleHog uses a per-detector regex scan loop — each detector runs its own regex engine against every matched span. Gitleaks iterates all rules sequentially with Go's `regexp` package. Both approaches create unpredictable branching as the CPU must speculate which rule will match next. Kingfisher (also Rust) uses Vectorscan + per-rule regex — the same two-stage architecture — but without scanner-rs's window narrowing, resulting in separate regex validation over broader regions.
 
 ### 4.2 Per-Worker Scratch Memory → Lower L2 Cache Refills
 
