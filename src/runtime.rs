@@ -902,8 +902,8 @@ impl ScannerRuntime {
     /// Scans a single file synchronously, returning findings with provenance.
     ///
     /// Findings are stored in an internal fixed-capacity buffer sized at
-    /// startup. If the capacity is exceeded, scanning stops early and an error
-    /// is returned; callers should treat the results as incomplete.
+    /// startup. If the capacity is exceeded, scanning stops early and an
+    /// `io::ErrorKind::Other` error is returned instead of partial results.
     ///
     /// # Errors
     /// Returns any I/O error from reading the file. If the findings buffer
@@ -1077,8 +1077,8 @@ mod tests_buffer_pool {
 
     // -----------------------------------------------------------------------
     // Clear — exercises fill(0) over from_raw_parts_mut span.
-    // Under Miri this verifies the entire BUFFER_LEN_MAX range is valid.
-    // Skipped under Miri to avoid slowness from 8MB memset.
+    // Skipped under Miri to avoid slowness from the 8 MiB memset; under
+    // normal test runs this still validates the full BUFFER_LEN_MAX range.
     // -----------------------------------------------------------------------
 
     #[test]

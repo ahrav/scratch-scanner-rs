@@ -9,9 +9,9 @@
 //! # Design Notes
 //! - Window merging widens spans to trade small extra scanning for fewer passes.
 //! - Entropy gating is conservative: short samples always pass.
-//! - UTF-16 anchor helpers are byte-wise wideners (ASCII-focused), not general
-//!   UTF-8 -> UTF-16 conversion.
 //! - UTF-16 decoding uses replacement characters and enforces output limits.
+//!   (ASCII-only UTF-16 *anchor expansion* lives in [`rule_repr`](super::rule_repr),
+//!   not here; this module provides general UTF-16 -> UTF-8 decode.)
 
 use super::hit_pool::SpanU32;
 use super::rule_repr::{EntropyCompiled, PackedPatterns};
@@ -88,7 +88,8 @@ pub(super) fn merge_ranges_with_gap_sorted(ranges: &mut ScratchVec<SpanU32>, gap
 /// - When collapsing, preserves the **earliest** (smallest) anchor hint.
 ///
 /// # Complexity
-/// - O(n log G) where G is the number of gap doublings, O(1) extra space.
+/// - O(n * D) time where D = ceil(log2(hay_len / gap)) is the number of
+///   gap-doubling passes; O(1) extra space.
 pub(super) fn coalesce_under_pressure_sorted(
     ranges: &mut ScratchVec<SpanU32>,
     hay_len: u32,

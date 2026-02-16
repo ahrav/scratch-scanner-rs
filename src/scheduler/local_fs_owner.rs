@@ -3,7 +3,7 @@
 //! # Architecture
 //!
 //! - CPU workers do both I/O and scan (no separate I/O threads)
-//! - Uses `LocalFirst` buffer pool policy (same thread acquires and releases)
+//! - Uses `TsBufferPool` (per-worker local queues with global fallback and stealing)
 //! - Sequential reads with overlap carry (no seeks, no re-reading overlap)
 //! - Discovery thread enqueues files; workers process entire files
 //!
@@ -499,8 +499,8 @@ impl<const N: usize> std::fmt::Write for StackMsg<N> {
 /// `norm_hash` values represent **distinct secrets** and must NOT be collapsed.
 /// This occurs when transform chains produce different decoded values at the
 /// same encoded location. Removing `norm_hash` from the key causes silent
-/// data loss. The git-scan path uses `FindingKey` (which includes `norm_hash`)
-/// for the same reason.
+/// data loss. The git-scan path uses `FindingKey` (which includes
+/// `secret_hash`, the equivalent field) for the same reason.
 #[inline]
 pub(super) fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
     if findings.len() <= 1 {
@@ -618,9 +618,9 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
 /// Build and emit a persistence batch for one chunk's post-dedupe findings.
 ///
 /// No-ops when `store_producer` is `None` or `findings` is empty.
-/// On emit failure, increments `persistence_emit_failures` and `io_errors`,
-/// and emits a diagnostic event. The scan continues — persistence errors are
-/// fail-soft per batch, not per run.
+/// On emit failure, increments `persistence_emit_failures` and emits a
+/// diagnostic event. The scan continues -- persistence errors are fail-soft
+/// per batch, not per run.
 #[inline]
 pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     store_producer: Option<&dyn StoreProducer>,
@@ -711,14 +711,16 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// open(path) ─► metadata.len() ─► acquire_buffer()
 ///                    │
 ///                    ▼
-///     ┌──────────────────────────────┐
-///     │     for each chunk:          │◄──────────────────┐
-///     │  1. copy_within(overlap)     │                   │
-///     │  2. read(new_bytes)          │                   │
-///     │  3. scan_chunk_into()        │                   │
-///     │  4. drop_prefix_findings()   │                   │
-///     │  5. emit_findings()          │                   │
-///     └──────────────┬───────────────┘                   │
+///     ┌──────────────────────────────────┐
+///     │     for each chunk:              │◄───────────────┐
+///     │  1. copy_within(overlap)         │                │
+///     │  2. read(new_bytes)              │                │
+///     │  3. scan_chunk_into()            │                │
+///     │  4. drop_prefix_findings()       │                │
+///     │  5. drain + dedupe_findings()    │                │
+///     │  6. emit_persistence_batch()     │                │
+///     │  7. emit_findings()              │                │
+///     └──────────────┬───────────────────┘                │
 ///                    │                                   │
 ///                    ▼                                   │
 ///            offset < file_size? ───yes──────────────────┘

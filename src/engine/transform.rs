@@ -592,7 +592,9 @@ impl Base64SpanStream {
     /// Flush a trailing run at end-of-stream, trimming trailing whitespace.
     ///
     /// The `_end_offset` parameter is accepted for API symmetry with `UrlSpanStream`
-    /// but is unused here; base64 spans are self-delimiting by trailing whitespace.
+    /// but is unused here; base64 spans end at `last_b64 + 1`, so the span
+    /// boundary is fully determined by the last alphabet/padding byte seen and
+    /// does not depend on the caller-supplied end offset.
     pub(super) fn finish<F>(&mut self, _end_offset: u64, mut on_span: F)
     where
         F: FnMut(u64, u64) -> bool,
@@ -1434,8 +1436,10 @@ mod simd_b64 {
     /// Stores the low 12 bytes of `v` into `out` without touching adjacent memory.
     ///
     /// # Safety
-    /// Uses SSSE3/SSE stores; caller must ensure the required CPU features are
-    /// available (the caller checks this before entering SIMD decode).
+    /// Uses SSE2 stores (`_mm_storeu_si128`); caller must ensure the required
+    /// CPU features are available (the caller checks this before entering SIMD
+    /// decode). The function is gated behind `ssse3` because it is only called
+    /// from SSSE3 decode paths.
     #[inline]
     #[target_feature(enable = "ssse3")]
     unsafe fn store_low12(v: __m128i, out: &mut [u8; 12]) {

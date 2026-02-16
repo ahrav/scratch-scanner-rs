@@ -146,9 +146,9 @@ impl Target {
 /// # Accessing patterns
 ///
 /// Pattern `i` is `bytes[offsets[i] as usize .. offsets[i+1] as usize]`.
-/// The number of patterns is `offsets.len() - 1`. Callers in `buffer_scan.rs`
-/// and `window_validate.rs` iterate this way rather than through a method,
-/// because the memmem inner loops inline the slice indexing directly.
+/// The number of patterns is `offsets.len() - 1`. The `contains_any_memmem`
+/// and `contains_all_memmem` helpers in `helpers.rs` iterate patterns this
+/// way, inlining the slice indexing directly for the memmem inner loops.
 ///
 /// # Invariants
 /// - `offsets[0] == 0` and the last offset equals `bytes.len()`.
@@ -242,13 +242,16 @@ impl PackedPatternsBuilder {
 ///
 /// The two-phase algorithm reduces regex work by narrowing candidate windows:
 ///
-/// 1. **Seed phase**: Vectorscan emits a seed window of `seed_radius` bytes
-///    around each anchor hit.
+/// 1. **Seed phase**: Vectorscan emits a seed window of
+///    `seed_radius * variant.scale()` bytes around each anchor hit (for raw
+///    anchors `scale()` is 1, so the byte radius equals `seed_radius`; for
+///    UTF-16 anchors it doubles).
 /// 2. **Confirm phase**: the seed window is checked for at least one `confirm`
 ///    pattern via memmem (ANY semantics). Windows that lack a confirm pattern
 ///    are discarded without running the regex.
-/// 3. **Expand phase**: confirmed seeds are widened to `full_radius` to give
-///    the regex enough context for a full match.
+/// 3. **Expand phase**: confirmed seeds are widened to
+///    `full_radius * variant.scale()` bytes to give the regex enough context
+///    for a full match.
 ///
 /// # Guarantees
 /// - `confirm` entries are encoded per variant and indexed by `Variant::idx()`.
@@ -315,7 +318,10 @@ pub(super) struct EntropyCompiled {
     pub(super) min_bits_per_byte: f32,
     /// Minimum candidate length in bytes for the entropy check to apply.
     pub(super) min_len: usize,
-    /// Maximum candidate length in bytes for the entropy check to apply.
+    /// Maximum number of bytes used for the entropy computation.
+    ///
+    /// Candidates longer than this are not skipped; instead the entropy
+    /// calculation is capped to the first `max_len` bytes.
     ///
     /// Also determines the size of the pre-computed `ln(i)/ln(2)` table
     /// in [`Engine::entropy_log2`](super::core::Engine).

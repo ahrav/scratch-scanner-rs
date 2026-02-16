@@ -5,7 +5,7 @@
 //! [`runner_diff_history`](super::runner_diff_history)). Each mode file
 //! owns its execution loop; this module provides the pieces they call:
 //!
-//! - **Directory discovery** — pack dirs, loose dirs, pack file listing.
+//! - **Spill directory setup** — unique temp directory for candidate spilling.
 //! - **Mmap management** — map pack files, apply sequential access hints.
 //! - **Pack view parsing** — validate headers, build `PackView`s for planning.
 //! - **Pack cache sizing** — layered heuristic (`estimate_pack_cache_bytes` →
@@ -104,7 +104,7 @@ pub(super) const PACK_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Aggregate memory cap across all workers (16 GiB).
 ///
 /// With N workers each sizing caches independently, the per-worker estimate
-/// could sum to excessive totals (e.g. 24 × 800 MiB = 19.2 GiB on a 50 GiB
+/// could sum to excessive totals (e.g. 24 × 800 MiB = 19.2 GiB on a ~13 GiB
 /// repo). This cap divides evenly across workers so total cache memory stays
 /// bounded regardless of pack size or worker count. With 20 workers each
 /// gets up to 819 MiB — enough for large repos without starving small ones.
@@ -448,8 +448,9 @@ pub(super) fn build_pack_views<'a>(
 /// Delta deps are pack entries that require decoding another object first
 /// (the "base"). High dependency counts penalize sharding because shard
 /// boundaries can separate a delta from its base, forcing cross-shard
-/// resolution. The pipeline uses these numbers for logging and to inform
-/// the strategy chosen by [`select_pack_exec_strategy`].
+/// resolution. The pipeline records these numbers in the run summary for
+/// diagnostics. Strategy selection ([`select_pack_exec_strategy`]) computes
+/// its own per-plan cost hints independently.
 pub(super) fn summarize_pack_plan_deps(plans: &[PackPlan]) -> (u64, u32) {
     let mut total = 0u64;
     let mut max = 0u32;
@@ -957,7 +958,7 @@ enum SchedulerPackTask {
 /// Fields grow to steady-state capacity after the first few tasks
 /// and remain stable for the rest of the scan.
 struct SchedulerPackScratch {
-    /// LRU-style delta base cache sized by [`per_worker_cache_bytes`].
+    /// Tiered set-associative CLOCK delta base cache sized by [`per_worker_cache_bytes`].
     cache: PackCache,
     /// Decode workspace: inflate buffer, delta apply buffer, object staging.
     exec_scratch: PackExecScratch,

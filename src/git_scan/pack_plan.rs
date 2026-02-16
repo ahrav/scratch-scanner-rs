@@ -309,8 +309,10 @@ pub fn build_pack_plans<'a, R: OidResolver>(
 /// - Pack corruption or resolver failures return `PackPlanError`.
 ///
 /// # Complexity
-/// - `O(N log N + E log N)` where `N` is unique candidate offsets and `E`
-///   is newly discovered pack-local base offsets.
+/// - `O((N + E) log(N + E))` where `N` is unique candidate offsets and `E`
+///   is newly discovered pack-local base offsets. The final sort of all
+///   `N + E` offsets dominates; binary-search lookups during base expansion
+///   contribute an additional `O(E log N)` term that is subsumed.
 pub(crate) fn build_pack_plan_for_pack<'a, R: OidResolver>(
     pack_id: u16,
     pack: &PackView<'a>,
@@ -769,9 +771,9 @@ impl ExecOrderResult {
 ///
 /// Phase 2 – Descendant counts (leaf BFS upward):
 ///   leaves = {1, 2, 4}
-///   desc_count[3] += desc_count[4]+1 = 1   (from leaf 4)
-///   desc_count[0] += desc_count[2]+1 = 1   (from leaf 2)
-///   desc_count[0] += desc_count[3]+1 = 3   (from node 3, now a leaf)
+///   desc_count[3] += (desc_count[4]+1) = (0+1) → desc_count[3] = 1
+///   desc_count[0] += (desc_count[2]+1) = (0+1) → desc_count[0] = 1
+///   desc_count[0] += (desc_count[3]+1) = (1+1) → desc_count[0] = 3
 ///   result: desc_count = [3, 0, 0, 1, 0]
 ///
 /// Phase 3 – DFS (thin subtrees first):

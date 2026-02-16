@@ -76,7 +76,8 @@
 //! # Design notes
 //! - No OS dependencies: callers provide `Read`/`Read+Seek` sources.
 //! - All hot-path buffers live in [`ArchiveScratch`] and are reused.
-//! - Callers control chunk overlap semantics via the sink.
+//! - Chunk overlap is configured once at [`ArchiveScratch::new`] time and
+//!   applied uniformly to every entry read loop.
 
 use std::io::Read;
 
@@ -116,7 +117,9 @@ pub enum ArchiveEnd {
 
 /// Metadata for a single archive entry delivered to the sink.
 ///
-/// `display_path` is the virtual path bytes (root + entry + locator suffix).
+/// `display_path` is the virtual path bytes. For tar and zip entries it
+/// includes a locator suffix (`@t` / `@z` / `@c`); gzip entries have no
+/// locator because there is only a single decompressed stream.
 /// `size_hint` is the uncompressed size when known, or 0 when unknown.
 /// `flags` is reserved for future per-entry metadata.
 pub struct EntryMeta<'a> {
@@ -178,9 +181,11 @@ pub trait ArchiveEntrySink {
 ///
 /// # `stream_buf` layout
 ///
-/// `stream_buf` is `chunk_size + overlap` bytes. On each read iteration
-/// the last `overlap` bytes from the previous chunk are copied to the
-/// front, then up to `chunk_size` new bytes are read after them.
+/// `stream_buf` is `chunk_size + overlap` bytes (with a minimum of
+/// `overlap + 1` to guarantee at least one new byte per read). On each
+/// read iteration the last `overlap` bytes from the previous chunk are
+/// copied to the front, then up to `chunk_size` new bytes are read
+/// after them.
 pub struct ArchiveScratch<Z: ZipSource> {
     canon: EntryPathCanonicalizer,
     vpaths: Vec<VirtualPathBuilder>,
@@ -1246,8 +1251,9 @@ pub fn scan_targz_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
 /// Scan a zip source with random access.
 ///
-/// The source must implement [`ZipSource`] (typically `Read + Seek + Clone`)
-/// to allow seeking to individual local file headers for payload reads.
+/// The source must implement [`ZipSource`] (`Read + Seek` plus a
+/// `try_clone` method for cloning the underlying handle) to allow
+/// seeking to individual local file headers for payload reads.
 ///
 /// Entry names are canonicalized, combined with a locator suffix (`@z` for
 /// valid LFH offsets, `@c` otherwise), and delivered to the sink. Entries

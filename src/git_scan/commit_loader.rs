@@ -258,7 +258,11 @@ pub struct LoadedCommit {
 pub struct CommitLoadLimits {
     /// Maximum number of commits to load.
     pub max_commits: u32,
-    /// Maximum commit object bytes before inflation.
+    /// Maximum decompressed commit object size in bytes.
+    ///
+    /// Applied as the output cap for zlib inflate and as the byte-length
+    /// ceiling during commit parsing. Compressed (on-disk) size is not
+    /// checked directly.
     pub max_commit_object_bytes: u32,
     /// Maximum parents per commit.
     pub max_parents: usize,
@@ -1148,11 +1152,13 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 /// Extracts and interns author/committer identity from raw commit bytes.
 ///
-/// Makes a single pass over the commit header (~200 bytes) to locate the
-/// `author` and `committer` lines, then interns the name/email strings.
-/// On parse failure (malformed header), the corresponding fields are set
-/// to [`SENTINEL_ID`]. If parsing succeeds but interning fails, returns
-/// `CommitLoadError::IdentityInternError`.
+/// Performs two linear scans over the commit header (one per identity
+/// line, each ~200 bytes): [`parse_author_identity`] locates the `author`
+/// header, then [`parse_committer_identity`] locates the `committer`
+/// header. The extracted name/email byte slices are interned into
+/// `interner`. On parse failure (malformed header), the corresponding
+/// fields are set to [`SENTINEL_ID`]. If parsing succeeds but interning
+/// fails, returns `CommitLoadError::IdentityInternError`.
 fn intern_commit_identities(
     data: &[u8],
     interner: &mut IdentityInterner,

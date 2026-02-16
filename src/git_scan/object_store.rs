@@ -79,7 +79,7 @@ use super::tree_diff_limits::TreeDiffLimits;
 const MAX_ENTRY_HEADER_BYTES: usize = 64;
 /// Maximum depth for delta chains.
 const MAX_DELTA_DEPTH: u8 = 64;
-/// Safety allowance for loose object headers (`"tree <size>\0"`).
+/// Safety allowance for loose object headers (`"<type> <size>\0"`).
 const LOOSE_HEADER_MAX_BYTES: usize = 64;
 /// Minimum number of spill-index slots (power of two).
 const MIN_SPILL_INDEX_ENTRIES: usize = 64;
@@ -727,7 +727,7 @@ impl<'a> ObjectStore<'a> {
     /// cache hits) without recursion, pushing one `TreeDeltaFrame` per hop.
     /// The walk terminates when a non-delta root is reached, a delta cache
     /// hit supplies the base bytes, or a REF delta requires a cross-pack
-    /// base loaded via [`Self::load_object_with_depth`].
+    /// base loaded via [`Self::load_object_with_isolated_decode_scratch`].
     ///
     /// **Phase 2 — Unwind backward**: iterates the frame stack in reverse,
     /// inflating each delta payload and applying it against the current base
@@ -1036,7 +1036,7 @@ impl<'a> ObjectStore<'a> {
         &self,
         oid: &OidBytes,
     ) -> Result<Option<(ObjectKind, Vec<u8>)>, TreeDiffError> {
-        // Loose objects are stored by hex fanout: <objects>/<2-hex>/<38-hex>.
+        // Loose objects are stored by hex fanout: <objects>/<2-hex>/<remaining-hex>.
         let hex = repo_paths::oid_to_hex(oid);
         let (dir, file) = hex.split_at(2);
         let dir_name = String::from_utf8_lossy(dir);

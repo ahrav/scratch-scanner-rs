@@ -1,18 +1,18 @@
 //! Buffer-level scanning coordination.
 //!
 //! This module wires together the prefilter pipeline and final rule evaluation
-//! for a single decoded buffer variant. The pipeline is:
+//! for a single buffer (root or decoded). The pipeline is:
 //!
 //! 1. **Prefilter** — Run the Vectorscan prefilter on raw bytes to collect hit
 //!    windows, populating `touched_pairs` and per-pair hit accumulators.
 //! 2. **Normalize** — For each touched (rule, variant) pair, sort hit windows,
 //!    merge adjacent/overlapping ones (gap-tolerant), and coalesce under
-//!    pressure if the window count exceeds the per-rule cap.
+//!    pressure if the window count exceeds the per-(rule, variant) cap.
 //! 3. **Two-phase confirm** (optional) — Re-check a narrow seed window with
 //!    memmem confirmation before expanding to the full validation radius.
 //!    This filters noisy prefilter hits cheaply.
 //! 4. **Validate** — Run full regex matching on the resulting windows and emit
-//!    findings via [`Engine::run_rule_on_window`](super::window_validate).
+//!    findings via [`Engine::run_rule_on_window`] (in `window_validate`).
 //!
 //! ## Pair encoding
 //!
@@ -44,7 +44,7 @@ use super::rule_repr::Variant;
 use super::scratch::ScanScratch;
 
 impl Engine {
-    /// Applies the prefilter/gating pipeline to a single buffer variant.
+    /// Applies the prefilter/gating pipeline to a single buffer.
     ///
     /// This is the inner scan loop called once per buffer (root or decoded).
     /// It processes only the `(rule, variant)` pairs that the Vectorscan
@@ -58,7 +58,7 @@ impl Engine {
     ///   space, used to anchor findings back to the original input.
     ///
     /// # Effects
-    /// - Populates per-rule hit windows and emits findings into `scratch.out`.
+    /// - Populates per-(rule, variant) hit windows and emits findings into `scratch.out`.
     /// - Resets `touched_pairs` and hit accumulators at the end so the next
     ///   buffer starts clean.
     ///

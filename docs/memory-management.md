@@ -42,7 +42,7 @@ These figures are from the diagnostic sizing model (`223` builtin rules,
 | norm_hash_buf (RealEngineScratch)   | ~256 KiB  | 1.3%       |
 | Other (ByteRing, TimingWheel, etc.) | ~1.2 MiB  | 6.8%       |
 
-**Key insight**: HitAccPool dominates at 83.3% of per-worker memory. This is
+**Key insight**: HitAccPool dominates at 82.1% of per-worker memory. This is
 sized for worst-case: 669 (rule,variant) pairs × 2048 max hits × 12 bytes/SpanU32.
 
 > **Future optimization**: HitAccPool may be over-provisioned. Reducing
