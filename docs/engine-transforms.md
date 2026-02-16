@@ -265,7 +265,7 @@ Decodes standard (`+/`) and URL-safe (`-_`) base64 alphabets:
 Input bytes: a b c d (one quantum)
 
 Padding patterns:
-  [a b c d]        → 3 output bytes: byte0 | (byte1 >> 4)
+  [a b c d]        → 3 output bytes: (byte0 << 2) | (byte1 >> 4)
                                      ((byte1 & 0x0F) << 4) | (byte2 >> 2)
                                      ((byte2 & 0x03) << 6) | byte3
 

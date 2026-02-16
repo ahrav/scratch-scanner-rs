@@ -226,7 +226,7 @@ search the encoded stream with Vectorscan.
 **Normalization rules**:
 - Ignore RFC4648 whitespace (space is only ignored if the span finder allows it).
 - Treat URL-safe `-`/`_` as `+`/`/`.
-- Stop scanning at `=` padding to avoid cross-span false matches.
+- Reset automaton state at `=` padding boundaries (matches never cross padding).
 
 ## Gate Policy: AnchorsInDecoded
 

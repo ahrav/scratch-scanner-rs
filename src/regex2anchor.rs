@@ -82,7 +82,7 @@ pub struct AnchorDeriveConfig {
     /// Minimum length for an anchor to be useful.
     /// Anchors shorter than this are considered too weak.
     pub min_anchor_len: usize,
-    /// Maximum number of elements in an exact set before degrading to prefix/suffix.
+    /// Maximum number of elements in an exact set before degrading to broader prefilters.
     pub max_exact_set: usize,
     /// Maximum length of any single string in an exact set.
     pub max_exact_string_len: usize,
@@ -213,7 +213,7 @@ pub enum ResidueGatePlan {
     /// Fast linear scan for a run of a byteclass of length [min,max].
     /// Only sound for patterns that reduce to a single consuming atom.
     RunLength(RunLengthGate),
-    /// Enumerated, bounded k-grams. (Not yet derived by this module.)
+    /// Enumerated, bounded k-grams. Derived when the `kgram-gate` feature is enabled.
     KGrams(KGramGate),
     /// Logical OR of gate plans (used for alternations).
     Or(Vec<ResidueGatePlan>),
@@ -973,7 +973,7 @@ fn derive_residue_gate_plan(hir: &Hir) -> Option<ResidueGatePlan> {
 
 /// Attempt to derive a run-length gate from a HIR.
 ///
-/// Only matches a single consuming atom (literal/class or fixed repetition),
+/// Only matches a single consuming atom (literal/class or repetition with min > 0),
 /// optionally wrapped by ASCII word boundaries and captures.
 /// Any single-sided boundary is ignored to avoid false negatives.
 ///

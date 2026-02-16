@@ -5,8 +5,9 @@
 //! # Grammar
 //!
 //! ```text
-//! scanner-rs scan fs --path <dir|file> [FS_FLAGS]
-//! scanner-rs scan git --repo <path>    [GIT_FLAGS]
+//! scanner-rs scan fs --path <dir|file>  [FS_FLAGS]
+//! scanner-rs scan git --repo <path>     [GIT_FLAGS]
+//! scanner-rs store <command>            [STORE_FLAGS]
 //! scanner-rs --help | -h
 //! ```
 
@@ -686,7 +687,7 @@ OPTIONS:
     --path=<dir|file>       Path to scan (also accepted as positional arg)
     --rules=<path>          YAML rules file (default: default_rules.yaml next to binary)
     --workers=<N>           Worker threads (default: CPU count)
-    --decode-depth=<N>      Max decode depth (default: 2)
+    --decode-depth=<N>      Max decode depth (default: 3)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                             Comma-separated: base64, url (case-insensitive)
     --null-sink             Drop all findings (measure scan overhead only)
@@ -714,7 +715,7 @@ OPTIONS:
     --repo=<path>             Repository path (also accepted as positional arg)
     --rules=<path>            YAML rules file (default: default_rules.yaml next to binary)
     --workers=<N>             Worker threads (default: auto)
-    --decode-depth=<N>        Max decode depth (default: 2)
+    --decode-depth=<N>        Max decode depth (default: 3)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                               Comma-separated: base64, url (case-insensitive)
     --anchors=manual|derived  Anchor mode (default: manual)

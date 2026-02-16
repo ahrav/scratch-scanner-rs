@@ -3,7 +3,9 @@
 Class diagram showing the key types in scanner-rs and their relationships.
 Verified against:
 `src/api.rs`, `src/engine/core.rs`, `src/engine/rule_repr.rs`,
-`src/engine/scratch.rs`, `src/runtime.rs`, `src/pipeline.rs`,
+`src/engine/scratch.rs`, `src/engine/hit_pool.rs`, `src/engine/safelist.rs`,
+`src/engine/offline_validate.rs`, `src/scratch_memory.rs`,
+`src/runtime.rs`, `src/pipeline.rs`,
 `src/pool/node_pool.rs`, `src/stdx/{bitset,ring_buffer}.rs`,
 `src/store/keys.rs`, `src/store/identity.rs`, and `src/store/fs.rs`.
 
@@ -96,6 +98,7 @@ classDiagram
     class SpanU32 {
         +u32 start
         +u32 end
+        +u32 anchor_hint
     }
 
     class TwoPhaseSpec {
@@ -137,6 +140,7 @@ classDiagram
     class ScanScratch {
         -ScratchVec~FindingRec~ out
         -ScratchVec~NormHash~ norm_hash
+        -ScratchVec~u64~ drop_hint_end
         -ScratchVec~WorkItem~ work_q
         -usize work_head
         -DecodeSlab slab

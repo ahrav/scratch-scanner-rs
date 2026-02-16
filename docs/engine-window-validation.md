@@ -33,7 +33,7 @@ Windows are provided externally (typically from anchor hits detected by Vectorsc
 ```
 Input: Window [w.start..w.end) in buffer
   ↓
-[Gate 1] Apply cheap byte gates (confirm-all, keywords; plus must-contain for Raw)
+[Gate 1] Apply cheap byte gates (must-contain, confirm-all, keywords for Raw)
   ↓
 [Gate 2] For UTF-16: Check decode budget + decode to UTF-8 + must-contain
   ↓

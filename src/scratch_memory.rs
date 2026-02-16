@@ -32,7 +32,8 @@ const PAGE_SIZE_MIN: usize = 4096;
 /// Errors returned by scratch allocators.
 #[derive(Debug)]
 pub enum ScratchMemoryError {
-    /// Size or element size was zero where a non-zero allocation is required.
+    /// Element type is a ZST (`size_of::<T>() == 0`) and a non-zero capacity
+    /// was requested. Zero-sized types are not supported.
     SizeZero,
     /// The requested layout was invalid (overflow or bad alignment).
     InvalidLayout,
@@ -62,8 +63,9 @@ impl<T> ScratchVec<T> {
     ///
     /// Only called in `drop()` for non-zero-capacity vectors. The layout is
     /// guaranteed valid because `with_capacity` already validated `cap *
-    /// size_of::<T>()` does not overflow and `size_of::<T>() > 0` — the
-    /// `unwrap` here cannot panic for values that passed construction.
+    /// size_of::<T>()` does not overflow, `size_of::<T>() > 0`, and alignment
+    /// is a power of two — so `from_size_align_unchecked` is sound for any
+    /// capacity that passed construction.
     fn dealloc_layout(cap: u32) -> Layout {
         let align = PAGE_SIZE_MIN.max(align_of::<T>());
         let cap = cap as usize;
@@ -81,8 +83,9 @@ impl<T> ScratchVec<T> {
     /// Allocate a fixed-capacity scratch vector.
     ///
     /// # Errors
-    /// - `SizeZero` if `T` has zero size and `cap > 0`.
-    /// - `InvalidLayout` if `cap * size_of::<T>()` overflows or alignment is invalid.
+    /// - `SizeZero` if `T` is a ZST (`size_of::<T>() == 0`) and `cap > 0`.
+    /// - `InvalidLayout` if `cap` exceeds `u32::MAX`, `cap * size_of::<T>()`
+    ///   overflows, or the resulting layout is invalid.
     /// - `OutOfMemory` if allocation fails.
     ///
     /// # Notes
@@ -232,8 +235,10 @@ impl<T> ScratchVec<T> {
     /// Appends a range from this vector's existing contents.
     ///
     /// This is useful for building new data from previous bytes without
-    /// allocating intermediate buffers. The source range may overlap with
-    /// the destination (memmove semantics).
+    /// allocating intermediate buffers. The preconditions guarantee that the
+    /// source range is disjoint from the destination; `ptr::copy` (memmove
+    /// semantics) is used defensively but overlap cannot occur when the
+    /// contract is upheld.
     ///
     /// # Panics (debug builds)
     ///
@@ -256,9 +261,10 @@ impl<T> ScratchVec<T> {
             "scratch vec capacity exceeded on extend_from_self_range"
         );
         // SAFETY: Source range `start..start+len` is within `0..self.len`
-        // (debug-asserted) and destination starts at `self.len`. These ranges
-        // may overlap when the source tail reaches into the destination, so we
-        // use `copy` (memmove) rather than `copy_nonoverlapping`.
+        // (debug-asserted) and destination starts at `self.len`. Because
+        // `start + len <= self.len`, the source ends before the destination
+        // begins, so the regions are always disjoint. `copy` (memmove) is
+        // used defensively; `copy_nonoverlapping` would also be sound here.
         unsafe {
             std::ptr::copy(
                 self.ptr.as_ptr().add(start).cast::<T>(),
@@ -447,13 +453,14 @@ impl<T> Drop for ScratchVec<T> {
 // SAFETY: `ScratchVec<T>` exclusively owns its allocation (no shared or aliased
 // pointers). When `T: Send`, transferring the vector to another thread is safe
 // because all owned data moves with it — identical reasoning to `Vec<T>: Send`.
-// Note: we intentionally do *not* implement `Sync` because the debug-only
-// bounds checks are not atomic and the type is designed for single-threaded
-// scratch use within one scan.
+// Note: we intentionally do *not* implement `Sync` because the type is designed
+// for single-threaded scratch use within one scan — there is no need for shared
+// references across threads, and omitting `Sync` encodes that intent at the
+// type level.
 unsafe impl<T: Send> Send for ScratchVec<T> {}
 
 // Compile-time size guard: `ScratchVec<u8>` should remain pointer + 2x u32
-// (plus alignment padding). This catches accidental field additions.
+// (no padding on common targets). This catches accidental field additions.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<ScratchVec<u8>>() == 16);
 #[cfg(target_pointer_width = "32")]

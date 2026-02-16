@@ -16,12 +16,15 @@
 //! â”‚   â”œâ”€â”€ Timeout         - Network/read timeout, definitely retry
 //! â”‚   â”œâ”€â”€ RateLimit       - 429, respect Retry-After header
 //! â”‚   â”œâ”€â”€ ServerError     - 500/502/503/504, transient backend issue
-//! â”‚   â””â”€â”€ ConnectionReset - Network blip, retry immediately
-//! â””â”€â”€ Permanent
-//!     â”œâ”€â”€ NotFound        - 404, object deleted during scan
-//!     â”œâ”€â”€ AccessDenied    - 403, auth/permission issue
-//!     â”œâ”€â”€ InvalidResponse - Malformed data, can't parse
-//!     â””â”€â”€ Cancelled       - User-initiated cancellation
+//! â"‚   â"œâ"€â"€ ConnectionReset - Network blip, retry immediately
+//! â"‚   â""â"€â"€ TransientIo     - Disk busy, interrupted, etc.
+//! â""â"€â"€ Permanent
+//!     â"œâ"€â"€ NotFound        - 404, object deleted during scan
+//!     â"œâ"€â"€ AccessDenied    - 403, auth/permission issue
+//!     â"œâ"€â"€ InvalidResponse - Malformed data, can't parse
+//!     â"œâ"€â"€ Cancelled       - User-initiated cancellation
+//!     â"œâ"€â"€ TooLarge        - Object exceeds configured size limit
+//!     â""â"€â"€ Unsupported     - Unsupported object type (symlink, device, etc.)
 //! ```
 //!
 //! # Retry Budget Scope
@@ -288,7 +291,7 @@ pub struct RetryBudget {
     /// Number of attempts made (including initial).
     attempts: u32,
 
-    /// Number of retries (attempts - 1, but only after failures).
+    /// Number of retries granted (times `should_retry` returned `Retry`).
     retries: u32,
 
     /// Total retry time spent sleeping.
@@ -579,7 +582,7 @@ pub struct FailureSummary {
     pub retry_delay_total: Duration,
     /// Final outcome
     pub outcome: ObjectOutcome,
-    /// Final error class if failed (None for success or cancellation)
+    /// Final error class if failed (None for success)
     pub final_error: Option<ErrorClass>,
 }
 
@@ -617,7 +620,9 @@ impl FailureSummary {
         }
     }
 
-    /// Check if this represents a true error (not success or cancellation).
+    /// Check if this represents a terminal failure (`FailedRetryExhausted` or
+    /// `FailedPermanent`). Returns `false` for success, cancellation,
+    /// in-progress, and partial outcomes.
     pub fn is_error(&self) -> bool {
         matches!(
             self.outcome,

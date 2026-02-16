@@ -106,7 +106,7 @@ pub enum EntryKind {
     RefDelta { base_oid: OidBytes },
 }
 
-/// Pack header parse error taxonomy.
+/// Pack parse error taxonomy (covers both file header and entry header parsing).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackParseError {
     TooSmall,

@@ -189,8 +189,8 @@ impl Base64YaraGate {
 
     /// One-shot scan over a whole buffer, treating '=' as a boundary.
     ///
-    /// This is a conservative buffer-level prefilter: it scans across multiple
-    /// spans and ignores padding boundaries so a single call can cover the
+    /// This is a conservative buffer-level prefilter: it resets state at
+    /// padding boundaries rather than halting, so a single call can cover the
     /// entire buffer. It may return more false positives than `hits`, but it
     /// will not introduce false negatives for valid base64 runs.
     ///
@@ -388,7 +388,7 @@ const BASE64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 /// wrapping or alternative alphabets.
 fn base64_encode_std(input: &[u8]) -> Vec<u8> {
     // This encoder is intentionally minimal and used only for gate pattern generation
-    // and tests, not for full decoding. Capacity uses div_ceil to avoid reallocation.
+    // and tests, not for general-purpose use. Capacity uses div_ceil to avoid reallocation.
     let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
 
     let mut i = 0usize;

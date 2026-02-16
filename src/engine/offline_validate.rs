@@ -338,7 +338,7 @@ const AWS_KEY_LEN: usize = 20;
 ///
 /// AWS key IDs encode an account number in a base-32–like scheme. This
 /// validator checks:
-/// 1. Length is exactly 20 bytes.
+/// 1. Length is at least 20 bytes (only the first 20 are examined).
 /// 2. Prefix matches a known type.
 /// 3. Characters 4–19 are in `[A-Z2-7]` (the AWS base-32 alphabet).
 /// 4. The decoded 10-byte suffix encodes a 40-bit account ID in the

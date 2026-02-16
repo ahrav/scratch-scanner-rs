@@ -30,6 +30,7 @@ flowchart TB
     subgraph RegexConfirm["Regex Confirmation"]
         MustContain["must_contain check<br/>(optional)"]
         ConfirmAll["confirm_all check<br/>(optional)"]
+        Keywords["keyword gate<br/>(optional, any-of memmem)"]
         Regex["rule.re.find_iter()"]
         UTF16Dec["UTF-16 Decode<br/>(for UTF-16 variants)"]
     end
@@ -43,6 +44,7 @@ flowchart TB
 
     subgraph EmitPolicy["Emit-Time Policies"]
         Safelist["Root-context safelist check<br/>(root emit paths only)"]
+        SecretSafelist["Secret-bytes safelist check<br/>(all findings)"]
         OfflineVal["Offline validation<br/>(structural checks on root-semantic findings)"]
         Cap["Findings cap check<br/>(max_findings_per_chunk)"]
     end
@@ -72,7 +74,8 @@ flowchart TB
 
     RegexConfirm --> MustContain
     MustContain --> ConfirmAll
-    ConfirmAll --> Regex
+    ConfirmAll --> Keywords
+    Keywords --> Regex
     Regex --> |"Raw variant"| SecretExtract
     Regex --> |"UTF-16 variant"| UTF16Dec
     UTF16Dec --> SecretExtract
@@ -81,7 +84,8 @@ flowchart TB
     Entropy --> ValueSuppressors
     ValueSuppressors --> LocalCtx
     LocalCtx --> Safelist
-    Safelist --> OfflineVal
+    Safelist --> SecretSafelist
+    SecretSafelist --> OfflineVal
     OfflineVal --> Cap
     Cap --> FindingRec
 
@@ -115,7 +119,7 @@ fn on_match(pid: usize, start: usize, end: usize, ...) {
         let variant = t.variant(); // Raw/Utf16Le/Utf16Be
         let rule = &rules[rule_id];
         let radius = compute_radius(rule, variant);
-        let window = SpanU32::new(start - radius, end + radius);
+        let window = SpanU32::new(start - radius, end + radius, start);
         let pair = rule_id * 3 + variant.idx();
         hit_acc_pool.push_span(pair, window, &mut touched_pairs);
     }
@@ -257,7 +261,9 @@ Finding policies are enforced when each finding is about to be recorded:
 - Evaluate the global safelist for root emit paths using
   `root_hint_start..root_hint_end` rebased to the active context slice.
 - Suppressed findings increment `safelist_suppressed` and are not inserted.
-- Non-root findings bypass safelist suppression.
+- Non-root findings bypass context-window safelist suppression but are still
+  checked by the secret-bytes safelist tier (suppressed findings increment
+  `secret_bytes_safelist_suppressed`).
 - `max_findings_per_chunk` is enforced in `push_finding_with_drop_hint`; excess
   findings increment `dropped_findings`.
 
@@ -359,9 +365,10 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
 - **Keyword gate (any-of)**: at least one keyword must appear inside the same
   validation window as the regex. This is a cheap memmem filter that reduces
   false positives without requiring global context.
-- **Entropy gate**: after a regex match, compute Shannon entropy (bits/byte)
-  of the matched bytes. Low-entropy matches are rejected as likely false
-  positives (e.g., repeated characters or structured IDs).
+- **Entropy gate**: after regex matching and secret extraction, compute Shannon
+  entropy (bits/byte) of the extracted secret bytes. Low-entropy matches are
+  rejected as likely false positives (e.g., repeated characters or structured
+  IDs).
 - **Value suppressor gate (any-of)**: after regex matching, entropy gating,
   and secret extraction, check if the extracted secret bytes contain any
   configured suppressor pattern. If any pattern matches, the finding is
@@ -378,8 +385,8 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
 These gates are designed to be **local and bounded**:
 - Keywords are checked *before* regex, and for UTF-16 windows the check happens
   **before decoding** to avoid wasting decode budget.
-- Entropy runs only on the regex match and is capped by `max_len` to keep cost
-  predictable.
+- Entropy runs only on the extracted secret bytes and is capped by `max_len` to
+  keep cost predictable.
 - Value suppressors run only on confirmed matches after secret extraction, so
   they add minimal cost per finding but do not reduce regex work.
 - Local context uses bounded lookaround windows and operates on decoded UTF-8
@@ -532,6 +539,7 @@ FindingRec {
     span_end: 140,
     root_hint_start: 100,    // Offset in original file
     root_hint_end: 140,
+    dedupe_with_span: true,  // Whether span participates in dedupe key
     step_id: StepId(0),      // Decode provenance chain
 }
 ```

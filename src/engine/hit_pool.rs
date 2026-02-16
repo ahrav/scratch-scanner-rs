@@ -5,8 +5,9 @@
 //!
 //! # Performance design
 //! All arrays are fixed-size after construction (pair count and max_hits are
-//! invariant for the lifetime of a `ScanScratch`). The struct stores raw
-//! pointers instead of `Vec` to eliminate bounds-check loads on the hot path.
+//! invariant for the lifetime of a `HitAccPool` instance). The struct stores
+//! raw pointers instead of `Vec` to eliminate bounds-check loads on the hot
+//! path.
 //! Per-pair metadata (`len` + `coalesced` flag) is collocated into a 4-byte
 //! `PairMeta` struct so that a single 32-bit load gives both fields and 16
 //! consecutive pairs fit in one cache line.
@@ -85,13 +86,13 @@ impl SpanU32 {
 /// gives both fields. 16 consecutive pairs fit in one cache line.
 ///
 /// # Invariants
-/// - `len` is in `0..=max_hits` (max_hits ≤ 2048 in production, fits u16).
+/// - `len` is in `0..=max_hits` (constructor rejects max_hits > `u16::MAX`).
 /// - `coalesced` is 0 or 1.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PairMeta {
     /// Number of windows accumulated for this pair.
-    /// Max value is max_hits (≤ 2048 in production), fits in u16.
+    /// Max value is max_hits (constructor enforces max_hits ≤ `u16::MAX`).
     len: u16,
     /// 1 if this pair has been coalesced, 0 otherwise.
     coalesced: u8,
@@ -153,9 +154,10 @@ pub(super) struct HitAccPool {
     pair_count: u32,
     /// `ceil(pair_count / 64)` — number of `u64` words in the touched bitset.
     touched_word_count: u32,
-    /// Explicit padding making the 8-byte alignment of pointer fields
-    /// visible in the source rather than relying on implicit `#[repr(C)]`
-    /// padding rules.
+    /// Explicit padding making the intended 16-byte header layout (three
+    /// `u32` fields + pad) visible in the source. The struct uses default
+    /// Rust repr, so field order is not guaranteed, but the pad documents
+    /// the developer's alignment intent.
     _pad: u32,
     // Raw pointers to exclusively-owned heap allocations.
     // All arrays are fixed-size after construction.
@@ -586,8 +588,9 @@ impl BenchHitAccPool {
 
 /// Fuzz harness wrapping [`HitAccPool`] for use by fuzz targets.
 ///
-/// Provides the same interface as `BenchHitAccPool` but gated behind
-/// `tiger-harness` for the fuzz crate.
+/// Similar to [`BenchHitAccPool`] but with fuzz-friendly semantics: `new`
+/// returns `Option` instead of panicking, `push`/`take` clamp the pair index
+/// instead of asserting, and an extra `pair_count()` accessor is exposed.
 #[cfg(feature = "tiger-harness")]
 pub struct FuzzHitAccPool {
     pool: HitAccPool,
