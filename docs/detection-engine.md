@@ -35,8 +35,8 @@ flowchart TB
     end
 
     subgraph PostMatch["Post-Match Gates"]
-        Entropy["Entropy gate<br/>(optional)"]
         SecretExtract["Secret span extraction"]
+        Entropy["Entropy gate<br/>(optional, on extracted secret)"]
         ValueSuppressors["Value suppressor gate<br/>(optional, any-of)"]
         LocalCtx["Local context gate<br/>(optional, fail-open)"]
     end
@@ -73,12 +73,12 @@ flowchart TB
     RegexConfirm --> MustContain
     MustContain --> ConfirmAll
     ConfirmAll --> Regex
-    Regex --> |"Raw variant"| Entropy
+    Regex --> |"Raw variant"| SecretExtract
     Regex --> |"UTF-16 variant"| UTF16Dec
-    UTF16Dec --> Entropy
+    UTF16Dec --> SecretExtract
 
-    Entropy --> SecretExtract
-    SecretExtract --> ValueSuppressors
+    SecretExtract --> Entropy
+    Entropy --> ValueSuppressors
     ValueSuppressors --> LocalCtx
     LocalCtx --> Safelist
     Safelist --> OfflineVal

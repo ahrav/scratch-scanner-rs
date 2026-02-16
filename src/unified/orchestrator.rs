@@ -138,8 +138,9 @@ fn uring_backend_available(ring_entries: u32) -> bool {
 /// Uses io_uring on Linux only when it is available and `--persist-findings`
 /// is disabled. Otherwise uses the blocking `parallel_scan_dir` path.
 ///
-/// Findings are emitted as structured JSONL events to stdout via the
-/// [`EventSink`]. Summary stats are written to stderr.
+/// Findings are emitted as structured events to stdout via the
+/// [`EventSink`] (format per `--event-format`). Summary stats are written
+/// to stderr.
 fn run_fs(
     cfg: FsScanConfig,
     event_format: EventFormat,

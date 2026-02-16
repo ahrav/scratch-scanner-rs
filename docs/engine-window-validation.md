@@ -94,6 +94,7 @@ pub(super) fn run_rule_on_window(
     file_id: FileId,
     scratch: &mut ScanScratch,
     anchor_hint: usize,
+    gates: &ResolvedGates<'_>,
 )
 ```
 
@@ -593,7 +594,7 @@ For externally-managed windows (already extracted from buffer). Used when:
 - Caller tracks window starting offset
 - Caller needs to know if any match passed gates
 
-Uses output parameters (`dropped`, `found_any`) and stages accepted findings in
+Uses output parameter (`found_any`) and stages accepted findings in
 `scratch.tmp_findings` with aligned sidecars (`tmp_drop_hint_end`, `tmp_norm_hash`).
 
 ### run_rule_on_utf16_window_into
@@ -627,7 +628,7 @@ The module includes comprehensive tests for `has_assignment_value_shape`:
 - ✓ Boundary conditions: exactly 10 chars passes, 9 chars fails
 - ✓ Negative cases: no separator, short tokens, empty values
 
-Located in `src/engine/window_validate.rs` (tests starting around line 1136).
+Located in `src/engine/window_validate_tests.rs` (included via `#[path]` attribute).
 
 ---
 

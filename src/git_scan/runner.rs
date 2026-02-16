@@ -165,12 +165,17 @@ pub struct GitScanConfig {
     pub pack_mmap: PackMmapLimits,
     /// Pack cache size in bytes (must fit in `u32`).
     pub pack_cache_bytes: usize,
-    /// Symmetric pack-exec threads per worker.
+    /// Total pack-exec worker threads.
     ///
-    /// Each top-level worker that scans a git repo spawns this many threads
-    /// for pack execution. Both threads handle I/O (page faults) and compute
-    /// (decode + scan), keeping caches hot. Default is 2 to overlap IO latency
-    /// without multiplicative thread explosion across concurrent repo scans.
+    /// Controls the number of parallel workers for pack decode + scan
+    /// execution. Each worker handles I/O (page faults) and compute
+    /// (decode + scan). The scheduler selects Serial (1 worker) or
+    /// PackParallel/IntraPackSharded (this many workers) based on
+    /// plan structure.
+    ///
+    /// Default: detected hardware parallelism (1× cores). CLI orchestration
+    /// may scale this using repository-size heuristics via
+    /// `auto_pack_exec_workers_for_in_pack`.
     ///
     /// Total pack threads in the system ≤ scheduler_workers × pack_exec_workers.
     pub pack_exec_workers: usize,
@@ -444,8 +449,9 @@ pub struct SkippedCandidate {
 
 /// Per-stage nanoseconds for the git scan pipeline.
 ///
-/// Most fields are wall-clock durations. `mapping` and `scan` come from
-/// git-perf counters when that instrumentation is enabled.
+/// All fields are only populated when the `git-perf` feature is enabled.
+/// Most are wall-clock durations; `mapping` and `scan` come from
+/// thread-local perf counters (accumulated across pack-exec workers).
 ///
 /// Shape is stable across feature flags. In non-`git-perf` builds, all fields
 /// remain available and default to zero.

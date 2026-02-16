@@ -72,7 +72,7 @@ use super::tree_stream::{TreeBytesReader, TreeStream};
 
 /// Maximum path length in bytes.
 ///
-/// This matches common filesystem limits (PATH_MAX on Linux/macOS).
+/// This matches Linux's PATH_MAX (macOS PATH_MAX is 1024).
 /// Paths exceeding this are rejected to prevent DoS via deeply nested trees.
 const MAX_PATH_LEN: usize = 4096;
 /// Streaming tree entry buffer size (bytes).
@@ -584,8 +584,8 @@ impl TreeDiffWalker {
     ///
     /// Implements the four-way kind matrix:
     /// - **tree / tree**: recurse if OIDs differ, skip if identical.
-    /// - **non-tree / tree**: treat new subtree as entirely added.
-    /// - **tree / non-tree**: emit the new blob as `Add`.
+    /// - **non-tree / tree**: emit the new blob as `Add`.
+    /// - **tree / non-tree**: treat new subtree as entirely added.
     /// - **non-tree / non-tree**: emit `Modify` if OIDs differ, skip if equal.
     ///
     /// Gitlinks on either side are handled implicitly: a gitlink-to-blob

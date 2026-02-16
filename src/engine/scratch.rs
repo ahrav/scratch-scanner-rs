@@ -77,7 +77,7 @@ pub(super) const DEDUP_RULE_ID_MAX: u32 = (1u32 << DEDUP_RULE_ID_BITS) - 1;
 /// Packs a rule ID and variant discriminator into a single `u32`.
 ///
 /// The lower [`DEDUP_RULE_ID_BITS`] (24) bits hold the rule ID; the upper 8
-/// bits hold `variant_disc` (Raw=0, Utf16Le=1, Utf16Be=2). This packing
+/// bits hold `variant_disc` (non-UTF16=0, Utf16Le=1, Utf16Be=2). This packing
 /// ensures UTF-16 LE/BE findings that share the same span and root hint
 /// produce distinct dedup keys.
 ///
@@ -537,7 +537,7 @@ pub struct ScanScratch {
     ///
     /// Prevents emitting the same finding multiple times when overlapping chunks
     /// or transform re-scans produce identical matches. The set is reset on file
-    /// boundary transitions (new file or `base_offset == 0`).
+    /// boundary transitions (new file).
     ///
     /// Key composition (32 bytes = one AEGIS-128L absorption block → 128-bit hash):
     /// - `file_id` (4 bytes) — scoped to current file
@@ -1369,9 +1369,8 @@ impl ScanScratch {
     ///
     /// # Contract for `keep`
     ///
-    /// `keep` may be called more than once for the same row when at least one
-    /// row is dropped (first-pass detection + second-pass compaction). It must
-    /// therefore be side-effect free and deterministic for a given input pair.
+    /// `keep` is called exactly once per row. It must be side-effect free and
+    /// deterministic for a given input pair.
     #[inline(always)]
     pub(super) fn retain_findings_aligned<F>(&mut self, mut keep: F) -> usize
     where

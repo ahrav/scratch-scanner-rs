@@ -10,8 +10,9 @@
 //!
 //! All three derivations follow the same pattern:
 //! 1. Build a canonical byte payload from the input fields.
-//! 2. Feed the payload through `keyed_hash` — a domain-separated BLAKE3 keyed
-//!    hash using one of the subkeys from [`StoreKeys`].
+//! 2. Feed the payload through a domain-separated BLAKE3 hash — `keyed_hash`
+//!    for `secret_hash` and `occurrence_id`, or `unkeyed_hash` for
+//!    `rule_fingerprint` (which must be comparable across operators).
 //!
 //! Domain separation (a NUL-terminated domain string prepended to the payload)
 //! ensures that identical byte payloads used in different contexts produce
@@ -20,7 +21,7 @@
 //! `occurrence_id` additionally normalizes its inputs before hashing to absorb
 //! benign variation that the engine's existing dedupe logic already collapses:
 //! - **Root-hint end normalization**: base64 padding (up to 2 trailing `=`
-//!   characters, inflating the encoded region by up to 3 bytes) causes the
+//!   characters, inflating the encoded region by up to 2 bytes) causes the
 //!   encoded-region length to vary for identical decoded content;
 //!   `normalize_root_hint_end` snaps the end offset to the padding-free minimum
 //!   so both padded and unpadded encodings hash identically. This normalization
@@ -42,9 +43,10 @@ use super::keys::StoreKeys;
 
 /// Identity contract version shared by all encodings in this module.
 ///
-/// Embedded as the first metadata byte in every canonical payload. Any change
-/// to field ordering, normalization logic, or domain strings requires bumping
-/// this version so that hashes produced under different contracts never collide.
+/// Embedded as the first metadata byte in the occurrence canonical payload.
+/// Any change to field ordering, normalization logic, or domain strings
+/// requires bumping this version so that hashes produced under different
+/// contracts never collide.
 pub const IDENTITY_CONTRACT_VERSION: u8 = 1;
 
 // Domain-separation strings for BLAKE3 keyed/unkeyed hashes.
@@ -140,7 +142,8 @@ impl IdentityFlags {
     /// Derives flags from `(step_id, include_span, variant, normalized)`,
     /// enforcing structural invariants:
     ///
-    /// - Root findings (`STEP_ROOT`) always set `ROOT_STEP` and include span.
+    /// - Root findings (`STEP_ROOT`) set `ROOT_STEP`; callers are expected to
+    ///   pass `include_span = true` for root findings.
     /// - `ROOT_HINT_END_NORMALIZED` is set when `normalized` is true (i.e., the
     ///   finding is a Base64 non-root finding that went through padding normalization).
     /// - Span inclusion follows engine dedupe semantics (`dedupe_with_span`):
@@ -372,14 +375,15 @@ pub fn occurrence_id(
 
 /// Normalized snapshot of the identity-relevant fields from a [`FindingRec`].
 ///
-/// This intermediate separates normalization (which may fail) from encoding
-/// (which is infallible), keeping each step testable in isolation.
+/// This intermediate separates normalization (which may fail) from encoding,
+/// keeping each step testable in isolation.
 /// Fields that do not participate in identity for a given finding class are
 /// zeroed during construction (e.g. `span_start`/`span_end` for non-root).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CanonicalFinding {
     flags: IdentityFlags,
-    /// Decoded-buffer span; zero for non-root findings (unstable across chunks).
+    /// Decoded-buffer span; zero for non-root findings unless `dedupe_with_span`
+    /// is set (unstable across chunks otherwise).
     span_start: u32,
     span_end: u32,
     root_hint_start: u64,
@@ -433,16 +437,16 @@ fn canonicalize_finding(
 /// # Problem
 ///
 /// Base64 encodes 3 raw bytes into 4 encoded characters. When the raw length
-/// is not a multiple of 3, the encoder appends 1–3 `=` padding characters.
+/// is not a multiple of 3, the encoder appends 1–2 `=` padding characters.
 /// Different base64 implementations (or the same implementation across
 /// versions) may or may not include the padding, causing `root_hint_end` to
-/// vary by up to 3 bytes for identical decoded content.
+/// vary by up to 2 bytes for identical decoded content.
 ///
 /// # Solution
 ///
 /// For non-root findings, compute the minimum encoded length that could
 /// represent the decoded span (`ceil(decoded_len * 4 / 3)`). If the actual
-/// encoded region length exceeds this minimum by 1–3 bytes — exactly the
+/// encoded region length exceeds this minimum by 1–2 bytes — exactly the
 /// padding window — snap `root_hint_end` back to the minimum. Differences
 /// outside this window are left untouched because they indicate a genuinely
 /// different encoded region, not mere padding variation.

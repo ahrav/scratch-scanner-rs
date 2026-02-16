@@ -31,7 +31,7 @@
 //! - Per-worker Chase-Lev deque (LIFO local, FIFO steal)
 //! - Per-worker scratch space via [`WorkerCtx<T, S>`]
 //! - Global injector for external producers
-//! - Tiered idle strategy: spin → yield → park
+//! - Tiered idle strategy: spin → park (with occasional yields)
 //!
 //! # Correctness Invariants
 //!
@@ -185,7 +185,7 @@ impl<T: Send + 'static> ExecutorHandle<T> {
     /// |--------|------|
     /// | CAS loop | 1-3 iterations typical (contention-dependent) |
     /// | Injector push | O(1) amortized (Crossbeam MPMC) |
-    /// | Unpark | 1 syscall (futex on Linux, kevent on macOS) |
+    /// | Unpark | 1 Condvar notify (pthread on POSIX) |
     ///
     /// For high-frequency external spawns, consider batching to amortize
     /// the per-spawn syscall overhead.
@@ -360,6 +360,7 @@ impl<T: Send + 'static> ExecutorHandle<T> {
 ///         │  state: AtomicUsize       ◄── spawn/join sync │
 ///         │  done: AtomicBool         ◄── shutdown signal │
 ///         │  unparkers: Vec<Unparker> ◄── wakeup handles  │
+///         │  next_unpark: AtomicUsize ◄── round-robin idx │
 ///         │  panic: Mutex<Option<..>> ◄── error capture   │
 ///         └───────────────────────────────────────────────┘
 /// ```
@@ -749,7 +750,7 @@ impl<T: Send + 'static> Executor<T> {
     /// - `scratch_init`: Called once per worker to create scratch space
     /// - `runner`: Called for each task to execute it
     ///
-    /// Workers start immediately and park until work is spawned.
+    /// Workers start immediately and idle (spin, then park) until work is spawned.
     pub fn new<S, ScratchInit, Runner>(
         cfg: ExecutorConfig,
         scratch_init: ScratchInit,
@@ -962,11 +963,10 @@ impl<T: Send + 'static> Executor<T> {
 /// 1. **Spin** (`idle_rounds <= spin_iters`): CPU-bound spinning with `spin_loop()` hint.
 ///    Best for bursty workloads where work arrives within nanoseconds.
 ///
-/// 2. **Yield** (every 16th iteration): `thread::yield_now()` gives other threads a chance.
-///    Reduces CPU pressure when spinning isn't productive.
-///
-/// 3. **Park** (after spin threshold): `park_timeout()` sleeps until unparked or timeout.
+/// 2. **Park** (after spin threshold): `park_timeout()` sleeps until unparked or timeout.
 ///    Minimizes CPU waste during idle periods while remaining responsive.
+///    Every 16th iteration past the spin threshold, `thread::yield_now()` is
+///    called before parking to give other threads a chance.
 ///
 /// # Complexity
 ///

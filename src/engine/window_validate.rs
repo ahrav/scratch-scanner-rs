@@ -12,16 +12,19 @@
 //!
 //! # Algorithm
 //! 1. Apply cheap byte gates (must-contain, confirm-all, keyword gate).
-//! 2. For UTF-16 variants, decode with per-window and total-output budgets.
-//! 3. Run regex with reusable capture locations to access capture groups.
-//! 4. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
-//! 5. Apply entropy gates on the *extracted secret*.
-//! 6. Apply value suppressors (when configured) on the extracted secret bytes.
-//! 7. Apply local context checks (when configured) on the secret span.
-//! 8. Apply root-context safelist suppression for root emit paths.
-//! 9. Apply secret-bytes safelist suppression (all findings, including decoded).
-//! 10. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 11. Record the finding with the extracted secret span.
+//!    For UTF-16 variants, confirm-all and keywords run on raw bytes *before*
+//!    decode; must-contain runs on decoded UTF-8 *after* decode.
+//! 2. Apply assignment-shape precheck (when configured).
+//! 3. For UTF-16 variants, decode with per-window and total-output budgets.
+//! 4. Run regex with reusable capture locations to access capture groups.
+//! 5. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
+//! 6. Apply entropy gates on the *extracted secret*.
+//! 7. Apply value suppressors (when configured) on the extracted secret bytes.
+//! 8. Apply local context checks (when configured) on the secret span.
+//! 9. Apply root-context safelist suppression for root emit paths.
+//! 10. Apply secret-bytes safelist suppression (all findings, including decoded).
+//! 11. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 12. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -240,8 +243,7 @@ fn has_assignment_value_shape(window: &[u8]) -> bool {
 /// Returns the `(line_start, line_end)` byte offsets of the line containing
 /// `secret_start`, searching within bounded lookaround windows.
 ///
-/// - `line_start` — byte *after* the preceding `\n` (or index 0 if none is
-///   found within `lookbehind` bytes).
+/// - `line_start` — byte *after* the preceding `\n`, within `lookbehind` bytes.
 /// - `line_end` — the `\n` byte itself (not past it).
 ///
 /// Returns `None` when **either** boundary is not found within the lookaround.

@@ -17,9 +17,16 @@ classDiagram
         -Vec~TransformConfig~ transforms
         -Tuning tuning
         -Option~VsPrefilterDb~ vs
+        -Option~VsAnchorDb~ vs_utf16
         -Option~Base64YaraGate~ b64_gate
         -SafelistFilter safelist
         -Vec~OfflineValidationSpec~ offline_validation_gates
+        -Vec~ConfirmAllCompiled~ confirm_all_gates
+        -Vec~KeywordsCompiled~ keyword_gates
+        -Vec~PackedPatterns~ value_suppressor_gates
+        -Vec~EntropyCompiled~ entropy_gates
+        -Vec~TwoPhaseCompiled~ two_phase_gates
+        -Vec~LocalContextSpec~ local_context_gates
         -usize max_window_diameter_bytes
         -usize max_prefilter_width
         +new(rules, transforms, tuning) Engine
@@ -315,7 +322,7 @@ classDiagram
   - bits 0..=15: `secret_group` value (when override-present bit is set)
   - bit 16: `needs_assignment_shape_check`
   - bit 17: `has_secret_group_override`
-  This keeps `RuleCompiled` at 80 bytes on 64-bit targets while preserving
+  This keeps `RuleCompiled` at ≤ 80 bytes on 64-bit targets while preserving
   full `u16` capture-group semantics.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.

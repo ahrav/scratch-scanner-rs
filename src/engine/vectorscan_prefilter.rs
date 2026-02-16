@@ -136,8 +136,9 @@ pub(crate) struct VsPrefilterDb {
 
 /// Per-rule metadata for stream-mode window seeding.
 ///
-/// `max_width` is derived from `hs_expression_info` in decoded-byte space and may
-/// be capped; a reported 0 width is treated as unbounded. When unbounded,
+/// `max_width` is derived from `hs_expression_info`; Vectorscan reports
+/// `UINT_MAX` for unbounded patterns and `0` for zero-width matches — both
+/// are mapped to `u32::MAX` for window seeding. When unbounded,
 /// `whole_buffer_on_hit` is set and the callback asks the caller to scan the
 /// full decoded stream instead of emitting offsets. `radius` comes from rule
 /// tuning and expands windows around the match end.
@@ -2533,9 +2534,9 @@ unsafe extern "C" fn vs_anchor_on_match(
 
 /// Returns `(max_width, c_pattern)` for use in compilation.
 ///
-/// Vectorscan reports `max_width = 0` when a pattern can match an unbounded
-/// number of bytes (e.g. `.*`). Callers must map zero to `u32::MAX` or
-/// fall back to whole-buffer scanning.
+/// Vectorscan reports `max_width = UINT_MAX` for truly unbounded patterns
+/// (e.g. `.*`) and `0` for zero-width matches (e.g. `^`, `\b`). Callers
+/// treat both as effectively unbounded for window seeding.
 ///
 /// # Errors
 /// Returns an error if the pattern contains NUL bytes or if
