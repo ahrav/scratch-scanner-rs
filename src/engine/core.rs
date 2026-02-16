@@ -188,7 +188,10 @@ pub(super) struct VectorscanCounters {
 
 #[cfg(feature = "stats")]
 impl VectorscanCounters {
-    /// Captures a consistent snapshot of all counters with relaxed ordering.
+    /// Captures a best-effort snapshot of all counters with relaxed ordering.
+    ///
+    /// Individual counter values are atomic but not guaranteed to reflect the
+    /// same point in time across counters.
     pub(super) fn snapshot(&self, db_built: bool, utf16_db_built: bool) -> VectorscanStats {
         VectorscanStats {
             db_built,
@@ -265,7 +268,7 @@ pub struct Engine {
     /// Pre-computed `ln(i)/ln(2)` table for Shannon entropy calculation.
     ///
     /// Sized to `max(entropy_gate.max_len)` across all rules. Avoids
-    /// per-window `f64::log2` calls in the entropy gate hot path.
+    /// per-window `f32::log2` calls in the entropy gate hot path.
     pub(super) entropy_log2: Vec<f32>,
 
     /// Unified Vectorscan prefilter DB for raw + anchor scanning.

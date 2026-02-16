@@ -26,7 +26,7 @@
 /// # Layout
 ///
 /// Fields ordered for optimal packing (largest alignment first).
-/// Size: 32 bytes (verified at compile time).
+/// Size: 40 bytes (verified at compile time).
 #[derive(Clone, Copy, Debug)]
 pub struct TreeDiffLimits {
     /// Maximum tree bytes kept in flight at any time.

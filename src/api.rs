@@ -35,7 +35,7 @@ use std::ops::Range;
 /// owning `FileTable`.
 ///
 /// # Construction
-/// Create via [`FileTable::insert`] or similar registration methods.
+/// Create via [`FileTable::push`] or similar registration methods.
 /// Direct construction with `FileId(n)` is valid but callers must ensure
 /// the index corresponds to an entry in the associated `FileTable`.
 ///
@@ -275,7 +275,7 @@ pub enum DecodeStep {
 
 /// Fixed-capacity decode-step chain stored inline in [`Finding`].
 ///
-/// Length is bounded by [`MAX_DECODE_STEPS`]; pushing past capacity panics.
+/// Length is bounded by [`MAX_DECODE_STEPS`]; extending past capacity panics.
 /// Steps are ordered from root to leaf when materialized.
 pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
 
@@ -462,7 +462,7 @@ pub enum DelimAfter {
     /// No delimiter requirement; the match may be followed by any byte or end.
     None,
     /// Gitleaks-style token terminator:
-    /// `['"|\\n|\\r|\\s|\\x60]` or end-of-input.
+    /// `['"|\\s|;|\\x60]`, escaped newlines (`\\[nr]`), or end-of-input.
     GitleaksTokenTerminator,
 }
 
@@ -545,7 +545,8 @@ impl LocalContextSpec {
 /// # Invariants
 /// - `name` must be non-empty.
 /// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
-///   `entropy`, `local_context`, and `offline_validation` must be valid when present.
+///   `entropy`, `local_context`, `offline_validation`, and `secret_group` must be
+///   valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.

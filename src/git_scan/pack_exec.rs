@@ -97,8 +97,8 @@ pub trait PackObjectSink {
     /// Receives a decoded blob candidate.
     ///
     /// The `bytes` slice is only valid for the duration of the call and may
-    /// be backed by either a cache entry or a scratch buffer. Implementations
-    /// must copy if they need to retain the bytes.
+    /// be backed by a cache entry, a scratch buffer, or a spill-backed mmap.
+    /// Implementations must copy if they need to retain the bytes.
     /// `path` points into the caller-owned arena.
     ///
     /// When the allocation guard is enabled, `emit` must avoid heap
@@ -692,11 +692,14 @@ fn next_candidate_range(
 /// The executor uses a three-buffer rotation scheme to avoid per-offset
 /// heap allocations on the hot path:
 ///
-/// - `inflate_buf` — receives raw zlib-inflated bytes (delta payloads or
-///   non-delta object data). Sized to `max_delta_bytes`.
-/// - `result_buf` — holds the final decoded object bytes after delta
-///   application. This is the buffer handed to `cache.insert()` or read
-///   by the sink. Sized to `max_object_bytes`.
+/// - `inflate_buf` — receives raw zlib-inflated delta payloads. Non-delta
+///   objects are inflated directly into `result_buf`. Sized to
+///   `max_delta_bytes`.
+/// - `result_buf` — holds the final decoded object bytes. For non-delta
+///   entries the inflated payload is written here directly; for delta
+///   entries the delta-applied output lands here. This is the buffer
+///   handed to `cache.insert()` or read by the sink. Sized to
+///   `max_object_bytes`.
 /// - `base_buf` — holds the base object bytes during fallback delta chain
 ///   resolution. Swapped with `result_buf` as each delta frame is applied
 ///   so the previous output becomes the next base.

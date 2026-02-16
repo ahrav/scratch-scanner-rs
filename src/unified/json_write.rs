@@ -602,11 +602,14 @@ mod neon {
     //! NEON (128-bit SIMD) fast path for JSON string escaping on AArch64.
     //!
     //! Each function loads 16 bytes at a time via `vld1q_u8`, classifies all
-    //! lanes in parallel with [`is_all_safe_neon`], and either bulk-copies
-    //! the chunk or bails to the scalar path for the remainder. The bail-out
-    //! delegates the *entire* tail (not just 16 bytes) so that
-    //! `write_json_bytes_scalar` can run its UTF-8 validation without
-    //! splitting a multi-byte codepoint.
+    //! lanes in parallel with [`is_all_safe_neon`], and bulk-copies safe chunks.
+    //!
+    //! The two variants differ when a non-safe chunk is found:
+    //! - **`write_json_str_neon`**: copies the safe prefix of the chunk, escapes
+    //!   the offending byte via scalar, then **resumes SIMD scanning**.
+    //! - **`write_json_bytes_neon`**: delegates the *entire* remaining tail to
+    //!   `write_json_bytes_scalar` so that UTF-8 validation doesn't split a
+    //!   multi-byte codepoint.
 
     use std::arch::aarch64::*;
 

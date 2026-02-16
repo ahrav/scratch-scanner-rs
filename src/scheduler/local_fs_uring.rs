@@ -94,7 +94,7 @@ pub enum ResolvePolicy {
     Default,
     /// Disallow symlink traversal in all components (opt-in).
     NoSymlinks,
-    /// Restrict traversal beneath dirfd root (requires dirfd strategy).
+    /// Restrict traversal beneath dirfd root (currently uses `AT_FDCWD`).
     BeneathRoot,
 }
 
@@ -392,10 +392,10 @@ impl FixedBufferHandle {
     fn as_mut_slice(&mut self) -> &mut [u8] {
         let ptr = self.pool.buf_ptr(self.index);
         let len = self.pool.buf_len(self.index);
-        // SAFETY: `buf_ptr` returns a valid pointer into the pool's mmap region for
-        // this buffer index, and `buf_len` returns its exact length. Each buffer index
-        // is owned by exactly one handle at a time (enforced by the free queue), and
-        // `&mut self` guarantees exclusive access.
+        // SAFETY: `buf_ptr` returns a valid pointer into the pool's heap-allocated
+        // buffer for this buffer index, and `buf_len` returns its exact length. Each
+        // buffer index is owned by exactly one handle at a time (enforced by the free
+        // queue), and `&mut self` guarantees exclusive access.
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 }
@@ -1036,7 +1036,8 @@ fn extract_worker_loop<E: ScanEngine>(
 /// - `in_flight` is 0 or 1 (single op in-flight per file)
 /// - `done` is monotonic: once true, never reset to false
 /// - `failed` is monotonic: once true, never reset to false
-/// - `phase` only moves forward: PendingOpen → PendingStat → ReadyRead
+/// - `phase` only moves forward: PendingOpen → PendingStat → Ready
+///   (blocking fallback may skip PendingStat)
 struct FileState {
     phase: FilePhase,
     in_flight: u32,
@@ -1048,6 +1049,8 @@ struct FileState {
 /// State machine phase for a file being processed by an I/O thread.
 ///
 /// Transitions are forward-only: `PendingOpen → PendingStat → Ready`.
+/// When blocking fallback is used (open failure with EINVAL/EOPNOTSUPP,
+/// or `BlockingOnly` mode), `PendingStat` may be skipped entirely.
 /// Each transition is driven by a CQE completion (or blocking fallback).
 /// The I/O thread enforces at most one in-flight op per file at any phase.
 enum FilePhase {
@@ -1223,7 +1226,7 @@ fn open_file_safe(path: &Path, follow_symlinks: bool) -> io::Result<File> {
 ///   per file to ensure prefix-drop deduplication logic is valid (no gaps from
 ///   failed earlier chunks).
 /// - **Open/stat staging**: Each file advances `PendingOpen → PendingStat → Ready`
-///   before any reads are submitted.
+///   (or directly to `Ready` via blocking fallback) before any reads are submitted.
 /// - **Drain before return**: All in-flight ops MUST complete before we return,
 ///   otherwise the kernel may write to freed memory.
 /// - **Buffer lifetime**: Buffers live in `ops[]` until CQE is reaped.

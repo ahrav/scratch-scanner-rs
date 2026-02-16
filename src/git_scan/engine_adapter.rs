@@ -68,7 +68,7 @@ pub struct CommitMetaContext {
     pub commit_meta_seen: Arc<AtomicBitSet>,
     /// Identity interner for resolving intern IDs to raw name/email bytes.
     ///
-    /// Present when identity enrichment is enabled (`--author-attribution`).
+    /// Present when identity enrichment is enabled (`enrich_identities`).
     /// The runner reads this for upfront `IdentityDictionary` emission;
     /// it is carried here to avoid a separate plumbing path through the
     /// scheduler into per-worker adapter construction.
@@ -265,8 +265,8 @@ pub struct EngineAdapter<'a> {
 impl<'a> EngineAdapter<'a> {
     /// Creates a new adapter with a structured event sink.
     ///
-    /// Findings are streamed as JSONL events during scanning (in addition to
-    /// being accumulated in `ScannedBlobs` for persistence).
+    /// Findings are streamed as structured events during scanning (in addition
+    /// to being accumulated in `ScannedBlobs` for persistence).
     ///
     /// # Panics (debug only)
     ///
@@ -514,8 +514,7 @@ impl<'a> EngineAdapter<'a> {
     }
 
     /// Scans raw blob bytes (bypassing content classification) and updates
-    /// metrics. Called by `scan_blob_into_buf` for text blobs and extracted
-    /// binary content.
+    /// metrics. Called by `scan_blob_into_buf` for text blobs.
     fn scan_blob_payload(
         &mut self,
         file_id: FileId,
@@ -881,8 +880,8 @@ fn scan_chunk(
 ///
 /// Each view represents a contiguous slice of a blob, potentially including
 /// an overlap prefix from the previous window. After scanning, findings
-/// whose `root_hint_end` falls within the overlap prefix are dropped to
-/// prevent double-reporting — except for the first window (`is_first`),
+/// whose `drop_hint_end` falls at or before the overlap boundary are dropped
+/// to prevent double-reporting — except for the first window (`is_first`),
 /// where no prior window exists to own those bytes.
 struct ChunkView<'a> {
     /// Absolute start offset of `window` within the blob.

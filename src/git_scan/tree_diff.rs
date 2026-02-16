@@ -72,7 +72,7 @@ use super::tree_stream::{TreeBytesReader, TreeStream};
 
 /// Maximum path length in bytes.
 ///
-/// This matches common filesystem limits (PATH_MAX on Linux/macOS).
+/// This matches Linux's PATH_MAX (macOS PATH_MAX is 1024).
 /// Paths exceeding this are rejected to prevent DoS via deeply nested trees.
 const MAX_PATH_LEN: usize = 4096;
 /// Streaming tree entry buffer size (bytes).

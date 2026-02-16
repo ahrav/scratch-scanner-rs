@@ -91,7 +91,7 @@ struct RootSpanMapGuard {
 /// Identical decoded bytes at different root positions must be scanned
 /// independently because findings carry root-buffer coordinates for dedup.
 /// XOR with a second 128-bit hash is sufficient because both halves are
-/// independently high-entropy (SipHash-1-3 / AEGIS-128L).
+/// independently high-entropy (AEGIS-128L).
 fn mix_root_hint_hash(h: u128, root_hint: &Option<Range<usize>>) -> u128 {
     let Some(hint) = root_hint.as_ref() else {
         return h;
@@ -118,7 +118,7 @@ impl Engine {
     /// - No Vectorscan stream DB exists for this transform, or
     /// - `decode_stream_and_scan` bailed out via `force_full`.
     ///
-    /// The full decoded output is hashed (128-bit SipHash via `hash128`) so
+    /// The full decoded output is hashed (128-bit AEGIS-128L MAC via `hash128`) so
     /// identical decoded content from different encoded spans is scanned at
     /// most once per buffer.
     ///
@@ -383,8 +383,9 @@ impl Engine {
     /// - `encoded` slices into the root buffer or decode slab and must remain
     ///   valid for this call.
     /// - `scratch` belongs to the current scan. The following fields are reset
-    ///   at entry: `decode_ring`, `pending_windows`, `vs_stream_matches`,
-    ///   `pending_spans`, `span_streams`, `tmp_findings`.
+    ///   at entry: `decode_ring`, `window_bytes`, `pending_windows`,
+    ///   `vs_stream_matches`, `pending_spans`, `span_streams`, `tmp_findings`,
+    ///   `tmp_drop_hint_end`, `tmp_norm_hash`.
     ///
     /// # Effects
     /// - Populates `scratch.tmp_findings` (committed at end) and `pending_spans`
@@ -813,8 +814,9 @@ impl Engine {
         //
         //   1. Budget enforcement (per-transform + global decode limits)
         //   2. UTF-16 slab buffering (conditional; feeds block scanner later)
-        //   3. Accounting (local_out, total_decode_output_bytes, MAC update)
-        //   4. Ring buffer push + Vectorscan stream scan (raw anchors)
+        //   3. Accounting (local_out, total_decode_output_bytes, MAC update,
+        //      ring buffer push)
+        //   4. Vectorscan stream scan (raw anchors)
         //   5. Gate DB scan (decoded-space anchor gating, if enabled)
         //   6. UTF-16 stream activation / feeding (lazy on first NUL byte)
         //   7. Vectorscan match → PendingWindow enqueue (timing wheel)

@@ -396,10 +396,11 @@ impl WorkerMetricsLocal {
         }
     }
 
-    /// Steal success rate: `steal_successes / steal_attempts`.
+    /// Steal success ratio: `steal_successes / steal_attempts`.
     ///
-    /// Indicates how often steal attempts found work. A rate near 0 means
-    /// peers' deques were usually empty when this worker tried to steal.
+    /// Note: `steal_attempts` counts only *failed* probes, so this is
+    /// `successes / failures`, not `successes / total_probes`. A rate near 0
+    /// means peers' deques were usually empty when this worker tried to steal.
     pub fn steal_rate(&self) -> f64 {
         if self.steal_attempts == 0 {
             0.0
@@ -604,13 +605,16 @@ impl MetricsSnapshot {
         }
     }
 
-    /// Aggregate steal success rate: `steal_successes / steal_attempts`.
+    /// Aggregate steal success ratio: `steal_successes / steal_attempts`.
     ///
-    /// Low steal rates (<0.1) may indicate:
+    /// Note: `steal_attempts` counts only *failed* probes, so this is
+    /// `successes / failures`, not `successes / total_probes`.
+    ///
+    /// Low ratios (<0.1) may indicate:
     /// - Workers are well-balanced (steals rarely needed)
     /// - Deques are often empty when stealing (potential idleness)
     ///
-    /// Very high steal rates (>0.5) suggest work is poorly distributed.
+    /// Very high ratios (>0.5) suggest work is poorly distributed.
     pub fn steal_rate(&self) -> f64 {
         if self.steal_attempts == 0 {
             0.0

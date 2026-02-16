@@ -807,8 +807,8 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
     ///   wheel_size = 8, cursor_slot = 5, found slot = 2
     ///
     ///   Slots:  [0] [1] [2] [3] [4] [5] [6] [7]
-    ///                 ^           ^
-    ///              found       cursor
+    ///                     ^           ^
+    ///                  found       cursor
     ///
     ///   Distance = (2 < 5) ? wheel_size - (5 - 2) : 2 - 5
     ///            = 8 - 3 = 5  (wraps around)

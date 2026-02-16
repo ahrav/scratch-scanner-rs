@@ -780,8 +780,9 @@ impl BlobIntroducer {
 
 /// Returns the power-of-two table size for `count` items at ≤70% load.
 ///
-/// A 70% load factor balances probe length (avg ~1.5 with linear probing)
-/// against memory. Power-of-two sizing enables bitmask indexing.
+/// A 70% max load factor (with power-of-two rounding lowering actual load)
+/// keeps average probe length short. Power-of-two sizing enables bitmask
+/// indexing.
 fn table_size_for_count(count: usize) -> usize {
     const LOAD_FACTOR_NUM: usize = 7;
     const LOAD_FACTOR_DEN: usize = 10;
@@ -1097,7 +1098,7 @@ pub(super) struct ParallelIntroResult {
 /// Runs blob introduction across multiple workers using shared `AtomicSeenSets`.
 ///
 /// Pre-partitions `plan` into `~4 × worker_count` chunks. Workers claim
-/// chunks via an atomic counter (work-stealing pattern). Each worker has
+/// chunks via an atomic counter (dynamic work-partitioning). Each worker has
 /// its own mutable `ObjectStore` caches and `PackCandidateCollector`; shared
 /// immutable repo/pack layout is reused via [`ObjectStoreLayout`]. Dedup is
 /// shared through `AtomicSeenSets`.

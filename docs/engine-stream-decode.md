@@ -476,7 +476,7 @@ pub(super) enum SpanStreamState {
 
 ```rust
 pub struct ScanScratch {
-    pub decode_ring: RingBuffer,           // Circular buffer of decoded bytes
+    pub decode_ring: ByteRing,             // Circular buffer of decoded bytes
     pub pending_windows: TimingWheel<...>, // Windows scheduled for processing
     pub stream_hit_counts: Vec<u32>,       // Per-rule-variant window counter
     pub stream_hit_touched: Vec<u32>,      // Touched indices for reset
@@ -487,7 +487,7 @@ pub struct ScanScratch {
     pub window_bytes: Vec<u8>,             // Temporary window materialization
     pub total_decode_output_bytes: usize,  // Running total across transforms
     pub slab: DecodeSlab,                  // Appended decoded output
-    pub seen: HashSet<u128>,               // Dedupe hashes
+    pub seen: FixedSet128,                 // Dedupe hashes
     pub tmp_findings: Vec<...>,            // Temporary findings buffer
     pub findings_dropped: usize,           // Count of dropped findings
 }
