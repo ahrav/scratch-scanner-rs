@@ -696,7 +696,10 @@ fn zero_hit_url_plus_to_space_still_scans_transforms() {
 fn base64_utf16_aws_key_is_detected() {
     let eng = demo_engine();
 
-    let aws = b"AKIAIOSFODNN7EXAMPLE"; // 20 bytes
+    // Use a realistic (non-example) AWS key. The previous value
+    // "AKIAIOSFODNN7EXAMPLE" is now correctly suppressed by the secret-bytes
+    // safelist as an AWS example key.
+    let aws = b"AKIAIOSFODNN7ABCDEFG"; // 20 bytes, not an EXAMPLE key
     let utf16le = utf16le_bytes(aws);
     let b64 = b64_encode(&utf16le);
 
@@ -1150,10 +1153,13 @@ fn safelist_emit_time_filter_suppresses_root_finding() {
 
 #[test]
 fn safelist_emit_time_filter_keeps_non_root_findings() {
+    // Use a value that matches the context safelist (pattern 0: placeholder+noun)
+    // for the root finding, but whose decoded value does NOT match the
+    // secret-bytes safelist (a realistic-looking token).
     let rule = RuleSpec {
         name: "safelist-mixed-root-non-root",
-        anchors: &[b"placeholder_token"],
-        radius: 32,
+        anchors: &[b"token"],
+        radius: 64,
         validator: ValidatorKind::None,
         two_phase: None,
         must_contain: None,
@@ -1163,7 +1169,8 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
-        re: Regex::new(r"placeholder_token").unwrap(),
+        // Matches both the context placeholder and the decoded value.
+        re: Regex::new(r"(?:placeholder_token|prod_token_A1B2C3)").unwrap(),
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -1185,7 +1192,10 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
     );
 
     let mut scratch = engine.new_scratch();
-    let hay = b"placeholder_token cGxhY2Vob2xkZXJfdG9rZW4=";
+    // Root: "placeholder_token" matches context safelist → suppressed.
+    // Base64: "cHJvZF90b2tlbl9BMUI..." decodes to "prod_token_A1B2C3" → NOT a
+    //         placeholder, so the secret-bytes safelist does not suppress it.
+    let hay = b"placeholder_token cHJvZF90b2tlbl9BMUIyQzM=";
     engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
 
     let recs = scratch.findings();
@@ -1196,7 +1206,7 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
     );
     assert_ne!(
         recs[0].step_id, STEP_ROOT,
-        "non-root findings must bypass emit-time safelist suppression"
+        "non-root findings must bypass context safelist suppression"
     );
     assert_eq!(
         recs.len(),
@@ -1212,9 +1222,12 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
 
 #[test]
 fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
+    // Use a non-placeholder value that matches neither the context safelist
+    // nor the secret-bytes safelist, to verify UTF-16 root emissions bypass
+    // the root-only context safelist path (they carry a Utf16Window step_id).
     let rule = RuleSpec {
         name: "safelist-utf16-root-emission",
-        anchors: &[b"placeholder_token"],
+        anchors: &[b"prod_token_A1B2C3"],
         radius: 64,
         validator: ValidatorKind::None,
         two_phase: None,
@@ -1225,7 +1238,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
-        re: Regex::new(r"placeholder_token").unwrap(),
+        re: Regex::new(r"prod_token_A1B2C3").unwrap(),
     };
 
     let mut tuning = demo_tuning();
@@ -1234,7 +1247,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
 
     let mut scratch = engine.new_scratch();
-    let hay = utf16le_bytes(b"placeholder_token");
+    let hay = utf16le_bytes(b"prod_token_A1B2C3");
     engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
 
     let recs = scratch.findings();
@@ -1611,6 +1624,221 @@ fn safelist_suppressed_counter_resets_between_scans() {
         scratch.safelist_suppressed(),
         0,
         "safelist_suppressed counter should reset between scans"
+    );
+}
+
+// ── Secret-bytes safelist integration tests ──────────────────────────────
+
+#[test]
+fn secret_bytes_safelist_suppresses_placeholder_when_context_is_clean() {
+    // The secret value is "hunter2" — a known placeholder. Surrounding context
+    // is clean (no context-safelist trigger), so only the secret-bytes safelist
+    // should suppress this.
+    let rule = RuleSpec {
+        name: "secret-bytes-clean-context",
+        anchors: &[b"token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"token[:=]\s*(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"token=hunter2";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        0,
+        "secret-bytes safelist should suppress placeholder 'hunter2' even with clean context"
+    );
+}
+
+#[test]
+fn secret_bytes_safelist_does_not_suppress_high_entropy_secret() {
+    let rule = RuleSpec {
+        name: "secret-bytes-high-entropy",
+        anchors: &[b"token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"token[:=]\s*(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"token=9f7A2kL8mN4qR1tV6xZ0cB3dF5gH7jK";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        1,
+        "secret-bytes safelist must not suppress high-entropy secrets"
+    );
+}
+
+#[test]
+fn secret_bytes_safelist_suppresses_decoded_placeholder() {
+    // Base64-encoded "hunter2" in a decoded buffer should still be suppressed
+    // by the secret-bytes safelist.
+    let rule = RuleSpec {
+        name: "secret-bytes-decoded",
+        anchors: &[b"hunter2"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"hunter2").unwrap(),
+    };
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    // "hunter2" base64-encoded = "aHVudGVyMg=="
+    let hay = b"data aHVudGVyMg==";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        0,
+        "decoded placeholder 'hunter2' should be suppressed by secret-bytes safelist"
+    );
+}
+
+#[cfg(feature = "perf-stats")]
+#[test]
+fn secret_bytes_safelist_counter_resets_between_scans() {
+    let rule = RuleSpec {
+        name: "secret-bytes-counter-reset",
+        anchors: &[b"token"],
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"token[:=]\s*(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+
+    // First scan: placeholder suppressed.
+    let hay1 = b"token=hunter2";
+    engine.scan_chunk_into(hay1, FileId(0), 0, &mut scratch);
+    assert!(
+        scratch.secret_bytes_safelist_suppressed() > 0,
+        "secret-bytes counter should be non-zero after suppression"
+    );
+
+    // Second scan: real secret, no suppression.
+    let hay2 = b"token=9f7A2kL8mN4qR1tV6xZ0cB3dF5gH7jK";
+    engine.scan_chunk_into(hay2, FileId(1), 0, &mut scratch);
+    assert_eq!(
+        scratch.secret_bytes_safelist_suppressed(),
+        0,
+        "secret_bytes_safelist_suppressed counter should reset between scans"
+    );
+}
+
+#[test]
+fn secret_bytes_safelist_suppressed_findings_dont_consume_cap() {
+    let mut tuning = demo_tuning();
+    tuning.max_findings_per_chunk = 2;
+
+    let rule = RuleSpec {
+        name: "secret-bytes-cap-ordering",
+        anchors: &[b"token"],
+        radius: 128,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"token[:=]\s*(\S+)").unwrap(),
+    };
+
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], Vec::new(), tuning, AnchorPolicy::ManualOnly);
+
+    let mut scratch = engine.new_scratch();
+    // Three values: placeholder, real1, real2. Cap is 2.
+    // Placeholder should be suppressed without consuming cap → both real findings emitted.
+    let hay = b"token=hunter2 token=9f7A2kL8mN token=4qR1tV6xZ0";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        2,
+        "suppressed placeholder must not consume findings cap"
+    );
+    assert_eq!(
+        scratch.dropped_findings(),
+        0,
+        "no findings should be dropped since cap was not exhausted"
     );
 }
 
@@ -4348,7 +4576,7 @@ fn scan_file_sync_materializes_provenance_across_chunks() -> std::io::Result<()>
         },
     );
 
-    let aws = b"AKIAIOSFODNN7EXAMPLE"; // 20 bytes
+    let aws = b"AKIAIOSFODNN7ABCDEFG"; // 20 bytes (non-example key)
     let utf16le = utf16le_bytes(aws);
     let b64 = b64_encode(&utf16le);
 
@@ -5740,7 +5968,7 @@ fn tiger_boundary_utf16_odd_byte_split() {
     let engine = correctness_engine();
     let overlap = engine.required_overlap();
 
-    let token = b"AKIAIOSFODNN7EXAMPLE";
+    let token = b"AKIAIOSFODNN7ABCDEFG";
     let encoded = utf16le_bytes(token);
     assert!(encoded.len() >= 2);
 

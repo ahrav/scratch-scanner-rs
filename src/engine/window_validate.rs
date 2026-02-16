@@ -19,8 +19,9 @@
 //! 6. Apply value suppressors (when configured) on the extracted secret bytes.
 //! 7. Apply local context checks (when configured) on the secret span.
 //! 8. Apply root-context safelist suppression for root emit paths.
-//! 9. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 10. Record the finding with the extracted secret span.
+//! 9. Apply secret-bytes safelist suppression (all findings, including decoded).
+//! 10. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 11. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -1292,6 +1293,12 @@ impl Engine {
     /// These differ for UTF-16 findings (`emitted_step_id` is `Utf16Window`,
     /// `parent_step_id` may still be `STEP_ROOT`).
     ///
+    /// Gate sequence (in order):
+    /// 1. Context-window safelist (root findings only).
+    /// 2. Secret-bytes safelist (all findings — placeholders in decoded buffers
+    ///    are equally fake).
+    /// 3. Offline structural validation (root-semantic findings only).
+    ///
     /// Returns `None` when the finding is suppressed. In that case suppression
     /// counters are incremented here so callers do not duplicate bookkeeping.
     #[allow(clippy::too_many_arguments)]
@@ -1320,6 +1327,13 @@ impl Engine {
             last_safelist_decision,
         ) {
             crate::perf_stats::sat_add_usize(&mut scratch.safelist_suppressed, 1);
+            return None;
+        }
+
+        // Secret-bytes safelist: checks all findings (not just root) because
+        // placeholder values in decoded buffers are equally fake.
+        if self.safelist.secret_bytes_matcher().is_match(secret_bytes) {
+            crate::perf_stats::sat_add_usize(&mut scratch.secret_bytes_safelist_suppressed, 1);
             return None;
         }
 

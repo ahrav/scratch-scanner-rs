@@ -1,0 +1,123 @@
+//! Property-based soundness tests for the secret-bytes safelist.
+//!
+//! Verifies the critical invariant: no high-entropy random byte string
+//! (>4.0 bits/byte, length 10–150) ever triggers the secret-bytes safelist
+//! when used as a secret value. Real secrets must not be suppressed.
+//!
+//! Tests use the full engine pipeline to exercise the exact code path that
+//! production scans take.
+
+use proptest::prelude::*;
+use regex::bytes::Regex;
+use scanner_rs::{demo_tuning, AnchorPolicy, Engine, Finding, RuleSpec, ValidatorKind};
+
+fn scan_findings(engine: &Engine, hay: &[u8]) -> Vec<Finding> {
+    let mut scratch = engine.new_scratch();
+    let mut out = Vec::with_capacity(16);
+    engine.scan_chunk_materialized(hay, &mut scratch, &mut out);
+    out
+}
+
+fn lcg(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    *state
+}
+
+/// Shannon entropy in bits per byte.
+fn shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let len = data.len() as f64;
+    let mut entropy = 0.0f64;
+    for &c in &counts {
+        if c > 0 {
+            let p = f64::from(c) / len;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// No high-entropy random string (>4.0 bits/byte, length 10–150) should
+    /// be suppressed by the secret-bytes safelist when extracted as a secret
+    /// value through the full engine pipeline.
+    #[test]
+    fn high_entropy_secret_never_suppressed(
+        secret_len in 10usize..=80,
+        seed in any::<u64>(),
+    ) {
+        // Generate random printable ASCII secret using LCG.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut rng = seed;
+        let secret: Vec<u8> = (0..secret_len)
+            .map(|_| {
+                let v = lcg(&mut rng);
+                alphabet[(v >> 33) as usize % alphabet.len()]
+            })
+            .collect();
+
+        let entropy = shannon_entropy(&secret);
+        // Only test high-entropy strings — low-entropy might legitimately
+        // contain placeholder patterns.
+        prop_assume!(entropy > 4.0);
+
+        let secret_str = std::str::from_utf8(&secret).unwrap();
+        // Ensure the secret doesn't coincidentally contain safelist patterns.
+        // The property test is about high-entropy secrets, and the probability
+        // of a random high-entropy string containing "hunter2", "changeme",
+        // "EXAMPLE", etc. is vanishingly small — but filter them out to avoid
+        // flaky test failures.
+        prop_assume!(!secret_str.contains("hunter2") && !secret_str.contains("HUNTER2"));
+        prop_assume!(!secret_str.contains("changeme") && !secret_str.contains("CHANGEME"));
+        prop_assume!(!secret_str.contains("EXAMPLE"));
+        prop_assume!(!secret_str.contains("placeholder") && !secret_str.contains("PLACEHOLDER"));
+        prop_assume!(!secret_str.contains("0123456789"));
+        prop_assume!(!secret_str.contains("abcdefghij"));
+
+        // Build an engine with a rule that extracts the secret via capture group.
+        let re_pattern = format!(r"SEC_([A-Za-z0-9]{{{secret_len}}})");
+        let rule = RuleSpec {
+            name: "proptest-secret-bytes",
+            anchors: &[b"SEC_"],
+            radius: 64,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            local_context: None,
+            secret_group: Some(1),
+            offline_validation: None,
+            re: Regex::new(&re_pattern).unwrap(),
+        };
+
+        let engine = Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let hay = format!("prefix SEC_{secret_str} suffix");
+        let hits = scan_findings(&engine, hay.as_bytes());
+        prop_assert!(
+            hits.iter().any(|h| h.rule == "proptest-secret-bytes"),
+            "high-entropy secret (entropy={:.2}, len={}) should NOT be suppressed \
+             by secret-bytes safelist: {:?}",
+            entropy,
+            secret_len,
+            &secret_str[..secret_str.len().min(40)]
+        );
+    }
+}

@@ -77,6 +77,7 @@ classDiagram
     class SafelistFilter {
         +new() SafelistFilter
         +matcher() RegexSet
+        +secret_bytes_matcher() RegexSet
     }
 
     class Target {
@@ -133,6 +134,7 @@ classDiagram
         -usize work_head
         -DecodeSlab slab
         -usize offline_suppressed
+        -usize secret_bytes_safelist_suppressed
         -FixedSet128 seen_findings_scan
         -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
