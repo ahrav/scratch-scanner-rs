@@ -5,6 +5,7 @@
 mod archive_path_canonicalization;
 mod archive_sliding_window;
 mod binary_classification;
+mod entropy_threshold_soundness;
 // Log-based persistence removed in favor of SQLite. See src/store/db/.
 // mod fs_log_codec;
 // mod fs_log_reader;
