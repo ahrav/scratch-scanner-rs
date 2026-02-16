@@ -20,7 +20,7 @@ Two entry styles are supported:
 - **Coordinate space management**: Maintain separate coordinate systems for raw bytes, UTF-16 variants, and decoded UTF-8 output
 - **Budget enforcement**: Track and limit UTF-16 decoding resource consumption
 - **Finding extraction**: Record matches with proper span information and secret data extraction
-- **Entropy validation**: Gate findings on Shannon entropy of matched tokens
+- **Entropy validation**: Gate findings on Shannon entropy of extracted secret bytes
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
 - **Emit-time policy checks**: Apply root safelist suppression and offline structural validation before recording findings
 
@@ -41,9 +41,9 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 4] Run regex with capture groups
   ↓
-[Gate 5] Check entropy on full match
+[Gate 5] Extract secret span from capture groups
   ↓
-[Gate 6] Extract secret span from capture groups
+[Gate 6] Check entropy on extracted secret
   ↓
 [Gate 7] Apply value suppressors on extracted secret bytes (when configured)
   ↓
@@ -216,7 +216,7 @@ if let Some(vs) = value_suppressors {
 
 **Purpose**: Discard findings whose extracted secret value contains a known placeholder or example pattern (e.g., `EXAMPLE`, `DUMMY_TOKEN`).
 
-**When evaluated**: After regex matching, entropy gating, and secret span extraction — before local context checks.
+**When evaluated**: After regex matching, secret span extraction, and entropy gating — before local context checks.
 
 **Matching semantics**: Case-sensitive memmem on the extracted secret bytes (not the full window). Uses `PackedPatterns` for the pattern set.
 
@@ -349,16 +349,22 @@ let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
 
 ## Entropy Checking: entropy_gate_passes Implementation
 
-Entropy gating filters matches based on Shannon entropy of the matched bytes, eliminating highly repetitive or structured tokens that are unlikely to be credentials.
+Entropy gating filters matches based on Shannon entropy of the extracted secret bytes, eliminating highly repetitive or structured tokens that are unlikely to be credentials.
 
 ### Invocation
 
 ```rust
+// Extract secret span first so entropy is evaluated on the
+// secret itself, not the full match.
+let (secret_start, secret_end) = extract_secret_span_locs_raw(
+    locs, secret_group_raw, has_secret_group_override,
+);
+let secret_bytes = &window[secret_start..secret_end];
+
 if let Some(ent) = entropy {
-    let mbytes = &window[match_start..match_end];
     if !entropy_gate_passes(
         &ent,
-        mbytes,
+        secret_bytes,
         scratch.ensure_entropy_scratch(),
         &self.entropy_log2,
     ) {
@@ -370,13 +376,13 @@ if let Some(ent) = entropy {
 ### Parameters
 
 - `ent`: Entropy threshold configuration (bits per byte, minimum token length, etc.)
-- `mbytes`: The matched bytes (full match, not secret span) to evaluate
+- `secret_bytes`: The extracted secret bytes to evaluate
 - `entropy_scratch`: Mutable scratch space for frequency tables
 - `entropy_log2`: Pre-computed log2 lookup table for efficiency
 
 ### Behavior
 
-- Evaluates entropy only on the **full regex match** (group 0), not the secret span or window
+- Evaluates entropy on the **extracted secret** bytes, not the full regex match or window
 - Rejects matches with entropy below configured threshold
 - Matches shorter than configured minimum length automatically pass (entropy is noisy on tiny samples)
 - On failure, **continues to next match** (not an early return) via `continue`
@@ -534,7 +540,7 @@ Gates are applied in a specific order to minimize decode work:
     ↓
 [7] Run regex on decoded UTF-8
     ↓
-[8] Post-match: entropy → secret extraction → value suppressors → local context
+[8] Post-match: secret extraction → entropy → value suppressors → local context
 ```
 
 This ordering ensures:
@@ -619,7 +625,7 @@ variant-specific ordering:
 1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape
 2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape
 3. Regex: O(n x complexity)
-4. Post-match: entropy -> secret extraction -> value suppressors -> local context
+4. Post-match: secret extraction -> entropy -> value suppressors -> local context
 
 Early failures save expensive regex execution. Post-match gates run only on
 confirmed regex matches, so their cost scales with finding count, not window count.
@@ -627,12 +633,12 @@ Root safelist suppression and offline structural validation both run inline at
 finding emission time, before the finding occupies a cap slot or triggers
 dedup computation.
 
-### Entropy on Full Match
+### Entropy on Extracted Secret
 
-Applied to group 0 (full match), not secret span, because:
-- Maintains entropy threshold relative to entire token structure
-- Prevents false positives on low-entropy delimiters
-- Consistent with gitleaks conventions
+Applied to the extracted secret span, not the full match, because:
+- The full match includes non-secret context (key names, assignment operators, quotes) that dilutes the entropy signal
+- Evaluating on the full match causes false negatives (high-entropy secrets rejected due to low-entropy surrounding context) and false accepts (low-entropy secrets passed due to high-entropy context)
+- Secret group extraction runs before entropy so the gate evaluates only the credential bytes
 
 ### UTF-16 Budget Enforcement
 

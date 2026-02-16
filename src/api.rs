@@ -712,7 +712,7 @@ impl RuleSpec {
 /// Shannon-entropy gate configuration.
 ///
 /// # Algorithm
-/// - Entropy is computed over the matched byte slice (full regex match).
+/// - Entropy is computed over the extracted secret span (not the full regex match).
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
 ///
