@@ -42,7 +42,8 @@ const IO_BUFFER_SIZE: usize = 256 * 1024;
 ///
 /// Counts are derived after global dedupe. `unique_blobs` counts distinct OIDs
 /// before seen-store filtering; `emitted_blobs` counts those that were unseen.
-/// Populated only when `perf-stats` is enabled in debug builds.
+/// `spill_runs` and `spill_bytes` are always populated; the remaining counters
+/// are populated only when `perf-stats` is enabled in debug builds.
 #[derive(Debug, Clone, Default)]
 pub struct SpillStats {
     /// Total candidates received.

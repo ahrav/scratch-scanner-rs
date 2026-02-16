@@ -8,9 +8,10 @@
 //!
 //! # Architecture
 //!
-//! The abstraction consists of three traits:
+//! The abstraction consists of four traits:
 //!
 //! - [`FindingRecord`]: A single finding from a scan (rule ID + byte offsets)
+//! - [`FindingWithHashRecord`]: Extension of `FindingRecord` carrying a normalized secret hash
 //! - [`EngineScratch`]: Per-worker scratch space for accumulating findings
 //! - [`ScanEngine`]: The scanning engine itself (overlap, scan_chunk_into, etc.)
 //!
@@ -130,11 +131,11 @@ pub trait FindingWithHashRecord: FindingRecord {
 ///
 /// # Hash Semantics
 ///
-/// `norm_hash` is a BLAKE3 digest of the *normalized* secret text (whitespace-
-/// collapsed, case-folded). Two findings with the same `norm_hash` matched
-/// the same logical secret, even if their byte spans differ due to surrounding
-/// context or transform chains. Real engine adapters carry the engine-computed
-/// hash; mock adapters may use a deterministic placeholder hash.
+/// `norm_hash` is a BLAKE3 digest of the raw secret bytes extracted after gate
+/// validation. Two findings with the same `norm_hash` matched the same logical
+/// secret, even if their byte spans differ due to surrounding context or
+/// transform chains. Real engine adapters carry the engine-computed hash; mock
+/// adapters may use a deterministic placeholder hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingWithHash<F: FindingRecord> {
     /// Underlying engine finding record.

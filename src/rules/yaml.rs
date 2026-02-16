@@ -47,7 +47,7 @@ use super::RulesError;
 /// Top-level YAML structure: `{ rules: [...] }`.
 ///
 /// This is the serde target for the entire rules file. The `rules` key
-/// maps to a heterogeneous list of [`YamlRule`] objects.
+/// maps to a list of [`YamlRule`] objects.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlRulesFile {
@@ -100,8 +100,10 @@ pub(crate) struct YamlRule {
 /// Entropy gate parameters for a rule.
 ///
 /// When present, the secret value (captured group) must have at least
-/// `min_bits_per_byte` bits of Shannon entropy per byte, and its length
-/// must fall within `[min_len, max_len]`, or the match is discarded.
+/// `min_bits_per_byte` bits of Shannon entropy per byte. Secrets shorter
+/// than `min_len` bypass the entropy check (noisy on small samples);
+/// secrets longer than `max_len` are evaluated on only the first
+/// `max_len` bytes.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
@@ -112,9 +114,11 @@ pub(crate) struct YamlEntropy {
 
 /// Two-phase scanning configuration.
 ///
-/// Phase 1 uses `seed_radius` to cheaply locate potential matches.
-/// Phase 2 expands to `full_radius` and requires at least one
-/// `confirm_any` literal in the wider window before emitting a finding.
+/// Phase 1 uses `seed_radius` to locate potential matches, then checks
+/// each seed window for at least one `confirm_any` literal — windows
+/// without a match are dropped immediately.
+/// Phase 2 expands surviving windows from `seed_radius` to `full_radius`
+/// and runs the regex on the wider view.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlTwoPhase {

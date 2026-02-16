@@ -81,7 +81,7 @@
 //! | [`affinity`] | CPU pinning and topology queries |
 //! | [`alloc`] | Allocation tracking via custom global allocator |
 //! | [`bench`] | Micro-benchmark harness with warmup and statistics |
-//! | [`rusage`] | Process resource usage (wall time, RSS, faults) |
+//! | [`rusage`] | Process resource usage (CPU time, RSS) |
 //!
 //! ## Testing Infrastructure
 //!

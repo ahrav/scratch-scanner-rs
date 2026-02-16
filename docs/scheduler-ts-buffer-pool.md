@@ -427,11 +427,14 @@ let n = read_socket(&mut buf.as_mut_slice()[..1024])?;
 // But only first 1024 bytes are valid!
 
 // Better: use TsChunk which tracks this
-let chunk = TsChunk {
+let chunk = TsChunk::new(
+    obj_id,     // object identifier
+    0,          // base_offset
+    n as u32,   // len (filled length)
+    0,          // prefix_len (no overlap for first chunk)
+    0,          // buf_offset
     buf,
-    buf_offset: 0,
-    len: n,  // ← Filled length
-};
+);
 ```
 
 ### `Inner` (Internal)

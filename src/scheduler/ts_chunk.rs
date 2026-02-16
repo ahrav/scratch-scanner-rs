@@ -9,9 +9,10 @@
 //!
 //! # Thread Safety
 //!
-//! `TsChunk` is `Send` but not `Sync`. It can be moved across threads (e.g.,
-//! from I/O completion to worker) but should not be shared concurrently.
-//! This is the typical ownership pattern for scheduler work items.
+//! `TsChunk` is both `Send` and `Sync` (all fields are `Send + Sync`).
+//! It can be moved across threads (e.g., from I/O completion to worker)
+//! and shared via `&` references. The typical usage pattern is exclusive
+//! ownership per worker, but the type does not restrict shared access.
 //!
 //! # Memory Layout
 //!
@@ -79,11 +80,13 @@ use crate::scheduler::ts_buffer_pool::TsBufferHandle;
 /// Invalid parameters cause an immediate panic at the construction site,
 /// not later when `data()` or `payload()` is called.
 ///
-/// # Invariants (enforced at construction)
+/// # Invariants (checked at construction via `debug_assert!`)
 ///
 /// - `prefix_len <= len`
 /// - `buf_offset + len <= buf.len()`
 /// - `base_offset + len` does not overflow `u64`
+///
+/// These checks use `debug_assert!` and are elided in release builds.
 pub struct TsChunk<Id: Copy> {
     /// Object identifier this chunk belongs to.
     id: Id,
@@ -217,7 +220,7 @@ impl<Id: Copy> TsChunk<Id> {
     ///
     /// # Performance
     ///
-    /// Single slice operation with no bounds check (invariants verified at construction).
+    /// Single slice operation; bounds are safe because invariants are checked at construction.
     #[inline]
     pub fn data(&self) -> &[u8] {
         let start = self.buf_offset as usize;

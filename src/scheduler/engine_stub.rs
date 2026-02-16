@@ -15,7 +15,7 @@
 //!
 //! The engine declares:
 //! - `required_overlap()`: Bytes of overlap needed for chunked scanning
-//! - `scan_chunk_into()`: Scan a buffer, appending findings to scratch
+//! - `scan_chunk_into()`: Scan a buffer, replacing scratch contents with new findings
 //! - `new_scratch()`: Per-worker scratch factory
 //! - `tuning`: Budget/limit parameters
 //!
@@ -79,9 +79,11 @@ pub struct RuleId(pub u16);
 /// owns them (see [`ScanScratch::drop_prefix_findings`]).
 ///
 /// **Within-chunk** dedupe (in [`local_fs_owner::dedupe_findings`]) uses the
-/// full 5-tuple `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`.
+/// full 6-tuple `(rule_id, root_hint_start, root_hint_end, span_start, span_end, norm_hash)`.
 /// `StepId` (transform chain) is intentionally excluded because the same match
-/// found via different transform paths is still one finding.
+/// found via different transform paths is still one finding *if* the normalized
+/// secret hash matches. Two findings at the same span with different `norm_hash`
+/// values represent distinct secrets and are preserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRec {
     pub rule_id: RuleId,
@@ -162,8 +164,8 @@ impl ScanScratch {
 
     /// Drop findings whose root_hint_end is fully within the overlap prefix.
     ///
-    /// Called after scanning a chunk to remove findings that will be re-found
-    /// in the next chunk (since they're in the overlap region).
+    /// Called after scanning a chunk to remove findings that were already
+    /// captured by the previous chunk (since they fall in the overlap prefix).
     ///
     /// # Arguments
     ///
@@ -176,8 +178,8 @@ impl ScanScratch {
     ///
     /// Unlike the real engine's `drain_findings` (which clears `out` first),
     /// this **appends** to `out` via `Vec::append`. The internal findings
-    /// buffer is empty after this call. This uses pointer swap — no element
-    /// copying when `out` is empty.
+    /// buffer is empty after this call. When `out` is empty this reduces
+    /// to a single `memcpy`.
     pub fn drain_findings_into(&mut self, out: &mut Vec<FindingRec>) {
         out.append(&mut self.findings);
     }
@@ -280,7 +282,7 @@ impl MockEngine {
         self.rules.len()
     }
 
-    /// Scan a chunk, appending findings to scratch.
+    /// Scan a chunk, clearing scratch and populating it with new findings.
     ///
     /// # Arguments
     ///

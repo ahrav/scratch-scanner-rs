@@ -8,7 +8,7 @@
 //! ```text
 //! Engine findings ──► build_persistence_batch() ──► FsFindingRecord[]
 //!                                                       │
-//!                                               FsFindingBatch { path, findings }
+//!                                               FsFindingBatch { object_path, findings }
 //!                                                       │
 //!                                               StoreProducer::emit_fs_batch()
 //!                                                       │
@@ -137,7 +137,7 @@ impl std::error::Error for FsStoreError {}
 /// - `end_run` is called once after `record_fs_run_loss` to finalize the run
 ///   (e.g. set end time and status in the database). The default implementation
 ///   is a no-op, suitable for backends that don't need run finalization.
-/// - Errors from either method are counted in [`FsRunLoss::persistence_emit_failures`]
+/// - Errors from `emit_fs_batch` are counted in [`FsRunLoss::persistence_emit_failures`]
 ///   but do **not** abort the scan; the scheduler continues scanning.
 pub trait StoreProducer: Send + Sync + 'static {
     /// Emit one post-dedupe finding batch for a single scanned object.

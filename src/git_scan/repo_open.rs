@@ -7,8 +7,9 @@
 //! - Loading persisted watermarks for incremental scanning
 //!
 //! Artifacts (MIDX, commit-graph) are always built in memory from pack/idx
-//! files in later phases (`artifact_acquire`). This module does not mmap or
-//! check for disk-based commit-graph or MIDX files.
+//! files in later phases (`artifact_acquire`). This module only performs
+//! a lightweight existence check (`is_file()`) on the commit-graph path to
+//! record its fingerprint; it does not mmap or parse disk-based artifacts.
 //!
 //! Packs are not mmapped here. They are opened on demand in later phases
 //! per pack plan to avoid unnecessary FD and VMA pressure.

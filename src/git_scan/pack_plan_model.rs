@@ -98,10 +98,10 @@ pub struct PackPlanStats {
     /// Span between first and last candidate offsets.
     pub(crate) candidate_span: u64,
     /// Number of indegree-0 nodes with dependents (delta tree roots).
-    /// Only populated when `perf-stats` is enabled.
+    /// Only populated when both `perf-stats` feature and `debug_assertions` are active.
     pub(crate) delta_tree_roots: u32,
     /// Maximum depth of the dependency DAG.
-    /// Only populated when `perf-stats` is enabled.
+    /// Only populated when both `perf-stats` feature and `debug_assertions` are active.
     pub(crate) delta_tree_max_depth: u32,
 }
 

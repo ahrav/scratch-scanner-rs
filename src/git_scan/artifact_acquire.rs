@@ -1,8 +1,8 @@
 //! Artifact construction for Git scanning.
 //!
 //! This module builds in-memory MIDX and commit-graph artifacts from pack
-//! index files and commit data. It does not attempt to reuse on-disk artifacts;
-//! disk-backed paths are handled by `repo_open`.
+//! index files and commit data. It does not attempt to reuse on-disk
+//! artifacts.
 //!
 //! # Construction Flow
 //!
@@ -142,7 +142,7 @@ impl From<RepoOpenError> for ArtifactAcquireError {
 /// Output of MIDX acquisition, carrying the MIDX bytes and resolved
 /// pack file paths needed for subsequent pack planning and execution.
 pub struct MidxAcquireResult {
-    /// The acquired MIDX bytes (either mmapped or built in-memory).
+    /// The acquired MIDX bytes (built in-memory).
     pub bytes: BytesView,
     /// Whether the MIDX was built in-memory (vs. loaded from disk).
     pub built_in_memory: bool,
