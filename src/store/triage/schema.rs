@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS secret_triage (
 /// - **WAL** — allows concurrent readers while a write is in progress.
 /// - **synchronous=NORMAL** — WAL integrity is maintained by the OS;
 ///   trades a tiny durability window for ~2× write throughput.
+/// - **foreign_keys=ON** — enforces `REFERENCES` constraints.
 /// - **busy_timeout=5000ms** — retries internally on `SQLITE_BUSY`
 ///   instead of returning an immediate error to the caller.
 pub fn configure_triage_connection(conn: &Connection) -> rusqlite::Result<()> {

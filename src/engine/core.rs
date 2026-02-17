@@ -48,9 +48,10 @@
 //! - Engine construction fails fast if required prefilter DBs cannot be built.
 //! - Base64 pre-gates are conservative: they only skip decode work when no
 //!   anchor *could* appear. Decoded-space validation remains authoritative.
-//! - Raw regex patterns are included in the Vectorscan prefilter DB only for
-//!   rules with weak or missing literal anchors (< 5 bytes). Rules with strong
-//!   anchors rely on anchor-pattern matching alone, reducing DB size.
+//! - Raw regex patterns are included in the Vectorscan prefilter DB for rules
+//!   with weak or missing literal anchors (< 5 bytes) or case-insensitive
+//!   regexes. Rules with strong, case-sensitive anchors rely on anchor-pattern
+//!   matching alone, reducing DB size.
 //! - Suppression gates are monotonic: they may remove findings after validation
 //!   but never mutate span or decode provenance for findings that remain.
 
@@ -126,6 +127,7 @@ pub struct VectorscanStats {
     /// Number of UTF-16 Vectorscan scans that errored.
     pub utf16_scans_err: u64,
     /// Buffers scanned without the raw Vectorscan prefilter (full-buffer fallback).
+    /// NOTE: Not yet wired in the scan pipeline; always reads zero.
     pub anchor_only: u64,
     /// Buffers that used raw Vectorscan and also ran a UTF-16 anchor scan.
     pub anchor_after_vs: u64,
@@ -329,7 +331,8 @@ pub struct Engine {
     /// Ring buffer size for stream-mode decoded scanning.
     ///
     /// Must accommodate the largest possible match span across all stream
-    /// patterns, the longest encoded span, and the stream decode chunk size.
+    /// patterns, the longest anchor validation window, the longest encoded
+    /// span, and the stream decode chunk size.
     pub(super) stream_ring_bytes: usize,
     /// True when at least one transform has a non-`Disabled` mode.
     ///

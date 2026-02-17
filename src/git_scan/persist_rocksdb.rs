@@ -5,8 +5,8 @@
 //! relies on sorted keys for efficient `multi_get` access.
 //! Finalize output is committed with a single `WriteBatch` so data writes and
 //! watermarks become visible atomically.
-//! When the feature is disabled, all public constructors and methods return
-//! explicit backend errors.
+//! When the feature is disabled, public constructors and methods return
+//! feature-not-available errors via the appropriate error variant.
 
 use std::io;
 use std::path::Path;

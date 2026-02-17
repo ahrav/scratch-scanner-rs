@@ -1065,7 +1065,7 @@ enum FilePhase {
 
 /// Mutable progress for chunked reads of a single file.
 ///
-/// `next_offset` advances by `chunk_size` (payload only) after each read
+/// `next_offset` advances by `payload_len` (at most `chunk_size`) after each read
 /// submission. `overlap_buf` carries the tail bytes of the previous chunk so
 /// the next read's buffer can be prefixed without re-reading from disk.
 struct ReadState {

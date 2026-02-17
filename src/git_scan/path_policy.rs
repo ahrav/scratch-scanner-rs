@@ -1,7 +1,7 @@
 //! Path policy classifier for tree diff candidates.
 //!
 //! Emits a compact bitfield that marks paths as source/test/vendor/generated/
-//! binary-ish/unknown using prefix and extension tables only. The classifier
+//! binary-ish/unknown using segment and extension tables only. The classifier
 //! is intentionally shallow: it does not inspect file contents and does not
 //! allocate. Multiple bits may be set for the same path (for example a test
 //! file is both `TEST` and `SOURCE`).
@@ -39,7 +39,7 @@ impl PathClass {
         Self(0)
     }
 
-    /// Returns the raw bitset value as a `u16`.
+    /// Returns the bitset value widened to `u16`.
     #[inline]
     #[must_use]
     pub const fn bits(self) -> u16 {
@@ -110,7 +110,7 @@ pub fn classify_path(path: &[u8]) -> PathClass {
 
 /// Returns true if the path should be excluded under the given policy version.
 ///
-/// Version 1: no exclusions (default behavior).
+/// Version 0–1: no exclusions (default behavior).
 /// Version 2+: exclude binary-classified paths.
 #[must_use]
 pub fn is_excluded_path(path: &[u8], version: u32) -> bool {

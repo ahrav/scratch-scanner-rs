@@ -5,10 +5,12 @@
 //! ## Core vs. perf-only metrics
 //!
 //! **Core operational metrics** (`bytes_scanned`, `chunks_scanned`, `io_errors`,
-//! `findings_emitted`, `worker_count`) are always recorded and merged so that
+//! `findings_emitted`, `worker_count`) and **timing/parking fields**
+//! (`open_stat_ns`, `read_ns`, `scan_ns`, `persist_ns`, `idle_spins`,
+//! `park_count`, `yield_count`) are always recorded and merged so that
 //! release builds report non-zero counters.
 //!
-//! **Perf-only metrics** (steal rates, histograms, parking stats, archive
+//! **Perf-only metrics** (steal rates, histograms, archive
 //! counters) are recorded only when
 //! `all(feature = "perf-stats", debug_assertions)` is enabled.
 //! Outside that mode their update paths are no-ops and snapshots stay zeroed.
@@ -540,12 +542,15 @@ impl MetricsSnapshot {
     ///
     /// Core operational metrics (`bytes_scanned`, `chunks_scanned`,
     /// `io_errors`, `findings_emitted`, `worker_count`) are always merged.
-    /// Perf-only metrics (steal rates, histograms, parking stats) are merged
-    /// only when `recording_enabled()` is true.
+    /// Timing and parking fields (`idle_spins`, `park_count`, `yield_count`,
+    /// `open_stat_ns`, etc.) are always merged for diagnostics. Perf-only
+    /// metrics (steal rates, histograms, archive) are merged only when
+    /// `recording_enabled()` is true.
     ///
     /// # Performance
     ///
-    /// O(1) for counters + O(64) for histogram merge. Total ~70 additions.
+    /// O(1) for counters + O(64) per histogram merge + archive merge.
+    /// Total ~200 additions when recording is enabled.
     pub fn merge_worker(&mut self, w: &WorkerMetricsLocal) {
         // Core operational metrics — always merge.
         self.bytes_scanned = self.bytes_scanned.wrapping_add(w.bytes_scanned);

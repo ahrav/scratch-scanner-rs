@@ -191,7 +191,7 @@ impl TransformConfig {
 /// Base64 decode/gate instrumentation counters.
 ///
 /// Requires `b64-stats` feature (which implies `perf-stats`).
-/// Counter mutations are compiled only when perf stats are enabled.
+/// Counter mutations are compiled only when `b64-stats` is enabled.
 ///
 /// # Guarantees
 /// - Counters saturate on overflow.
@@ -231,7 +231,8 @@ pub struct Base64DecodeStats {
 
 #[cfg(feature = "b64-stats")]
 impl Base64DecodeStats {
-    /// Resets all counters to zero.
+    /// Resets all counters to zero in debug builds with `perf-stats` enabled.
+    /// In release builds this is a no-op; counters accumulate across scans.
     pub(crate) fn reset(&mut self) {
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -479,7 +480,7 @@ pub enum TailCharset {
     LowerAlnum,
     /// `[A-Za-z0-9_-]`
     AlnumDashUnderscore,
-    /// `[A-Za-z0-9=_\-.]` (case-insensitive)
+    /// `[A-Za-z0-9=_\-.]`
     Sendgrid66Set,
     /// `[a-h0-9]` (case-insensitive)
     DatabricksSet,
@@ -555,8 +556,9 @@ impl LocalContextSpec {
 ///
 /// # Performance
 /// - Smaller `radius` values reduce regex work but can miss matches if too small.
-/// - `must_contain`, `keywords_any`, and `entropy` act as progressively cheaper
-///   pre-/post-regex filters evaluated on the match window.
+/// - `must_contain`, `keywords_any`, and `entropy` act as lightweight
+///   pre-/post-regex filters evaluated on the match window (each cheaper
+///   than full regex evaluation).
 /// - `value_suppressors_any` is a post-extraction filter that runs after regex
 ///   matching and entropy gating; it adds minimal cost per confirmed match but
 ///   does not reduce regex work.

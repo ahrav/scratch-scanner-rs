@@ -1,4 +1,5 @@
-//! Persistence store contracts, cryptographic identity, and SQLite backend.
+//! Persistence store contracts, cryptographic identity, SQLite backend, and
+//! secret triage tracking.
 //!
 //! This module is the public surface for finding persistence. It re-exports
 //! the most-used types from its submodules so callers can write
@@ -15,13 +16,15 @@
 //! - [`fs`] — write-side API ([`StoreProducer`]) used by the scheduler FS scan
 //!   paths to hand off post-dedupe findings to a persistence backend.
 //!
+//! **Identity modules:**
+//! - [`root_id`] — root identity derivation (Git, FS, archive, stdin, S3).
+//! - [`path_id`] — path identity derivation and canonicalization.
+//!
 //! **SQLite persistence:**
 //! - [`db`] — SQLite-backed findings database: schema, write path
 //!   ([`SqliteStoreProducer`]), and read-path queries for CLI commands.
 //!   Key query functions (`list_runs`, `diff_runs`, etc.) are re-exported
 //!   here for ergonomic access from the orchestrator.
-//! - [`root_id`] — root identity derivation (Git, FS, archive, stdin, S3).
-//! - [`path_id`] — path identity derivation and canonicalization.
 //!
 //! **Triage:**
 //! - [`triage`] — secret triage status tracking ([`TriageStore`]).

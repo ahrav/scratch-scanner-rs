@@ -13,11 +13,13 @@
 //! # Module map
 //! - `atomic_bitset`: lock-free bitset with atomic test-and-set for concurrent dedup.
 //! - `atomic_seen_sets`: composite concurrent dedup tracker wrapping three `AtomicBitSet`s.
-//! - `bitset`: fixed-size and dynamic bitsets with word-level operations.
+//! - `bitset`: heap-allocated dynamic bitset with word-level operations.
 //! - `byte_ring`: internal byte ring keyed by absolute stream offsets.
 //! - `fixed_set`: fixed-capacity hash set with epoch-based O(1) reset.
 //! - `fixed_vec`: stack-allocated vector with constant capacity.
 //! - `ring_buffer`: stack-allocated ring buffer with power-of-two capacity.
+//! - `fastrange`: fast modular reduction for power-of-two and arbitrary ranges.
+//! - `spsc`: bounded single-producer single-consumer channel for cross-thread handoff.
 //! - `timing_wheel`: hashed timing wheel with FIFO per bucket and bitmap occupancy.
 //!
 //! # Safety
