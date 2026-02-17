@@ -58,12 +58,12 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`count_budget`] | Integer-based permits (e.g., max concurrent fetches) |
+//! | [`count_budget`] | Integer-based permits (e.g., in-flight object caps) |
 //! | `file_id_alloc` | Run-scoped `FileId` allocator for unique logical file boundaries |
 //! | [`findings`] | Per-worker finding buffers with dedup via [`SecretHash`] |
 //! | [`ts_buffer_pool`] | Thread-safe buffer recycling to avoid allocation churn |
 //! | [`ts_chunk`] | Thread-safe chunk wrapper for cross-thread handoff |
-//! | [`worker_id`] | Thread-local worker ID for metrics/debugging |
+//! | [`worker_id`] | Thread-local worker ID for per-worker fast-path routing |
 //!
 //! ## I/O Backends
 //!
@@ -80,15 +80,16 @@
 //! |--------|---------|
 //! | [`affinity`] | CPU pinning and topology queries |
 //! | [`alloc`] | Allocation tracking via custom global allocator |
-//! | [`bench`] | Micro-benchmark harness with warmup and statistics |
-//! | [`rusage`] | Process resource usage (wall time, RSS, faults) |
+//! | [`bench`] | Benchmark harness with warmup and statistics |
+//! | [`rusage`] | Process resource usage (CPU time, RSS) |
 //!
 //! ## Testing Infrastructure
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`failure`] | Error classification (retryable vs permanent vs exhaustion) |
+//! | [`failure`] | Production error classification (retryable vs permanent vs exhaustion) |
 //! | [`sim`] | Deterministic simulation for property testing |
+//! | [`sim_executor_harness`] | Deterministic step-driven executor model for simulation |
 //! | [`task_graph`] | Object lifecycle FSM (enumerate → fetch → scan → done) |
 //!
 //! ## Benchmarks
@@ -104,9 +105,9 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`device_slots`] | Per-device I/O concurrency limits (SSD vs HDD vs network) |
+//! | [`device_slots`] | Per-device I/O concurrency limits (mmap-based I/O fairness) |
 //! | [`global_resource_pool`] | Centralized permits for "fat" jobs (large mmap, etc.) |
-//! | [`yield_policy`] | Cooperative yield strategies to prevent starvation |
+//! | [`yield_policy`] | Deterministic yield policies for reproducible scheduling |
 //!
 //! # Non-Negotiable Invariants
 //!
@@ -188,10 +189,11 @@
 //!
 //! # Safety
 //!
-//! Unsafe code is used sparingly and only where performance requires it:
-//! - `metrics.rs`: bounds-check-free histogram recording (index proven in-range)
-//!
-//! All unsafe blocks have documented invariants and are tested.
+//! Unsafe code is used sparingly and only where performance requires it.
+//! Modules containing `unsafe` blocks: `metrics`, `alloc`, `affinity`,
+//! `chunking`, `engine_impl`, `rusage`, `local_fs_owner`, and
+//! `local_fs_uring` (Linux). All unsafe blocks have documented invariants
+//! and are tested.
 //!
 //! # Re-exports
 //!

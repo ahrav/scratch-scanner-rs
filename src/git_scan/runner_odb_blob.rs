@@ -10,7 +10,7 @@
 //!    (oid, pack_id, path) candidates for each unique blob. On success the
 //!    candidates land directly in the
 //!    `PackCandidateCollector`; on overflow (`CandidateLimitExceeded` /
-//!    `PathArenaFull`) the introducer's seen-set is reset and the walk is
+//!    `PathArenaFull`) a fresh introducer is created and the walk is
 //!    re-run through a `Spiller` → `MappingBridge` dedupe pipeline.
 //!
 //! 2. **Pack planning** -- candidates are bucketed by pack id, then a
@@ -98,7 +98,7 @@ use super::repo_open::RepoJobState;
 /// # Commit-meta emission
 ///
 /// The [`CommitMetaContext`] bundles the event sink, commit-graph index,
-/// and emit-once bitset for exactly-once `CommitMeta` event emission per
+/// identity interner, and emit-once bitset for exactly-once `CommitMeta` event emission per
 /// referenced commit across all pack-exec workers and loose-scan adapters
 /// spawned by this function. See
 /// [`EngineAdapter::stream_findings`](super::engine_adapter::EngineAdapter)

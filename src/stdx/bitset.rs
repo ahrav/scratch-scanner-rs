@@ -33,7 +33,8 @@ pub const fn words_for_bits(n: usize) -> usize {
 /// is not a multiple of 64) are always zero. This invariant is critical for
 /// `PartialEq` correctness, as it relies on slice equality.
 ///
-/// All indexing operations panic when `idx >= bit_length`. Use [`iter_set`](Self::iter_set)
+/// All indexing operations debug-assert that `idx < bit_length` (elided in
+/// release builds; see individual methods). Use [`iter_set`](Self::iter_set)
 /// to traverse set bits in ascending order.
 ///
 /// # Examples
@@ -104,7 +105,7 @@ impl DynamicBitSet {
 
     /// Returns whether `idx` is set.
     ///
-    /// Panics if `idx >= bit_length`.
+    /// Debug-asserts that `idx < bit_length`.
     #[inline]
     pub fn is_set(&self, idx: usize) -> bool {
         debug_assert!(idx < self.bit_length, "bit index out of bounds");
@@ -115,7 +116,7 @@ impl DynamicBitSet {
 
     /// Sets the bit at `idx`.
     ///
-    /// Panics if `idx >= bit_length`.
+    /// Debug-asserts that `idx < bit_length`.
     #[inline]
     pub fn set(&mut self, idx: usize) {
         debug_assert!(idx < self.bit_length, "bit index out of bounds");
@@ -126,7 +127,7 @@ impl DynamicBitSet {
 
     /// Clears the bit at `idx`.
     ///
-    /// Panics if `idx >= bit_length`.
+    /// Debug-asserts that `idx < bit_length`.
     #[inline]
     pub fn unset(&mut self, idx: usize) {
         debug_assert!(idx < self.bit_length, "bit index out of bounds");
@@ -184,8 +185,9 @@ impl DynamicBitSet {
 impl DynamicBitSet {
     /// Returns `true` if the padding bits in the last word are all zero.
     ///
-    /// This invariant is critical for correctness of `PartialEq`, `count`,
-    /// and iteration.
+    /// This invariant is critical for correctness of `PartialEq` and safe
+    /// serialization/hashing. `count()` and `iter_set()` mask the last word
+    /// defensively but rely on the invariant as a secondary guarantee.
     pub(crate) fn padding_invariant_holds(&self) -> bool {
         if self.words.is_empty() {
             return true;

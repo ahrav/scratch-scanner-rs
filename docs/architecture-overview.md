@@ -124,7 +124,7 @@ graph TB
 | **TimingWheel**     | `src/stdx/timing_wheel.rs:479` | Hashed timing wheel for window expiration scheduling                 |
 | **Git Preflight**   | `src/git_scan/preflight.rs`    | Maintenance readiness check for commit-graph, MIDX, and pack count   |
 | **ArtifactStatus**  | `src/git_scan/preflight.rs`    | `Ready` vs `NeedsMaintenance` flag produced by Git preflight         |
-| **Repo Open**       | `src/git_scan/repo_open.rs`    | Repo discovery, artifact mmaps, start set resolution, watermark load |
+| **Repo Open**       | `src/git_scan/repo_open.rs`    | Repo discovery, object format detection, start set resolution, watermark load |
 | **RepoJobState**    | `src/git_scan/repo_open.rs`    | Bundled repo metadata for downstream Git scan phases                 |
 | **StartSetId**      | `src/git_scan/start_set.rs`    | Deterministic identity for start set configuration                   |
 | **Watermark Keys**  | `src/git_scan/watermark_keys.rs` | Stable ref watermark key/value encoding                            |
@@ -186,8 +186,9 @@ graph TB
 
 ## Git Repo Open
 
-Repo open resolves the repository layout, detects object format, checks for
-commit-graph and MIDX presence, and memory-maps those artifacts when ready.
+Repo open resolves the repository layout, detects object format, and records
+artifact paths (commit-graph, MIDX) for lock-file detection. It does not mmap
+or parse disk-based artifacts; those are built in memory by `artifact_acquire`.
 It also resolves the start set refs (via `StartSetResolver`) and loads per-ref
 watermarks from `RefWatermarkStore` using the `StartSetId` and policy hash.
 The resulting `RepoJobState` is the metadata contract for later Git phases.

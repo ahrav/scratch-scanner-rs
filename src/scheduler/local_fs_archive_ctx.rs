@@ -243,7 +243,7 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
     /// Scan a buffer chunk, drain/dedupe findings, emit events + persistence,
     /// and update chunk metrics.
     ///
-    /// Shared core used by archive entry scanning loops (gzip, tar, zip).
+    /// Shared core used by archive entry scanning loops (currently gzip).
     /// The caller is responsible for reading bytes, charging budgets, and
     /// managing the outer loop condition — this method handles everything
     /// from `scan_chunk_into` through carry/offset bookkeeping.

@@ -83,7 +83,7 @@ pub enum FailureKind {
     Hang,
     /// An invariant about ordering, offsets, or dedupe was violated.
     InvariantViolation { code: u32 },
-    /// A correctness oracle failed (reserved for later phases).
+    /// A correctness oracle failed (ground-truth, differential, or archive).
     OracleMismatch,
     /// The same scenario produced different final findings across schedules.
     StabilityMismatch,
@@ -2382,7 +2382,7 @@ fn total_file_bytes(fs: &SimFs, files: &[SimPath]) -> u64 {
 }
 
 /// Resolve the max steps bound. If `cfg.max_steps > 0`, honor it; otherwise
-/// derive a conservative bound from file count and byte count.
+/// derive a conservative bound from file count, byte count, and fault ops.
 fn resolve_max_steps(cfg: &RunConfig, file_count: u64, total_bytes: u64, fault_ops: u64) -> u64 {
     if cfg.max_steps > 0 {
         return cfg.max_steps;

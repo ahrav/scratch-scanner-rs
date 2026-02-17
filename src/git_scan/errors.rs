@@ -1,9 +1,10 @@
 //! Error types for Git scanning stages.
 //!
 //! Errors are stage-specific to keep diagnostics precise and avoid a
-//! single monolithic error enum that grows unbounded. All enums are
+//! single monolithic error enum that grows unbounded. Error enums are
 //! `#[non_exhaustive]` to allow adding variants without breaking callers;
-//! consumers should include a fallback match arm.
+//! consumers should include a fallback match arm. (Helper enums like
+//! `MappingCandidateKind` are exhaustive by design.)
 //!
 //! # Design Notes
 //! - Variants with `detail` carry human-readable context and are not stable

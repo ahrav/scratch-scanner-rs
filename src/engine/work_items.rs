@@ -258,7 +258,7 @@ impl Default for WorkItem {
     }
 }
 
-/// Compact encoded-span reference (8 bytes).
+/// Compact encoded-span reference (12 bytes).
 ///
 /// Replaces the former `EncRef` enum (24 bytes). The `is_slab` flag
 /// distinguishes root-buffer ranges from slab ranges.

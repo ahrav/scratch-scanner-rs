@@ -15,7 +15,7 @@
 //! | [`sarif_sink`] | SARIF 2.1.0 event sink (findings only) |
 //! | [`text_sink`] | Human-readable text sink (compact / verbose) |
 //! | [`orchestrator`] | Top-level dispatch: engine build → source driver → event sink |
-//! | [`source`] | Source drivers (FS directory walk, Git pack/loose scan) |
+//! | [`source`] | Source driver helpers (currently Git-only; FS scan uses `crate::scheduler` directly) |
 
 pub mod cli;
 pub mod events;
@@ -39,8 +39,10 @@ pub use cli::ScanConfig;
 
 /// Identifies which source produced a scan event.
 ///
-/// Appears in every [`ScanEvent`](events::ScanEvent) so consumers can
-/// route findings and metrics by origin.
+/// Appears in [`Finding`](events::FindingEvent), [`Progress`](events::ProgressEvent),
+/// and [`Summary`](events::SummaryEvent) events so consumers can route findings
+/// and metrics by origin. Git-specific events (`CommitMeta`, `IdentityDictionary`)
+/// and diagnostics omit it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
     /// Filesystem scan (directory walk or single file).
@@ -121,7 +123,7 @@ pub struct FsScanConfig {
     pub root: PathBuf,
     /// Number of worker threads (defaults to CPU count).
     pub workers: usize,
-    /// Max transform decode depth (`None` → engine default of 2).
+    /// Max transform decode depth (`None` → engine default of 3).
     pub decode_depth: Option<usize>,
     /// When `true`, skip archive (zip/tar/gz) expansion (default: `false`, archives are expanded).
     pub skip_archives: bool,
@@ -135,8 +137,8 @@ pub struct FsScanConfig {
     pub scan_binary: bool,
     /// When `true`, wire a [`StoreProducer`](crate::store::StoreProducer) into
     /// the parallel scan so post-dedupe findings are emitted to the persistence
-    /// backend. The default backend writes append-only framed segment logs
-    /// under the configured store root.
+    /// backend. The default backend writes to a SQLite database under the
+    /// configured store root.
     pub persist_findings: bool,
 }
 
@@ -167,7 +169,7 @@ pub struct GitSourceConfig {
     pub merge_mode: crate::git_scan::MergeDiffMode,
     /// Anchor extraction mode for rule matching.
     pub anchor_mode: AnchorMode,
-    /// Max transform decode depth (`None` → engine default of 2).
+    /// Max transform decode depth (`None` → engine default of 3).
     pub decode_depth: Option<usize>,
     /// Pack execution worker count (`None` → config default).
     pub pack_exec_workers: Option<usize>,

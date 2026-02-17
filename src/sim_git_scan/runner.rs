@@ -2,8 +2,7 @@
 //!
 //! The runner executes stage tasks under a deterministic scheduler and
 //! records a bounded trace for replay. End-of-run oracles validate output
-//! shape (sorted/disjoint sets), watermark gating, and stability across
-//! schedule seeds.
+//! shape (sorted/disjoint sets) and stability across schedule seeds.
 //!
 //! Stage pipeline:
 //! `RepoOpen -> CommitWalk -> TreeDiff -> PackExec -> Finalize`
@@ -72,7 +71,7 @@ pub struct RunReport {
     pub commit_count: u32,
     /// Candidate count emitted by tree diff.
     pub candidate_count: u32,
-    /// Skipped candidate count.
+    /// Count of unique skipped OIDs (after dedup).
     pub skipped_count: usize,
     /// Finalize outcome.
     pub outcome: SimFinalizeOutcome,

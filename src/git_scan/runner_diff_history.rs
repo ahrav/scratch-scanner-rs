@@ -27,10 +27,11 @@
 //!
 //! # Batch planning
 //!
-//! Unlike the ODB-blob path, all pack plans are built before execution begins.
-//! This enables a pre-execution artifact staleness check: if `git gc` or
-//! `git repack` ran between planning and execution, the function bails with
+//! All pack plans are built before execution begins, with an artifact
+//! staleness check between planning and execution. If `git gc` or
+//! `git repack` ran during that window, the function bails with
 //! `ConcurrentMaintenance` rather than reading corrupt pack offsets.
+//! (The ODB-blob path places this staleness check before planning instead.)
 //!
 //! # Execution strategies
 //!
@@ -111,7 +112,7 @@ use super::runner_exec::{
 /// # Commit-meta emission
 ///
 /// The [`CommitMetaContext`] bundles the event sink, commit-graph index,
-/// and emit-once bitset for exactly-once `CommitMeta` event emission per
+/// identity interner, and emit-once bitset for exactly-once `CommitMeta` event emission per
 /// referenced commit. The index maps commit-graph positions to OIDs and
 /// timestamps; the bitset gates emission so each `commit_id` produces at
 /// most one `CommitMeta` event even when multiple adapters (or multiple

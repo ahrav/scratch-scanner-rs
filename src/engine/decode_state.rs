@@ -15,10 +15,10 @@ use std::ops::{ControlFlow, Range};
 use super::transform::stream_decode;
 use crate::api::TransformConfig;
 
-/// Arena-internal compact decode step (12 bytes vs 40 bytes for [`DecodeStep`]).
+/// Arena-internal compact decode step (12 bytes vs 32 bytes for [`DecodeStep`]).
 ///
 /// The public [`DecodeStep`] uses `usize` spans and an enum with `Range<usize>`
-/// fields, which costs 40 bytes on 64-bit targets. This compact form uses `u32`
+/// fields, which costs 32 bytes on 64-bit targets. This compact form uses `u32`
 /// spans (safe because buffers are capped at `u32::MAX`) and packs the
 /// discriminant + payload index into a single `u32`, yielding 12 bytes total.
 ///

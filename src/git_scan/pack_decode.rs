@@ -171,7 +171,7 @@ pub fn entry_header_at(
 /// - `PackDecodeError::Inflate(InflateError::Backend)` on backend/zlib errors.
 ///
 /// # Panics
-/// Panics if `header.data_start` is out of bounds for `pack` (assertion in
+/// Panics if `header.data_start` is out of bounds for `pack` (bounds check in
 /// `PackFile::slice_from`).
 pub fn inflate_entry_payload_with(
     de: &mut Decompress,
@@ -219,7 +219,7 @@ pub fn inflate_entry_payload_with(
 ///   [`inflate_entry_payload_with`] with the same variants and conditions.
 ///
 /// # Panics
-/// - Panics if `header.data_start` is out of bounds for `pack` (assertion in
+/// - Panics if `header.data_start` is out of bounds for `pack` (bounds check in
 ///   `PackFile::slice_from`).
 /// - May panic if called reentrantly on the same thread because the
 ///   thread-local inflate scratch uses `RefCell` borrowing.

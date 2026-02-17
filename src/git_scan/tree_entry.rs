@@ -34,9 +34,10 @@
 //!
 //! # Iterator Behavior
 //!
-//! The iterator is fused: after returning an error, all subsequent calls
-//! to `next()` return `None`. This prevents garbage results from partially
-//! parsed state.
+//! The iterator behaves as fused: after returning an error, all subsequent
+//! calls to `next()` return `None`. This prevents garbage results from
+//! partially parsed state. (Note: `FusedIterator` is not formally
+//! implemented; the fusing behavior is enforced by an internal flag.)
 //!
 //! # Streaming vs. Complete Buffers
 //!
@@ -171,7 +172,9 @@ pub(crate) struct ParsedTreeEntry {
 impl ParsedTreeEntry {
     /// Materializes a borrowed `TreeEntry` from the parsed offsets.
     ///
-    /// `data` must be the same buffer that the entry was parsed from.
+    /// `data` must be the same buffer that the entry was parsed from, and
+    /// must not have been mutated or reallocated since parsing (offsets are
+    /// byte-exact).
     pub(crate) fn materialize<'a>(&self, data: &'a [u8], oid_len: u8) -> TreeEntry<'a> {
         TreeEntry {
             name: &data[self.name_start..self.name_end],

@@ -139,7 +139,7 @@ impl StartSetConfig {
                 out.push(4);
 
                 // Sort and dedup a slice view for order/duplicate invariance.
-                // No data cloning, only pointer-sized elements are copied.
+                // No data cloning; only slice references are copied, not the underlying bytes.
                 let mut v: Vec<&[u8]> = refs.iter().map(|r| r.as_slice()).collect();
                 v.sort_unstable();
                 v.dedup();
