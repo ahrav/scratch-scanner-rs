@@ -39,8 +39,9 @@ const NO_WORKER: usize = usize::MAX;
 thread_local! {
     /// Per-thread worker ID storage.
     ///
-    /// Initialized to `NO_WORKER` (not a worker thread). The executor sets this
-    /// to the actual worker ID before entering the work loop, and clears it on exit.
+    /// Initialized to `NO_WORKER` (not a worker thread). Callers that create
+    /// worker threads should set this to the actual worker ID before entering
+    /// the work loop, and clear it on exit.
     ///
     /// # Initialization Timing
     ///
@@ -51,7 +52,7 @@ thread_local! {
 
 /// Set current worker ID for this thread.
 ///
-/// Executor workers call this once at startup with `Some(id)` and
+/// Worker threads should call this once at startup with `Some(id)` and
 /// once at exit with `None`.
 ///
 /// # Performance

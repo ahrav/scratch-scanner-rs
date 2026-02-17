@@ -138,7 +138,10 @@ impl CandidateChunk {
     /// are globally mergeable. The ordering compares path bytes (not arena
     /// offsets) to stay stable across runs.
     ///
-    /// Deduplication uses the full canonical key (OID + path + context).
+    /// Two dedup passes run in sequence:
+    /// 1. Exact-match dedup on the full canonical key (OID + path + context).
+    /// 2. Per-OID reduction that keeps only the most canonical candidate for
+    ///    each distinct OID (lowest commit id, then path, then context).
     pub fn sort_and_dedupe(&mut self) {
         let arena = &self.path_arena;
         self.candidates

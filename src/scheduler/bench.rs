@@ -6,7 +6,7 @@
 //! - Wall time (p50, p95, p99)
 //! - CPU time (user + system via rusage)
 //! - Memory usage (peak RSS)
-//! - Scheduler overhead (tasks/s, bytes/s)
+//! - Throughput (MiB/s, files/s)
 //!
 //! # Key Principles
 //!
@@ -18,11 +18,8 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! let engine = Arc::new(create_engine());
-//! let source = || create_file_source();
-//! let cfg = BenchConfig::default();
-//!
-//! let report = bench_local_scan(engine, source, cfg);
+//! let mut bench = MyBenchImpl::new(config);
+//! let report = run_benchmark(&mut bench, BenchConfig::default());
 //! println!("{}", report.summary());
 //! ```
 //!

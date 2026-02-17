@@ -25,7 +25,7 @@ use super::run_reader::RunReader;
 /// The merger performs dedupe by suppressing adjacent equal records in the
 /// merged order.
 pub struct RunMerger<R: Read> {
-    /// Per-run readers and their scratch buffers.
+    /// Per-run readers (one cursor per input run).
     cursors: Vec<RunCursor<R>>,
     /// Min-heap of the next record from each cursor.
     heap: BinaryHeap<HeapItem>,

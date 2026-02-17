@@ -74,23 +74,19 @@ impl FindingRecord for ApiFindingRec {
 // EngineScratch for engine::ScanScratch
 // ============================================================================
 
-/// Wrapper around the real `ScanScratch` that stores an engine reference.
+/// Wrapper around the real `ScanScratch` using a lazy reset pattern.
 ///
 /// The real `ScanScratch::reset_for_scan` requires an `&Engine` reference,
-/// but the trait's `clear()` method doesn't provide one. We store the engine
-/// reference when creating the scratch, then use it in `clear()`.
+/// but the trait's `clear()` method cannot provide one. Instead of storing
+/// an engine reference, we use a **lazy reset** approach:
 ///
-/// # Alternative Approaches Considered
+/// - `clear()` only clears the local drain buffers (`findings_buf`,
+///   `norm_hash_buf`).
+/// - `Engine::scan_chunk_into()` calls `reset_for_scan()` internally
+///   before scanning, resetting the engine's internal state.
 ///
-/// 1. **Change trait signature**: Would break the abstraction and require
-///    the scheduler to know about engine internals.
-///
-/// 2. **Store findings separately**: Would add copying overhead.
-///
-/// 3. **Lazy reset**: Clear only the local drain buffer; delay full engine scratch
-///    reset until next scan. This is what we do: `clear()` clears `findings_buf`
-///    (our local drain buffer), and `scan_chunk_into` calls `reset_for_scan`
-///    internally before scanning to reset the engine's internal state.
+/// This preserves the trait's simplicity while satisfying the real engine's
+/// requirements.
 pub struct RealEngineScratch {
     scratch: RealScanScratch,
     /// Temporary buffer for draining findings.
