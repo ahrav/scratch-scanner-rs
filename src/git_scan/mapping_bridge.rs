@@ -8,9 +8,10 @@
 //! # Algorithm
 //! 1. Validate strict OID ordering (rejects duplicates or regressions).
 //! 2. Re-intern the candidate path into the bridge arena.
-//! 3. Look up the blob OID in the MIDX using a streaming cursor.
-//! 4. Emit a packed or loose candidate into the downstream sink.
-//! 5. Track per-blob stats and reconcile them at `finish()`.
+//! 3. Classify the interned path and build candidate context with updated flags.
+//! 4. Look up the blob OID in the MIDX using a streaming cursor.
+//! 5. Emit a packed or loose candidate into the downstream sink.
+//! 6. Track per-blob stats and reconcile them at `finish()`.
 //!
 //! # Invariants
 //! - Input OIDs must be strictly increasing and duplicate-free.
