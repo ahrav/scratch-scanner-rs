@@ -17,6 +17,7 @@ The values below are from the current repository snapshot:
 - Built-in rules: `223`
 - `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
 - `entropy` enabled: `218` rules
+- `min_entropy_bits_per_byte` enabled: `43` rules (hex-alphabet Tier 1)
 - `local_context` enabled: `1` rule (`generic-api-key`)
 - `value_suppressors_any` enabled: `15` rules (`adafruit-api-key`, `adobe-client-id`, `algolia-api-key`, `atlassian-api-token`, `confluent-access-token`, `confluent-secret-key`, `curl-auth-header`, `curl-auth-user`, `discord-api-token`, `discord-client-secret`, `generic-api-key`, `hashicorp-tf-password`, `heroku-api-key`, `linear-client-secret`, `zendesk-secret-key`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
@@ -277,7 +278,11 @@ rules:
   keywords_any:
   - mytok_
   value_suppressors_any: null
-  entropy: null
+  entropy:                          # Shannon + min-entropy gate (optional)
+    min_bits_per_byte: 3.0          # Shannon entropy floor
+    min_len: 16                     # skip gate if secret < min_len bytes
+    max_len: 256                    # cap measurement at max_len bytes
+    min_entropy_bits_per_byte: null  # min-entropy floor (null = disabled)
   two_phase: null
   local_context: null
   offline_validation: null
