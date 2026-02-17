@@ -80,13 +80,14 @@ use crate::scheduler::ts_buffer_pool::TsBufferHandle;
 /// Invalid parameters cause an immediate panic at the construction site,
 /// not later when `data()` or `payload()` is called.
 ///
-/// # Invariants (checked at construction via `debug_assert!`)
+/// # Invariants (checked at construction)
 ///
 /// - `prefix_len <= len`
 /// - `buf_offset + len <= buf.len()`
 /// - `base_offset + len` does not overflow `u64`
 ///
-/// These checks use `debug_assert!` and are elided in release builds.
+/// The first two checks use `assert!` and fire in all builds; the overflow
+/// check uses `debug_assert!` and is elided in release builds.
 pub struct TsChunk<Id: Copy> {
     /// Object identifier this chunk belongs to.
     id: Id,
