@@ -39,7 +39,7 @@
 //!
 //! Notebook JSON is technically text (no NUL bytes), but
 //! [`classify_content`](super::classify_content) still routes it through
-//! extraction so the scan engine sees **only code/markdown cells**, not the
+//! extraction so the scan engine sees **only cell source lines**, not the
 //! surrounding JSON structural noise or bulky `outputs` blobs.
 
 use serde::Deserialize;

@@ -2,7 +2,8 @@
 //!
 //! These limits bound memory usage and protect against pathological commit
 //! graphs during the `(watermark, tip]` traversal and topological ordering.
-//! All limits are explicit and enforced; exceeding a limit yields an error.
+//! All limits are explicit and enforced; exceeding most limits yields an
+//! error (`max_new_ref_skip_checks` silently caps a loop instead).
 
 /// Hard caps for commit-graph traversal and ordering.
 ///

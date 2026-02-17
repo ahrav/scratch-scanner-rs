@@ -44,7 +44,7 @@ pub struct SpillLimits {
 
     /// Maximum path length allowed in spill records.
     ///
-    /// Default: 8 KiB (matches tree diff path cap).
+    /// Default: 8 KiB (2× tree diff path cap of 4 KiB).
     pub max_path_len: u16,
 }
 

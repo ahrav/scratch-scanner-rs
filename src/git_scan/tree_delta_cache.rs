@@ -112,9 +112,9 @@ pub struct TreeDeltaCache {
 ///
 /// # Lifetime constraint
 ///
-/// The inner [`CacheHandle`] stores a raw pointer to the backing
-/// [`SetAssociativeCache`]. Callers must ensure the cache is not dropped
-/// or moved while any handle is live.
+/// The inner [`CacheHandle`] stores raw pointers into the cache's
+/// heap-allocated storage buffers. Callers must ensure the cache is not
+/// dropped while any handle is live.
 #[derive(Debug)]
 pub struct TreeDeltaCacheHandle {
     inner: CacheHandle<DeltaSlot>,

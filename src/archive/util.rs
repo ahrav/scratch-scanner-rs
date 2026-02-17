@@ -1,12 +1,13 @@
 //! Shared low-level utilities for archive format parsers.
 //!
-//! Four categories of helpers used identically across the tar, zip, and path
-//! modules:
+//! Five categories of helpers shared across format-specific scanners:
 //!
 //! - **FNV-1a hashing** — non-cryptographic 64-bit hash for path-truncation
 //!   suffixes and zip entry deduplication.
 //! - **Hex formatting** — allocation-free u64 → 16-hex-digit conversion.
 //! - **I/O** — `read_exact_n`, a labeled variant of `Read::read_exact`.
+//! - **Counted I/O** — `CountedRead`, a byte-counting `Read` wrapper for
+//!   inflation ratio enforcement.
 //! - **Budget mapping** — `BudgetHit` → `PartialReason` translation shared by
 //!   every format-specific scanner.
 //!
@@ -112,8 +113,8 @@ const HEX_LOWER: [u8; 16] = *b"0123456789abcdef";
 /// # Panics
 ///
 /// Debug-asserts that `out16.len() == 16`.  In release builds the
-/// debug-assert is elided, but an incorrect length still panics via
-/// Rust's bounds-checked indexing.
+/// debug-assert is elided, but a length shorter than 16 still panics
+/// via Rust's bounds-checked indexing.
 #[inline(always)]
 pub(crate) fn write_u64_hex_lower(x: u64, out16: &mut [u8]) {
     debug_assert_eq!(out16.len(), 16);
