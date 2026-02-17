@@ -4,7 +4,7 @@
 //!
 //! This module provides a deterministic simulation harness that explores
 //! out-of-order I/O completions and task scheduling to verify scheduler
-//! invariants hold under all possible interleavings.
+//! invariants hold under randomly sampled interleavings.
 //!
 //! # Why Simulation Over Multi-Threading?
 //!

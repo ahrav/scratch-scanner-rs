@@ -248,9 +248,13 @@ pub fn scan_chunked_records(engine: &Engine, buf: &[u8], mut plan: ChunkPlan) ->
 ///
 /// Coverage rule:
 /// - Same rule id.
-/// - Root-span containment:
+/// - Root-span containment (after base64 padding normalization):
 ///   `chunked.root_hint_start <= oracle.root_hint_start` and
-///   `chunked.root_hint_end   >= oracle.root_hint_end`.
+///   `normalized_end(chunked) >= normalized_end(oracle)`.
+///
+/// For transform-derived findings, `root_hint_end` is normalized to strip
+/// up to 3 bytes of base64 padding so chunked scans that see an unpadded
+/// span still cover the oracle span that includes padding.
 ///
 /// Errors:
 /// - Returns a message describing the first missing oracle finding.
@@ -300,7 +304,7 @@ pub fn check_oracle_covered(
     Ok(())
 }
 
-// ---- deterministic RNG helpers ----
+// ---- deterministic chunking helpers ----
 
 fn clamp_chunk_len(want: usize, remaining: usize) -> usize {
     if remaining == 0 {

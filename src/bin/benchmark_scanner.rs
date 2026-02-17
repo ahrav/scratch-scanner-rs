@@ -710,7 +710,8 @@ struct PmuEventSpec {
 
 /// Attribute structure for perf_event_open syscall.
 ///
-/// Matches the kernel's `struct perf_event_attr` layout.
+/// Covers the first 11 fields of the kernel's `struct perf_event_attr` layout
+/// (sufficient for basic hardware counter configuration).
 #[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1250,22 +1251,12 @@ impl BenchmarkSuite {
     fn list_tests(&self) {
         let mut names = Vec::new();
         for &size in SIZE_SWEEP {
-            for engine in [
-                "manual_regex",
-                "manual_anchor",
-                "derived_regex",
-                "derived_anchor",
-            ] {
+            for engine in ["manual", "derived"] {
                 names.push(test_name_size(DatasetKind::Random.name(), size, engine));
             }
         }
         for kind in DatasetKind::ALL {
-            for engine in [
-                "manual_regex",
-                "manual_anchor",
-                "derived_regex",
-                "derived_anchor",
-            ] {
+            for engine in ["manual", "derived"] {
                 names.push(test_name_dataset(kind.name(), engine));
             }
         }

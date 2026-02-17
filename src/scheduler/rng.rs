@@ -9,9 +9,10 @@
 //! - We're selecting victims from N=4-16 workers, not doing Monte Carlo
 //! - Deterministic: same seed → same sequence (critical for reproducibility)
 //!
-//! **Bounded sampling**: Lemire's method (no division)
-//! - `% upper` compiles to division (15-40 cycles)
-//! - Lemire uses multiplication (3-4 cycles)
+//! **Bounded sampling**: Lemire's fast-range method (multiplication + one threshold division)
+//! - `% upper` compiles to division on every sample (15-40 cycles)
+//! - Lemire uses multiplication for range reduction (3-4 cycles) with one
+//!   unconditional threshold division for rejection sampling
 //! - Power-of-two fast path uses bitmask (1 cycle)
 //!
 //! **No `Copy`**: Copying an RNG duplicates the stream, causing identical
@@ -23,7 +24,7 @@
 //! |-----------|------|
 //! | `next_u64()` | ~3-4 cycles |
 //! | `next_usize(power_of_2)` | ~5 cycles (bitmask) |
-//! | `next_usize(other)` | ~8-12 cycles (Lemire, no division) |
+//! | `next_usize(other)` | ~20-40 cycles (Lemire, one threshold division) |
 
 /// Deterministic RNG for scheduling decisions.
 ///
@@ -106,11 +107,12 @@ impl XorShift64 {
         self.bounded_u64(upper as u64) as u32
     }
 
-    /// Lemire's nearly-divisionless method for bounded random generation.
+    /// Lemire's fast-range method for bounded random generation.
     ///
     /// Maps a random u64 to [0, upper) uniformly using multiplication.
-    /// Rejection sampling ensures uniformity, but rejection is rare
-    /// (probability < upper / 2^64, which is negligible for small upper).
+    /// One unconditional threshold division (`-upper % upper`) computes the
+    /// rejection boundary. Rejection sampling ensures uniformity, but rejection
+    /// is rare (probability < upper / 2^64, negligible for small upper).
     #[inline]
     fn bounded_u64(&mut self, upper: u64) -> u64 {
         // Lemire rejection threshold: 2^64 mod upper
@@ -183,8 +185,9 @@ impl Default for XorShift64 {
     }
 }
 
-/// SplitMix64 mixing function from Sebastiano Vigna's "Further scramblings of Marsaglia's
-/// xorshift generators" (2017).
+/// SplitMix64 mixing function (Stafford's Mix13 variant). See Vigna's
+/// "An experimental exploration of Marsaglia's xorshift generators, scrambled" (2016)
+/// for analysis.
 ///
 /// Used to improve seed quality when forking RNGs.
 /// Turns correlated sequential outputs into well-distributed seeds.
@@ -398,10 +401,10 @@ mod tests {
         let rng = XorShift64::new(42);
         let _cloned = rng.clone();
 
-        // If Copy was implemented, this function wouldn't compile
-        // because you can't have Clone without Copy being auto-derived
-        // when Copy is manually implemented. The fact this compiles
-        // proves we don't have Copy.
+        // If Copy were implemented, rng2 would be implicitly copied
+        // rather than moved, and would still be usable after this call.
+        // The fact that rng2 is consumed (moved) proves Copy is not
+        // implemented.
         fn takes_ownership(r: XorShift64) -> u64 {
             let mut r = r;
             r.next_u64()

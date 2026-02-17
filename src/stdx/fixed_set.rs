@@ -25,13 +25,14 @@
 /// - Hash table access is random, not sequential iteration.
 /// - Each probe needs both `key` and `gen` for the same slot.
 /// - Keeping the fields adjacent favors single-line fetches in practice.
-/// - Explicit padding fixes the layout to a 24-byte slot.
+/// - Layout is 32 bytes per slot under `repr(C)` (16-byte key + 4-byte gen
+///   + 12 bytes padding from `u128` alignment).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Slot128 {
     key: u128, // 16 bytes
     gen: u32,  // 4 bytes
-    _pad: u32, // 4 bytes - align to 24 bytes total
+    _pad: u32, // 4 bytes — explicit fill; struct is 32 bytes total (8 bytes trailing padding from u128 alignment)
 }
 
 /// Fixed-capacity hash set for deduplication (128-bit keys).

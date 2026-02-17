@@ -59,11 +59,12 @@ pub struct CandidateContext {
     pub parent_idx: u8,
     /// Type of change: Add or Modify.
     pub change_kind: ChangeKind,
-    /// Git tree entry file mode, truncated to `u16`.
+    /// Git tree entry file mode, cast to `u16`.
     ///
-    /// Populated by the tree diff walker as `mode as u16` (e.g. regular
-    /// file `0o100644` → `0o644`). Used in sort keys and spill records
-    /// for deduplication and ordering.
+    /// Populated by the tree diff walker as `mode as u16`. All standard
+    /// Git tree entry modes (e.g. `0o100644` = 33188) fit in `u16`
+    /// without truncation. Used in sort keys and spill records for
+    /// deduplication and ordering.
     pub ctx_flags: u16,
     /// Candidate flags — [`PathClass`](super::path_policy::PathClass) bitflags
     /// produced by [`classify_path`](super::path_policy::classify_path).
@@ -92,7 +93,7 @@ pub struct TreeCandidate {
 pub struct ResolvedCandidate<'a> {
     /// Blob object ID.
     pub oid: OidBytes,
-    /// Full path bytes (borrowed from the candidate buffer).
+    /// Full path bytes (borrowed from the owning buffer or chunk arena).
     pub path: &'a [u8],
     /// Commit-graph position associated with this emitted candidate context.
     pub commit_id: u32,
@@ -309,8 +310,8 @@ mod tests {
     #[test]
     fn ctx_flags_carries_file_mode() {
         // tree_diff.rs passes `mode as u16` (Git tree entry mode) as ctx_flags.
-        // Regular file = 0o100644, truncated to u16 = 0o644 = 420.
-        let mode_regular: u16 = 0o100644u32 as u16; // 420
+        // Regular file = 0o100644 = 33188 (fits in u16 without truncation).
+        let mode_regular: u16 = 0o100644u32 as u16; // 33188
         assert_ne!(mode_regular, 0, "regular file mode must be non-zero");
 
         let limits = TreeDiffLimits::RESTRICTIVE;
