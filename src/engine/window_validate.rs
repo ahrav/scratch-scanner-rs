@@ -15,16 +15,18 @@
 //!    For UTF-16 variants, confirm-all and keywords run on raw bytes *before*
 //!    decode; must-contain runs on decoded UTF-8 *after* decode.
 //! 2. Apply assignment-shape precheck (when configured).
-//! 3. For UTF-16 variants, decode with per-window and total-output budgets.
-//! 4. Run regex with reusable capture locations to access capture groups.
-//! 5. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
-//! 6. Apply entropy gates on the *extracted secret*.
-//! 7. Apply value suppressors (when configured) on the extracted secret bytes.
-//! 8. Apply local context checks (when configured) on the secret span.
-//! 9. Apply root-context safelist suppression for root emit paths.
-//! 10. Apply secret-bytes safelist suppression (all findings, including decoded).
-//! 11. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 12. Record the finding with the extracted secret span.
+//! 3. Apply character-class distribution gate (when configured) — SIMD-accelerated
+//!    rejection of windows dominated by lowercase ASCII.
+//! 4. For UTF-16 variants, decode with per-window and total-output budgets.
+//! 5. Run regex with reusable capture locations to access capture groups.
+//! 6. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
+//! 7. Apply entropy gates on the *extracted secret*.
+//! 8. Apply value suppressors (when configured) on the extracted secret bytes.
+//! 9. Apply local context checks (when configured) on the secret span.
+//! 10. Apply root-context safelist suppression for root emit paths.
+//! 11. Apply secret-bytes safelist suppression (all findings, including decoded).
+//! 12. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 13. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
