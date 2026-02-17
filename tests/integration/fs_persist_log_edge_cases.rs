@@ -30,6 +30,7 @@ fn simple_rule() -> RuleSpec {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,

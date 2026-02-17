@@ -326,6 +326,28 @@ pub(super) struct EntropyCompiled {
     /// Also determines the size of the pre-computed `ln(i)/ln(2)` table
     /// in [`Engine::entropy_log2`](super::core::Engine).
     pub(super) max_len: usize,
+    /// Lower bound on min-entropy in bits/byte (NIST SP 800-90B).
+    ///
+    /// `None` skips the min-entropy gate. When set, candidates whose
+    /// `H_inf = log2(n) - log2(max_bin_count)` falls below this threshold
+    /// are rejected even if Shannon entropy passes.
+    pub(super) min_entropy_bits_per_byte: Option<f32>,
+}
+
+/// Compiled character-class distribution gate.
+///
+/// Copied from the validated [`crate::api::CharClassSpec`] at compile time.
+/// Used by the window-validation hot path to reject windows dominated by
+/// lowercase ASCII before running the regex.
+///
+/// # Invariants
+/// - Values are validated by `RuleSpec::assert_valid`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CharClassCompiled {
+    /// Maximum percentage of lowercase ASCII bytes allowed (0–100).
+    pub(super) max_lower_pct: u8,
+    /// Minimum window length for the gate to apply.
+    pub(super) min_window_len: u16,
 }
 
 /// Sentinel value indicating no gate is assigned for a given slot.
@@ -411,6 +433,7 @@ pub(super) struct RuleCompiled {
     pub(super) keywords: u32,
     pub(super) value_suppressors: u32,
     pub(super) entropy: u32,
+    pub(super) char_class: u32,
     pub(super) local_context: u32,
     pub(super) two_phase: u32,
     pub(super) offline_validation: u32,
@@ -452,7 +475,7 @@ pub(super) struct RuleCold {
 // Compile-time size guard: gate index is now a plain u32 (4 bytes) with
 // NO_GATE sentinel, down from 8-byte Option<u32> (no niche optimization).
 const _: () = assert!(std::mem::size_of::<u32>() == 4);
-const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 80);
+const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 88);
 
 // --------------------------
 // Compile helpers
@@ -468,6 +491,7 @@ pub(super) struct CompiledGates {
     pub(super) keywords: Option<KeywordsCompiled>,
     pub(super) value_suppressors: Option<PackedPatterns>,
     pub(super) entropy: Option<EntropyCompiled>,
+    pub(super) char_class: Option<CharClassCompiled>,
     pub(super) local_context: Option<LocalContextSpec>,
     pub(super) offline_validation: Option<OfflineValidationSpec>,
 }
@@ -539,6 +563,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         min_bits_per_byte: e.min_bits_per_byte,
         min_len: e.min_len,
         max_len: e.max_len,
+        min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
     });
 
     // Enable assignment-shape precheck for rules with assignment-pattern regexes.
@@ -553,16 +578,23 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         keywords: NO_GATE,
         value_suppressors: NO_GATE,
         entropy: NO_GATE,
+        char_class: NO_GATE,
         local_context: NO_GATE,
         two_phase: NO_GATE,
         offline_validation: NO_GATE,
     };
+
+    let char_class = spec.char_class.map(|cc| CharClassCompiled {
+        max_lower_pct: cc.max_lower_pct,
+        min_window_len: cc.min_window_len,
+    });
 
     let gates = CompiledGates {
         two_phase,
         keywords,
         value_suppressors,
         entropy,
+        char_class,
         local_context: spec.local_context,
         offline_validation: spec.offline_validation,
     };
@@ -727,6 +759,7 @@ mod tests {
             keywords_any: None,
             value_suppressors_any,
             entropy: None,
+            char_class: None,
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,

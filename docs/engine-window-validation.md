@@ -20,7 +20,7 @@ Two entry styles are supported:
 - **Coordinate space management**: Maintain separate coordinate systems for raw bytes, UTF-16 variants, and decoded UTF-8 output
 - **Budget enforcement**: Track and limit UTF-16 decoding resource consumption
 - **Finding extraction**: Record matches with proper span information and secret data extraction
-- **Entropy validation**: Gate findings on Shannon entropy of extracted secret bytes
+- **Entropy validation**: Gate findings on Shannon entropy and optional min-entropy (NIST SP 800-90B) of extracted secret bytes
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
 - **Emit-time policy checks**: Apply root safelist suppression and offline structural validation before recording findings
 
@@ -369,7 +369,17 @@ let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
 
 ## Entropy Checking: entropy_gate_passes Implementation
 
-Entropy gating filters matches based on Shannon entropy of the extracted secret bytes, eliminating highly repetitive or structured tokens that are unlikely to be credentials.
+Entropy gating filters matches based on two complementary metrics computed from
+the extracted secret bytes, eliminating tokens unlikely to be credentials:
+
+1. **Shannon entropy** (always checked): measures average information content.
+   Rejects highly repetitive or structured tokens (e.g., all-same-byte, sequential digits).
+2. **Min-entropy** (optional, per NIST SP 800-90B): measures worst-case predictability.
+   `H_inf = -log2(p_max) = log2(n) - log2(max_bin_count)`. Rejects distributions
+   where one byte value dominates even though the overall Shannon entropy looks moderate.
+
+Both metrics are computed in a single fused pass over the 256-bin histogram
+(`compute_entropy_metrics`), adding ~1 instruction per bin (cmov for max tracking).
 
 ### Invocation
 
@@ -381,29 +391,23 @@ let (secret_start, secret_end) = extract_secret_span_locs_raw(
 );
 let secret_bytes = &window[secret_start..secret_end];
 
-if let Some(ent) = entropy {
-    if !entropy_gate_passes(
-        &ent,
-        secret_bytes,
-        scratch.ensure_entropy_scratch(),
-        &self.entropy_log2,
-    ) {
-        continue;  // Skip to next match, not full return
-    }
-}
+let entropy_ok = post_match_entropy_passes(
+    entropy, secret_bytes, scratch, &self.entropy_log2,
+);
 ```
 
 ### Parameters
 
-- `ent`: Entropy threshold configuration (bits per byte, minimum token length, etc.)
+- `entropy`: Optional `EntropyCompiled` with Shannon threshold, min-entropy threshold, and length bounds
 - `secret_bytes`: The extracted secret bytes to evaluate
-- `entropy_scratch`: Mutable scratch space for frequency tables
+- `scratch`: Mutable scan scratch (provides entropy histogram scratch space)
 - `entropy_log2`: Pre-computed log2 lookup table for efficiency
 
 ### Behavior
 
 - Evaluates entropy on the **extracted secret** bytes, not the full regex match or window
-- Rejects matches with entropy below configured threshold
+- Shannon entropy is checked first (rejects ~80-90% of non-secrets)
+- Min-entropy is checked second when `min_entropy_bits_per_byte` is set
 - Matches shorter than configured minimum length automatically pass (entropy is noisy on tiny samples)
 - On failure, **continues to next match** (not an early return) via `continue`
 

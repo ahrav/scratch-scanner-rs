@@ -71,8 +71,8 @@ use super::helpers::{build_log2_table, u64_to_usize};
 use super::rule_repr::PackedPatternsBuilder;
 use super::rule_repr::{
     add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
-    utf16le_bytes, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold,
-    RuleCompiled, Target, TwoPhaseCompiled, Variant, NO_GATE,
+    utf16le_bytes, CharClassCompiled, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled,
+    PackedPatterns, RuleCold, RuleCompiled, Target, TwoPhaseCompiled, Variant, NO_GATE,
 };
 use super::safelist::SafelistFilter;
 use super::scratch::{RootSpanMapCtx, ScanScratch, DEDUP_RULE_ID_MAX};
@@ -264,6 +264,8 @@ pub struct Engine {
     pub(super) local_context_gates: Vec<LocalContextSpec>,
     /// Offline structural validation specs (e.g. CRC-32, format checks).
     pub(super) offline_validation_gates: Vec<OfflineValidationSpec>,
+    /// Character-class distribution gates (SIMD-accelerated pre-filter).
+    pub(super) char_class_gates: Vec<CharClassCompiled>,
     /// Global context safelist evaluated at finding emission time.
     pub(super) safelist: SafelistFilter,
 
@@ -426,6 +428,7 @@ impl Engine {
         let mut two_phase_gates: Vec<TwoPhaseCompiled> = Vec::new();
         let mut local_context_gates: Vec<LocalContextSpec> = Vec::new();
         let mut offline_validation_gates: Vec<OfflineValidationSpec> = Vec::new();
+        let mut char_class_gates: Vec<CharClassCompiled> = Vec::new();
 
         let mut rules_compiled: Vec<RuleCompiled> = Vec::with_capacity(rules.len());
         let mut rules_cold: Vec<RuleCold> = Vec::with_capacity(rules.len());
@@ -460,6 +463,11 @@ impl Engine {
                 assert!(offline_validation_gates.len() < NO_GATE as usize);
                 rule.offline_validation = offline_validation_gates.len() as u32;
                 offline_validation_gates.push(ov);
+            }
+            if let Some(cc) = gates.char_class {
+                assert!(char_class_gates.len() < NO_GATE as usize);
+                rule.char_class = char_class_gates.len() as u32;
+                char_class_gates.push(cc);
             }
             rules_compiled.push(rule);
             rules_cold.push(RuleCold { name: spec.name });
@@ -987,6 +995,7 @@ impl Engine {
             two_phase_gates,
             local_context_gates,
             offline_validation_gates,
+            char_class_gates,
             safelist: SafelistFilter::new(),
             entropy_log2,
             vs,
@@ -1102,6 +1111,19 @@ impl Engine {
             None
         } else {
             Some(self.local_context_gates[idx as usize])
+        }
+    }
+
+    /// Resolves the character-class distribution gate for a rule.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
+    #[inline(always)]
+    pub(super) fn char_class_gate(&self, idx: u32) -> Option<CharClassCompiled> {
+        if idx == NO_GATE {
+            None
+        } else {
+            Some(self.char_class_gates[idx as usize])
         }
     }
 
@@ -2192,6 +2214,7 @@ pub fn bench_entropy_gate_passes_with_state(
         min_bits_per_byte: min_bits,
         min_len,
         max_len: state.max_len,
+        min_entropy_bits_per_byte: None,
     };
     super::helpers::entropy_gate_passes(&spec, bytes, &mut state.scratch, &state.log2_table)
 }

@@ -166,6 +166,7 @@ graph TB
         MinBpb["min_bits_per_byte: f32"]
         MinLen["min_len: usize"]
         MaxLen["max_len: usize"]
+        MinEntropyBpb["min_entropy_bits_per_byte: Option&lt;f32&gt;"]
     end
 
     subgraph LocalContextSpec["LocalContextSpec (optional)"]

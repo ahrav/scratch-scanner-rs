@@ -53,13 +53,15 @@
 //!
 //! ## Branchless decode strategy
 //!
-//! All three lookup tables ([`BASE62_LUT`], [`HEX_LUT`], [`BASE64_LUT`])
-//! share a common sentinel convention:
+//! All four lookup tables ([`BASE62_LUT`], [`HEX_LUT`], [`BASE64_LUT`],
+//! [`BASE64URL_LUT`]) share a common sentinel convention:
 //!
 //! - Valid values occupy the low bits (0–61 for base-62, 0–15 for hex,
 //!   0–63 for base64) and **never** set bit 7.
 //! - Invalid bytes map to `0xFF` (bit 7 set).
 //! - Base64 padding (`=`) maps to `0xFE` (bit 7 set, bit 0 clear).
+//! - [`BASE64URL_LUT`] omits the padding sentinel (`0xFE`) entirely because
+//!   its sole caller (PyPI macaroon tokens) never encounters `=` padding.
 //!
 //! Decode loops exploit this by OR-accumulating lookup results into a
 //! single `invalid` flag and deferring the validity branch until after
@@ -753,8 +755,11 @@ fn validate_pypi_token(secret: &[u8]) -> OfflineVerdict {
 
 /// Check that every byte in `seg` satisfies `pred`.
 ///
-/// Uses OR-accumulation (branchless) to avoid per-byte branches:
-/// any byte failing the predicate sets `bad` to non-zero.
+/// Uses OR-accumulation to minimize branches: the loop body avoids
+/// early-exit, deferring the pass/fail decision until after all bytes are
+/// checked. Whether individual predicate calls compile to branchless
+/// instructions depends on the predicate and target (e.g., range checks
+/// on AArch64 often compile to `cmp + cset`).
 #[inline]
 fn all_bytes(seg: &[u8], pred: fn(u8) -> bool) -> bool {
     let mut bad: u8 = 0;
@@ -793,6 +798,22 @@ fn is_hex(b: u8) -> bool {
 /// Compound prefixes (`xoxe.xoxb-`, `xoxe.xoxp-`) are checked first to
 /// avoid misparse against simpler prefixes. Unknown prefixes return
 /// `Indeterminate` for forward compatibility.
+///
+/// ## Dispatch table
+///
+/// | Prefix             | Sub-validator                         | Rules served                                          | Case        |
+/// |--------------------|---------------------------------------|-------------------------------------------------------|-------------|
+/// | `xoxe.xox[bp]-`   | [`validate_slack_config_access`]      | `slack-config-access-token`                           | insensitive |
+/// | `xoxb-`            | [`validate_slack_xoxb`]               | `slack-bot-token`, `slack-legacy-bot-token`            | sensitive   |
+/// | `xoxp-`            | [`validate_slack_user_token`]         | `slack-user-token`                                    | sensitive   |
+/// | `xoxe-`            | [`validate_slack_xoxe`]               | `slack-config-refresh-token`, `slack-user-token`       | insensitive |
+/// | `xapp-`            | [`validate_slack_xapp`]               | `slack-app-token`                                     | insensitive |
+/// | `xox[os]-`         | [`validate_slack_legacy`]             | `slack-legacy-token`                                  | sensitive   |
+/// | `xox[ar]-`         | [`validate_slack_legacy_workspace`]   | `slack-legacy-workspace-token`                        | sensitive   |
+///
+/// Compound prefixes are checked before simple ones so `xoxe.xoxb-` is not
+/// misrouted through the `xoxe-` path. Unknown prefixes return `Indeterminate`
+/// for forward compatibility with future Slack token formats.
 fn validate_slack_token(secret: &[u8]) -> OfflineVerdict {
     // Need at least 5 bytes for the shortest prefix (xoxb-, xoxp-, etc.)
     if secret.len() < 5 {
@@ -938,12 +959,18 @@ fn validate_slack_xoxb(after_prefix: &[u8]) -> OfflineVerdict {
         }
     }
 
+    // Both current and legacy `xoxb-` formats were attempted and neither
+    // matched. Since the `xoxb-` prefix sets a strong structural expectation,
+    // return Invalid rather than Indeterminate.
     OfflineVerdict::Invalid
 }
 
 /// Validate `xoxp-` / `xoxe-` user token.
 ///
 /// Format after prefix: `{d10-13}-{d10-13}-{d10-13}-{an+hyphen 28-34}`.
+///
+/// Called directly for `xoxp-` tokens, and by [`validate_slack_xoxe`] when the
+/// first segment has 10–13 digits (user/enterprise token vs config-refresh).
 fn validate_slack_user_token(after_prefix: &[u8]) -> OfflineVerdict {
     let segs: Vec<&[u8]> = after_prefix.splitn(5, |&b| b == b'-').collect();
     if segs.len() < 4 {

@@ -52,6 +52,7 @@ impl RuleCase {
                     min_bits_per_byte: *bits_x10 as f32 / 10.0,
                     min_len: *min_len,
                     max_len: *max_len,
+                    min_entropy_bits_per_byte: None,
                 }),
             two_phase: self
                 .two_phase
