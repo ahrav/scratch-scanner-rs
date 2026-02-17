@@ -7,7 +7,9 @@
 //! heap allocation.
 //!
 //! # Design
-//! - Append-only: bytes are never removed, so references remain valid.
+//! - Append-only during normal use: bytes are not selectively removed, so
+//!   references remain valid until an explicit reset (see
+//!   [`ByteArena::clear_keep_capacity`]).
 //! - References are offsets, not pointers, so `Vec` reallocation does not
 //!   invalidate them.
 //! - No deduplication is performed; repeated inserts store repeated bytes.
@@ -96,7 +98,7 @@ impl ByteRef {
 ///
 /// # Invariants
 /// - Total bytes never exceeds `capacity`
-/// - All returned `ByteRef` values remain valid for arena lifetime
+/// - All returned `ByteRef` values remain valid until [`clear_keep_capacity`](Self::clear_keep_capacity) is called
 /// - All returned `ByteRef` values have `off + len <= capacity`
 #[derive(Clone, Debug)]
 pub struct ByteArena {
