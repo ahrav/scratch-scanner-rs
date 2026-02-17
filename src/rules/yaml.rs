@@ -35,7 +35,8 @@ use std::sync::{LazyLock, Mutex};
 use serde::Deserialize;
 
 use crate::api::{
-    EntropySpec, LocalContextSpec, OfflineValidationSpec, RuleSpec, TwoPhaseSpec, ValidatorKind,
+    CharClassSpec, EntropySpec, LocalContextSpec, OfflineValidationSpec, RuleSpec, TwoPhaseSpec,
+    ValidatorKind,
 };
 
 use super::RulesError;
@@ -88,6 +89,8 @@ pub(crate) struct YamlRule {
     #[serde(default)]
     pub entropy: Option<YamlEntropy>,
     #[serde(default)]
+    pub char_class: Option<YamlCharClass>,
+    #[serde(default)]
     pub two_phase: Option<YamlTwoPhase>,
     #[serde(default)]
     pub local_context: Option<YamlLocalContext>,
@@ -112,6 +115,18 @@ pub(crate) struct YamlEntropy {
     pub max_len: usize,
     #[serde(default)]
     pub min_entropy_bits_per_byte: Option<f32>,
+}
+
+/// Character-class pre-filter gate parameters for a rule.
+///
+/// When present, scan windows whose byte composition exceeds `max_lower_pct`
+/// percent lowercase ASCII (`a`–`z`) **and** are at least `min_window_len`
+/// bytes long are rejected before the regex is applied.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(crate) struct YamlCharClass {
+    pub max_lower_pct: u8,
+    pub min_window_len: u16,
 }
 
 /// Two-phase scanning configuration.
@@ -341,6 +356,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             keywords_any,
             value_suppressors_any,
             entropy,
+            char_class,
             two_phase,
             local_context,
             offline_validation,
@@ -397,6 +413,29 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
         });
 
+        let char_class = char_class.map(|cc| CharClassSpec {
+            max_lower_pct: cc.max_lower_pct,
+            min_window_len: cc.min_window_len,
+        });
+
+        // Auto-enable char_class for high-entropy rules that don't explicitly
+        // set it. Rules with entropy threshold >= 3.0 bits/byte are scanning
+        // for secrets (API keys, tokens), not passwords or low-entropy strings.
+        // Excludes ~6 low-entropy password rules (e.g. nuget-config-password
+        // at 1.0).
+        let char_class = char_class.or_else(|| {
+            entropy.as_ref().and_then(|ent| {
+                if ent.min_bits_per_byte >= 3.0 {
+                    Some(CharClassSpec {
+                        max_lower_pct: 95,
+                        min_window_len: 32,
+                    })
+                } else {
+                    None
+                }
+            })
+        });
+
         let offline_validation = offline_validation
             .map(|ov| yaml_offline_to_spec(name, ov))
             .transpose()?;
@@ -414,7 +453,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             keywords_any,
             value_suppressors_any,
             entropy,
-            char_class: None,
+            char_class,
             local_context,
             offline_validation,
             secret_group,

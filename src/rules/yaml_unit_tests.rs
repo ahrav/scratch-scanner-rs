@@ -62,6 +62,11 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         }),
     });
 
+    let char_class = rule.char_class.map(|cc| YamlCharClass {
+        max_lower_pct: cc.max_lower_pct,
+        min_window_len: cc.min_window_len,
+    });
+
     let offline_validation = rule.offline_validation.map(|ov| match ov {
         OfflineValidationSpec::Crc32Base62 {
             prefix_skip,
@@ -120,6 +125,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         keywords_any,
         value_suppressors_any,
         entropy,
+        char_class,
         two_phase,
         local_context,
         offline_validation,
@@ -291,6 +297,24 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
             }
             (None, None) => {}
             _ => panic!("local_context presence mismatch for {}", orig.name),
+        }
+
+        // Char class.
+        match (orig.char_class, parsed.char_class) {
+            (Some(occ), Some(pcc)) => {
+                assert_eq!(
+                    occ.max_lower_pct, pcc.max_lower_pct,
+                    "char_class max_lower_pct mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    occ.min_window_len, pcc.min_window_len,
+                    "char_class min_window_len mismatch for {}",
+                    orig.name
+                );
+            }
+            (None, None) => {}
+            _ => panic!("char_class presence mismatch for {}", orig.name),
         }
 
         // Offline validation.
@@ -665,6 +689,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
         "keywords_any",
         "value_suppressors_any",
         "entropy",
+        "char_class",
         "two_phase",
         "local_context",
         "offline_validation",
@@ -672,7 +697,12 @@ fn default_rules_yaml_has_no_unknown_fields() {
     ];
     let offline_validation_fields: &[&str] =
         &["type", "prefix_skip", "payload_len", "checksum_len"];
-    let entropy_fields: &[&str] = &["min_bits_per_byte", "min_len", "max_len"];
+    let entropy_fields: &[&str] = &[
+        "min_bits_per_byte",
+        "min_len",
+        "max_len",
+        "min_entropy_bits_per_byte",
+    ];
     let two_phase_fields: &[&str] = &["seed_radius", "full_radius", "confirm_any"];
     let local_ctx_fields: &[&str] = &[
         "lookbehind",
@@ -700,8 +730,10 @@ fn default_rules_yaml_has_no_unknown_fields() {
             );
         }
         // Check nested section fields.
+        let char_class_fields: &[&str] = &["max_lower_pct", "min_window_len"];
         let nested_sections: &[(&str, &[&str])] = &[
             ("entropy", entropy_fields),
+            ("char_class", char_class_fields),
             ("two_phase", two_phase_fields),
             ("local_context", local_ctx_fields),
             ("offline_validation", offline_validation_fields),
