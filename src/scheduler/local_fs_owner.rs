@@ -684,8 +684,12 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// 1. Check abort flag.
 /// 2. Detect archive format by extension, then by header magic.
 /// 3. If archive: dispatch to `dispatch_archive_scan` and return.
-/// 4. If binary-skip enabled: probe for NUL bytes / extractable format.
-/// 5. Otherwise: sequential chunk+overlap scan via the buffer pool.
+/// 4. Pre-open extension/lock skip: if binary-skip enabled, reject files
+///    whose extension is in the binary skip set or whose filename matches
+///    the lock-file table — without opening the file.
+/// 5. Open the file, read metadata.
+/// 6. If binary-skip enabled: probe first bytes for NUL / extractable format.
+/// 7. Otherwise: sequential chunk+overlap scan via the buffer pool.
 ///
 /// # Design: Sequential Read with Overlap Carry
 ///
@@ -708,6 +712,10 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// │                        process_file() flow                         │
 /// └────────────────────────────────────────────────────────────────────┘
 ///
+/// ext/lock skip? ──skip──► return (binary_skipped++)
+///       │
+///      pass
+///       ▼
 /// open(path) ─► metadata.len() ─► acquire_buffer()
 ///                    │
 ///                    ▼
@@ -765,6 +773,32 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 .record_archive_partial(r, path_bytes, false),
         }
         return;
+    }
+
+    // Extension-based pre-open skip: avoid opening files whose extension
+    // marks them as definitely-binary or as a credential-safe lock file.
+    // BinaryExtractable formats (.jar, .class, .pyc, .ipynb) are NOT in the
+    // skip set — they will fall through to the content classifier below.
+    //
+    // Ordering: extension check first (cheap u64 binary search on the packed
+    // table), then lock-file check (linear scan of short filename table).
+    // Both increment `binary_skipped` — a single counter that tracks all
+    // pre-content-probe exclusions regardless of reason.
+    if skip_binary {
+        if let Some(ext_os) = task.path.extension() {
+            let ext = ext_os.as_encoded_bytes();
+            if crate::git_scan::path_policy::ext_in_skip_set(ext) {
+                // TODO(consistency): wrapping_add here vs saturating_add elsewhere in
+                // process_file (io_errors, chunks_scanned, bytes_scanned). Both are
+                // equivalent for u64, but the inconsistency is worth normalizing.
+                ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                return;
+            }
+        }
+        if crate::git_scan::path_policy::is_lock_filename(path_bytes) {
+            ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+            return;
+        }
     }
 
     // Open file

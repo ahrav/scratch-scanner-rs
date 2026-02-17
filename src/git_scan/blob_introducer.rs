@@ -725,8 +725,14 @@ impl BlobIntroducer {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    let excluded = matches!(self.path_policy_version, 2..)
-                        && class.contains(PathClass::BINARY);
+                    // Inline the version-gate instead of calling `is_excluded_path()`:
+                    // `classify_path` was already called, so reusing `class` avoids
+                    // a redundant re-classification in the hot loop.
+                    let excluded = match self.path_policy_version {
+                        0 | 1 => false,
+                        2 => class.contains(PathClass::BINARY),
+                        _ => class.is_nonscannable(),
+                    };
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -1023,8 +1029,14 @@ impl<'a> BlobIntroWorker<'a> {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    let excluded = matches!(self.path_policy_version, 2..)
-                        && class.contains(PathClass::BINARY);
+                    // Inline the version-gate instead of calling `is_excluded_path()`:
+                    // `classify_path` was already called, so reusing `class` avoids
+                    // a redundant re-classification in the hot loop.
+                    let excluded = match self.path_policy_version {
+                        0 | 1 => false,
+                        2 => class.contains(PathClass::BINARY),
+                        _ => class.is_nonscannable(),
+                    };
                     let idx = oid_index.get(&oid);
 
                     if excluded {

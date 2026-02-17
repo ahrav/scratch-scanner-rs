@@ -330,7 +330,8 @@ pub struct WorkerMetricsLocal {
     pub persist_ns: u64,
     /// Times worker yielded to OS scheduler (TieredIdle yield path).
     pub yield_count: u64,
-    /// Files skipped because they appear to be binary.
+    /// Files skipped due to binary content probe, pre-open extension match,
+    /// or lock-file filename match.
     pub binary_skipped: u64,
     /// Files where text was extracted from a known binary format.
     pub binary_extracted: u64,
@@ -477,7 +478,8 @@ pub struct MetricsSnapshot {
     pub findings_dropped: u64,
     /// Total persistence batch emission failures.
     pub persistence_emit_failures: u64,
-    /// Total files skipped because they appear to be binary.
+    /// Total files skipped due to binary content probe, pre-open extension
+    /// match, or lock-file filename match.
     pub binary_skipped: u64,
     /// Total files where text was extracted from a known binary format.
     pub binary_extracted: u64,

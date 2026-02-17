@@ -141,7 +141,15 @@ pub struct GitScanConfig {
     pub start_set: StartSetConfig,
     /// Merge diff strategy for merge commits.
     pub merge_diff_mode: MergeDiffMode,
-    /// Path-policy version for scan configuration hashing.
+    /// Path-policy version controlling which file categories are excluded
+    /// during scan.
+    ///
+    /// - `0 | 1`: no extension-based exclusions (legacy / disabled).
+    /// - `2`: exclude paths classified as binary (`PathClass::BINARY`).
+    /// - `3+`: exclude binary **and** lock/pin files (`is_nonscannable()`).
+    ///
+    /// The version also participates in the scan configuration hash so that
+    /// changing the exclusion policy invalidates previously persisted results.
     pub path_policy_version: u32,
     /// Repo-open limits (mmap sizes, ref caps, etc.).
     pub repo_open: RepoOpenLimits,
@@ -219,7 +227,7 @@ impl Default for GitScanConfig {
             policy_hash: [0u8; 32],
             start_set: StartSetConfig::DefaultBranchOnly,
             merge_diff_mode: MergeDiffMode::AllParents,
-            path_policy_version: 1,
+            path_policy_version: 3,
             repo_open: RepoOpenLimits::DEFAULT,
             commit_walk: CommitWalkLimits::DEFAULT,
             tree_diff: TreeDiffLimits::DEFAULT,
