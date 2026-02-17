@@ -2,7 +2,8 @@
 //!
 //! A **path** represents a scanned object within a root: a file, an archive
 //! entry, or a virtual object from stdin. `path_id` is a 32-byte BLAKE3 hash
-//! derived from the owning root_id plus a canonical path representation.
+//! derived from the owning root_id, a path scheme identifier, and a canonical
+//! path representation.
 //!
 //! # Path canonicalization
 //!

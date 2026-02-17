@@ -3,8 +3,8 @@
 //! # Purpose
 //!
 //! Compare benchmark results to detect performance regressions:
-//! - Throughput regression (bytes/sec, tasks/sec)
-//! - Latency regression (p50, p95, p99)
+//! - Throughput regression (MiB/s)
+//! - Latency regression (p50, p95, p99 wall time)
 //! - Memory regression (peak RSS)
 //!
 //! # CI Integration

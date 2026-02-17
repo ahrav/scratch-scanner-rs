@@ -59,7 +59,7 @@ const DEFAULT_BUF_CAPACITY: usize = 64 * 1024;
 ///
 /// The opening `[` is written on construction. Each [`emit()`](EventSink::emit)
 /// appends one comma-separated JSON object. [`flush()`](EventSink::flush)
-/// closes the array with `]\n` and flushes the underlying writer.
+/// closes the array with `\n]\n` and flushes the underlying writer.
 ///
 /// See the [module docs](self) for wire format, threading model, and error
 /// contract.

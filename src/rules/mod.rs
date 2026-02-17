@@ -229,8 +229,8 @@ pub(crate) fn builtin_rules_hash64() -> u64 {
 /// Parse and return the built-in rule set.
 ///
 /// This replaces the old `gitleaks_rules()` function. Rules are parsed and
-/// compiled once (via `OnceLock`) then cloned on subsequent calls, avoiding
-/// repeated memory leaks from `Box::leak` in the YAML parser.
+/// compiled once (via `OnceLock`) then cloned on subsequent calls, so the
+/// `Box::leak` allocations in the YAML parser happen at most once.
 ///
 /// Panics if embedded YAML is invalid or empty, because that indicates a
 /// build-time packaging/programming error, not runtime user input.

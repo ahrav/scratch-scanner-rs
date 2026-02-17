@@ -52,7 +52,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! let engine = Arc::new(MockEngine::default());
+//! let engine = Arc::new(MockEngine::new(rules, overlap));
 //! let synthetic = SyntheticConfig::realistic();
 //! let local_cfg = LocalConfig::default();
 //!
@@ -113,8 +113,8 @@ impl LocalScanBenchmark {
     ///
     /// # Panics
     ///
-    /// Panics if `synthetic_config` or `local_config` are invalid (these are
-    /// programmer errors, not runtime errors).
+    /// Panics if `local_config` is invalid (programmer error).
+    /// `synthetic_config` validation failures are returned as `io::Error`.
     pub fn new(
         engine: Arc<MockEngine>,
         synthetic_config: SyntheticConfig,

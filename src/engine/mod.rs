@@ -15,6 +15,8 @@
 //!   stages that populate and consume scratch state.
 //! - `decode_state`, `work_items`, `hit_pool`: bounded scheduling/storage helpers
 //!   for decoded work.
+//! - `rule_repr`: compiled rule representation and gate metadata.
+//! - `offline_validate`: offline (post-scan) validation for rules that require it.
 //! - `transform`, `safelist`, `helpers`: supporting logic reused by scan stages.
 //! - `vectorscan_prefilter`, `vs_cache`: Vectorscan database build/load/runtime
 //!   integration.
@@ -27,7 +29,8 @@
 //!   references are only valid until the next `ScanScratch::reset_for_scan`.
 //! - Offsets stored in hot paths use `u32`; callers must chunk inputs so buffer
 //!   lengths fit in `u32`.
-//! - `SpanU32` and `BufRef::Slab` ranges are only valid until the next reset.
+//! - `SpanU32` ranges and slab-backed buffer references are only valid until
+//!   the next reset.
 //! - All per-scan work is bounded by tuning limits: windows, hits, findings,
 //!   decode output bytes, transform depth, and work items.
 //! - UTF-16 anchors always contain at least one NUL byte, enabling a raw-only

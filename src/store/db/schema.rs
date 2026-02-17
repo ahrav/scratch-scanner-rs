@@ -84,7 +84,7 @@ pub fn configure_readonly_connection(conn: &Connection) -> rusqlite::Result<()> 
 /// Uses `BEGIN IMMEDIATE` to acquire a reserved lock before running DDL.
 /// This prevents two concurrent callers from interleaving migration steps
 /// (the second caller blocks on the busy timeout, then sees the version
-/// bump and returns early).
+/// bump and runs the idempotent DDL harmlessly).
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version >= SCHEMA_VERSION {

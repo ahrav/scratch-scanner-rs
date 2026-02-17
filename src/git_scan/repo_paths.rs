@@ -17,7 +17,7 @@ use super::pack_inflate::ObjectKind;
 use super::repo::GitRepoPaths;
 
 // ---------------------------------------------------------------------------
-// Directory collection (infallible)
+// Directory collection
 // ---------------------------------------------------------------------------
 
 /// Collect pack directories from the primary and alternate object dirs.

@@ -305,7 +305,7 @@ BENCHMARK SELECTION:
     -p, --preset PRESET     Configuration preset:
                             - default: Balanced settings (100 files, 64KiB)
                             - ci: Quick check (50 files, 4KiB, 3 iters)
-                            - detailed: Thorough (1000 files, mixed sizes, 20 iters)
+                            - detailed: Thorough (1000 files, mixed sizes, 10 iters)
                             - stress: High load (10000 files)
 
 LOCAL SCAN OPTIONS (--bench local only):
@@ -734,8 +734,9 @@ fn format_simple_baseline_ext(b: &BenchBaselineExt) -> String {
 
 /// Extended baseline parsed from file.
 ///
-/// Contains all metrics needed to reconstruct a synthetic `BenchReport`
-/// for comparison against a current run.
+/// Contains key metrics for reconstructing a synthetic `BenchReport`
+/// for comparison. Note: p95/p99 latencies are not preserved; the
+/// synthetic report uses p50 for all percentile slots.
 #[derive(Clone, Debug)]
 struct ParsedBaseline {
     throughput_mibs: f64,

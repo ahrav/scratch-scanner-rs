@@ -3,10 +3,10 @@
 //! Pack candidates include the pack id and offset for sequential decoding.
 //! Loose candidates capture blobs not present in the MIDX. Both variants
 //! carry a `CandidateContext` whose `path_ref` points into the path arena
-//! owned by the mapping bridge.
+//! that produced the candidate (mapping bridge or `PackCandidateCollector`).
 //!
 //! # Invariants
-//! - Candidates borrow path bytes from the mapping bridge arena.
+//! - Candidates borrow path bytes from the arena that produced them.
 //! - Pack IDs are in MIDX PNAM order; offsets are pack-relative.
 
 use super::byte_arena::{ByteArena, ByteRef};
@@ -19,8 +19,8 @@ use super::tree_candidate::CandidateSink;
 
 /// Candidate mapped to a pack offset.
 ///
-/// The `ctx.path_ref` points into the mapping bridge arena that produced
-/// this candidate; consumers must keep that arena alive while using it.
+/// The `ctx.path_ref` points into the arena that produced this candidate;
+/// consumers must keep that arena alive while using it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackCandidate {
     /// Blob object ID.
@@ -35,8 +35,8 @@ pub struct PackCandidate {
 
 /// Candidate that must be loaded from loose objects.
 ///
-/// The `ctx.path_ref` points into the mapping bridge arena that produced
-/// this candidate; consumers must keep that arena alive while using it.
+/// The `ctx.path_ref` points into the arena that produced this candidate;
+/// consumers must keep that arena alive while using it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LooseCandidate {
     /// Blob object ID.

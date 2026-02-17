@@ -6,8 +6,9 @@
 //!
 //! # Design
 //! - Uses `ahash::AHashMap` (already a dependency) for O(1) dedup lookups.
-//! - Dedup key is `u64` hash-as-key: no heap alloc per entry, acceptable
-//!   collision probability (~5.4e-10 at 100K entries) for display-only data.
+//! - Dedup key is `u64` hash-as-key: amortized O(1) allocation (map/vec
+//!   growth), acceptable collision probability (~2.7e-10 birthday bound at
+//!   100K entries) for display-only data.
 //! - Arena stores raw bytes; non-UTF-8 is preserved and handled at
 //!   serialization (JSONL uses `\u00XX` escaping).
 //! - [`SENTINEL_ID`] (`u32::MAX`) signals parse failure; never maps to a
@@ -64,15 +65,15 @@ const _: () = {
 ///
 /// # Thread safety
 ///
-/// Not `Sync` — intended for single-threaded population during commit
-/// graph traversal, after which the interner is shared immutably (via
-/// `&self` on [`get`](Self::get) and [`iter`](Self::iter)).
+/// Intended for single-threaded population during commit graph traversal,
+/// after which the interner is shared immutably (via `&self` on
+/// [`get`](Self::get) and [`iter`](Self::iter)).
 ///
 /// # Hash-collision trade-off
 ///
 /// Two distinct byte sequences that hash to the same `u64` will silently
-/// alias to the same intern ID. At 100K unique entries, collision
-/// probability is ~5.4 × 10⁻¹⁰ per pair — acceptable because identity
+/// alias to the same intern ID. At 100K unique entries, the birthday-bound
+/// collision probability is ~2.7 × 10⁻¹⁰ — acceptable because identity
 /// strings are display-only metadata, not security-critical join keys.
 pub struct IdentityInterner {
     arena: ByteArena,

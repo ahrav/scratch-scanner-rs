@@ -11,7 +11,8 @@
 //!
 //! - No heap allocation.
 //! - Extension matching is case-insensitive on ASCII bytes.
-//! - The NUL-byte heuristic mirrors Git's `buffer_is_binary` and uses
+//! - The NUL-byte heuristic is inspired by Git's `buffer_is_binary` (same
+//!   technique, different check length: 8192 vs Git's 8000) and uses
 //!   `memchr` for SIMD-accelerated scanning.
 
 pub mod extract;
@@ -50,8 +51,9 @@ pub enum ExtractableFormat {
 /// Returns `true` if the first `check_len` bytes of `data` contain a NUL byte,
 /// indicating the content is likely binary (images, compiled objects, etc.).
 ///
-/// Uses `memchr` for SIMD-accelerated scanning, matching Git's own
-/// `buffer_is_binary` heuristic. Empty data is not considered binary.
+/// Uses `memchr` for SIMD-accelerated scanning, inspired by Git's
+/// `buffer_is_binary` heuristic (same technique, different check length).
+/// Empty data is not considered binary.
 #[inline]
 pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
     if data.is_empty() {
@@ -71,7 +73,8 @@ pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
 /// 3. If NUL bytes are present: check extension for extractable formats →
 ///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Binary`].
 ///
-/// Empty data always returns [`ContentVerdict::Text`] (nothing to skip).
+/// Empty data returns [`ContentVerdict::Text`] unless the path has an
+/// extractable extension (e.g. `.ipynb`).
 #[inline]
 pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVerdict {
     if !is_likely_binary(data, check_len) {

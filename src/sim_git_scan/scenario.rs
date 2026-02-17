@@ -6,10 +6,11 @@
 //! - Optional raw artifact bytes (commit-graph, MIDX, packs) for
 //!   byte-level simulation cases.
 //!
-//! Invariants (enforced by callers today):
+//! Invariants (expected by consumers):
 //! - Ref names are raw bytes and must be treated as opaque.
 //! - OIDs are stored as raw bytes and must match the repo object format.
-//! - Commits reference existing trees; trees reference existing objects.
+//! - Commits should reference existing trees; trees should reference
+//!   existing objects. (Not enforced at construction time.)
 //! - Blob bytes are immutable for the duration of a run.
 //! - OIDs should be unique within each object kind to avoid ambiguity.
 

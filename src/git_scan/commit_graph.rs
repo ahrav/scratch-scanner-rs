@@ -39,7 +39,8 @@ impl CommitGraphIndex {
     ///
     /// # Costs
     /// - Time: O(N) over commit-graph entries
-    /// - Memory: O(N * oid_len) for commit and tree OIDs plus timestamps
+    /// - Memory: O(N × `size_of::<OidBytes>()`) for commit and tree OIDs, plus
+    ///   O(N × 8) for timestamps
     ///
     /// # Errors
     /// Returns `CommitPlanError` if the underlying `CommitGraph` returns an

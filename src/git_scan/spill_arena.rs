@@ -37,7 +37,7 @@ use std::os::unix::io::AsRawFd;
 /// Reference to a spilled payload within the arena.
 ///
 /// Holds an `Arc` to the read-only mapping so the underlying bytes remain
-/// valid even if the arena is moved or cloned.
+/// valid even after the arena is moved or dropped.
 #[derive(Clone, Debug)]
 pub struct SpillSlice {
     reader: Arc<Mmap>,
@@ -121,9 +121,11 @@ impl From<io::Error> for SpillArenaError {
 ///
 /// # Thread safety
 ///
-/// `SpillArena` is `!Sync` — only one thread may append. The returned
-/// `SpillSlice` handles are `Send + Sync` because they hold an `Arc`
-/// to the immutable read mapping.
+/// `SpillArena` is designed for single-writer use — only one thread
+/// should append at a time. The type is technically `Sync` (all fields
+/// are `Sync`), but concurrent appends would race on the cursor.
+/// The returned `SpillSlice` handles are `Send + Sync` because they
+/// hold an `Arc` to the immutable read mapping.
 #[derive(Debug)]
 pub struct SpillArena {
     path: PathBuf,

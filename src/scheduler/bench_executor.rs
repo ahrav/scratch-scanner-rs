@@ -240,7 +240,7 @@ fn get_spin_calibration() -> u64 {
 
 /// Calibrate spin loop by measuring actual time.
 ///
-/// Runs 10,000 iterations and computes iterations per nanosecond.
+/// Runs 100,000 iterations and computes iterations per nanosecond.
 fn calibrate_spin() -> u64 {
     const CALIBRATION_ITERS: u64 = 100_000;
 

@@ -166,7 +166,7 @@ impl FileSizeDistribution {
                     return *min;
                 }
                 let range = max - min;
-                // Use rejection sampling for unbiased bounded random
+                // Modulo reduction (slightly biased for non-power-of-two ranges)
                 let r = rng.next_u64();
                 min + (r as usize % (range + 1))
             }
@@ -276,7 +276,7 @@ pub struct SyntheticFileSource {
     /// Directory containing generated files.
     temp_dir: PathBuf,
 
-    /// List of generated files (shared, cheap to clone).
+    /// List of generated files (shared via `Arc`).
     files: Arc<[LocalFile]>,
 
     /// Configuration used.
@@ -365,7 +365,9 @@ impl SyntheticFileSource {
 
     /// Create a file source for scanning.
     ///
-    /// This is cheap (Arc clone, no file list copy).
+    /// Clones the file list via `Arc::to_vec()` (deep copy of paths, not
+    /// file contents). For 1000 files this is ~24 KB — negligible between
+    /// benchmark iterations.
     pub fn file_source(&self) -> VecFileSource {
         VecFileSource::from_arc(Arc::clone(&self.files))
     }

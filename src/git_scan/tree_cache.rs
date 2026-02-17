@@ -79,9 +79,9 @@ pub struct TreeCache {
 ///
 /// # Lifetime constraint
 ///
-/// The inner [`CacheHandle`] stores a raw pointer to the backing
-/// [`SetAssociativeCache`]. Callers must ensure the cache is not dropped
-/// or moved while any handle is live. This is a runtime contract; it is
+/// The inner [`CacheHandle`] stores raw pointers into the cache's
+/// heap-allocated storage buffers. Callers must ensure the cache is not
+/// dropped while any handle is live. This is a runtime contract; it is
 /// not enforced by Rust lifetimes.
 #[derive(Debug)]
 pub struct TreeCacheHandle {
@@ -113,7 +113,8 @@ impl TreeCache {
         }
     }
 
-    /// Returns the configured capacity (rounded to usable bytes).
+    /// Returns the configured capacity (rounded to usable bytes, or the
+    /// raw input when the cache is disabled).
     #[must_use]
     pub const fn capacity_bytes(&self) -> u32 {
         self.inner.capacity_bytes()
@@ -127,7 +128,8 @@ impl TreeCache {
 
     /// Looks up cached tree bytes by OID and returns a pinned handle.
     ///
-    /// Returns `None` if the cache is disabled or if the entry is missing.
+    /// Returns `None` if the cache is disabled, the entry is missing, or
+    /// the slot's pin count is saturated (`u16::MAX`).
     /// On hit, the slot is pinned and the CLOCK bit is set.
     pub fn get_handle(&mut self, oid: &OidBytes) -> Option<TreeCacheHandle> {
         self.inner

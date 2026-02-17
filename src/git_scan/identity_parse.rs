@@ -8,7 +8,7 @@
 //! ```
 //!
 //! [`super::commit_parse::parse_commit`] already extracts structural fields
-//! (tree, parents, message) but not identity. Rather than threading identity
+//! (tree, parents, committer timestamp) but not identity. Rather than threading identity
 //! extraction through that well-tested parser, this module makes a second pass
 //! over the same header bytes (~200 B). The cost is negligible — a single
 //! linear scan with no allocation — and keeps the two concerns decoupled.
