@@ -1,6 +1,6 @@
 //! Small arithmetic helpers for scan-time counters.
 //!
-//! These helpers centralize saturating/wrapping/max/set update patterns so
+//! These helpers centralize saturating/max/set update patterns so
 //! hot paths stay concise and consistent.
 //! They only mutate counters when
 //! `all(feature = "perf-stats", debug_assertions)` is enabled; otherwise all

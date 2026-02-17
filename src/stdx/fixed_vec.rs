@@ -88,10 +88,10 @@ impl<T, const N: usize> FixedVec<T, N> {
     ///
     /// # Effects
     /// - `len` becomes 0.
-    /// - The old elements are dropped if `T: Drop`.
+    /// - The old elements are dropped if `needs_drop::<T>()` is true.
     ///
     /// # Performance
-    /// - O(len) when `T: Drop`, otherwise O(1).
+    /// - O(len) when `needs_drop::<T>()` is true, otherwise O(1).
     fn clear(&mut self) {
         // Skip drop loop for types that don't need it (e.g., DecodeStep).
         // needs_drop is a const fn, so this branch is eliminated at compile time.

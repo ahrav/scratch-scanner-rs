@@ -6,10 +6,10 @@
 //! in memory by `artifact_acquire`.
 //!
 //! Pipeline overview:
-//! 1. `repo_open` loads commit-graph/MIDX metadata and start set state.
+//! 1. `repo_open` resolves repo paths, detects object format, and loads start set state.
 //! 2. `commit_walk` builds the commit plan.
 //! 3. `tree_diff` extracts candidate blobs and paths.
-//! 4. `spill` dedupes and filters candidates against the seen store.
+//! 4. `spiller` dedupes and filters candidates against the seen store.
 //! 5. `mapping_bridge` maps unique blobs to pack/loose candidates.
 //! 6. `pack_plan` builds per-pack decode plans from pack candidates.
 //! 7. `pack_exec` decodes blobs and streams bytes into `engine_adapter`.
@@ -37,8 +37,9 @@
 //! # Facade Contract
 //! This module is the public stage-oriented facade for git scanning. Re-exports
 //! are grouped by pipeline stage so callers can depend on stable boundaries
-//! (`repo_open`/artifact acquisition, commit traversal, candidate extraction,
-//! decode+scan, and finalize+persist) instead of individual internal modules.
+//! (repo open/artifact acquisition, commit loading, tree diff/candidate
+//! extraction, spill/dedup/mapping, pack planning/execution, engine scanning,
+//! and finalize/persist) instead of individual internal modules.
 
 pub mod alloc_guard;
 pub mod artifact_acquire;

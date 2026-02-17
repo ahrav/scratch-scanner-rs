@@ -235,7 +235,7 @@ impl TriageStore {
         Ok(sec.and_then(TriageStatus::from_i32))
     }
 
-    /// List all occurrence-level triage decisions for a root.
+    /// List occurrence-level triage decisions for a root, up to `limit` rows.
     pub fn list_occurrence_triage(
         &self,
         root_id: &[u8; 32],

@@ -8,7 +8,7 @@
 //! Invariants:
 //! - Rule prefixes are ASCII and included in anchors; regexes match `prefix + tail`.
 //! - Noise bytes are lowercase `x` to avoid accidental prefix matches.
-//! - `ExpectedSecret.root_span` refers to the encoded bytes stored in `SimFs`.
+//! - `ExpectedSecret.root_span` refers to the encoded bytes within the file's content buffer.
 //! - Archive entry spans refer to uncompressed entry payload bytes.
 
 use regex::bytes::Regex;
@@ -41,13 +41,13 @@ pub struct ScenarioGenConfig {
     pub rule_count: u32,
     /// Number of files to generate.
     pub file_count: u32,
-    /// Number of secrets inserted per file.
+    /// Number of secrets inserted per file or archive entry.
     pub secrets_per_file: u32,
     /// Length of the random token tail appended to each rule prefix.
     pub token_len: u32,
-    /// Minimum number of noise bytes between secrets.
+    /// Minimum number of noise bytes between and around secrets.
     pub min_noise_len: u32,
-    /// Maximum number of noise bytes between secrets.
+    /// Maximum number of noise bytes between and around secrets.
     pub max_noise_len: u32,
     /// Allowed secret representations to choose from.
     pub representations: Vec<SecretRepr>,

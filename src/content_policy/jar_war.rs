@@ -23,8 +23,9 @@
 //! - **`MAX_TOTAL_EXTRACTED`** (100 MiB): hard ceiling on the output
 //!   buffer to bound memory usage regardless of archive contents.
 //!
-//! When any budget is exceeded, extraction stops gracefully — whatever
-//! text was already appended is kept.
+//! Per-entry limits (`MAX_CLASS_SIZE`) skip the oversized entry.
+//! The total budget (`MAX_TOTAL_EXTRACTED`) stops extraction entirely.
+//! In both cases, text already appended is kept.
 //!
 //! # Scratch buffer reuse
 //!

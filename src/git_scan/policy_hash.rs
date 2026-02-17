@@ -11,7 +11,7 @@
 //! # Invariants
 //! - Identical inputs yield identical hashes across platforms.
 //! - Rule ordering does not affect the hash.
-//! - Any semantically relevant change in inputs changes the hash.
+//! - Any change in the fields encoded by `encode_policy` changes the hash.
 //! - The encoding is versioned; bumping `POLICY_HASH_VERSION` invalidates
 //!   all previous hashes (forcing full rescans).
 

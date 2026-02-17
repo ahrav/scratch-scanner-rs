@@ -2,7 +2,8 @@
 //!
 //! These limits are guardrails against unbounded metadata reads and
 //! allocations during repo discovery. All limits are explicit and enforced;
-//! exceeding a limit should surface as an error rather than silent truncation.
+//! exceeding a limit generally surfaces as an error, though some bounds
+//! (e.g. `max_alternates_count`) silently truncate excess entries.
 //!
 //! # Design Notes
 //! - Limits are validated at startup; invalid configurations are treated
