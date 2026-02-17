@@ -12,7 +12,7 @@
 //! | Group | Functions | Key metric |
 //! |---|---|---|
 //! | `primitives` | `write_u64`, `write_oid_hex`, `write_json_str`, `write_json_bytes`, `write_f64` | Bytes/sec throughput |
-//! | `encoding` | `encode_finding`, `encode_commit_meta`, batch encode, `JsonlEventSink::emit` | Events/sec throughput |
+//! | `encoding` | `encode_finding`, `encode_commit_meta`, batch encode, `JsonlEventSink::emit`, `JsonEventSink::emit`, multi-thread contention | Events/sec throughput |
 //! | `comparison` | `write_u64` vs `itoa`, `write_f64` vs `ryu` | Elements/sec (head-to-head) |
 //!
 //! ## Running
@@ -271,7 +271,7 @@ fn make_commit_meta_with_identity() -> CommitMetaEvent {
 /// Measure `write_u64` across three magnitude bands.
 ///
 /// The two-digits-at-a-time lookup table means cost scales with digit count,
-/// not with the numeric value itself. The three cases (1-digit, 10-digit,
+/// not with the numeric value itself. The three cases (2-digit, 10-digit,
 /// 20-digit) confirm that per-digit cost is constant.
 fn bench_write_u64(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_u64");
@@ -328,8 +328,9 @@ fn bench_write_oid_hex(c: &mut Criterion) {
     group.finish();
 }
 
-/// Measure `write_json_str` across string lengths (32, 128, 512 bytes) and
-/// two content profiles: clean ASCII (SIMD-only) and escape-heavy (1-in-16).
+/// Measure `write_json_str` across four content profiles: sub-SIMD scalar
+/// (4, 8, 14 bytes), clean ASCII (32, 128, 512 bytes), escape-heavy
+/// (1-in-16; 32, 128, 512 bytes), and sparse escapes (512 bytes).
 ///
 /// The clean vs. escaped comparison quantifies the cost of SIMD→scalar
 /// fallbacks. On aarch64 with NEON, clean ASCII should approach memcpy speed;

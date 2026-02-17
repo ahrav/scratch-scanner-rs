@@ -82,7 +82,7 @@ const BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Generate base64-like data with controlled "ey" prefix density.
 ///
-/// JWTs start with `eyJ` (base64 for `{"`) which means "ey" appears at the
+/// JWTs start with `eyJ` (base64 prefix for `{"...` JSON objects) which means "ey" appears at the
 /// start of every JWT header. However, "ey" also appears naturally in base64
 /// data at ~1/4096 frequency (1/64 * 1/64). This function creates worst-case
 /// data for JWT detection by:
@@ -293,7 +293,8 @@ fn make_rule_multi(
 /// # Background
 ///
 /// JWTs are base64-encoded JSON with structure: `header.payload.signature`.
-/// The header always starts with `{"` which base64-encodes to `eyJ`. Many
+/// The header always starts with `{"alg"` (or similar JSON key), which
+/// base64-encodes to a string starting with `eyJ`. Many
 /// rules use `ey` (2 chars) as the anchor, but this matches frequently in
 /// any base64 data.
 ///
@@ -301,7 +302,7 @@ fn make_rule_multi(
 ///
 /// - `ey` (2 chars): Matches any base64 starting with 'e','y'. High false rate.
 /// - `eyJ` (3 chars): Matches JSON-like base64 headers. Better filtering.
-/// - `eyJhbGci` (8 chars): Matches `{"alg":` prefix. Very specific but may
+/// - `eyJhbGci` (8 chars): Matches `{"alg"` prefix. Very specific but may
 ///   miss JWTs with different first keys.
 ///
 /// # Data scenarios

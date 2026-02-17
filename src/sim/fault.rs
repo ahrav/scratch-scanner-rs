@@ -40,7 +40,9 @@ pub struct ReadFault {
 /// I/O fault kinds understood by the simulation runner.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum IoFault {
-    /// Map to a stable `io::ErrorKind` in the runner.
+    /// Signal a generic I/O error. The runner treats any `ErrKind` as a
+    /// permanent failure and skips the file. The `kind` field is reserved
+    /// for future per-`ErrorKind` dispatch.
     ErrKind { kind: u16 },
     /// Return at most `max_len` bytes for the read.
     PartialRead { max_len: u32 },
