@@ -117,7 +117,8 @@ pub use engine::{
     bench_extract_secret_span_locs, bench_find_spans_into, bench_hash128,
     bench_map_utf16_decoded_offset, bench_merge_ranges, bench_merge_ranges_load,
     bench_merge_ranges_run, bench_offline_validate_aws_access_key,
-    bench_offline_validate_sentry_org_token, bench_pack_patterns_raw, bench_shannon_entropy,
+    bench_offline_validate_pypi_token, bench_offline_validate_sentry_org_token,
+    bench_offline_validate_slack_token, bench_pack_patterns_raw, bench_shannon_entropy,
     bench_shannon_entropy_with_state, bench_stream_decode_base64, bench_stream_decode_url,
     BenchEntropyState, BenchMergeRangesState, BenchPackedPatterns, BenchUtf16DecodeState,
 };

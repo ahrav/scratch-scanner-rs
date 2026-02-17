@@ -37,6 +37,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         min_bits_per_byte: e.min_bits_per_byte,
         min_len: e.min_len,
         max_len: e.max_len,
+        min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
     });
 
     let two_phase = rule.two_phase.as_ref().map(|tp| YamlTwoPhase {
@@ -92,6 +93,18 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         },
         OfflineValidationSpec::SentryOrgToken => YamlOfflineValidation {
             kind: "sentry_org_token".into(),
+            prefix_skip: None,
+            payload_len: None,
+            checksum_len: None,
+        },
+        OfflineValidationSpec::PyPiToken => YamlOfflineValidation {
+            kind: "pypi_token".into(),
+            prefix_skip: None,
+            payload_len: None,
+            checksum_len: None,
+        },
+        OfflineValidationSpec::SlackToken => YamlOfflineValidation {
+            kind: "slack_token".into(),
             prefix_skip: None,
             payload_len: None,
             checksum_len: None,
@@ -1661,6 +1674,74 @@ rules:
     }
 }
 
+#[test]
+fn parse_offline_validation_pypi_token() {
+    let yaml = r#"
+rules:
+  - name: "ov-pypi"
+    regex: 'pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}'
+    anchors: ["pypi-ageichlwas5vcmc"]
+    radius: 1064
+    offline_validation:
+      type: pypi_token
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse pypi_token");
+    assert_eq!(
+        rules[0].offline_validation,
+        Some(OfflineValidationSpec::PyPiToken)
+    );
+}
+
+#[test]
+fn parse_offline_validation_slack_token() {
+    let yaml = r#"
+rules:
+  - name: "ov-slack"
+    regex: 'xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*'
+    anchors: ["xoxb"]
+    radius: 2048
+    offline_validation:
+      type: slack_token
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse slack_token");
+    assert_eq!(
+        rules[0].offline_validation,
+        Some(OfflineValidationSpec::SlackToken)
+    );
+}
+
+#[test]
+fn roundtrip_offline_validation_pypi_and_slack() {
+    let yaml = r#"
+rules:
+  - name: "rt-pypi"
+    regex: 'pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}'
+    anchors: ["pypi-ageichlwas5vcmc"]
+    radius: 1064
+    offline_validation:
+      type: pypi_token
+  - name: "rt-slack"
+    regex: 'xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*'
+    anchors: ["xoxb"]
+    radius: 2048
+    offline_validation:
+      type: slack_token
+"#;
+    let original = parse_yaml_rules(yaml).expect("parse");
+    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+    let file = YamlRulesFile { rules: yaml_rules };
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
+    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+
+    for (orig, reparsed) in original.iter().zip(parsed.iter()) {
+        assert_eq!(
+            orig.offline_validation, reparsed.offline_validation,
+            "round-trip mismatch for {}",
+            orig.name
+        );
+    }
+}
+
 // ---- default_rules.yaml offline validation spec assertions ----
 
 #[test]
@@ -1710,6 +1791,37 @@ fn default_rules_offline_validation_specs() {
     assert_eq!(
         find("sentry-org-token").offline_validation,
         Some(OfflineValidationSpec::SentryOrgToken),
+    );
+
+    // PyPI upload token.
+    assert_eq!(
+        find("pypi-upload-token").offline_validation,
+        Some(OfflineValidationSpec::PyPiToken),
+    );
+
+    // Slack token rules (8 rules, excluding slack-webhook-url).
+    for rule_name in [
+        "slack-app-token",
+        "slack-bot-token",
+        "slack-config-access-token",
+        "slack-config-refresh-token",
+        "slack-legacy-bot-token",
+        "slack-legacy-token",
+        "slack-legacy-workspace-token",
+        "slack-user-token",
+    ] {
+        assert_eq!(
+            find(rule_name).offline_validation,
+            Some(OfflineValidationSpec::SlackToken),
+            "{rule_name} should have slack_token offline validation"
+        );
+    }
+
+    // slack-webhook-url is a URL, not a token — no offline validation.
+    assert_eq!(
+        find("slack-webhook-url").offline_validation,
+        None,
+        "slack-webhook-url should NOT have offline validation"
     );
 
     // Unrelated rules should have no offline validation.
@@ -1799,6 +1911,24 @@ fn default_rules_offline_validators_reject_bad_tokens() {
     let spec = find("sentry-org-token").offline_validation.unwrap();
     assert_eq!(
         offline_validate::validate(spec, &bad_sentry),
+        OfflineVerdict::Invalid,
+    );
+
+    // PyPI: valid base64url but decodes to wrong header.
+    let mut bad_pypi = Vec::new();
+    bad_pypi.extend_from_slice(b"pypi-AAAAAAAAAAAAAAAA"); // decodes to 12 zero bytes
+    bad_pypi.extend_from_slice(&[b'B'; 50]);
+    let spec = find("pypi-upload-token").offline_validation.unwrap();
+    assert_eq!(
+        offline_validate::validate(spec, &bad_pypi),
+        OfflineVerdict::Invalid,
+    );
+
+    // Slack: xoxb with invalid segment structure.
+    let bad_slack = b"xoxb-123-abc";
+    let spec = find("slack-bot-token").offline_validation.unwrap();
+    assert_eq!(
+        offline_validate::validate(spec, bad_slack),
         OfflineVerdict::Invalid,
     );
 }

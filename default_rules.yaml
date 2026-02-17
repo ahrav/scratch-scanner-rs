@@ -3474,6 +3474,8 @@ rules:
     max_len: 1000
   two_phase: null
   local_context: null
+  offline_validation:
+    type: pypi_token
   secret_group: null
 - name: rapidapi-access-token
   regex: (?i)[\w.-]{0,50}?(?:rapidapi)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{50})(?:[\x60'"\s;]|\\[nr]|$)
@@ -3830,6 +3832,8 @@ rules:
     max_len: 512
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-bot-token
   regex: xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*
@@ -3845,6 +3849,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-config-access-token
   regex: (?i)xoxe.xox[bp]-\d-[A-Z0-9]{163,166}
@@ -3866,6 +3872,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-config-refresh-token
   regex: (?i)xoxe-\d-[A-Z0-9]{146}
@@ -3883,6 +3891,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-legacy-bot-token
   regex: xoxb-[0-9]{8,14}-[a-zA-Z0-9]{18,26}
@@ -3898,6 +3908,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-legacy-token
   regex: xox[os]-\d+-\d+-\d+-[a-fA-F\d]+
@@ -3915,6 +3927,8 @@ rules:
     max_len: 512
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-legacy-workspace-token
   regex: xox[ar]-(?:\d-)?[0-9a-zA-Z]{8,48}
@@ -3932,6 +3946,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-user-token
   regex: xox[pe](?:-[0-9]{10,13}){3}-[a-zA-Z0-9-]{28,34}
@@ -3949,6 +3965,8 @@ rules:
     max_len: 256
   two_phase: null
   local_context: null
+  offline_validation:
+    type: slack_token
   secret_group: null
 - name: slack-webhook-url
   regex: (?:https?://)?hooks.slack.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}

@@ -86,6 +86,7 @@ mod window_validate;
 // Supporting modules
 mod helpers;
 mod safelist;
+mod simd_classify;
 mod transform;
 mod vectorscan_prefilter; // Vectorscan/Hyperscan prefilter DBs and FFI callbacks
 mod vs_cache; // On-disk cache for serialized Vectorscan databases
@@ -116,7 +117,8 @@ pub use core::{
 pub use hit_pool::BenchHitAccPool;
 #[cfg(feature = "bench")]
 pub use offline_validate::{
-    bench_offline_validate_aws_access_key, bench_offline_validate_sentry_org_token,
+    bench_offline_validate_aws_access_key, bench_offline_validate_pypi_token,
+    bench_offline_validate_sentry_org_token, bench_offline_validate_slack_token,
 };
 
 #[cfg(feature = "tiger-harness")]

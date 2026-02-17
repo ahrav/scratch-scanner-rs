@@ -110,6 +110,8 @@ pub(crate) struct YamlEntropy {
     pub min_bits_per_byte: f32,
     pub min_len: usize,
     pub max_len: usize,
+    #[serde(default)]
+    pub min_entropy_bits_per_byte: Option<f32>,
 }
 
 /// Two-phase scanning configuration.
@@ -304,6 +306,8 @@ fn yaml_offline_to_spec(
         "grafana_service_account" => Ok(OfflineValidationSpec::GrafanaServiceAccount),
         "aws_access_key" => Ok(OfflineValidationSpec::AwsAccessKey),
         "sentry_org_token" => Ok(OfflineValidationSpec::SentryOrgToken),
+        "pypi_token" => Ok(OfflineValidationSpec::PyPiToken),
+        "slack_token" => Ok(OfflineValidationSpec::SlackToken),
         unknown => Err(RulesError::OfflineValidation {
             rule_name: rule_name.to_string(),
             message: format!("unknown offline_validation type '{unknown}'"),
@@ -390,6 +394,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             min_bits_per_byte: e.min_bits_per_byte,
             min_len: e.min_len,
             max_len: e.max_len,
+            min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
         });
 
         let offline_validation = offline_validation
@@ -409,6 +414,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             keywords_any,
             value_suppressors_any,
             entropy,
+            char_class: None,
             local_context,
             offline_validation,
             secret_group,
