@@ -72,8 +72,8 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 
 /// Run `git` in `repo` and return trimmed UTF-8 stdout.
 ///
-/// Output is lossy UTF-8 and trailing whitespace is removed.
-/// Only stdout is captured; stderr is ignored.
+/// Output is lossy UTF-8 with leading and trailing whitespace removed.
+/// Both stdout and stderr are captured; only stdout is used.
 fn run_git(repo: &PathBuf, args: &[&str]) -> io::Result<String> {
     let output = Command::new("git")
         .arg("-C")

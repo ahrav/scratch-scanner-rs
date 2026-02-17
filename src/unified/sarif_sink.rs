@@ -4,7 +4,8 @@
 //! (version, schema, tool driver) is written eagerly in
 //! [`SarifEventSink::new`]; each `Finding` event appends one result object
 //! to `runs[0].results`. Non-finding events (`Progress`, `Summary`,
-//! `Diagnostic`) are silently dropped — they have no SARIF representation.
+//! `Diagnostic`, `CommitMeta`, `IdentityDictionary`) are silently dropped —
+//! they have no SARIF representation.
 //!
 //! `flush()` writes the closing `]}]}\n` and flushes the writer.
 //!
@@ -34,8 +35,9 @@ const SARIF_SCHEMA: &str = "https://schemastore.azurewebsites.net/schemas/json/s
 
 /// SARIF 2.1.0 event sink.
 ///
-/// Only `Finding` events produce SARIF results. Progress, summary, and
-/// diagnostic events are silently ignored.
+/// Only `Finding` events produce SARIF results. All other event types
+/// (progress, summary, diagnostic, commit metadata, identity dictionary)
+/// are silently ignored.
 pub struct SarifEventSink<W: Write + Send> {
     writer: Mutex<BufWriter<W>>,
     first: AtomicBool,

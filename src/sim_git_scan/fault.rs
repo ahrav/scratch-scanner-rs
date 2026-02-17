@@ -29,7 +29,7 @@ pub enum GitResourceId {
 /// I/O fault variants for Git simulation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitIoFault {
-    /// Return an I/O error by kind (mirrors `std::io::ErrorKind` mapping).
+    /// Return an I/O error by kind (opaque u8 tag).
     ErrKind { kind: u8 },
     /// Return at most `max_len` bytes (short read).
     PartialRead { max_len: u32 },

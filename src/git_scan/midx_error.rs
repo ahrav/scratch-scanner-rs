@@ -1,14 +1,14 @@
 //! Error types for multi-pack index parsing and lookup.
 //!
-//! These errors cover MIDX parsing, validation, and lookup failures. Most
-//! variants are `MidxCorrupt` or `Invalid*` signals that the MIDX file or
-//! its inputs are inconsistent with the Git MIDX format.
+//! These errors cover MIDX parsing, validation, and lookup failures.
+//! Variants signal that the MIDX file or its inputs are inconsistent
+//! with the Git MIDX format.
 
 use std::fmt;
 
 /// A 4-byte MIDX chunk identifier with human-readable Display.
 ///
-/// Prints as ASCII when all bytes are printable, otherwise as hex.
+/// Prints as ASCII when all bytes are graphic (non-space printable), otherwise as hex.
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub struct ChunkId(pub [u8; 4]);
 
@@ -86,8 +86,8 @@ pub enum MidxError {
     LoffIndexOutOfBounds { index: u32, count: u32 },
     /// Input OIDs are not strictly sorted.
     ///
-    /// Used when validating sorted OID streams (for example, during in-memory
-    /// MIDX construction).
+    /// Used when validating sorted OID streams (for example, during
+    /// sorted-input validation in MIDX building or mapping bridge).
     InputNotSorted,
     /// Duplicate input OID.
     ///
@@ -102,7 +102,8 @@ impl MidxError {
         Self::MidxCorrupt { detail }
     }
 
-    /// Constructs a `MidxIncomplete` error with a bounded sample of missing names.
+    /// Constructs a `MidxIncomplete` error. Callers should bound `missing_packs`
+    /// to [`missing_packs_limit()`] entries.
     pub fn midx_incomplete(missing_count: usize, missing_packs: Vec<String>) -> Self {
         Self::MidxIncomplete {
             missing_count,

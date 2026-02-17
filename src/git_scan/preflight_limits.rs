@@ -6,7 +6,7 @@
 //! maximum number of pack files inspected across object stores.
 //!
 //! # Invariants
-//! - Limits are validated at construction and in const contexts.
+//! - Limits are validated in const contexts; callers may invoke `validate()` explicitly.
 //! - Pack count thresholds are advisory; readiness is determined elsewhere.
 
 /// Hard caps for maintenance preflight.

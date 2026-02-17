@@ -60,7 +60,7 @@ pub struct GitReproArtifact {
 
     /// Scenario generation seed used to materialize repository state.
     pub scenario_seed: u64,
-    /// Fault scheduler seed used to drive fault-injection ordering.
+    /// Task scheduler seed used to drive execution ordering.
     pub schedule_seed: u64,
 
     /// Test case data.
