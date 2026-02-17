@@ -17,7 +17,7 @@
 //! | Path arena       | 64 MB       | Shared across all candidates        |
 //! | Tree cache       | 64 MB       | Tree payload cache (fixed slots)    |
 //! | Tree delta cache | 128 MB      | Tree delta base cache (fixed slots) |
-//! | Diff stack       | 256 frames x ~100 bytes = 25 KB | Per-diff operation |
+//! | Diff stack       | 256 frames                      | Per-diff operation |
 //!
 //! Total default budget: ~307 MB per repo job (excluding mmapped data).
 
@@ -110,7 +110,7 @@ impl TreeDiffLimits {
 
     /// Restrictive limits for testing or memory-constrained environments.
     ///
-    /// Memory budget: ~2 MB per repo job (tight, for tests only).
+    /// Memory budget: ~18 MB per repo job (tight, for tests only).
     pub const RESTRICTIVE: Self = Self {
         max_tree_bytes_in_flight: 64 * 1024 * 1024,  // 64 MB
         max_tree_spill_bytes: 64 * 1024 * 1024,      // 64 MB

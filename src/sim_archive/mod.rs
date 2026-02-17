@@ -56,7 +56,8 @@ pub struct ArchiveMaterialization {
 /// Build deterministic archive bytes for the simulation harness.
 ///
 /// Returns a materialization that includes entry locator metadata used by
-/// `entry_paths`. Gzip archives must contain exactly one entry.
+/// `entry_paths`. Gzip archives use only the first entry (extra entries are
+/// silently ignored).
 pub fn materialize_archive(spec: &ArchiveFileSpec) -> Result<ArchiveMaterialization, String> {
     let mut out = match spec.kind {
         ArchiveKindSpec::Gzip => {

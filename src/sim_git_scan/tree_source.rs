@@ -18,8 +18,9 @@ use super::scenario::{GitRepoModel, GitTreeEntrySpec, GitTreeSpec};
 
 /// Simulated tree source backed by the repo model.
 ///
-/// The tree payloads are pre-encoded for deterministic, allocation-free
-/// access during tree diffing.
+/// The tree payloads are pre-encoded for deterministic access during tree
+/// diffing. Each `load_tree` call clones the cached bytes into an owned
+/// `TreeBytes`.
 #[derive(Debug)]
 pub struct SimTreeSource {
     oid_len: u8,

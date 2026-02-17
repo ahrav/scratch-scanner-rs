@@ -98,7 +98,8 @@ fn shrink_fault_plan(
         }
     }
 
-    // Remove empty resources to keep the plan compact.
+    // Remove empty resources to keep the plan compact (Other(...) resources
+    // are retained regardless to preserve non-read fault injection).
     let mut candidate = artifact.clone();
     candidate
         .fault_plan

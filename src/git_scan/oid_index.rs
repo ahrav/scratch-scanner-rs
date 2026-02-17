@@ -6,7 +6,7 @@
 //! without per-lookup allocations.
 //!
 //! # Invariants
-//! - Table size is a power of two and `mask = len - 1`.
+//! - Table capacity is a power of two and `mask = capacity - 1`.
 //! - Empty slots use `NONE_U32` as the sentinel value.
 //! - `len <= capacity * LOAD_FACTOR` (enforced at build time).
 //!

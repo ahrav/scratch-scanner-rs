@@ -49,7 +49,7 @@
 //! # What This Does NOT Guarantee Yet
 //!
 //! - **Bounded task queues**: crossbeam queues are unbounded.
-//!   Use `TokenBudget` to enforce `max_queued_tasks`.
+//!   Use `TokenBudget` to cap the number of queued tasks.
 //! - **I/O completion integration**: the seam exists via [`ExecutorHandle::spawn()`].
 
 use super::executor_core::{
