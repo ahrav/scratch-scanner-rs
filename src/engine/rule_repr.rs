@@ -353,7 +353,7 @@ pub(super) struct CharClassCompiled {
 /// Sentinel value indicating no gate is assigned for a given slot.
 ///
 /// Using `u32::MAX` as a sentinel instead of `Option<u32>` saves 4 bytes per
-/// gate field (no discriminant padding), shrinking `RuleCompiled` by 28 bytes
+/// gate field (no discriminant padding), shrinking `RuleCompiled` by 32 bytes
 /// total. Valid pool indices never reach `u32::MAX` because pool sizes are
 /// bounded by the number of rules.
 pub(super) const NO_GATE: u32 = u32::MAX;
@@ -395,7 +395,8 @@ fn pack_rule_meta(secret_group: Option<u16>, needs_assignment_shape_check: bool)
 /// 2. **Post-match only**: secret-group bits in `rule_meta` — read only when the
 ///    regex matches.
 /// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
-///    `entropy`, `local_context`, `two_phase`, `offline_validation` —
+///    `entropy`, `char_class`, `local_context`, `two_phase`,
+///    `offline_validation` —
 ///    dereferenced through `Engine` pool accessors only when the
 ///    corresponding gate is present (`!= NO_GATE`). Most rules have 0–2
 ///    gates, so these are cold for the majority of candidates.
@@ -410,6 +411,7 @@ fn pack_rule_meta(secret_group: Option<u16>, needs_assignment_shape_check: bool)
 /// | `keywords`     | `keyword_gates`           |
 /// | `value_suppressors` | `value_suppressor_gates` |
 /// | `entropy`      | `entropy_gates`           |
+/// | `char_class`   | `char_class_gates`        |
 /// | `local_context`| `local_context_gates`     |
 /// | `two_phase`    | `two_phase_gates`         |
 /// | `offline_validation` | `offline_validation_gates` |

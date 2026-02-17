@@ -793,6 +793,27 @@ fn is_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
+/// Split `data` on `sep` into at most `N` segments in a stack-local array.
+///
+/// Returns `(segments, count)` where `segments[..count]` are valid slices.
+/// Behaves like `data.splitn(N, |&b| b == sep).collect::<Vec<_>>()` without
+/// heap allocation.
+fn splitn_stack<const N: usize>(data: &[u8], sep: u8) -> ([&[u8]; N], usize) {
+    let mut segs: [&[u8]; N] = [&[]; N];
+    let mut count = 0;
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == sep && count + 1 < N {
+            segs[count] = &data[start..i];
+            count += 1;
+            start = i + 1;
+        }
+    }
+    segs[count] = &data[start..];
+    count += 1;
+    (segs, count)
+}
+
 /// Validate a Slack API token by dispatching on prefix.
 ///
 /// Compound prefixes (`xoxe.xoxb-`, `xoxe.xoxp-`) are checked first to
@@ -871,8 +892,8 @@ fn validate_slack_token(secret: &[u8]) -> OfflineVerdict {
 ///
 /// Format after compound prefix: `{1 digit}-{163–166 upper+digit}`.
 fn validate_slack_config_access(after_prefix: &[u8]) -> OfflineVerdict {
-    let segs: Vec<&[u8]> = after_prefix.splitn(3, |&b| b == b'-').collect();
-    if segs.len() < 2 {
+    let (segs, seg_count) = splitn_stack::<3>(after_prefix, b'-');
+    if seg_count < 2 {
         return OfflineVerdict::Indeterminate;
     }
 
@@ -897,8 +918,8 @@ fn validate_slack_config_access(after_prefix: &[u8]) -> OfflineVerdict {
 ///
 /// Format after prefix: `{1 digit}-{upper+digit}-{digits}-{lower+digit}`.
 fn validate_slack_xapp(after_prefix: &[u8]) -> OfflineVerdict {
-    let segs: Vec<&[u8]> = after_prefix.splitn(5, |&b| b == b'-').collect();
-    if segs.len() < 4 {
+    let (segs, seg_count) = splitn_stack::<5>(after_prefix, b'-');
+    if seg_count < 4 {
         return OfflineVerdict::Indeterminate;
     }
 
@@ -927,10 +948,10 @@ fn validate_slack_xapp(after_prefix: &[u8]) -> OfflineVerdict {
 /// Current: `{d10-13}-{d10-13}-{alnum+hyphen tail}`.
 /// Legacy:  `{d8-14}-{an18-26}`.
 fn validate_slack_xoxb(after_prefix: &[u8]) -> OfflineVerdict {
-    let segs: Vec<&[u8]> = after_prefix.splitn(4, |&b| b == b'-').collect();
+    let (segs, seg_count) = splitn_stack::<4>(after_prefix, b'-');
 
     // Try current format: 3+ segments (d10-13, d10-13, tail with possible hyphens).
-    if segs.len() >= 3 {
+    if seg_count >= 3 {
         let s1 = segs[0];
         let s2 = segs[1];
         if (10..=13).contains(&s1.len())
@@ -948,7 +969,7 @@ fn validate_slack_xoxb(after_prefix: &[u8]) -> OfflineVerdict {
     }
 
     // Try legacy format: 2 segments (d8-14, an18-26).
-    if segs.len() >= 2 {
+    if seg_count >= 2 {
         let s1 = segs[0];
         if (8..=14).contains(&s1.len()) && all_bytes(s1, |b| b.is_ascii_digit()) {
             let tail_start = s1.len() + 1;
@@ -972,8 +993,8 @@ fn validate_slack_xoxb(after_prefix: &[u8]) -> OfflineVerdict {
 /// Called directly for `xoxp-` tokens, and by [`validate_slack_xoxe`] when the
 /// first segment has 10–13 digits (user/enterprise token vs config-refresh).
 fn validate_slack_user_token(after_prefix: &[u8]) -> OfflineVerdict {
-    let segs: Vec<&[u8]> = after_prefix.splitn(5, |&b| b == b'-').collect();
-    if segs.len() < 4 {
+    let (segs, seg_count) = splitn_stack::<5>(after_prefix, b'-');
+    if seg_count < 4 {
         return OfflineVerdict::Indeterminate;
     }
 
@@ -1032,8 +1053,8 @@ fn validate_slack_xoxe(after_prefix: &[u8]) -> OfflineVerdict {
 ///
 /// Format after prefix: `{d+}-{d+}-{d+}-{hex+}`.
 fn validate_slack_legacy(after_prefix: &[u8]) -> OfflineVerdict {
-    let segs: Vec<&[u8]> = after_prefix.splitn(5, |&b| b == b'-').collect();
-    if segs.len() < 4 {
+    let (segs, seg_count) = splitn_stack::<5>(after_prefix, b'-');
+    if seg_count < 4 {
         return OfflineVerdict::Indeterminate;
     }
 

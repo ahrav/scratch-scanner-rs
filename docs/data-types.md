@@ -27,6 +27,7 @@ classDiagram
         -Vec~KeywordsCompiled~ keyword_gates
         -Vec~PackedPatterns~ value_suppressor_gates
         -Vec~EntropyCompiled~ entropy_gates
+        -Vec~CharClassCompiled~ char_class_gates
         -Vec~TwoPhaseCompiled~ two_phase_gates
         -Vec~LocalContextSpec~ local_context_gates
         -usize max_window_diameter_bytes
@@ -49,6 +50,7 @@ classDiagram
         +Option~&'static [&'static [u8]]~ keywords_any
         +Option~&'static [&'static [u8]]~ value_suppressors_any
         +Option~EntropySpec~ entropy
+        +Option~CharClassSpec~ char_class
         +Option~LocalContextSpec~ local_context
         +Option~OfflineValidationSpec~ offline_validation
         +Option~u16~ secret_group
@@ -63,6 +65,7 @@ classDiagram
         -u32 keywords
         -u32 value_suppressors
         -u32 entropy
+        -u32 char_class
         -u32 local_context
         -u32 two_phase
         -u32 offline_validation
@@ -202,8 +205,10 @@ classDiagram
     Engine --> OfflineValidationSpec : offline gate pool
 
     RuleSpec --> TwoPhaseSpec : optional
+    RuleSpec --> CharClassSpec : optional
     RuleSpec --> OfflineValidationSpec : optional
     RuleCompiled --> TwoPhaseCompiled : optional gate index (`u32`; `NO_GATE` sentinel)
+    RuleCompiled --> CharClassCompiled : optional gate index (`u32`; `NO_GATE` sentinel)
     TwoPhaseCompiled --> PackedPatterns : uses
 
     ScanScratch --> FindingRec : produces
@@ -326,7 +331,7 @@ classDiagram
   - bits 0..=15: `secret_group` value (when override-present bit is set)
   - bit 16: `needs_assignment_shape_check`
   - bit 17: `has_secret_group_override`
-  This keeps `RuleCompiled` at ≤ 80 bytes on 64-bit targets while preserving
+  This keeps `RuleCompiled` at ≤ 88 bytes on 64-bit targets while preserving
   full `u16` capture-group semantics.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
@@ -430,6 +435,8 @@ classDiagram
         GrafanaServiceAccount
         AwsAccessKey
         SentryOrgToken
+        PyPiToken
+        SlackToken
     }
 
     class OfflineVerdict {

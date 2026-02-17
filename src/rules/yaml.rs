@@ -106,7 +106,9 @@ pub(crate) struct YamlRule {
 /// `min_bits_per_byte` bits of Shannon entropy per byte. Secrets shorter
 /// than `min_len` bypass the entropy check (noisy on small samples);
 /// secrets longer than `max_len` are evaluated on only the first
-/// `max_len` bytes.
+/// `max_len` bytes. An optional `min_entropy_bits_per_byte` adds a
+/// min-entropy (NIST SP 800-90B) gate that catches skewed distributions
+/// where one byte dominates even though Shannon entropy looks moderate.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
@@ -178,6 +180,8 @@ pub(crate) struct YamlLocalContext {
 /// | `grafana_service_account`  | [`OfflineValidationSpec::GrafanaServiceAccount`] |
 /// | `aws_access_key`           | [`OfflineValidationSpec::AwsAccessKey`] |
 /// | `sentry_org_token`         | [`OfflineValidationSpec::SentryOrgToken`] |
+/// | `pypi_token`               | [`OfflineValidationSpec::PyPiToken`] |
+/// | `slack_token`              | [`OfflineValidationSpec::SlackToken`] |
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlOfflineValidation {

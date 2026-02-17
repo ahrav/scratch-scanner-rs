@@ -658,14 +658,16 @@ impl Engine {
     ///   decoded offsets back into raw UTF-16 bytes.
     ///
     /// # Behavior
-    /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
-    /// assignment-shape, regex, entropy, value suppressor, local context,
-    /// context-window safelist, secret-bytes safelist, offline validation) while
-    /// enforcing UTF-16 decode budgets. Context-window safelist suppression uses
-    /// the emitted finding step (`utf16_step_id`, checked as
-    /// `step_id == STEP_ROOT`); the secret-bytes safelist runs on all findings.
-    /// Offline validation uses the parent `step_id` so root-level UTF-16
-    /// findings are correctly identified as root-semantic.
+    /// Applies a gate sequence adapted for UTF-16: confirm-all and keywords run
+    /// on raw bytes (pre-decode), then must-contain, assignment-shape, and
+    /// char_class run on decoded bytes (post-decode), followed by regex, entropy,
+    /// value suppressor, local context, context-window safelist, secret-bytes
+    /// safelist, and offline validation. UTF-16 decode budgets are enforced.
+    /// Context-window safelist suppression uses the emitted finding step
+    /// (`utf16_step_id`, checked as `step_id == STEP_ROOT`); the secret-bytes
+    /// safelist runs on all findings. Offline validation uses the parent
+    /// `step_id` so root-level UTF-16 findings are correctly identified as
+    /// root-semantic.
     ///
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(

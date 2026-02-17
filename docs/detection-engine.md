@@ -31,6 +31,7 @@ flowchart TB
         MustContain["must_contain check<br/>(optional)"]
         ConfirmAll["confirm_all check<br/>(optional)"]
         Keywords["keyword gate<br/>(optional, any-of memmem)"]
+        CharClass["char_class gate<br/>(optional, SIMD byte classify)"]
         Regex["rule.re.find_iter()"]
         UTF16Dec["UTF-16 Decode<br/>(for UTF-16 variants)"]
     end
@@ -75,7 +76,8 @@ flowchart TB
     RegexConfirm --> MustContain
     MustContain --> ConfirmAll
     ConfirmAll --> Keywords
-    Keywords --> Regex
+    Keywords --> CharClass
+    CharClass --> Regex
     Regex --> |"Raw variant"| SecretExtract
     Regex --> |"UTF-16 variant"| UTF16Dec
     UTF16Dec --> SecretExtract

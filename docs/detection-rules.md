@@ -21,7 +21,8 @@ The values below are from the current repository snapshot:
 - `local_context` enabled: `1` rule (`generic-api-key`)
 - `value_suppressors_any` enabled: `15` rules (`adafruit-api-key`, `adobe-client-id`, `algolia-api-key`, `atlassian-api-token`, `confluent-access-token`, `confluent-secret-key`, `curl-auth-header`, `curl-auth-user`, `discord-api-token`, `discord-client-secret`, `generic-api-key`, `hashicorp-tf-password`, `heroku-api-key`, `linear-client-secret`, `zendesk-secret-key`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
-- `offline_validation` enabled: `9` rules (`aws-access-token`, `github-app-token`, `github-fine-grained-pat`, `github-oauth`, `github-pat`, `github-refresh-token`, `grafana-service-account-token`, `npm-access-token`, `sentry-org-token`)
+- `char_class` enabled: `212` rules (auto-enabled for all rules with `entropy.min_bits_per_byte >= 3.0`)
+- `offline_validation` enabled: `18` rules (`aws-access-token`, `github-app-token`, `github-fine-grained-pat`, `github-oauth`, `github-pat`, `github-refresh-token`, `grafana-service-account-token`, `npm-access-token`, `pypi-upload-token`, `sentry-org-token`, `slack-app-token`, `slack-bot-token`, `slack-config-access-token`, `slack-config-refresh-token`, `slack-legacy-bot-token`, `slack-legacy-token`, `slack-legacy-workspace-token`, `slack-user-token`)
 - `must_contain` enabled: `0` rules
 - `keywords_any` enabled: `223` rules
 
@@ -143,6 +144,7 @@ graph TB
         KeywordsAny["keywords_any: Option<&'static [&'static [u8]]>"]
         ValueSuppressorsAny["value_suppressors_any: Option<&'static [&'static [u8]]>"]
         Entropy["entropy: Option<EntropySpec>"]
+        CharClass["char_class: Option<CharClassSpec>"]
         LocalContext["local_context: Option<LocalContextSpec>"]
         OfflineValidation["offline_validation: Option<OfflineValidationSpec>"]
         SecretGroup["secret_group: Option<u16>"]
@@ -155,6 +157,8 @@ graph TB
         OvGrafana["GrafanaServiceAccount"]
         OvAws["AwsAccessKey"]
         OvSentry["SentryOrgToken"]
+        OvPyPi["PyPiToken"]
+        OvSlack["SlackToken"]
     end
 
     subgraph TwoPhaseSpec["TwoPhaseSpec (optional)"]
@@ -168,6 +172,11 @@ graph TB
         MinLen["min_len: usize"]
         MaxLen["max_len: usize"]
         MinEntropyBpb["min_entropy_bits_per_byte: Option&lt;f32&gt;"]
+    end
+
+    subgraph CharClassSpec["CharClassSpec (optional)"]
+        MaxLowerPct["max_lower_pct: u8"]
+        MinWindowLen["min_window_len: u16"]
     end
 
     subgraph LocalContextSpec["LocalContextSpec (optional)"]
@@ -283,6 +292,9 @@ rules:
     min_len: 16                     # skip gate if secret < min_len bytes
     max_len: 256                    # cap measurement at max_len bytes
     min_entropy_bits_per_byte: null  # min-entropy floor (null = disabled)
+  char_class: null                  # auto-enabled when entropy.min_bits_per_byte >= 3.0
+  #   max_lower_pct: 95            # override: max % lowercase ASCII before rejection
+  #   min_window_len: 32           # override: skip gate for short windows
   two_phase: null
   local_context: null
   offline_validation: null
