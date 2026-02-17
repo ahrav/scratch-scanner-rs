@@ -105,7 +105,8 @@ fn gen_clean_ascii(size: usize, seed: u64) -> Vec<u8> {
 ///
 /// # Benchmark variants
 ///
-/// - **not_found**: Search for a byte that doesn't exist (full buffer scan)
+/// - **not_found**: Search for a byte absent from the buffer (full scan for ASCII,
+///   near-instant first-occurrence for random data where 0x00 bytes exist)
 /// - **memchr2**: Two-byte search to measure multi-pattern overhead
 /// - **count**: Count all occurrences (tests iterator overhead)
 ///
@@ -121,12 +122,14 @@ fn bench_memchr_baseline(c: &mut Criterion) {
     let ascii = gen_clean_ascii(BUFFER_SIZE, 0x1234);
     let random = gen_random_bytes(BUFFER_SIZE, 0x5678);
 
-    // Search for a byte that doesn't exist
+    // Search for a byte absent from ASCII data (full buffer scan)
     group.bench_function("ascii_not_found", |b| {
         b.iter(|| black_box(memchr::memchr(0xFF, black_box(&ascii))))
     });
 
-    group.bench_function("random_not_found", |b| {
+    // Search for 0x00 in random data; 0x00 bytes exist (~1/256 positions),
+    // so this measures first-occurrence latency rather than full-scan throughput.
+    group.bench_function("random_first_occurrence", |b| {
         b.iter(|| black_box(memchr::memchr(0x00, black_box(&random))))
     });
 
@@ -463,7 +466,7 @@ fn bench_minimal_engine(c: &mut Criterion) {
 /// set with derived anchors. The gap between Layer 3 and Layer 4 reveals the
 /// cost of:
 ///
-/// - Many patterns (50+ rules) in the automaton
+/// - Many patterns (200+ rules) in the automaton
 /// - Derived anchor generation
 /// - Transform detection (even if not triggered)
 /// - More complex callback dispatch

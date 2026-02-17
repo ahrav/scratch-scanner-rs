@@ -36,7 +36,7 @@ impl SimCommitGraph {
     /// links to avoid repeated OID lookups during walks.
     ///
     /// # Errors
-    /// - `InvalidOidLength` if any commit or tree OID length is wrong.
+    /// - `InvalidOidLength` if any commit, tree, or parent OID length is wrong.
     /// - `DuplicateOid` if two commits share the same OID.
     /// - `MissingObject` if a parent OID is not present in the model.
     pub fn from_repo(repo: &GitRepoModel) -> Result<Self, SimGitError> {

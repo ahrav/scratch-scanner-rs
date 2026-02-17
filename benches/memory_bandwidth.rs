@@ -10,7 +10,7 @@
 //!
 //! | Level | Size Range | Expected Read BW |
 //! |-------|------------|------------------|
-//! | L1D   | < 64KB     | 150-300 GB/s     |
+//! | L1D   | < 128KB    | 150-300 GB/s     |
 //! | L2    | 128KB-16MB | 80-150 GB/s      |
 //! | RAM   | > 32MB     | 50-100 GB/s      |
 //!
@@ -414,7 +414,7 @@ fn bench_cache_read_modify_write(c: &mut Criterion) {
 
 /// Linear Congruential Generator for deterministic random indices.
 ///
-/// Uses Knuth's MMIX LCG constants (multiplier: 6364136223846793005, increment: 1).
+/// Uses MMIX-derived LCG (multiplier: 6364136223846793005, increment: 1).
 /// Full 64-bit period ensures no repeated indices within benchmark iteration counts.
 /// Deterministic seeding guarantees reproducible access patterns across runs.
 #[inline]
@@ -765,7 +765,9 @@ fn bench_byte_count_scalar(c: &mut Criterion) {
 /// - **4x unrolling**: Processes 64 bytes per loop iteration (4 × 16-byte vectors).
 ///   This saturates the memory bus and hides instruction latency.
 /// - **u16 accumulators**: Uses `vpadalq_u8` (pairwise add and accumulate) to widen
-///   u8 values to u16, preventing overflow until final reduction.
+///   u8 values to u16. Note: u16 lanes can overflow for buffers larger than ~8 KB
+///   (128 iterations × 510 max per lane); the throughput measurement remains valid
+///   but the computed sum will wrap for large buffers.
 /// - **Separate accumulators**: Four independent `acc0..acc3` avoid data dependencies
 ///   between loop iterations, enabling out-of-order execution.
 ///

@@ -627,7 +627,7 @@ fn minimal_engine() -> Engine {
 /// the cost of:
 /// - Vectorscan anchor matching
 /// - Regex validation on anchor windows
-/// - Validator callbacks (checksum, entropy, etc.)
+/// - Offline validation on confirmed findings (format checks, checksums)
 ///
 /// ...without the additional overhead of detecting and decoding base64/URL
 /// content. Useful for measuring Tiers 2 and 3.
@@ -642,7 +642,7 @@ fn engine_no_transforms() -> Engine {
 /// Standard demo engine with full rule set.
 ///
 /// This is the production configuration: derived anchors, all validators,
-/// and full transform support (base64, URL, hex decoding). Use this engine
+/// and full transform support (base64, URL decoding). Use this engine
 /// for representative end-to-end throughput measurements.
 fn full_engine() -> Engine {
     demo_engine_with_anchor_mode(AnchorMode::Derived)

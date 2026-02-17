@@ -229,7 +229,8 @@ fn generate_grouped_rules(count: usize, group_size: usize) -> Vec<RuleSpec> {
 /// to measure scaling behavior that matches real-world rule sets. Key differences
 /// from synthetic rules:
 ///
-/// - **Variable anchor lengths**: 4-11 characters (AKIA=4, ssh-ed25519=11)
+/// - **Variable base prefix lengths**: 4-11 characters (AKIA=4, ssh-ed25519=11),
+///   plus a 3-character unique suffix making actual anchors 7-14 characters
 /// - **Character diversity**: Underscores, hyphens, mixed case (not just uppercase)
 /// - **Entropy requirements**: 1/3 of rules require minimum entropy, adding
 ///   post-match validation overhead
@@ -332,7 +333,8 @@ fn generate_realistic_rules(count: usize) -> Vec<RuleSpec> {
 ///
 /// - **Manual anchors**: Rules with explicit anchor patterns in `RuleSpec.anchors`
 /// - **Derived anchors**: Anchors extracted automatically from regex prefixes
-/// - **Residue rules**: Rules that couldn't be anchored (scanned on every byte)
+/// - **Residue rules**: Rules that couldn't derive anchors (gated by weaker
+///   heuristics like run-length or k-gram checks instead of Vectorscan patterns)
 /// - **Unfilterable**: Rules where no filtering is possible (expensive!)
 /// - **DB built**: Whether a Vectorscan database was compiled
 /// - **UTF-16 DB built**: Whether a separate UTF-16 variant DB exists
@@ -385,7 +387,8 @@ fn bench_diagnostics(c: &mut Criterion) {
 
     // Full gitleaks engine
     let gitleaks = scanner_rs::demo_engine_with_anchor_mode(scanner_rs::AnchorMode::Derived);
-    print_engine_diagnostics("Gitleaks (derived)", &gitleaks, 212);
+    let gitleaks_rule_count = scanner_rs::demo_rules().len();
+    print_engine_diagnostics("Gitleaks (derived)", &gitleaks, gitleaks_rule_count);
 
     // Compare UTF-16 enabled vs disabled
     let rules_100 = generate_realistic_rules(100);
@@ -578,8 +581,10 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
 /// # Background
 ///
 /// Some secrets appear in UTF-16 encoded files (e.g., Windows resources, certain
-/// config formats). Enabling `scan_utf16_variants` creates a second Vectorscan
-/// database with UTF-16 LE/BE variants of all anchors.
+/// config formats). When `scan_utf16_variants` is enabled, the engine scans a
+/// second Vectorscan database at runtime (UTF-16 LE/BE variants of all anchors).
+/// The database is always compiled at construction time; the flag controls whether
+/// it is used during scanning.
 ///
 /// # Trade-off
 ///

@@ -3,7 +3,7 @@
 //! The `triage.meta` file stores a fixed-size binary record:
 //!
 //! ```text
-//! [magic: "TRM1" (4B)] [node_id: u64 LE] [max_clock: u64 LE] [crc32: u32 LE]
+//! [magic: "TRM1" (4B)] [node_id: u64 LE] [clock: u64 LE] [crc32: u32 LE]
 //! ```
 //!
 //! Total: 24 bytes. Written via atomic rename for crash safety.
@@ -129,8 +129,8 @@ impl TriageClock {
 
 /// Generate a random node_id using available entropy.
 fn generate_node_id() -> u64 {
-    // Use the same approach as SqliteStoreProducer::generate_run_id —
-    // /dev/urandom on unix, fallback to time+PID hash otherwise.
+    // Similar /dev/urandom approach as generate_run_id in store::db::writer —
+    // /dev/urandom on unix, fallback to time+PID XOR otherwise.
     #[cfg(unix)]
     {
         use std::io::Read;

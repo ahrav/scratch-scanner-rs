@@ -26,7 +26,7 @@ impl<R: Read> RunReader<R> {
     ///
     /// # Errors
     /// Returns `InvalidRunHeader` on bad magic/version/oid length and
-    /// `CorruptRunFile` on unexpected EOF during header read.
+    /// `Io` on unexpected EOF during header read.
     pub fn new(mut reader: R, max_path_len: u16) -> Result<Self, SpillError> {
         let mut header_bytes = [0u8; 12];
         reader
