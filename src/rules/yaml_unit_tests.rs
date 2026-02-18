@@ -619,74 +619,159 @@ fn structured_prefix_rules_keep_value_suppressors_unset() {
 }
 
 #[test]
-/// Regression: adafruit now carries the shared placeholder suppressor baseline.
-fn adafruit_api_key_suppresses_placeholder_value() {
-    let rule_name = "adafruit-api-key";
-    let hay = b"adafruit_token=exampleexampleexampleexampleabcd";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder adafruit API key to be suppressed"
-    );
-}
+fn suppressor_value_cases() {
+    // Each entry: (rule_name, haystack, expect_hit, label).
+    const CASES: &[(&str, &[u8], bool, &str)] = &[
+        // Formerly: adafruit_api_key_suppresses_placeholder_value
+        (
+            "adafruit-api-key",
+            b"adafruit_token=exampleexampleexampleexampleabcd",
+            false,
+            "placeholder adafruit API key should be suppressed",
+        ),
+        // Formerly: adafruit_api_key_allows_real_value
+        (
+            "adafruit-api-key",
+            b"adafruit_token=a8f2k9x7m4p1q6w3b5n0j4c9d2e7h6m1",
+            true,
+            "real-looking adafruit API key should be reported",
+        ),
+        // Formerly: heroku_api_key_suppresses_placeholder_uuid
+        (
+            "heroku-api-key",
+            b"heroku_key=00000000-0000-0000-0000-000000000000",
+            false,
+            "all-zeros placeholder UUID should be suppressed",
+        ),
+        // Formerly: heroku_api_key_allows_real_uuid
+        (
+            "heroku-api-key",
+            b"heroku_key=7e2f19c4-83d1-4a56-b7e9-1f3c8d2a5b60",
+            true,
+            "real-looking Heroku UUID should be reported",
+        ),
+        // Formerly: discord_client_secret_suppresses_placeholder_value
+        (
+            "discord-client-secret",
+            b"discord_app_key=exampleexampleexampleexampleabcd",
+            false,
+            "placeholder discord client secret should be suppressed",
+        ),
+        // Formerly: discord_client_secret_allows_real_value
+        (
+            "discord-client-secret",
+            b"discord_app_key=\"a8f2c9d7e4b1063895fa2d7c4e0b1a39\"",
+            true,
+            "real-looking discord client secret should be reported",
+        ),
+        // Formerly: generic_api_key_suppresses_placeholder_value
+        (
+            "generic-api-key",
+            b"API_KEY=YOUR_EXAMPLE_1",
+            false,
+            "placeholder API key should be suppressed",
+        ),
+        // Formerly: generic_api_key_allows_real_value
+        (
+            "generic-api-key",
+            b"API_KEY=a8f2k9x7m4p1q6w3",
+            true,
+            "real-looking API key should be reported",
+        ),
+        // Formerly: hashicorp_tf_password_suppresses_placeholder_value
+        (
+            "hashicorp-tf-password",
+            b"password = \"changeme123\"",
+            false,
+            "placeholder terraform password should be suppressed",
+        ),
+        // Formerly: hashicorp_tf_password_allows_real_value
+        (
+            "hashicorp-tf-password",
+            b"password = \"a8f2k9x7m4p1q6w3\"",
+            true,
+            "real-looking terraform password should be reported",
+        ),
+        // Formerly: hashicorp_tf_password_allows_real_value_with_password_substring
+        (
+            "hashicorp-tf-password",
+            b"password = \"prodpassword19\"",
+            true,
+            "terraform password containing 'password' should be reported",
+        ),
+        // Formerly: curl_auth_header_suppresses_placeholder_bearer_token
+        (
+            "curl-auth-header",
+            b"curl -H \"Authorization: Bearer YOUR_TOKEN_HERE\" https://api.example.com",
+            false,
+            "placeholder bearer token should be suppressed",
+        ),
+        // Formerly: curl_auth_header_allows_real_bearer_token
+        (
+            "curl-auth-header",
+            b"curl -H \"Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9\" https://api.internal",
+            true,
+            "real-looking bearer token should be reported",
+        ),
+        // Formerly: curl_auth_header_suppresses_placeholder_api_key
+        (
+            "curl-auth-header",
+            b"curl -H \"X-Api-Key: EXAMPLE_KEY_12345\" https://api.example.com",
+            false,
+            "placeholder X-Api-Key value should be suppressed",
+        ),
+        // Formerly: curl_auth_user_suppresses_placeholder_user_password
+        (
+            "curl-auth-user",
+            b"curl -u admin:changeme https://api.example.com",
+            false,
+            "placeholder user:password should be suppressed",
+        ),
+        // Formerly: curl_auth_user_allows_real_user_password
+        (
+            "curl-auth-user",
+            b"curl -u deploy_bot:a8f2k9x7m4p1q6w3 https://registry.internal",
+            true,
+            "real-looking curl -u credentials should be reported",
+        ),
+        // Formerly: curl_auth_user_allows_real_password_with_password_substring
+        (
+            "curl-auth-user",
+            b"curl -u deploy_bot:password1234 https://registry.internal",
+            true,
+            "curl -u credentials containing 'password' should be reported",
+        ),
+        // Formerly: curl_auth_user_suppresses_literal_password_example
+        (
+            "curl-auth-user",
+            b"curl -u 'user:password' https://api.example.com",
+            false,
+            "user:password literal example should be suppressed",
+        ),
+        // Formerly: atlassian_api_token_suppresses_placeholder_value
+        (
+            "atlassian-api-token",
+            b"JIRA_TOKEN=yourexampletokenabcd1234",
+            false,
+            "placeholder atlassian token should be suppressed",
+        ),
+        // Formerly: atlassian_api_token_allows_real_value
+        (
+            "atlassian-api-token",
+            b"JIRA_TOKEN=a8f2k9x7m4p1q6w3b5n0c1d2",
+            true,
+            "real-looking atlassian token should be reported",
+        ),
+    ];
 
-#[test]
-fn adafruit_api_key_allows_real_value() {
-    let rule_name = "adafruit-api-key";
-    let hay = b"adafruit_token=a8f2k9x7m4p1q6w3b5n0j4c9d2e7h6m1";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking adafruit API key to be reported"
-    );
-}
-
-#[test]
-fn heroku_api_key_suppresses_placeholder_uuid() {
-    let rule_name = "heroku-api-key";
-    let hay = b"heroku_key=00000000-0000-0000-0000-000000000000";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected all-zeros placeholder UUID to be suppressed"
-    );
-}
-
-#[test]
-fn heroku_api_key_allows_real_uuid() {
-    let rule_name = "heroku-api-key";
-    let hay = b"heroku_key=7e2f19c4-83d1-4a56-b7e9-1f3c8d2a5b60";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking Heroku UUID to be reported"
-    );
-}
-
-#[test]
-fn discord_client_secret_suppresses_placeholder_value() {
-    let rule_name = "discord-client-secret";
-    // 32-char value containing "example" (suppressor substring).
-    // Uses "discord_app_key" to avoid triggering the global safelist on `secret[:=]`.
-    let hay = b"discord_app_key=exampleexampleexampleexampleabcd";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder discord client secret to be suppressed"
-    );
-}
-
-#[test]
-fn discord_client_secret_allows_real_value() {
-    let rule_name = "discord-client-secret";
-    // Use "discord_app_key" instead of "discord_secret" to avoid
-    // triggering the global safelist pattern `secret[:=]`.
-    let hay = b"discord_app_key=\"a8f2c9d7e4b1063895fa2d7c4e0b1a39\"";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking discord client secret to be reported"
-    );
+    for &(rule_name, hay, expect_hit, label) in CASES {
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert_eq!(
+            has_rule_hit(&hits, rule_name),
+            expect_hit,
+            "{rule_name}: {label}"
+        );
+    }
 }
 
 #[test]
@@ -759,28 +844,6 @@ fn default_rules_yaml_has_no_unknown_fields() {
             assert_no_unknown_nested_fields(map, section, allowed, i, name);
         }
     }
-}
-
-#[test]
-fn generic_api_key_suppresses_placeholder_value() {
-    let rule_name = "generic-api-key";
-    let hay = b"API_KEY=YOUR_EXAMPLE_1";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder API key to be suppressed"
-    );
-}
-
-#[test]
-fn generic_api_key_allows_real_value() {
-    let rule_name = "generic-api-key";
-    let hay = b"API_KEY=a8f2k9x7m4p1q6w3";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking API key to be reported"
-    );
 }
 
 #[test]
@@ -942,116 +1005,6 @@ fn atlassian_api_token_random_high_entropy_values_are_not_suppressed() {
     );
 }
 
-#[test]
-fn hashicorp_tf_password_suppresses_placeholder_value() {
-    let rule_name = "hashicorp-tf-password";
-    let hay = br#"password = "changeme123""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder terraform password to be suppressed"
-    );
-}
-
-#[test]
-fn hashicorp_tf_password_allows_real_value() {
-    let rule_name = "hashicorp-tf-password";
-    let hay = br#"password = "a8f2k9x7m4p1q6w3""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking terraform password to be reported"
-    );
-}
-
-#[test]
-fn hashicorp_tf_password_allows_real_value_with_password_substring() {
-    let rule_name = "hashicorp-tf-password";
-    let hay = br#"password = "prodpassword19""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected terraform password containing 'password' to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_header_suppresses_placeholder_bearer_token() {
-    let rule_name = "curl-auth-header";
-    let hay = br#"curl -H "Authorization: Bearer YOUR_TOKEN_HERE" https://api.example.com"#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder bearer token to be suppressed"
-    );
-}
-
-#[test]
-fn curl_auth_header_allows_real_bearer_token() {
-    let rule_name = "curl-auth-header";
-    let hay = br#"curl -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9" https://api.internal"#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking bearer token to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_header_suppresses_placeholder_api_key() {
-    let rule_name = "curl-auth-header";
-    let hay = br#"curl -H "X-Api-Key: EXAMPLE_KEY_12345" https://api.example.com"#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder X-Api-Key value to be suppressed"
-    );
-}
-
-#[test]
-fn curl_auth_user_suppresses_placeholder_user_password() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u admin:changeme https://api.example.com";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder user:password to be suppressed"
-    );
-}
-
-#[test]
-fn curl_auth_user_allows_real_user_password() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u deploy_bot:a8f2k9x7m4p1q6w3 https://registry.internal";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking curl -u credentials to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_user_allows_real_password_with_password_substring() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u deploy_bot:password1234 https://registry.internal";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected curl -u credentials containing 'password' to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_user_suppresses_literal_password_example() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u 'user:password' https://api.example.com";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected user:password literal example to be suppressed"
-    );
-}
-
 /// Regression test for PR #43 review comment:
 /// Reviewer claimed URL text could trigger the "example" suppressor and
 /// hide a real bearer token. With emit-time safelist enabled, `example`
@@ -1082,28 +1035,6 @@ fn hashicorp_tf_password_suppressors_do_not_include_password() {
     assert!(
         !suppressors.iter().any(|s| s == b"password"),
         "literal 'password' must not be a value suppressor — it would cause false negatives"
-    );
-}
-
-#[test]
-fn atlassian_api_token_suppresses_placeholder_value() {
-    let rule_name = "atlassian-api-token";
-    let hay = b"JIRA_TOKEN=yourexampletokenabcd1234";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder atlassian token to be suppressed"
-    );
-}
-
-#[test]
-fn atlassian_api_token_allows_real_value() {
-    let rule_name = "atlassian-api-token";
-    let hay = b"JIRA_TOKEN=a8f2k9x7m4p1q6w3b5n0c1d2";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking atlassian token to be reported"
     );
 }
 
@@ -1824,52 +1755,143 @@ fn default_rules_offline_validators_reject_bad_tokens() {
         OfflineVerdict::Invalid,
     );
 
-    // Slack: xoxb with invalid segment structure.
+    // Slack: xoxb with unrecognised segment structure — Indeterminate (not
+    // Invalid) so unknown future token formats are not suppressed.
     let bad_slack = b"xoxb-123-abc";
     let spec = find("slack-bot-token").offline_validation.unwrap();
     assert_eq!(
         offline_validate::validate(spec, bad_slack),
-        OfflineVerdict::Invalid,
+        OfflineVerdict::Indeterminate,
     );
 }
 
-/// The dropbox-api-token regex captures exactly `[a-z0-9]{15}` (15 bytes).
-/// The entropy gate should reject low-entropy tokens like "aaaaaaaaaaaaaaa".
 #[test]
-fn dropbox_api_token_entropy_gate_rejects_low_entropy() {
-    // "aaaaaaaaaaaaaaa" is 15 chars of zero entropy — should be rejected.
-    let low_entropy = b"dropbox_key = aaaaaaaaaaaaaaa\n";
-    let hits = scan_single_builtin_rule("dropbox-api-token", low_entropy);
-    assert!(
-        !hits.iter().any(|h| h.rule == "dropbox-api-token"),
-        "low-entropy dropbox token should be filtered by entropy gate"
-    );
-}
+fn entropy_boundary_cases() {
+    // Formerly: dropbox_api_token_entropy_gate_rejects_low_entropy,
+    //           linkedin_client_id_entropy_gate_rejects_low_entropy,
+    //           sumologic_access_id_entropy_gate_rejects_low_entropy,
+    //           sendgrid_api_token_entropy_{rejects_below,accepts_above}_threshold,
+    //           adobe_client_secret_entropy_{rejects_below,accepts_above}_threshold,
+    //           alibaba_access_key_id_entropy_{rejects_below,accepts_above}_threshold,
+    //           asana_client_id_entropy_{rejects_degenerate,rejects_low,accepts_high}_entropy,
+    //           discord_client_id_entropy_{rejects_degenerate,rejects_low,accepts_high}_entropy.
 
-/// The linkedin-client-id regex captures exactly `[a-z0-9]{14}` (14 bytes).
-/// The entropy gate should reject low-entropy tokens like "aaaaaaaaaaaaaa".
-#[test]
-fn linkedin_client_id_entropy_gate_rejects_low_entropy() {
-    // "aaaaaaaaaaaaaa" is 14 chars of zero entropy — should be rejected.
-    let low_entropy = b"linkedin_key = aaaaaaaaaaaaaa\n";
-    let hits = scan_single_builtin_rule("linkedin-client-id", low_entropy);
-    assert!(
-        !hits.iter().any(|h| h.rule == "linkedin-client-id"),
-        "low-entropy linkedin client id should be filtered by entropy gate"
+    // (rule_name, haystack, expect_hit, label)
+    let sendgrid_low = format!("secret = SG.{}\n", "abcd".repeat(16) + "ab");
+    let sendgrid_high_base = "abcdefghijklmnopqrstuvwxyz012345";
+    let sendgrid_high = format!(
+        "secret = SG.{}\n",
+        sendgrid_high_base.repeat(2).to_string() + &sendgrid_high_base[..2]
     );
-}
+    let adobe_low = format!("secret = p8e-{}\n", "abcd".repeat(8));
+    let adobe_high = format!("secret = p8e-{}\n", "abcdefghijklmnopqrstuvwxyz012345");
+    let alibaba_low = format!("secret = LTAI{}\n", "abcd".repeat(5));
+    let alibaba_high = format!("secret = LTAI{}\n", "abcdefghijklmnopqrst");
 
-/// The sumologic-access-id regex captures exactly `su[a-zA-Z0-9]{12}` (14 bytes).
-/// The entropy gate should reject low-entropy tokens like "suaaaaaaaaaaaa".
-#[test]
-fn sumologic_access_id_entropy_gate_rejects_low_entropy() {
-    // "suaaaaaaaaaaaa" is 14 bytes with near-zero entropy — should be rejected.
-    let low_entropy = b"sumo_key = suaaaaaaaaaaaa\n";
-    let hits = scan_single_builtin_rule("sumologic-access-id", low_entropy);
-    assert!(
-        !hits.iter().any(|h| h.rule == "sumologic-access-id"),
-        "low-entropy sumologic access id should be filtered by entropy gate"
-    );
+    let cases: &[(&str, &[u8], bool, &str)] = &[
+        // Zero-entropy rejection (degenerate inputs).
+        (
+            "dropbox-api-token",
+            b"dropbox_key = aaaaaaaaaaaaaaa\n",
+            false,
+            "zero-entropy dropbox token should be rejected",
+        ),
+        (
+            "linkedin-client-id",
+            b"linkedin_key = aaaaaaaaaaaaaa\n",
+            false,
+            "zero-entropy linkedin client id should be rejected",
+        ),
+        (
+            "sumologic-access-id",
+            b"sumo_key = suaaaaaaaaaaaa\n",
+            false,
+            "near-zero entropy sumologic access id should be rejected",
+        ),
+        // Threshold 3.0: below/above pairs.
+        (
+            "sendgrid-api-token",
+            sendgrid_low.as_bytes(),
+            false,
+            "~2.24 bits/byte should be rejected by 3.0 threshold",
+        ),
+        (
+            "sendgrid-api-token",
+            sendgrid_high.as_bytes(),
+            true,
+            "~5.1 bits/byte should pass the 3.0 threshold",
+        ),
+        (
+            "adobe-client-secret",
+            adobe_low.as_bytes(),
+            false,
+            "~2.50 bits/byte should be rejected by 3.0 threshold",
+        ),
+        (
+            "adobe-client-secret",
+            adobe_high.as_bytes(),
+            true,
+            "~5.1 bits/byte should pass the 3.0 threshold",
+        ),
+        (
+            "alibaba-access-key-id",
+            alibaba_low.as_bytes(),
+            false,
+            "~2.65 bits/byte should be rejected by 3.0 threshold",
+        ),
+        (
+            "alibaba-access-key-id",
+            alibaba_high.as_bytes(),
+            true,
+            "~4.58 bits/byte should pass the 3.0 threshold",
+        ),
+        // Threshold 2.5: digit-only rules.
+        (
+            "asana-client-id",
+            b"asana_key = 1111111111111111\n",
+            false,
+            "0.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "asana-client-id",
+            b"asana_key = 1234123412341234\n",
+            false,
+            "2.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "asana-client-id",
+            b"asana_key = 1122334455667788\n",
+            true,
+            "3.0 bits/byte should pass the 2.5 threshold",
+        ),
+        (
+            "discord-client-id",
+            b"discord_id = 111111111111111111\n",
+            false,
+            "0.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "discord-client-id",
+            b"discord_id = 123412341234123412\n",
+            false,
+            "~2.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "discord-client-id",
+            b"discord_id = 112233445566778899\n",
+            true,
+            "3.17 bits/byte should pass the 2.5 threshold",
+        ),
+    ];
+
+    for &(rule_name, hay, expect_hit, label) in cases {
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert_eq!(
+            has_rule_hit(&hits, rule_name),
+            expect_hit,
+            "{rule_name}: {label}"
+        );
+    }
 }
 
 /// CI guard: for every builtin rule with an entropy gate, the capture group's
@@ -1963,190 +1985,6 @@ fn entropy_min_len_does_not_exceed_capture_maximum() {
         "entropy min_len exceeds capture maximum for {} rule(s):\n  {}",
         failures.len(),
         failures.join("\n  "),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Boundary-aware entropy threshold tests
-//
-// These test that specific entropy values between the old (2.0) and new (3.0
-// or 2.5) thresholds are correctly rejected, and high-entropy strings are
-// accepted. This closes the gap where the existing zero-entropy tests (all
-// `a`s) would pass at any positive threshold.
-// ---------------------------------------------------------------------------
-
-/// Boundary test: sendgrid-api-token with body below 3.0 bits/byte threshold.
-///
-/// The capture `SG.` + (`abcd` × 16 + `ab`) has 7 distinct bytes in 69
-/// positions ≈ 2.24 bits/byte — above the old 2.0 threshold, below the new 3.0.
-#[test]
-fn sendgrid_api_token_entropy_rejects_below_threshold() {
-    let body = "abcd".repeat(16) + "ab"; // 66 chars
-    let hay = format!("secret = SG.{body}\n");
-    let hits = scan_single_builtin_rule("sendgrid-api-token", hay.as_bytes());
-    assert!(
-        !hits.iter().any(|h| h.rule == "sendgrid-api-token"),
-        "sendgrid token with ~2.24 bits/byte should be rejected by 3.0 threshold"
-    );
-}
-
-/// Boundary test: sendgrid-api-token with body above 3.0 bits/byte threshold.
-///
-/// The capture `SG.` + 32 distinct `[a-z0-9]` chars repeated to 66 has 35
-/// distinct bytes in 69 positions ≈ 5.1 bits/byte.
-#[test]
-fn sendgrid_api_token_entropy_accepts_above_threshold() {
-    let base = "abcdefghijklmnopqrstuvwxyz012345"; // 32 distinct chars
-    let body = base.repeat(2) + &base[..2]; // 66 chars
-    let hay = format!("secret = SG.{body}\n");
-    let hits = scan_single_builtin_rule("sendgrid-api-token", hay.as_bytes());
-    assert!(
-        hits.iter().any(|h| h.rule == "sendgrid-api-token"),
-        "sendgrid token with ~5.1 bits/byte should pass the 3.0 threshold"
-    );
-}
-
-/// Boundary test: adobe-client-secret with body below 3.0 bits/byte threshold.
-///
-/// The capture `p8e-` + (`abcd` × 8) has 8 distinct bytes in 36 positions
-/// ≈ 2.50 bits/byte — below the 3.0 threshold.
-#[test]
-fn adobe_client_secret_entropy_rejects_below_threshold() {
-    let body = "abcd".repeat(8); // 32 chars
-    let hay = format!("secret = p8e-{body}\n");
-    let hits = scan_single_builtin_rule("adobe-client-secret", hay.as_bytes());
-    assert!(
-        !hits.iter().any(|h| h.rule == "adobe-client-secret"),
-        "adobe token with ~2.50 bits/byte should be rejected by 3.0 threshold"
-    );
-}
-
-/// Boundary test: adobe-client-secret with body above 3.0 bits/byte threshold.
-///
-/// The capture `p8e-` + 32 distinct `[a-z0-9]` chars has 35 distinct bytes
-/// in 36 positions ≈ 5.1 bits/byte.
-#[test]
-fn adobe_client_secret_entropy_accepts_above_threshold() {
-    let body = "abcdefghijklmnopqrstuvwxyz012345"; // 32 distinct chars
-    let hay = format!("secret = p8e-{body}\n");
-    let hits = scan_single_builtin_rule("adobe-client-secret", hay.as_bytes());
-    assert!(
-        hits.iter().any(|h| h.rule == "adobe-client-secret"),
-        "adobe token with ~5.1 bits/byte should pass the 3.0 threshold"
-    );
-}
-
-/// Boundary test: alibaba-access-key-id with body below 3.0 bits/byte threshold.
-///
-/// The capture `LTAI` + (`abcd` × 5) has 8 distinct bytes in 24 positions
-/// ≈ 2.65 bits/byte — below the 3.0 threshold.
-#[test]
-fn alibaba_access_key_id_entropy_rejects_below_threshold() {
-    let body = "abcd".repeat(5); // 20 chars
-    let hay = format!("secret = LTAI{body}\n");
-    let hits = scan_single_builtin_rule("alibaba-access-key-id", hay.as_bytes());
-    assert!(
-        !hits.iter().any(|h| h.rule == "alibaba-access-key-id"),
-        "alibaba key with ~2.65 bits/byte should be rejected by 3.0 threshold"
-    );
-}
-
-/// Boundary test: alibaba-access-key-id with body above 3.0 bits/byte threshold.
-///
-/// The capture `LTAI` + 20 distinct lowercase chars has 24 distinct bytes
-/// in 24 positions ≈ 4.58 bits/byte.
-#[test]
-fn alibaba_access_key_id_entropy_accepts_above_threshold() {
-    let body = "abcdefghijklmnopqrst"; // 20 distinct chars
-    let hay = format!("secret = LTAI{body}\n");
-    let hits = scan_single_builtin_rule("alibaba-access-key-id", hay.as_bytes());
-    assert!(
-        hits.iter().any(|h| h.rule == "alibaba-access-key-id"),
-        "alibaba key with ~4.58 bits/byte should pass the 3.0 threshold"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Boundary tests for digit-only rules at threshold 2.5
-// ---------------------------------------------------------------------------
-
-/// Boundary test: asana-client-id (digit-only, threshold 2.5) rejects
-/// degenerate input. All-same digits have 0.0 bits/byte entropy.
-#[test]
-fn asana_client_id_entropy_rejects_degenerate() {
-    let hay = b"asana_key = 1111111111111111\n";
-    let hits = scan_single_builtin_rule("asana-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "asana-client-id"),
-        "asana id with 0.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: asana-client-id rejects low-entropy digits.
-///
-/// `1234` × 4 = 4 distinct digits, each appearing 4 times in 16 bytes
-/// → 2.0 bits/byte, below the 2.5 threshold.
-#[test]
-fn asana_client_id_entropy_rejects_low_entropy() {
-    let hay = b"asana_key = 1234123412341234\n";
-    let hits = scan_single_builtin_rule("asana-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "asana-client-id"),
-        "asana id with 2.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: asana-client-id accepts high-entropy digits.
-///
-/// 8 distinct digits, each appearing twice in 16 bytes → 3.0 bits/byte,
-/// above the 2.5 threshold.
-#[test]
-fn asana_client_id_entropy_accepts_high_entropy() {
-    let hay = b"asana_key = 1122334455667788\n";
-    let hits = scan_single_builtin_rule("asana-client-id", hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "asana-client-id"),
-        "asana id with 3.0 bits/byte should pass the 2.5 threshold"
-    );
-}
-
-/// Boundary test: discord-client-id (digit-only, threshold 2.5) rejects
-/// degenerate input. All-same digits have 0.0 bits/byte entropy.
-#[test]
-fn discord_client_id_entropy_rejects_degenerate() {
-    let hay = b"discord_id = 111111111111111111\n";
-    let hits = scan_single_builtin_rule("discord-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "discord-client-id"),
-        "discord id with 0.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: discord-client-id rejects low-entropy digits.
-///
-/// `1234` repeated to 18 chars = 4 distinct digits with uneven distribution
-/// → ~2.0 bits/byte, below the 2.5 threshold.
-#[test]
-fn discord_client_id_entropy_rejects_low_entropy() {
-    let hay = b"discord_id = 123412341234123412\n";
-    let hits = scan_single_builtin_rule("discord-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "discord-client-id"),
-        "discord id with ~2.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: discord-client-id accepts high-entropy digits.
-///
-/// 9 distinct digits, each appearing twice in 18 bytes → 3.17 bits/byte,
-/// above the 2.5 threshold.
-#[test]
-fn discord_client_id_entropy_accepts_high_entropy() {
-    let hay = b"discord_id = 112233445566778899\n";
-    let hits = scan_single_builtin_rule("discord-client-id", hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "discord-client-id"),
-        "discord id with 3.17 bits/byte should pass the 2.5 threshold"
     );
 }
 
