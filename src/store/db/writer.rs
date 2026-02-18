@@ -735,10 +735,6 @@ mod tests {
         }
     }
 
-    // ======================================================================
-    // Step 5: Additional writer tests
-    // ======================================================================
-
     #[test]
     fn rule_cache_hit_avoids_db_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
