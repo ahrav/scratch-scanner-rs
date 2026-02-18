@@ -18,7 +18,7 @@
 //! | `object_path` | `locations[0].physicalLocation.artifactLocation.uri` |
 //! | `start` | `locations[0].physicalLocation.region.byteOffset` |
 //! | `end - start` | `locations[0].physicalLocation.region.byteLength` |
-//! | `confidence_score` | `rank` (scaled: score/10 × 100.0, per §3.27.29) |
+//! | `confidence_score` | `rank` (clamped to 0.0–100.0, per §3.27.29) |
 //!
 //! [SARIF 2.1.0]: https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html
 
@@ -131,8 +131,10 @@ fn encode_sarif_result(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     write_u64(f.end.saturating_sub(f.start), buf);
     // SARIF 2.1.0 §3.27.29: result.rank (0.0–100.0) for per-result confidence.
     // Maps the 0–10 additive gate score to the SARIF 0.0–100.0 range.
+    // Clamp to spec-valid range: negative scores map to 0.0, >10 to 100.0.
     buf.extend_from_slice(b"}}}],\"rank\":");
-    write_f64((f.confidence_score as f64 / 10.0) * 100.0, buf);
+    let rank = ((f.confidence_score.max(0) as f64) / 10.0) * 100.0;
+    write_f64(rank.min(100.0), buf);
     buf.push(b'}');
 }
 
@@ -341,5 +343,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let result = &v["runs"][0]["results"][0];
         assert_eq!(result["rank"], 70.0, "score 7 → rank 70.0: {result}");
+    }
+
+    /// Verify SARIF rank stays within the spec-valid 0.0–100.0 range
+    /// even when confidence_score is negative or above 10.
+    #[test]
+    fn sarif_rank_clamped_to_valid_range() {
+        for (score, expected_min, expected_max) in
+            [(-3i8, 0.0, 100.0), (i8::MIN, 0.0, 100.0), (15, 0.0, 100.0)]
+        {
+            let out = collect_sarif(vec![ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"test.rs",
+                start: 0,
+                end: 10,
+                rule_id: 1,
+                rule_name: "test-rule",
+                commit_id: None,
+                change_kind: None,
+                confidence_score: score,
+            })]);
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let rank = v["runs"][0]["results"][0]["rank"].as_f64().unwrap();
+            assert!(
+                rank >= expected_min && rank <= expected_max,
+                "score {score} -> rank {rank}, expected [{expected_min}, {expected_max}]"
+            );
+        }
     }
 }
