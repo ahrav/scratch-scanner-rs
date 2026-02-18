@@ -103,11 +103,11 @@ fn fs_scan_skips_binary_files() {
         "binary file should be skipped: {output}"
     );
 
-    // Binary skip counter should be incremented.
+    // Extension skip counter should be incremented (.png is in the skip set).
     assert!(
-        report.metrics.binary_skipped > 0,
-        "expected binary_skipped > 0, got {}",
-        report.metrics.binary_skipped
+        report.metrics.ext_skipped > 0,
+        "expected ext_skipped > 0, got {}",
+        report.metrics.ext_skipped
     );
 }
 
@@ -344,9 +344,9 @@ fn binary_skip_stats_correct() {
     let (_, report) = run_scan_with_config(files, default_cfg());
 
     assert_eq!(
-        report.metrics.binary_skipped, 3,
-        "expected 3 binary files skipped, got {}",
-        report.metrics.binary_skipped
+        report.metrics.ext_skipped, 3,
+        "expected 3 files extension-skipped, got {}",
+        report.metrics.ext_skipped
     );
 }
 
@@ -358,7 +358,9 @@ fn binary_file_classified_after_sniff_fails() {
     let dir = TempDir::new().unwrap();
 
     // Binary content: NUL bytes but no archive magic.
-    let bin_path = dir.path().join("data.bin");
+    // Use .xyz extension (not in the extension skip set) so the content
+    // probe is actually exercised rather than short-circuiting on extension.
+    let bin_path = dir.path().join("data.xyz");
     std::fs::write(&bin_path, b"\x00\x01SECRET\x00\x02").unwrap();
     let size = std::fs::metadata(&bin_path).unwrap().len();
 
