@@ -261,7 +261,7 @@ fn char_class_gate_passes(window: &[u8], spec: CharClassCompiled) -> bool {
     let total = window.len() as u32;
     // Integer cross-multiply avoids f32 division:
     // lower / total <= max_lower_pct / 100  ⟺  lower * 100 <= total * max_lower_pct
-    profile.lower * 100 <= total * spec.max_lower_pct as u32
+    (profile.lower as u64) * 100 <= (total as u64) * (spec.max_lower_pct as u64)
 }
 
 /// Returns the `(line_start, line_end)` byte offsets of the line containing
