@@ -989,3 +989,7 @@ mod tests {
         assert!(!class.contains(PathClass::LOCK_FILE));
     }
 }
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+#[path = "path_policy_tests.rs"]
+mod path_policy_tests;
