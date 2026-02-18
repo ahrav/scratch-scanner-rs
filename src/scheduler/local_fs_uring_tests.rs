@@ -389,8 +389,8 @@ fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
 
     assert_eq!(cpu_metrics.binary_extracted, 1);
     assert_eq!(
-        cpu_metrics.findings_dropped, 3,
-        "extraction path should count engine + scheduler dropped findings"
+        cpu_metrics.findings_dropped, 1,
+        "extraction path should count effective dropped findings (engine drops minus scheduler prunes)"
     );
 
     Ok(())
