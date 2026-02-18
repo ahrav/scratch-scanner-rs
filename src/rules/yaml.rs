@@ -42,6 +42,22 @@ use crate::api::{
 use super::RulesError;
 
 // ---------------------------------------------------------------------------
+// Auto-enable char_class defaults
+// ---------------------------------------------------------------------------
+
+/// Minimum Shannon entropy threshold (bits/byte) for auto-enabling the
+/// character-class distribution gate. Rules at or above this threshold
+/// target high-entropy secrets (API keys, tokens); rules below it target
+/// passwords or low-entropy strings where the gate would cause false negatives.
+pub(crate) const AUTO_CHAR_CLASS_ENTROPY_THRESHOLD: f32 = 3.0;
+
+/// Default max-lowercase-percentage for auto-enabled char_class gates.
+pub(crate) const AUTO_CHAR_CLASS_MAX_LOWER_PCT: u8 = 95;
+
+/// Default minimum window length for auto-enabled char_class gates.
+pub(crate) const AUTO_CHAR_CLASS_MIN_WINDOW_LEN: u16 = 32;
+
+// ---------------------------------------------------------------------------
 // YAML serde types
 // ---------------------------------------------------------------------------
 
@@ -429,10 +445,10 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
         // at 1.0).
         let char_class = char_class.or_else(|| {
             entropy.as_ref().and_then(|ent| {
-                if ent.min_bits_per_byte >= 3.0 {
+                if ent.min_bits_per_byte >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD {
                     Some(CharClassSpec {
-                        max_lower_pct: 95,
-                        min_window_len: 32,
+                        max_lower_pct: AUTO_CHAR_CLASS_MAX_LOWER_PCT,
+                        min_window_len: AUTO_CHAR_CLASS_MIN_WINDOW_LEN,
                     })
                 } else {
                     None

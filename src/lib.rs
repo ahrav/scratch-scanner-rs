@@ -90,10 +90,10 @@ compile_error!(
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;
 pub use api::{
-    AnchorPolicy, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding, FindingRec,
-    Gate, LocalContextSpec, RuleSpec, StepId, TailCharset, TransformConfig, TransformId,
-    TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind,
-    LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
+    AnchorPolicy, CharClassSpec, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding,
+    FindingRec, Gate, LocalContextSpec, OfflineValidationSpec, RuleSpec, StepId, TailCharset,
+    TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness,
+    ValidatorKind, LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
 };
 
 pub use demo::{

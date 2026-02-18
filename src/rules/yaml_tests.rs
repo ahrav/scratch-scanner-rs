@@ -273,15 +273,17 @@ proptest! {
         // char_class: either explicit from the case, or auto-enabled when
         // entropy >= 3.0 bits/byte.
         let expect_auto_enable = case.char_class.is_none()
-            && case.entropy.is_some_and(|(bits_x10, _, _)| bits_x10 as f32 / 10.0 >= 3.0);
+            && case
+                .entropy
+                .is_some_and(|(bits_x10, _, _)| bits_x10 as f32 / 10.0 >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD);
         match (&case.char_class, &rule.char_class) {
             (Some((max_lower_pct, min_window_len)), Some(cc)) => {
                 prop_assert_eq!(cc.max_lower_pct, *max_lower_pct);
                 prop_assert_eq!(cc.min_window_len, *min_window_len);
             }
             (None, Some(cc)) if expect_auto_enable => {
-                prop_assert_eq!(cc.max_lower_pct, 95);
-                prop_assert_eq!(cc.min_window_len, 32);
+                prop_assert_eq!(cc.max_lower_pct, AUTO_CHAR_CLASS_MAX_LOWER_PCT);
+                prop_assert_eq!(cc.min_window_len, AUTO_CHAR_CLASS_MIN_WINDOW_LEN);
             }
             (None, None) if !expect_auto_enable => {}
             _ => panic!("char_class presence mismatch"),
