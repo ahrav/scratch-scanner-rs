@@ -461,16 +461,16 @@ fn compute_confidence_score(
 ) -> i8 {
     let mut s: i8 = 0;
     if gates.entropy.is_some() {
-        s += confidence::ENTROPY_PASS;
+        s = s.saturating_add(confidence::ENTROPY_PASS);
     }
     if gates.keywords.is_some() {
-        s += confidence::KEYWORD_PRESENT;
+        s = s.saturating_add(confidence::KEYWORD_PRESENT);
     }
     if rule.needs_assignment_shape_check() {
-        s += confidence::ASSIGNMENT_SHAPE;
+        s = s.saturating_add(confidence::ASSIGNMENT_SHAPE);
     }
     if outcome.offline_verdict_valid {
-        s += confidence::OFFLINE_VALID;
+        s = s.saturating_add(confidence::OFFLINE_VALID);
     }
     s
 }
