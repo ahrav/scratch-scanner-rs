@@ -1933,7 +1933,7 @@ fn persistence_batches_emitted_for_zip_scan() {
 #[test]
 fn sniff_detected_gzip_archive_emits_findings() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("data.bin"); // no .gz extension
+    let path = tmp.path().join("data.xyz"); // no .gz extension
 
     let payload = payload_with_secret_at(5);
     let gz_bytes = build_gz_bytes(&payload);
@@ -1947,7 +1947,7 @@ fn sniff_detected_gzip_archive_emits_findings() {
         "expected finding from sniff-detected gzip; output: {out}"
     );
     assert!(
-        findings[0].path.contains("data.bin"),
+        findings[0].path.contains("data.xyz"),
         "finding path should reference the original file: {}",
         findings[0].path
     );
@@ -1967,7 +1967,7 @@ fn sniff_detected_gzip_archive_emits_findings() {
 #[test]
 fn sniff_detected_tar_archive_emits_findings() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("payload.dat"); // no .tar extension
+    let path = tmp.path().join("payload.xyz"); // no .tar extension
 
     let tar_bytes = build_simple_tar("inner.txt", b"prefix SECRET suffix");
     // Tar archive is always >= 512 bytes due to the header block.
@@ -2007,7 +2007,7 @@ fn sniff_detected_tar_archive_emits_findings() {
 #[test]
 fn sniff_detected_zip_archive_emits_findings() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("bundle.dat"); // no .zip extension
+    let path = tmp.path().join("bundle.xyz"); // no .zip extension
 
     let payload = payload_with_secret_at(2);
     let zip_bytes = build_zip_single_stored_entry("secret.txt", &payload, false);
