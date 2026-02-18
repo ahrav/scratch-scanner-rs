@@ -297,7 +297,7 @@ segments (e.g., `key-null-safety-9xK2mB`).
 ### 9. Offline Structural Validation
 
 After safelist suppression, findings for rules with an `offline_validation`
-gate are checked by `offline_validation_suppresses()`. This runs inline at
+gate are checked by `compute_offline_verdict()`. This runs inline at
 emission time, before the finding consumes a `max_findings_per_chunk` slot.
 
 - Only **root-semantic** findings are validated (`parent_step_id == STEP_ROOT`).
