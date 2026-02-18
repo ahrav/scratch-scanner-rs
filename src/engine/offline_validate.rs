@@ -981,9 +981,9 @@ fn validate_slack_xoxb(after_prefix: &[u8]) -> OfflineVerdict {
     }
 
     // Both current and legacy `xoxb-` formats were attempted and neither
-    // matched. Since the `xoxb-` prefix sets a strong structural expectation,
-    // return Invalid rather than Indeterminate.
-    OfflineVerdict::Invalid
+    // matched. Return Indeterminate (not Invalid) so that unknown future
+    // token layouts are not suppressed as false positives.
+    OfflineVerdict::Indeterminate
 }
 
 /// Validate `xoxp-` / `xoxe-` user token.
@@ -1046,7 +1046,10 @@ fn validate_slack_xoxe(after_prefix: &[u8]) -> OfflineVerdict {
         return validate_slack_user_token(after_prefix);
     }
 
-    OfflineVerdict::Invalid
+    // First segment matches neither config-refresh (1 digit) nor user token
+    // (10-13 digits). Return Indeterminate so unknown future formats are not
+    // suppressed as false positives.
+    OfflineVerdict::Indeterminate
 }
 
 /// Validate `xox[os]-` legacy token.
@@ -1690,22 +1693,54 @@ mod tests {
         };
 
         let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
-            ("bot_current", b"xoxb-1234567890-1234567890-abcDEF12345678901234abcd".to_vec(), Valid),
-            ("bot_legacy", b"xoxb-12345678-aBcDeFgHiJkLmNoPqRsT".to_vec(), Valid),
+            (
+                "bot_current",
+                b"xoxb-1234567890-1234567890-abcDEF12345678901234abcd".to_vec(),
+                Valid,
+            ),
+            (
+                "bot_legacy",
+                b"xoxb-12345678-aBcDeFgHiJkLmNoPqRsT".to_vec(),
+                Valid,
+            ),
             ("bot_invalid_segments", b"xoxb-123-abc".to_vec(), Invalid),
-            ("user", b"xoxp-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(), Valid),
-            ("xapp", b"xapp-1-ABCD1234567-5678901234-abcdef1234567890".to_vec(), Valid),
+            (
+                "user",
+                b"xoxp-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(),
+                Valid,
+            ),
+            (
+                "xapp",
+                b"xapp-1-ABCD1234567-5678901234-abcdef1234567890".to_vec(),
+                Valid,
+            ),
             ("config_access", config_access, Valid),
             ("config_refresh", config_refresh, Valid),
             ("legacy", b"xoxo-123-456-789-deadbeef".to_vec(), Valid),
-            ("legacy_workspace", b"xoxa-2-abcdefgh12345678".to_vec(), Valid),
+            (
+                "legacy_workspace",
+                b"xoxa-2-abcdefgh12345678".to_vec(),
+                Valid,
+            ),
             ("unknown_prefix", b"xoxz-something".to_vec(), Indeterminate),
             ("too_short", b"xox".to_vec(), Indeterminate),
-            ("case_insensitive_xapp", b"XAPP-1-ABCDEF123-456789-abcdef12".to_vec(), Valid),
-            ("xoxe_user_format", b"xoxe-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(), Valid),
+            (
+                "case_insensitive_xapp",
+                b"XAPP-1-ABCDEF123-456789-abcdef12".to_vec(),
+                Valid,
+            ),
+            (
+                "xoxe_user_format",
+                b"xoxe-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(),
+                Valid,
+            ),
             ("config_access_xoxp", config_access_xoxp, Valid),
             ("xoxr_workspace", b"xoxr-abcdefghij12345678".to_vec(), Valid),
-            ("xoxs_legacy", b"xoxs-123-456-789-0123456789abcdef".to_vec(), Valid),
+            (
+                "xoxs_legacy",
+                b"xoxs-123-456-789-0123456789abcdef".to_vec(),
+                Valid,
+            ),
         ];
 
         for (label, token, expected) in &cases {

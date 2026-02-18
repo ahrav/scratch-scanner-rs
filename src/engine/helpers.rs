@@ -768,65 +768,45 @@ mod tests {
     // ---- contains_any_memmem ----
 
     #[test]
-    fn contains_any_memmem_zero_needles() {
-        let packed = build_packed(&[]);
-        assert!(!contains_any_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_any_memmem_single_needle_present() {
-        let packed = build_packed(&[b"world"]);
-        assert!(contains_any_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_any_memmem_single_needle_absent() {
-        let packed = build_packed(&[b"xyz"]);
-        assert!(!contains_any_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_any_memmem_multiple_needles_one_present() {
-        let packed = build_packed(&[b"xyz", b"world"]);
-        assert!(contains_any_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_any_memmem_multiple_needles_none_present() {
-        let packed = build_packed(&[b"xyz", b"abc"]);
-        assert!(!contains_any_memmem(b"hello world", &packed));
+    fn contains_any_memmem_cases() {
+        let hay = b"hello world";
+        let cases: &[(&str, &[&[u8]], bool)] = &[
+            ("zero needles", &[], false),
+            ("single needle present", &[b"world"], true),
+            ("single needle absent", &[b"xyz"], false),
+            ("multiple needles one present", &[b"xyz", b"world"], true),
+            ("multiple needles none present", &[b"xyz", b"abc"], false),
+        ];
+        for &(desc, needles, expected) in cases {
+            let packed = build_packed(needles);
+            assert_eq!(
+                contains_any_memmem(hay, &packed),
+                expected,
+                "contains_any_memmem failed for case: {desc}",
+            );
+        }
     }
 
     // ---- contains_all_memmem ----
 
     #[test]
-    fn contains_all_memmem_zero_needles() {
-        let packed = build_packed(&[]);
-        assert!(contains_all_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_all_memmem_single_needle_present() {
-        let packed = build_packed(&[b"hello"]);
-        assert!(contains_all_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_all_memmem_single_needle_absent() {
-        let packed = build_packed(&[b"xyz"]);
-        assert!(!contains_all_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_all_memmem_multiple_needles_all_present() {
-        let packed = build_packed(&[b"hello", b"world"]);
-        assert!(contains_all_memmem(b"hello world", &packed));
-    }
-
-    #[test]
-    fn contains_all_memmem_multiple_needles_one_missing() {
-        let packed = build_packed(&[b"hello", b"xyz"]);
-        assert!(!contains_all_memmem(b"hello world", &packed));
+    fn contains_all_memmem_cases() {
+        let hay = b"hello world";
+        let cases: &[(&str, &[&[u8]], bool)] = &[
+            ("zero needles", &[], true),
+            ("single needle present", &[b"hello"], true),
+            ("single needle absent", &[b"xyz"], false),
+            ("multiple needles all present", &[b"hello", b"world"], true),
+            ("multiple needles one missing", &[b"hello", b"xyz"], false),
+        ];
+        for &(desc, needles, expected) in cases {
+            let packed = build_packed(needles);
+            assert_eq!(
+                contains_all_memmem(hay, &packed),
+                expected,
+                "contains_all_memmem failed for case: {desc}",
+            );
+        }
     }
 
     fn expected_map_utf16_offset(input: &[u8], decoded_offset: usize, le: bool) -> usize {
