@@ -435,6 +435,61 @@ fn deterministic_secret(state: &mut u64, len: usize) -> String {
     out
 }
 
+/// Shared loop logic for random-high-entropy suppressor tests.
+fn assert_random_high_entropy_not_suppressed(
+    rule_name: &str,
+    seed: u64,
+    distinct_min: usize,
+    secret_gen: &dyn Fn(&mut u64) -> String,
+    haystack_fmt: &dyn Fn(&str) -> String,
+) {
+    let rule = builtin_rule_by_name(rule_name);
+    let suppressors = rule
+        .value_suppressors_any
+        .unwrap_or_else(|| panic!("{rule_name} should have value suppressors"));
+    let suppressors: Vec<&str> = suppressors
+        .iter()
+        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+        .collect();
+
+    let mut scan = make_rule_scanner(rule_name);
+    let mut state = seed;
+    let mut checked = 0usize;
+    for _ in 0..192 {
+        let secret = secret_gen(&mut state);
+        if suppressors.iter().any(|sup| {
+            secret
+                .to_ascii_lowercase()
+                .contains(&sup.to_ascii_lowercase())
+        }) {
+            continue;
+        }
+
+        let distinct = secret
+            .as_bytes()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<u8>>()
+            .len();
+        if distinct < distinct_min {
+            continue;
+        }
+
+        let hay = haystack_fmt(&secret);
+        let hits = scan(hay.as_bytes());
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected randomized secret '{secret}' to be reported for {rule_name}"
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 96,
+        "expected >=96 validated secrets for {rule_name}, got {checked}"
+    );
+}
+
 #[test]
 fn default_rules_yaml_matches_builtin_rules() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_rules.yaml");
@@ -762,6 +817,13 @@ fn suppressor_value_cases() {
             true,
             "real-looking atlassian token should be reported",
         ),
+        // Formerly: curl_auth_header_non_safelisted_url_does_not_suppress_real_token
+        (
+            "curl-auth-header",
+            br#"curl https://api.internal -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#,
+            true,
+            "non-safelisted URL must not suppress a real bearer token",
+        ),
     ];
 
     for &(rule_name, hay, expect_hit, label) in CASES {
@@ -847,185 +909,74 @@ fn default_rules_yaml_has_no_unknown_fields() {
 }
 
 #[test]
-fn generic_api_key_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "generic-api-key";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("generic-api-key should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
+fn random_high_entropy_values_are_not_suppressed() {
+    // Formerly: generic_api_key_random_high_entropy_values_are_not_suppressed,
+    //           hashicorp_tf_password_random_high_entropy_values_are_not_suppressed,
+    //           atlassian_api_token_random_high_entropy_values_are_not_suppressed,
+    //           curl_auth_header_random_high_entropy_values_are_not_suppressed,
+    //           curl_auth_user_random_high_entropy_values_are_not_suppressed.
 
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0x9E3779B97F4A7C15_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 24);
-        // Skip generated values that happen to contain a suppressor substring.
-        if suppressors.iter().any(|sup| secret.contains(sup)) {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 8 {
-            continue;
-        }
-
-        let hay = format!("API_KEY={secret}");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized secret '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized secrets, got {checked}"
+    // generic-api-key: 24-char alphanumeric, distinct >= 8.
+    assert_random_high_entropy_not_suppressed(
+        "generic-api-key",
+        0x9E3779B97F4A7C15,
+        8,
+        &|state| deterministic_secret(state, 24),
+        &|secret| format!("API_KEY={secret}"),
     );
-}
 
-#[test]
-fn hashicorp_tf_password_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "hashicorp-tf-password";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("hashicorp-tf-password should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xA5A5A5A5A5A5A5A5_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 12);
-        if suppressors
-            .iter()
-            .any(|sup| secret.to_lowercase().contains(&sup.to_lowercase()))
-        {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 6 {
-            continue;
-        }
-
-        let hay = format!("password = \"{secret}\"");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized terraform password '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized secrets, got {checked}"
+    // hashicorp-tf-password: 12-char alphanumeric, distinct >= 6.
+    assert_random_high_entropy_not_suppressed(
+        "hashicorp-tf-password",
+        0xA5A5A5A5A5A5A5A5,
+        6,
+        &|state| deterministic_secret(state, 12),
+        &|secret| format!("password = \"{secret}\""),
     );
-}
 
-#[test]
-fn atlassian_api_token_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "atlassian-api-token";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("atlassian-api-token should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    // The atlassian rule's group 1 expects [a-z0-9]{20}[a-f0-9]{4} — 24 lowercase hex-ish chars.
+    // atlassian-api-token: 20 [a-z0-9] + 4 [a-f0-9], distinct >= 6.
     let hex_alphabet: &[u8] = b"0123456789abcdef";
     let alnum_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    assert_random_high_entropy_not_suppressed(
+        "atlassian-api-token",
+        0xCAFEBABEDEAD5678,
+        6,
+        &|state| {
+            let mut secret = String::with_capacity(24);
+            for _ in 0..20 {
+                let next = lcg_next(state);
+                secret.push(alnum_alphabet[(next % alnum_alphabet.len() as u64) as usize] as char);
+            }
+            for _ in 0..4 {
+                let next = lcg_next(state);
+                secret.push(hex_alphabet[(next % hex_alphabet.len() as u64) as usize] as char);
+            }
+            secret
+        },
+        &|secret| format!("JIRA_TOKEN={secret}"),
+    );
 
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xCAFEBABEDEAD5678_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        // Build a valid secret: 20 [a-z0-9] chars + 4 [a-f0-9] chars.
-        let mut secret = String::with_capacity(24);
-        for _ in 0..20 {
-            let next = lcg_next(&mut seed);
-            secret.push(alnum_alphabet[(next % alnum_alphabet.len() as u64) as usize] as char);
-        }
-        for _ in 0..4 {
-            let next = lcg_next(&mut seed);
-            secret.push(hex_alphabet[(next % hex_alphabet.len() as u64) as usize] as char);
-        }
+    // curl-auth-header: 24-char alphanumeric, distinct >= 8.
+    assert_random_high_entropy_not_suppressed(
+        "curl-auth-header",
+        0xDEADBEEFCAFEBABE,
+        8,
+        &|state| deterministic_secret(state, 24),
+        &|secret| format!("curl -H \"Authorization: Bearer {secret}\" https://api.internal"),
+    );
 
-        if suppressors
-            .iter()
-            .any(|sup| secret.to_lowercase().contains(&sup.to_lowercase()))
-        {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 6 {
-            continue;
-        }
-
-        let hay = format!("JIRA_TOKEN={secret}");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized atlassian token '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized secrets, got {checked}"
+    // curl-auth-user: 20-char alphanumeric, distinct >= 8.
+    assert_random_high_entropy_not_suppressed(
+        "curl-auth-user",
+        0xA5A5A5A5B4B4B4B4,
+        8,
+        &|state| deterministic_secret(state, 20),
+        &|secret| format!("curl -u deploy_svc:{secret} https://registry.internal"),
     );
 }
 
-/// Regression test for PR #43 review comment:
-/// Reviewer claimed URL text could trigger the "example" suppressor and
-/// hide a real bearer token. With emit-time safelist enabled, `example`
-/// hosts are intentionally suppressed; this test uses a non-safelisted
-/// host to keep value suppressor behavior isolated.
-#[test]
-fn curl_auth_header_non_safelisted_url_does_not_suppress_real_token() {
-    let rule_name = "curl-auth-header";
-    // Real token + non-safelisted URL should still be reported.
-    let hay = br#"curl https://api.internal -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "non-safelisted URL must not suppress a real bearer token"
-    );
-}
-
-/// Regression test for PR #43 review comment:
-/// Reviewer claimed "password" was in hashicorp-tf-password's
-/// value_suppressors_any, which would suppress real passwords containing
-/// that substring. In fact, "password" is NOT a suppressor for this rule.
+/// "password" must not appear in hashicorp-tf-password's value_suppressors_any,
+/// as it would suppress real passwords containing that substring.
 #[test]
 fn hashicorp_tf_password_suppressors_do_not_include_password() {
     let rule = builtin_rule_by_name("hashicorp-tf-password");
@@ -1035,108 +986,6 @@ fn hashicorp_tf_password_suppressors_do_not_include_password() {
     assert!(
         !suppressors.iter().any(|s| s == b"password"),
         "literal 'password' must not be a value suppressor — it would cause false negatives"
-    );
-}
-
-#[test]
-fn curl_auth_header_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "curl-auth-header";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("curl-auth-header should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xDEADBEEFCAFEBABE_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 24);
-        // Skip generated values that happen to contain a suppressor substring.
-        if suppressors.iter().any(|sup| {
-            secret
-                .to_ascii_lowercase()
-                .contains(&sup.to_ascii_lowercase())
-        }) {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 8 {
-            continue;
-        }
-
-        let hay = format!("curl -H \"Authorization: Bearer {secret}\" https://api.internal");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized bearer token '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized bearer tokens, got {checked}"
-    );
-}
-
-#[test]
-fn curl_auth_user_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "curl-auth-user";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("curl-auth-user should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xA5A5A5A5B4B4B4B4_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 20);
-        // Skip generated values that happen to contain a suppressor substring.
-        if suppressors.iter().any(|sup| {
-            secret
-                .to_ascii_lowercase()
-                .contains(&sup.to_ascii_lowercase())
-        }) {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 8 {
-            continue;
-        }
-
-        let hay = format!("curl -u deploy_svc:{secret} https://registry.internal");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized curl -u password '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized curl -u passwords, got {checked}"
     );
 }
 
@@ -2095,4 +1944,160 @@ fn entropy_min_bits_per_byte_within_sane_bounds() {
         failures.len(),
         failures.join("\n  "),
     );
+}
+
+#[test]
+fn roundtrip_min_entropy_bits_per_byte() {
+    let yaml = r#"
+rules:
+  - name: "rt-min-entropy"
+    regex: '[A-Za-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 20
+      max_len: 128
+      min_entropy_bits_per_byte: 2.0
+"#;
+    let original = parse_yaml_rules(yaml).expect("parse");
+    let ent = original[0].entropy.as_ref().expect("entropy present");
+    assert_eq!(
+        ent.min_entropy_bits_per_byte,
+        Some(2.0),
+        "parsed min_entropy_bits_per_byte should be Some(2.0)"
+    );
+
+    // Round-trip through YAML serialization.
+    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+    let file = YamlRulesFile { rules: yaml_rules };
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
+    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+    let reparsed_ent = parsed[0]
+        .entropy
+        .as_ref()
+        .expect("entropy present after roundtrip");
+    assert_eq!(
+        reparsed_ent.min_entropy_bits_per_byte,
+        Some(2.0),
+        "round-tripped min_entropy_bits_per_byte should be Some(2.0)"
+    );
+}
+
+#[test]
+fn char_class_auto_enabled_for_high_entropy_rule_without_explicit_field() {
+    let yaml = r#"
+rules:
+  - name: "high-entropy-no-cc"
+    regex: 'tok_[a-zA-Z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 8
+      max_len: 64
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse");
+    let cc = rules[0]
+        .char_class
+        .as_ref()
+        .expect("char_class should be auto-enabled for high-entropy rule");
+    assert_eq!(cc.max_lower_pct, 95);
+    assert_eq!(cc.min_window_len, 32);
+}
+
+#[test]
+fn char_class_not_auto_enabled_for_low_entropy_rule() {
+    let yaml = r#"
+rules:
+  - name: "low-entropy-no-cc"
+    regex: 'password=[a-z]{8}'
+    anchors: ["password="]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 1.0
+      min_len: 4
+      max_len: 32
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse");
+    assert!(
+        rules[0].char_class.is_none(),
+        "char_class should NOT be auto-enabled for low-entropy rule"
+    );
+}
+
+#[test]
+fn explicit_char_class_not_overridden_by_auto_enable() {
+    let yaml = r#"
+rules:
+  - name: "explicit-cc"
+    regex: 'tok_[a-zA-Z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 4.0
+      min_len: 8
+      max_len: 64
+    char_class:
+      max_lower_pct: 80
+      min_window_len: 16
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse");
+    let cc = rules[0]
+        .char_class
+        .as_ref()
+        .expect("explicit char_class should be present");
+    assert_eq!(
+        cc.max_lower_pct, 80,
+        "explicit value should be preserved, not overridden"
+    );
+    assert_eq!(
+        cc.min_window_len, 16,
+        "explicit value should be preserved, not overridden"
+    );
+}
+
+#[test]
+fn char_class_null_in_yaml_is_equivalent_to_absent() {
+    // Verify that `char_class: null` and absent `char_class` both trigger
+    // auto-enable for high-entropy rules. In serde YAML, `null` and absent
+    // both deserialize to `None` for `Option<T>` with `#[serde(default)]`.
+    // This is standard YAML/serde semantics, not a bug.
+    let yaml_with_null = r#"
+rules:
+  - name: "cc-null"
+    regex: 'tok_[a-zA-Z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    char_class: null
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 8
+      max_len: 64
+"#;
+    let yaml_absent = r#"
+rules:
+  - name: "cc-absent"
+    regex: 'tok_[a-zA-Z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 8
+      max_len: 64
+"#;
+    let with_null = parse_yaml_rules(yaml_with_null).expect("parse null");
+    let absent = parse_yaml_rules(yaml_absent).expect("parse absent");
+
+    // Both should have auto-enabled char_class with identical defaults.
+    let cc_null = with_null[0]
+        .char_class
+        .as_ref()
+        .expect("null should auto-enable");
+    let cc_absent = absent[0]
+        .char_class
+        .as_ref()
+        .expect("absent should auto-enable");
+    assert_eq!(cc_null.max_lower_pct, cc_absent.max_lower_pct);
+    assert_eq!(cc_null.min_window_len, cc_absent.min_window_len);
 }

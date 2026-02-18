@@ -321,7 +321,7 @@ classDiagram
   suppressed finding is never inserted, so `findings`, `norm_hashes`, and
   `drop_hint_end` stay aligned 1:1 without a post-scan compaction pass.
 - Offline validation runs inline at finding emission time in `window_validate`
-  as Gate 11. Each root-semantic finding (parent `step_id == STEP_ROOT`) whose
+  as Gate 12. Each root-semantic finding (parent `step_id == STEP_ROOT`) whose
   rule has an `OfflineValidationSpec` gate is checked against the extracted
   secret bytes. `Valid` and `Indeterminate` verdicts keep the finding;
   `Invalid` suppresses it before the finding occupies a cap slot. Non-root
