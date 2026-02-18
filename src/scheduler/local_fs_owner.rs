@@ -714,7 +714,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// │                        process_file() flow                         │
 /// └────────────────────────────────────────────────────────────────────┘
 ///
-/// ext/lock skip? ──skip──► return (binary_skipped++)
+/// ext/lock skip? ──skip──► return (ext_skipped++ / lock_skipped++)
 ///       │
 ///      pass
 ///       ▼
@@ -784,21 +784,18 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     //
     // Ordering: extension check first (cheap u64 binary search on the packed
     // table), then lock-file check (linear scan of short filename table).
-    // Both increment `binary_skipped` — a single counter that tracks all
-    // pre-content-probe exclusions regardless of reason.
+    // Each path increments its own counter (`ext_skipped` / `lock_skipped`)
+    // so callers can distinguish the skip reason.
     if skip_binary {
         if let Some(ext_os) = task.path.extension() {
             let ext = ext_os.as_encoded_bytes();
             if crate::git_scan::path_policy::ext_in_skip_set(ext) {
-                // TODO(consistency): wrapping_add here vs saturating_add elsewhere in
-                // process_file (io_errors, chunks_scanned, bytes_scanned). Both are
-                // equivalent for u64, but the inconsistency is worth normalizing.
-                ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                ctx.metrics.ext_skipped = ctx.metrics.ext_skipped.saturating_add(1);
                 return;
             }
         }
         if crate::git_scan::path_policy::is_lock_filename(path_bytes) {
-            ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+            ctx.metrics.lock_skipped = ctx.metrics.lock_skipped.saturating_add(1);
             return;
         }
     }
@@ -906,7 +903,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         );
         match verdict {
             crate::content_policy::ContentVerdict::Binary => {
-                ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.wrapping_add(1);
+                ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.saturating_add(1);
                 return;
             }
             crate::content_policy::ContentVerdict::BinaryExtractable(fmt) => {

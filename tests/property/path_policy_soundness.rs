@@ -12,6 +12,7 @@
 //! - `classify_path` is deterministic and UNKNOWN is exclusive.
 
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
 use proptest::prelude::*;
 
@@ -235,6 +236,8 @@ fn reference_skip_set() -> HashSet<Vec<u8>> {
     known.iter().map(|e| e.to_vec()).collect()
 }
 
+static REFERENCE_SET: LazyLock<HashSet<Vec<u8>>> = LazyLock::new(reference_skip_set);
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
@@ -252,7 +255,7 @@ proptest! {
             0..=12
         )
     ) {
-        let reference = reference_skip_set();
+        let reference = &*REFERENCE_SET;
         let lower: Vec<u8> = ext.iter().map(|b| b.to_ascii_lowercase()).collect();
         let expected = reference.contains(&lower);
         let actual = ext_in_skip_set(&ext);

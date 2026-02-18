@@ -330,9 +330,12 @@ pub struct WorkerMetricsLocal {
     pub persist_ns: u64,
     /// Times worker yielded to OS scheduler (TieredIdle yield path).
     pub yield_count: u64,
-    /// Files skipped due to binary content probe, pre-open extension match,
-    /// or lock-file filename match.
+    /// Files skipped because content probe detected binary data (NUL byte heuristic).
     pub binary_skipped: u64,
+    /// Files skipped pre-open because extension matched the binary skip set.
+    pub ext_skipped: u64,
+    /// Files skipped pre-open because filename matched the lock-file table.
+    pub lock_skipped: u64,
     /// Files where text was extracted from a known binary format.
     pub binary_extracted: u64,
 
@@ -376,6 +379,8 @@ impl WorkerMetricsLocal {
             persist_ns: 0,
             yield_count: 0,
             binary_skipped: 0,
+            ext_skipped: 0,
+            lock_skipped: 0,
             binary_extracted: 0,
             queue_time_ns: Log2Hist::new(),
             task_time_ns: Log2Hist::new(),
@@ -478,9 +483,12 @@ pub struct MetricsSnapshot {
     pub findings_dropped: u64,
     /// Total persistence batch emission failures.
     pub persistence_emit_failures: u64,
-    /// Total files skipped due to binary content probe, pre-open extension
-    /// match, or lock-file filename match.
+    /// Total files skipped because content probe detected binary data (NUL byte heuristic).
     pub binary_skipped: u64,
+    /// Total files skipped pre-open because extension matched the binary skip set.
+    pub ext_skipped: u64,
+    /// Total files skipped pre-open because filename matched the lock-file table.
+    pub lock_skipped: u64,
     /// Total files where text was extracted from a known binary format.
     pub binary_extracted: u64,
     /// Aggregate archive scanning outcomes.
@@ -529,6 +537,8 @@ impl MetricsSnapshot {
             findings_dropped: 0,
             persistence_emit_failures: 0,
             binary_skipped: 0,
+            ext_skipped: 0,
+            lock_skipped: 0,
             binary_extracted: 0,
             archive: ArchiveStats::default(),
             open_stat_ns: 0,
@@ -564,6 +574,8 @@ impl MetricsSnapshot {
             .persistence_emit_failures
             .wrapping_add(w.persistence_emit_failures);
         self.binary_skipped = self.binary_skipped.wrapping_add(w.binary_skipped);
+        self.ext_skipped = self.ext_skipped.wrapping_add(w.ext_skipped);
+        self.lock_skipped = self.lock_skipped.wrapping_add(w.lock_skipped);
         self.binary_extracted = self.binary_extracted.wrapping_add(w.binary_extracted);
         self.worker_count = self.worker_count.wrapping_add(1);
 

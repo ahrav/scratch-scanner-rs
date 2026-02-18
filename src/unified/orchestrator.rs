@@ -347,7 +347,7 @@ fn run_fs(
     // Also write machine-readable stats to stderr for compatibility.
     let scanned_human = format_human_bytes(report.metrics.bytes_scanned);
     eprintln!(
-        "files={}\nchunks={}\nbytes={} ({})\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        "files={}\nchunks={}\nbytes={} ({})\nfindings={}\nerrors={}\ndropped_findings={}\npersist_emit_failures={}\npersist_incomplete={}\nbinary_skipped={}\next_skipped={}\nlock_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\npersist_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         report.stats.files_enqueued,
         report.metrics.chunks_scanned,
         report.metrics.bytes_scanned,
@@ -358,6 +358,8 @@ fn run_fs(
         report.stats.persistence_emit_failures,
         report.stats.persistence_incomplete,
         report.metrics.binary_skipped,
+        report.metrics.ext_skipped,
+        report.metrics.lock_skipped,
         report.metrics.binary_extracted,
         init_elapsed.as_millis(),
         scan_elapsed.as_millis(),
@@ -899,7 +901,7 @@ fn print_git_stderr_summary(
     let init_ms = total_elapsed.saturating_sub(scan_elapsed).as_millis();
     let scanned_human = format_human_bytes(common.bytes_scanned);
     eprintln!(
-        "objects={}\nchunks={}\nbytes={} ({})\nfindings={}\nerrors={}\nbinary_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
+        "objects={}\nchunks={}\nbytes={} ({})\nfindings={}\nerrors={}\nbinary_skipped={}\next_skipped={}\nlock_skipped={}\nbinary_extracted={}\ninit_ms={}\nscan_ms={}\nelapsed_ms={}\nthroughput_mib_s={:.2}\nworkers={}",
         common.objects_scanned,
         common.chunks_scanned,
         common.bytes_scanned,
@@ -907,6 +909,8 @@ fn print_git_stderr_summary(
         common.findings_emitted,
         errors,
         common.binary_skipped,
+        common.ext_skipped,
+        common.lock_skipped,
         common.binary_extracted,
         init_ms,
         scan_elapsed.as_millis(),

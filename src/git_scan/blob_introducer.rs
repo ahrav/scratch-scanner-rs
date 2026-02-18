@@ -525,15 +525,25 @@ pub struct BlobIntroducer {
     seen: SeenSets,
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
+    // TODO: This should be configurabled. We want to be able to scan
+    // binaries and also ignore certain file extensions.
+    /// When true, skip the extension-based nonscannable filter so that
+    /// binary-extension blobs reach the engine adapter for scanning.
+    scan_binary: bool,
 }
 
 impl BlobIntroducer {
     /// Creates a new blob introducer sized to the MIDX object count.
+    ///
+    /// When `scan_binary` is true the extension-based nonscannable filter is
+    /// disabled so that binary-extension blobs are emitted as candidates and
+    /// reach the engine adapter for content scanning.
     pub fn new(
         limits: &TreeDiffLimits,
         oid_len: u8,
         object_count: u32,
         max_loose_oids: u32,
+        scan_binary: bool,
     ) -> Self {
         assert!(
             oid_len == 20 || oid_len == 32,
@@ -552,6 +562,7 @@ impl BlobIntroducer {
             seen: SeenSets::new(object_count),
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
+            scan_binary,
         }
     }
 
@@ -722,7 +733,9 @@ impl BlobIntroducer {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    let excluded = class.is_nonscannable();
+                    // When scan_binary is set, honour the user's request to
+                    // scan binary blobs by skipping the extension-based filter.
+                    let excluded = !self.scan_binary && class.is_nonscannable();
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -849,6 +862,7 @@ struct BlobIntroWorker<'a> {
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
     abort: &'a AtomicBool,
+    scan_binary: bool,
 }
 
 impl<'a> BlobIntroWorker<'a> {
@@ -858,6 +872,7 @@ impl<'a> BlobIntroWorker<'a> {
         max_loose_oids: u32,
         seen: &'a AtomicSeenSets,
         abort: &'a AtomicBool,
+        scan_binary: bool,
     ) -> Self {
         Self {
             max_depth: limits.max_tree_depth,
@@ -873,6 +888,7 @@ impl<'a> BlobIntroWorker<'a> {
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             abort,
+            scan_binary,
         }
     }
 
@@ -1016,7 +1032,7 @@ impl<'a> BlobIntroWorker<'a> {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    let excluded = class.is_nonscannable();
+                    let excluded = !self.scan_binary && class.is_nonscannable();
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -1231,6 +1247,7 @@ pub(super) fn introduce_parallel<'a>(
                         per_worker_loose,
                         seen,
                         abort,
+                        config.engine_adapter.scan_binary,
                     );
 
                     // Claim and process chunks.

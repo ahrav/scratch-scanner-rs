@@ -498,9 +498,17 @@ fn cmp_lower_vs_input(reference: &[u8], input: &[u8]) -> Ordering {
 }
 
 /// Returns true if the filename portion of `path` matches a known lock file.
+///
+/// Handles both `/` (POSIX/git) and `\` (Windows) separators so this works
+/// for OS paths passed from the local-filesystem scanner as well as git paths.
 #[inline]
 pub fn is_lock_filename(path: &[u8]) -> bool {
-    is_lock_name(git_filename(path))
+    // Find the last separator of either kind.
+    let after_sep = match memchr::memrchr2(b'/', b'\\', path) {
+        Some(idx) => &path[idx + 1..],
+        None => path,
+    };
+    is_lock_name(after_sep)
 }
 
 // ---------------------------------------------------------------------------
@@ -748,9 +756,9 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------------------
-    // Regression: all 43 original BINARY_EXTS still classify as BINARY
+    // Common binary extensions must be in the skip set
     // ------------------------------------------------------------------
-    const OLD_BINARY_EXTS: &[&[u8]] = &[
+    const BINARY_EXTS_SAMPLE: &[&[u8]] = &[
         b"png", b"jpg", b"jpeg", b"gif", b"bmp", b"ico", b"tiff", b"webp", b"zip", b"gz", b"tgz",
         b"xz", b"bz2", b"7z", b"rar", b"tar", b"zst", b"pdf", b"doc", b"docx", b"ppt", b"pptx",
         b"xls", b"xlsx", b"mp3", b"wav", b"flac", b"ogg", b"mp4", b"mov", b"avi", b"mkv", b"woff",
@@ -758,11 +766,11 @@ mod tests {
     ];
 
     #[test]
-    fn old_binary_exts_still_binary() {
-        for ext in OLD_BINARY_EXTS {
+    fn common_binary_exts_in_skip_set() {
+        for ext in BINARY_EXTS_SAMPLE {
             assert!(
                 ext_in_skip_set(ext),
-                "old BINARY_EXT {:?} not in skip set",
+                "binary ext {:?} not in skip set",
                 core::str::from_utf8(ext).unwrap_or("??"),
             );
         }
@@ -888,6 +896,15 @@ mod tests {
         assert!(!is_lock_filename(b"main.rs"));
         assert!(!is_lock_filename(b""));
         assert!(!is_lock_filename(b"foo/"));
+    }
+
+    #[test]
+    fn lock_file_matches_backslash_paths() {
+        // Windows OS paths use backslash separators. is_lock_filename must
+        // extract the filename correctly even when the path uses `\`.
+        assert!(is_lock_filename(b"C:\\project\\Cargo.lock"));
+        assert!(is_lock_filename(b"src\\go.sum"));
+        assert!(is_lock_filename(b"deep\\nested\\dir\\Gemfile.lock"));
     }
 
     // ------------------------------------------------------------------
