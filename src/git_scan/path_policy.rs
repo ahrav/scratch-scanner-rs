@@ -9,7 +9,7 @@
 //! Binary extensions are stored in a sorted packed-u64 table for O(log n)
 //! lookup via binary search. Each extension (1–8 lowercase ASCII bytes) is
 //! packed big-endian into a `u64`, giving lexicographic numeric ordering.
-//! The table is `const`-constructable and fits in ~1.4 KB (L1-resident).
+//! The table is `const`-constructable and fits in ~1.3 KB (L1-resident).
 //!
 //! Lock files are matched by exact filename (after the last `/` separator)
 //! using a sorted `&[&[u8]]` table with case-insensitive binary search.
@@ -105,8 +105,8 @@ impl BitOrAssign for PathClass {
 ///
 /// MSB-first alignment ensures numeric ordering matches lexicographic byte
 /// ordering. The input MUST already be lowercase — this function does NOT
-/// normalize case. Extensions longer than 8 bytes return 0 (handled by the
-/// long-extension overflow table).
+/// normalize case. Empty extensions and extensions longer than 8 bytes
+/// return 0 (the latter are handled by the long-extension overflow table).
 ///
 /// ```text
 /// "png" → [0x70][0x6e][0x67][0x00][0x00][0x00][0x00][0x00] = 0x706e670000000000

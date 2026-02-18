@@ -9,9 +9,9 @@
 //!
 //! # Module Role
 //!
-//! This is the single local-filesystem scan path used by the scheduler. The
-//! module name is retained for historical reasons, but all local scan entry
-//! points (`scan_local`, `LocalConfig`, `LocalFile`) live here.
+//! This is the primary local-filesystem scan path used by the scheduler
+//! (an io_uring variant exists in `local_fs_uring.rs`). All local scan
+//! entry points (`scan_local`, `LocalConfig`, `LocalFile`) live here.
 //!
 //! # Why Blocking Reads First?
 //!
@@ -21,7 +21,7 @@
 //!
 //! # Correctness Invariants
 //!
-//! - **Work-conserving**: Every discovered file is scanned (blocking buffer acquire)
+//! - **Work-conserving**: Every discovered file is scanned (`CountBudget` backpressure ensures buffer availability)
 //! - **Chunk overlap**: `engine.required_overlap()` bytes overlap between chunks
 //! - **Budget bounded**: `max_in_flight_objects` limits discovered-but-not-complete files
 //! - **Buffer bounded**: `pool_buffers` limits peak memory
@@ -38,7 +38,7 @@
 //! # I/O Pattern: Overlap Carry
 //!
 //! Instead of seeking back for each chunk's overlap:
-//! 1. Acquire ONE buffer per file (blocking)
+//! 1. Acquire ONE buffer per file (panics if exhausted; `CountBudget` prevents this)
 //! 2. Read sequentially, carry overlap bytes forward via `copy_within`
 //! 3. Eliminates: seeks, re-reading overlap from kernel, per-chunk pool churn
 //!
@@ -264,7 +264,7 @@ pub struct LocalFile {
 
 /// Iterator over files to scan.
 ///
-/// This is a simple wrapper; real implementations would walk directories,
+/// This is a minimal trait; real implementations would walk directories,
 /// filter by extension, respect gitignore, etc.
 pub trait FileSource: Send + 'static {
     /// Get the next file to scan, if any.
@@ -486,7 +486,9 @@ impl<const N: usize> std::fmt::Write for StackMsg<N> {
 ///
 /// `Vec::dedup_by` only removes *adjacent* duplicates. Sorting brings
 /// identical findings together, ensuring all duplicates are removed.
-/// The sort key ordering also provides stable, deterministic output ordering.
+/// The sort key ordering provides deterministic output ordering (the key
+/// covers all dedup fields, so instability of `sort_unstable_by_key` does
+/// not affect the post-dedup result).
 ///
 /// # When This Is Needed
 ///
@@ -694,7 +696,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 /// # Design: Sequential Read with Overlap Carry
 ///
 /// Instead of seeking back for each chunk's overlap, we:
-/// 1. Acquire ONE buffer for the entire file (blocking)
+/// 1. Acquire ONE buffer for the entire file (panics if exhausted; `CountBudget` prevents this)
 /// 2. Read sequentially, carrying overlap bytes forward via `copy_within`
 /// 3. No seeks, no re-reading overlap from kernel, no per-chunk pool churn
 ///

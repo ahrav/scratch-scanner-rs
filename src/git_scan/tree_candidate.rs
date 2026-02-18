@@ -69,7 +69,7 @@ pub struct CandidateContext {
     /// Candidate flags — [`PathClass`](super::path_policy::PathClass) bitflags
     /// produced by [`classify_path`](super::path_policy::classify_path).
     ///
-    /// Bits: test, vendor, generated, binary, source, unknown.
+    /// Bits: source, test, vendor, generated, binary, unknown, lock_file.
     pub cand_flags: u16,
     /// Path reference into the shared `ByteArena`.
     pub path_ref: ByteRef,
