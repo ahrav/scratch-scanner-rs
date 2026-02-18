@@ -742,6 +742,10 @@ mod tests {
         assert!(line.contains("\"start\":42"));
         assert!(line.contains("\"end\":80"));
         assert!(line.contains("\"rule\":\"aws-access-key\""));
+        assert!(
+            line.contains("\"confidence_score\":0"),
+            "zero confidence_score must appear in JSONL: {line}"
+        );
         assert!(!line.contains("commit_id"));
     }
 
@@ -1022,6 +1026,43 @@ mod tests {
         assert!(
             line.contains("\"confidence_score\":7"),
             "JSONL must contain confidence_score: {line}"
+        );
+    }
+
+    #[test]
+    fn negative_confidence_score_in_jsonl() {
+        // Mildly negative score.
+        let line = collect_jsonl(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/secret.rs",
+            start: 10,
+            end: 50,
+            rule_id: 1,
+            rule_name: "api-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: -3,
+        }));
+        assert!(
+            line.contains("\"confidence_score\":-3"),
+            "negative confidence_score must round-trip: {line}"
+        );
+
+        // Minimum i8 value.
+        let line = collect_jsonl(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/secret.rs",
+            start: 10,
+            end: 50,
+            rule_id: 1,
+            rule_name: "api-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: i8::MIN,
+        }));
+        assert!(
+            line.contains("\"confidence_score\":-128"),
+            "i8::MIN confidence_score must round-trip: {line}"
         );
     }
 }

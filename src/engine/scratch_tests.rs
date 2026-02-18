@@ -560,3 +560,57 @@ fn higher_confidence_wins_dedup() {
         "norm_hash should be updated to the higher-confidence finding's hash"
     );
 }
+
+#[test]
+fn higher_confidence_retained_on_reverse_insert() {
+    // Insert the HIGH-confidence finding first, then the low-confidence one.
+    // The dedup logic must keep the higher score even when it arrives first.
+    let engine = Engine::new(
+        vec![simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 1024);
+
+    let high = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: STEP_ROOT,
+        confidence_score: 7,
+    };
+    let low = FindingRec {
+        confidence_score: 3,
+        ..high
+    };
+
+    let hash_high = [0xBB; 32];
+    let hash_low = [0xAA; 32];
+
+    // High first, then low.
+    scratch.push_finding_with_drop_hint(high, hash_high, high.root_hint_end, high.dedupe_with_span);
+    scratch.push_finding_with_drop_hint(low, hash_low, low.root_hint_end, low.dedupe_with_span);
+
+    assert_eq!(
+        scratch.pending_findings_len(),
+        1,
+        "duplicate should not create a second finding"
+    );
+
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        findings[0].confidence_score, 7,
+        "higher confidence must be retained when inserted first"
+    );
+    assert_eq!(
+        hashes[0], hash_high,
+        "norm_hash must remain the high-confidence finding's hash"
+    );
+}
