@@ -86,6 +86,7 @@ mod window_validate;
 // Supporting modules
 mod helpers;
 mod safelist;
+mod simd_classify;
 mod transform;
 mod vectorscan_prefilter; // Vectorscan/Hyperscan prefilter DBs and FFI callbacks
 mod vs_cache; // On-disk cache for serialized Vectorscan databases
@@ -116,10 +117,39 @@ pub use core::{
 pub use hit_pool::BenchHitAccPool;
 #[cfg(feature = "bench")]
 pub use offline_validate::{
-    bench_offline_validate_aws_access_key, bench_offline_validate_sentry_org_token,
+    bench_offline_validate_aws_access_key, bench_offline_validate_pypi_token,
+    bench_offline_validate_sentry_org_token, bench_offline_validate_slack_token,
 };
+
+#[cfg(feature = "bench")]
+pub fn bench_classify_window(data: &[u8]) -> (u32, u32, u32, u32) {
+    let p = simd_classify::classify_window(data);
+    (p.lower, p.upper, p.digit, p.special)
+}
 
 #[cfg(feature = "tiger-harness")]
 pub use hit_pool::FuzzHitAccPool;
 #[cfg(feature = "tiger-harness")]
 pub use vs_cache::fuzz_try_load;
+
+/// Fuzz entry point: classify `data` into (lower, upper, digit, special) counts.
+///
+/// Wraps [`simd_classify::classify_window`] and returns a tuple to avoid
+/// leaking the `pub(crate)` [`simd_classify::CharClassProfile`] type.
+#[cfg(feature = "tiger-harness")]
+pub fn fuzz_classify_window(data: &[u8]) -> (u32, u32, u32, u32) {
+    let p = simd_classify::classify_window(data);
+    (p.lower, p.upper, p.digit, p.special)
+}
+
+/// Fuzz entry point: run offline validation for `spec` on `secret` bytes.
+///
+/// Wraps [`offline_validate::validate`] to expose it to the fuzz harness
+/// through the `tiger-harness` feature gate.
+#[cfg(feature = "tiger-harness")]
+pub fn fuzz_offline_validate(
+    spec: crate::api::OfflineValidationSpec,
+    secret: &[u8],
+) -> crate::api::OfflineVerdict {
+    offline_validate::validate(spec, secret)
+}

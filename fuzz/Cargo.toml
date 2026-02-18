@@ -147,3 +147,17 @@ path = "fuzz_targets/fuzz_encode_pipeline.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_simd_classify"
+path = "fuzz_targets/fuzz_simd_classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_offline_validators"
+path = "fuzz_targets/fuzz_offline_validators.rs"
+test = false
+doc = false
+bench = false

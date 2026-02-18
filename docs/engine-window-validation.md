@@ -20,7 +20,7 @@ Two entry styles are supported:
 - **Coordinate space management**: Maintain separate coordinate systems for raw bytes, UTF-16 variants, and decoded UTF-8 output
 - **Budget enforcement**: Track and limit UTF-16 decoding resource consumption
 - **Finding extraction**: Record matches with proper span information and secret data extraction
-- **Entropy validation**: Gate findings on Shannon entropy of extracted secret bytes
+- **Entropy validation**: Gate findings on Shannon entropy and optional min-entropy (NIST SP 800-90B) of extracted secret bytes
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
 - **Emit-time policy checks**: Apply root safelist suppression and offline structural validation before recording findings
 
@@ -39,21 +39,23 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 3] Apply assignment-shape precheck (if rule-specific)
   ↓
-[Gate 4] Run regex with capture groups
+[Gate 4] Apply character-class distribution gate (SIMD-accelerated, when configured)
   ↓
-[Gate 5] Extract secret span from capture groups
+[Gate 5] Run regex with capture groups
   ↓
-[Gate 6] Check entropy on extracted secret
+[Gate 6] Extract secret span from capture groups
   ↓
-[Gate 7] Apply value suppressors on extracted secret bytes (when configured)
+[Gate 7] Check entropy on extracted secret (Shannon + optional min-entropy)
   ↓
-[Gate 8] Apply local context checks (bounded, fail-open)
+[Gate 8] Apply value suppressors on extracted secret bytes (when configured)
   ↓
-[Gate 9] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
+[Gate 9] Apply local context checks (bounded, fail-open)
   ↓
-[Gate 10] Apply secret-bytes safelist suppression (all findings, including decoded)
+[Gate 10] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
   ↓
-[Gate 11] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+[Gate 11] Apply secret-bytes safelist suppression (all findings, including decoded)
+  ↓
+[Gate 12] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -207,7 +209,27 @@ if rule.needs_assignment_shape_check() && !has_assignment_value_shape(window) {
 
 **When enabled**: When the rule regex expects an assignment-like structure.
 
-### 5. Value Suppressor Gate
+### 5. Character-Class Distribution Gate
+
+```rust
+if let Some(cc) = gates.char_class {
+    if !char_class_gate_passes(window, cc) {
+        return;
+    }
+}
+```
+
+**Purpose**: Reject windows dominated by lowercase ASCII (prose, variable names) that cannot be high-entropy secrets.
+
+**Algorithm**: SIMD-accelerated byte classification (NEON on aarch64, SSE2 on x86_64) counts lowercase/uppercase/digit/special bytes. If `lower_count * 100 > total * max_lower_pct`, the window is rejected. Integer cross-multiply avoids float division on the hot path.
+
+**Fail-open**: Windows shorter than `min_window_len` pass unconditionally. This is intentional: the char_class gate is a false-positive filter, not a security boundary. Failing open on short windows prevents suppressing true positives whose windows happen to be narrow. The default `min_window_len >= 16` ensures the gate only activates when there are enough bytes for statistically meaningful class proportions.
+
+**When enabled**: Rules with `char_class` configured, or auto-enabled for entropy-gated rules with `min_bits_per_byte >= 3.0` (defaults: `max_lower_pct: 95`, `min_window_len: 32`).
+
+**Performance**: O(window.len()) with 16-byte SIMD throughput. Runs before the regex to eliminate ~5–15% of windows cheaply.
+
+### 6. Value Suppressor Gate (Post-Match)
 
 ```rust
 if let Some(vs) = value_suppressors {
@@ -227,7 +249,7 @@ if let Some(vs) = value_suppressors {
 
 **Use case**: Suppressing well-known test/example values that structurally resemble real secrets.
 
-### 6. Local Context Gate (Design A)
+### 7. Local Context Gate (Post-Match)
 
 Local context gates run **after** regex matching and secret extraction. They
 inspect a bounded lookaround slice (same line) to validate micro-context such as
@@ -240,7 +262,7 @@ assignment separators, quoting, or key-name hints. These checks are:
 Local context gates are rule-selective and opt-in via rule config.
 They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
-### 7. Emit-Time Safelist Suppression
+### 8. Emit-Time Safelist Suppression
 
 Emit-time safelist operates in two tiers:
 
@@ -270,7 +292,7 @@ segments (e.g., `key-null-safety-9xK2mB`).
 - Context-anchored patterns and short substrings (e.g., "mock") that risk
   false suppression of real secrets are excluded from this tier.
 
-### 8. Offline Structural Validation
+### 9. Offline Structural Validation
 
 After safelist suppression, findings for rules with an `offline_validation`
 gate are checked by `offline_validation_suppresses()`. This runs inline at
@@ -369,7 +391,17 @@ let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
 
 ## Entropy Checking: entropy_gate_passes Implementation
 
-Entropy gating filters matches based on Shannon entropy of the extracted secret bytes, eliminating highly repetitive or structured tokens that are unlikely to be credentials.
+Entropy gating filters matches based on two complementary metrics computed from
+the extracted secret bytes, eliminating tokens unlikely to be credentials:
+
+1. **Shannon entropy** (always checked): measures average information content.
+   Rejects highly repetitive or structured tokens (e.g., all-same-byte, sequential digits).
+2. **Min-entropy** (optional, per NIST SP 800-90B): measures worst-case predictability.
+   `H_inf = -log2(p_max) = log2(n) - log2(max_bin_count)`. Rejects distributions
+   where one byte value dominates even though the overall Shannon entropy looks moderate.
+
+Both metrics are computed in a single fused pass over the 256-bin histogram
+(`compute_entropy_metrics`), adding ~1 instruction per bin (cmov for max tracking).
 
 ### Invocation
 
@@ -381,29 +413,23 @@ let (secret_start, secret_end) = extract_secret_span_locs_raw(
 );
 let secret_bytes = &window[secret_start..secret_end];
 
-if let Some(ent) = entropy {
-    if !entropy_gate_passes(
-        &ent,
-        secret_bytes,
-        scratch.ensure_entropy_scratch(),
-        &self.entropy_log2,
-    ) {
-        continue;  // Skip to next match, not full return
-    }
-}
+let entropy_ok = post_match_entropy_passes(
+    entropy, secret_bytes, scratch, &self.entropy_log2,
+);
 ```
 
 ### Parameters
 
-- `ent`: Entropy threshold configuration (bits per byte, minimum token length, etc.)
+- `entropy`: Optional `EntropyCompiled` with Shannon threshold, min-entropy threshold, and length bounds
 - `secret_bytes`: The extracted secret bytes to evaluate
-- `entropy_scratch`: Mutable scratch space for frequency tables
+- `scratch`: Mutable scan scratch (provides entropy histogram scratch space)
 - `entropy_log2`: Pre-computed log2 lookup table for efficiency
 
 ### Behavior
 
 - Evaluates entropy on the **extracted secret** bytes, not the full regex match or window
-- Rejects matches with entropy below configured threshold
+- Shannon entropy is checked first (rejects ~80-90% of non-secrets)
+- Min-entropy is checked second when `min_entropy_bits_per_byte` is set
 - Matches shorter than configured minimum length automatically pass (entropy is noisy on tiny samples)
 - On failure, **continues to next match** (not an early return) via `continue`
 
@@ -642,8 +668,8 @@ Accounts for patterns with backward context or mid-match anchors. 64 bytes balan
 
 Gates progress from cheapest (memmem) to most expensive (regex), with slight
 variant-specific ordering:
-1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape
-2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape
+1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape -> char_class
+2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape -> char_class
 3. Regex: O(n x complexity)
 4. Post-match: secret extraction -> entropy -> value suppressors -> local context
 

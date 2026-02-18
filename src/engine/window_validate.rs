@@ -15,16 +15,18 @@
 //!    For UTF-16 variants, confirm-all and keywords run on raw bytes *before*
 //!    decode; must-contain runs on decoded UTF-8 *after* decode.
 //! 2. Apply assignment-shape precheck (when configured).
-//! 3. For UTF-16 variants, decode with per-window and total-output budgets.
-//! 4. Run regex with reusable capture locations to access capture groups.
-//! 5. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
-//! 6. Apply entropy gates on the *extracted secret*.
-//! 7. Apply value suppressors (when configured) on the extracted secret bytes.
-//! 8. Apply local context checks (when configured) on the secret span.
-//! 9. Apply root-context safelist suppression for root emit paths.
-//! 10. Apply secret-bytes safelist suppression (all findings, including decoded).
-//! 11. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 12. Record the finding with the extracted secret span.
+//! 3. Apply character-class distribution gate (when configured) — SIMD-accelerated
+//!    rejection of windows dominated by lowercase ASCII.
+//! 4. For UTF-16 variants, decode with per-window and total-output budgets.
+//! 5. Run regex with reusable capture locations to access capture groups.
+//! 6. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
+//! 7. Apply entropy gates on the *extracted secret*.
+//! 8. Apply value suppressors (when configured) on the extracted secret bytes.
+//! 9. Apply local context checks (when configured) on the secret span.
+//! 10. Apply root-context safelist suppression for root emit paths.
+//! 11. Apply secret-bytes safelist suppression (all findings, including decoded).
+//! 12. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 13. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -69,7 +71,8 @@ use super::helpers::{
     entropy_gate_passes, extract_secret_span_locs_raw, map_utf16_decoded_offset,
 };
 use super::rule_repr::{
-    ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCompiled, Variant,
+    CharClassCompiled, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns,
+    RuleCompiled, Variant,
 };
 use super::scratch::ScanScratch;
 
@@ -89,12 +92,13 @@ pub(super) struct ResolvedGates<'e> {
     pub(super) confirm_all: Option<&'e ConfirmAllCompiled>,
     pub(super) keywords: Option<&'e KeywordsCompiled>,
     pub(super) entropy: Option<EntropyCompiled>,
+    pub(super) char_class: Option<CharClassCompiled>,
     pub(super) value_suppressors: Option<&'e PackedPatterns>,
     pub(super) local_context: Option<LocalContextSpec>,
 }
 
 impl Engine {
-    /// Resolves the five per-window gates for a rule into stack-local references.
+    /// Resolves the six per-window gates for a rule into stack-local references.
     ///
     /// Called once per (rule, variant) pair in `scan_rules_on_buffer` and the
     /// `*_into` staging paths, then the result is passed into every
@@ -108,6 +112,7 @@ impl Engine {
             confirm_all: self.confirm_all_gate(rule.confirm_all),
             keywords: self.keyword_gate(rule.keywords),
             entropy: self.entropy_gate(rule.entropy),
+            char_class: self.char_class_gate(rule.char_class),
             value_suppressors: self.value_suppressor_gate(rule.value_suppressors),
             local_context: self.local_context_gate(rule.local_context),
         }
@@ -238,6 +243,34 @@ fn has_assignment_value_shape(window: &[u8]) -> bool {
     // variable names or config values, not secrets. This threshold was chosen to
     // reject noise without risking false negatives on real API keys/tokens.
     token_len >= 10
+}
+
+/// Character-class distribution pre-filter: rejects windows dominated by
+/// lowercase ASCII (e.g. prose, English variable names) that cannot be
+/// high-entropy secrets.
+///
+/// Fails open for windows shorter than `spec.min_window_len` to avoid false
+/// negatives on short matches. Uses integer cross-multiply to avoid float
+/// division on the hot path.
+///
+/// # Design trade-off
+///
+/// This gate runs on the **full window**, not the extracted secret bytes.
+/// The entropy gate, by contrast, runs post-extraction on secret bytes only.
+/// Running char_class pre-regex avoids the regex cost entirely for prose
+/// windows, but surrounding context (e.g., `password=`) contributes to the
+/// classification. The generous default (`max_lower_pct: 95`) accommodates
+/// this dilution.
+#[inline]
+fn char_class_gate_passes(window: &[u8], spec: CharClassCompiled) -> bool {
+    if window.len() < spec.min_window_len as usize {
+        return true; // fail-open for short windows
+    }
+    let profile = super::simd_classify::classify_window(window);
+    // Integer cross-multiply avoids f32 division:
+    // lower / total <= max_lower_pct / 100  ⟺  lower * 100 <= total * max_lower_pct
+    // Use u64 throughout to avoid u32 truncation on the (theoretical) >4 GiB path.
+    (profile.lower as u64) * 100 <= (window.len() as u64) * (spec.max_lower_pct as u64)
 }
 
 /// Returns the `(line_start, line_end)` byte offsets of the line containing
@@ -377,6 +410,26 @@ fn local_context_passes(
     true
 }
 
+/// Evaluates all entropy-family gates on extracted secret bytes.
+///
+/// Returns `true` if the candidate passes (entropy is high enough or no gate configured).
+/// Wraps the `if let Some / else true` pattern duplicated at each call site.
+#[inline]
+fn post_match_entropy_passes(
+    entropy: Option<EntropyCompiled>,
+    secret_bytes: &[u8],
+    scratch: &mut ScanScratch,
+    entropy_log2: &[f32],
+) -> bool {
+    let Some(ent) = entropy else { return true };
+    entropy_gate_passes(
+        &ent,
+        secret_bytes,
+        scratch.ensure_entropy_scratch(),
+        entropy_log2,
+    )
+}
+
 impl Engine {
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
@@ -447,6 +500,14 @@ impl Engine {
                     return;
                 }
 
+                // Character-class distribution gate: reject windows dominated by
+                // lowercase ASCII (prose, variable names) that cannot be secrets.
+                if let Some(cc) = gates.char_class {
+                    if !char_class_gate_passes(window, cc) {
+                        return;
+                    }
+                }
+
                 // Compute search start based on anchor hint with back-scan margin.
                 // Gates still run on full window for correctness, but regex starts near anchor.
                 let hint_in_window = anchor_hint.saturating_sub(w.start);
@@ -481,16 +542,12 @@ impl Engine {
                     let secret_end = search_start + secret_end;
                     let secret_bytes = &window[secret_start..secret_end];
 
-                    let entropy_ok = if let Some(ent) = entropy {
-                        entropy_gate_passes(
-                            &ent,
-                            secret_bytes,
-                            scratch.ensure_entropy_scratch(),
-                            &self.entropy_log2,
-                        )
-                    } else {
-                        true
-                    };
+                    let entropy_ok = post_match_entropy_passes(
+                        entropy,
+                        secret_bytes,
+                        scratch,
+                        &self.entropy_log2,
+                    );
 
                     if entropy_ok {
                         // Value suppressor gate: discard findings whose extracted
@@ -610,14 +667,16 @@ impl Engine {
     ///   decoded offsets back into raw UTF-16 bytes.
     ///
     /// # Behavior
-    /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
-    /// assignment-shape, regex, entropy, value suppressor, local context,
-    /// context-window safelist, secret-bytes safelist, offline validation) while
-    /// enforcing UTF-16 decode budgets. Context-window safelist suppression uses
-    /// the emitted finding step (`utf16_step_id`, checked as
-    /// `step_id == STEP_ROOT`); the secret-bytes safelist runs on all findings.
-    /// Offline validation uses the parent `step_id` so root-level UTF-16
-    /// findings are correctly identified as root-semantic.
+    /// Applies a gate sequence adapted for UTF-16: confirm-all and keywords run
+    /// on raw bytes (pre-decode), then must-contain, assignment-shape, and
+    /// char_class run on decoded bytes (post-decode), followed by regex, entropy,
+    /// value suppressor, local context, context-window safelist, secret-bytes
+    /// safelist, and offline validation. UTF-16 decode budgets are enforced.
+    /// Context-window safelist suppression uses the emitted finding step
+    /// (`utf16_step_id`, checked as `step_id == STEP_ROOT`); the secret-bytes
+    /// safelist runs on all findings. Offline validation uses the parent
+    /// `step_id` so root-level UTF-16 findings are correctly identified as
+    /// root-semantic.
     ///
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
@@ -723,6 +782,13 @@ impl Engine {
             return;
         }
 
+        // Character-class distribution gate on decoded bytes.
+        if let Some(cc) = gates.char_class {
+            if !char_class_gate_passes(decoded, cc) {
+                return;
+            }
+        }
+
         let endianness = match variant {
             Variant::Utf16Le => Utf16Endianness::Le,
             Variant::Utf16Be => Utf16Endianness::Be,
@@ -753,16 +819,8 @@ impl Engine {
                 extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
             let secret_bytes = &decoded[secret_start..secret_end];
 
-            let entropy_ok = if let Some(ent) = entropy {
-                entropy_gate_passes(
-                    &ent,
-                    secret_bytes,
-                    scratch.ensure_entropy_scratch(),
-                    &self.entropy_log2,
-                )
-            } else {
-                true
-            };
+            let entropy_ok =
+                post_match_entropy_passes(entropy, secret_bytes, scratch, &self.entropy_log2);
 
             if entropy_ok {
                 // Value suppressor gate (see raw-path comment for rationale).
@@ -905,6 +963,13 @@ impl Engine {
             return;
         }
 
+        // Character-class distribution gate.
+        if let Some(cc) = gates.char_class {
+            if !char_class_gate_passes(window, cc) {
+                return;
+            }
+        }
+
         // Compute search start based on anchor hint with back-scan margin.
         // Gates still run on full window for correctness, but regex starts near anchor.
         let hint_in_window = anchor_hint.saturating_sub(window_start) as usize;
@@ -933,16 +998,8 @@ impl Engine {
             let secret_end = search_start + secret_end;
             let secret_bytes = &window[secret_start..secret_end];
 
-            let entropy_ok = if let Some(ent) = entropy {
-                entropy_gate_passes(
-                    &ent,
-                    secret_bytes,
-                    scratch.ensure_entropy_scratch(),
-                    &self.entropy_log2,
-                )
-            } else {
-                true
-            };
+            let entropy_ok =
+                post_match_entropy_passes(entropy, secret_bytes, scratch, &self.entropy_log2);
 
             if entropy_ok {
                 // Value suppressor gate (see raw-path comment for rationale).
@@ -1130,6 +1187,13 @@ impl Engine {
             return;
         }
 
+        // Character-class distribution gate on decoded bytes.
+        if let Some(cc) = gates.char_class {
+            if !char_class_gate_passes(decoded, cc) {
+                return;
+            }
+        }
+
         let endianness = match variant {
             Variant::Utf16Le => Utf16Endianness::Le,
             Variant::Utf16Be => Utf16Endianness::Be,
@@ -1162,16 +1226,8 @@ impl Engine {
                 extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
             let secret_bytes = &decoded[secret_start..secret_end];
 
-            let entropy_ok = if let Some(ent) = entropy {
-                entropy_gate_passes(
-                    &ent,
-                    secret_bytes,
-                    scratch.ensure_entropy_scratch(),
-                    &self.entropy_log2,
-                )
-            } else {
-                true
-            };
+            let entropy_ok =
+                post_match_entropy_passes(entropy, secret_bytes, scratch, &self.entropy_log2);
 
             if entropy_ok {
                 // Value suppressor gate (see raw-path comment for rationale).

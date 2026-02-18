@@ -35,10 +35,27 @@ use std::sync::{LazyLock, Mutex};
 use serde::Deserialize;
 
 use crate::api::{
-    EntropySpec, LocalContextSpec, OfflineValidationSpec, RuleSpec, TwoPhaseSpec, ValidatorKind,
+    CharClassSpec, EntropySpec, LocalContextSpec, OfflineValidationSpec, RuleSpec, TwoPhaseSpec,
+    ValidatorKind,
 };
 
 use super::RulesError;
+
+// ---------------------------------------------------------------------------
+// Auto-enable char_class defaults
+// ---------------------------------------------------------------------------
+
+/// Minimum Shannon entropy threshold (bits/byte) for auto-enabling the
+/// character-class distribution gate. Rules at or above this threshold
+/// target high-entropy secrets (API keys, tokens); rules below it target
+/// passwords or low-entropy strings where the gate would cause false negatives.
+pub(crate) const AUTO_CHAR_CLASS_ENTROPY_THRESHOLD: f32 = 3.0;
+
+/// Default max-lowercase-percentage for auto-enabled char_class gates.
+pub(crate) const AUTO_CHAR_CLASS_MAX_LOWER_PCT: u8 = 95;
+
+/// Default minimum window length for auto-enabled char_class gates.
+pub(crate) const AUTO_CHAR_CLASS_MIN_WINDOW_LEN: u16 = 32;
 
 // ---------------------------------------------------------------------------
 // YAML serde types
@@ -88,6 +105,8 @@ pub(crate) struct YamlRule {
     #[serde(default)]
     pub entropy: Option<YamlEntropy>,
     #[serde(default)]
+    pub char_class: Option<YamlCharClass>,
+    #[serde(default)]
     pub two_phase: Option<YamlTwoPhase>,
     #[serde(default)]
     pub local_context: Option<YamlLocalContext>,
@@ -103,13 +122,29 @@ pub(crate) struct YamlRule {
 /// `min_bits_per_byte` bits of Shannon entropy per byte. Secrets shorter
 /// than `min_len` bypass the entropy check (noisy on small samples);
 /// secrets longer than `max_len` are evaluated on only the first
-/// `max_len` bytes.
+/// `max_len` bytes. An optional `min_entropy_bits_per_byte` adds a
+/// min-entropy (NIST SP 800-90B) gate that catches skewed distributions
+/// where one byte dominates even though Shannon entropy looks moderate.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
     pub min_bits_per_byte: f32,
     pub min_len: usize,
     pub max_len: usize,
+    #[serde(default)]
+    pub min_entropy_bits_per_byte: Option<f32>,
+}
+
+/// Character-class pre-filter gate parameters for a rule.
+///
+/// When present, scan windows whose byte composition exceeds `max_lower_pct`
+/// percent lowercase ASCII (`a`–`z`) **and** are at least `min_window_len`
+/// bytes long are rejected before the regex is applied.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(crate) struct YamlCharClass {
+    pub max_lower_pct: u8,
+    pub min_window_len: u16,
 }
 
 /// Two-phase scanning configuration.
@@ -161,6 +196,8 @@ pub(crate) struct YamlLocalContext {
 /// | `grafana_service_account`  | [`OfflineValidationSpec::GrafanaServiceAccount`] |
 /// | `aws_access_key`           | [`OfflineValidationSpec::AwsAccessKey`] |
 /// | `sentry_org_token`         | [`OfflineValidationSpec::SentryOrgToken`] |
+/// | `pypi_token`               | [`OfflineValidationSpec::PyPiToken`] |
+/// | `slack_token`              | [`OfflineValidationSpec::SlackToken`] |
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlOfflineValidation {
@@ -304,6 +341,8 @@ fn yaml_offline_to_spec(
         "grafana_service_account" => Ok(OfflineValidationSpec::GrafanaServiceAccount),
         "aws_access_key" => Ok(OfflineValidationSpec::AwsAccessKey),
         "sentry_org_token" => Ok(OfflineValidationSpec::SentryOrgToken),
+        "pypi_token" => Ok(OfflineValidationSpec::PyPiToken),
+        "slack_token" => Ok(OfflineValidationSpec::SlackToken),
         unknown => Err(RulesError::OfflineValidation {
             rule_name: rule_name.to_string(),
             message: format!("unknown offline_validation type '{unknown}'"),
@@ -337,6 +376,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             keywords_any,
             value_suppressors_any,
             entropy,
+            char_class,
             two_phase,
             local_context,
             offline_validation,
@@ -390,6 +430,35 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             min_bits_per_byte: e.min_bits_per_byte,
             min_len: e.min_len,
             max_len: e.max_len,
+            min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
+        });
+
+        let char_class = char_class.map(|cc| CharClassSpec {
+            max_lower_pct: cc.max_lower_pct,
+            min_window_len: cc.min_window_len,
+        });
+
+        // Auto-enable char_class for high-entropy rules that don't explicitly
+        // set it. Rules with entropy threshold >= 3.0 bits/byte are scanning
+        // for secrets (API keys, tokens), not passwords or low-entropy strings.
+        // Excludes ~6 low-entropy password rules (e.g. nuget-config-password
+        // at 1.0).
+        //
+        // Note: `char_class: null` in YAML deserializes to `None` (same as
+        // absent), so auto-enable fires for both. This is standard serde/YAML
+        // behavior. To opt out, set `char_class: { max_lower_pct: 100, min_window_len: 0 }`
+        // which effectively disables the gate.
+        let char_class = char_class.or_else(|| {
+            entropy.as_ref().and_then(|ent| {
+                if ent.min_bits_per_byte >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD {
+                    Some(CharClassSpec {
+                        max_lower_pct: AUTO_CHAR_CLASS_MAX_LOWER_PCT,
+                        min_window_len: AUTO_CHAR_CLASS_MIN_WINDOW_LEN,
+                    })
+                } else {
+                    None
+                }
+            })
         });
 
         let offline_validation = offline_validation
@@ -409,6 +478,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             keywords_any,
             value_suppressors_any,
             entropy,
+            char_class,
             local_context,
             offline_validation,
             secret_group,

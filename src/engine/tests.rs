@@ -15,6 +15,8 @@ use super::rule_repr::EntropyCompiled;
 use super::rule_repr::{utf16be_bytes, utf16le_bytes, PackedPatterns, Variant};
 #[cfg(feature = "stdx-proptest")]
 use super::scratch::EntropyScratch;
+#[cfg(feature = "stdx-proptest")]
+use super::simd_classify::classify_window;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::transform::find_url_spans_into;
 #[cfg(feature = "stdx-proptest")]
@@ -32,9 +34,9 @@ use crate::api::OfflineVerdict;
 #[cfg(feature = "stdx-proptest")]
 use crate::api::Tuning;
 use crate::api::{
-    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
-    OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness,
-    ValidatorKind, STEP_ROOT,
+    AnchorPolicy, CharClassSpec, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate,
+    LocalContextSpec, OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode,
+    Utf16Endianness, ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -181,6 +183,7 @@ fn norm_hash_deterministic_for_raw_matches() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -229,6 +232,7 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -275,6 +279,7 @@ fn local_context_gate_applies_in_base64_stream_decode() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -336,6 +341,7 @@ fn local_context_gate_filters_without_assignment_when_bounds_present() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -382,6 +388,7 @@ fn local_context_key_names_required_and_fail_open_when_out_of_range() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -658,6 +665,7 @@ fn zero_hit_url_plus_to_space_still_scans_transforms() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -721,6 +729,7 @@ fn base64_padding_in_root_hint() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -817,6 +826,7 @@ fn keyword_gate_filters_without_keyword() {
         keywords_any: Some(KEYWORDS),
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -850,6 +860,7 @@ fn derived_confirm_all_is_compiled() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -921,6 +932,7 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
         keywords_any: None,
         value_suppressors_any: Some(SUPPRESSORS),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -969,6 +981,7 @@ fn value_suppressor_filters_matching_secret_in_raw_path() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1002,6 +1015,7 @@ fn value_suppressor_passes_non_matching_secret_in_raw_path() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1035,6 +1049,7 @@ fn value_suppressor_any_match_filters_with_multiple_patterns() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"DUMMY", b"EXAMPLE"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1072,6 +1087,7 @@ fn value_suppressor_absent_does_not_change_behavior() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1105,6 +1121,7 @@ fn safelist_emit_time_filter_suppresses_root_finding() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1166,6 +1183,7 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1235,6 +1253,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1280,6 +1299,7 @@ fn safelist_suppression_does_not_consume_findings_cap() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1323,6 +1343,7 @@ fn max_findings_cap_applies_after_safelist_suppression() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1382,6 +1403,7 @@ fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1438,6 +1460,7 @@ fn safelist_emit_time_filter_drops_tail_root_finding() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1486,6 +1509,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             keywords_any: None,
             value_suppressors_any: None,
             entropy: None,
+            char_class: None,
             local_context: None,
             secret_group: None,
             offline_validation: None,
@@ -1501,6 +1525,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             keywords_any: None,
             value_suppressors_any: None,
             entropy: None,
+            char_class: None,
             local_context: None,
             secret_group: None,
             offline_validation: None,
@@ -1516,6 +1541,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             keywords_any: None,
             value_suppressors_any: None,
             entropy: None,
+            char_class: None,
             local_context: None,
             secret_group: None,
             offline_validation: None,
@@ -1552,6 +1578,7 @@ fn safelist_emit_time_filter_all_findings_suppressed() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1597,6 +1624,7 @@ fn safelist_suppressed_counter_resets_between_scans() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1645,6 +1673,7 @@ fn secret_bytes_safelist_suppresses_placeholder_when_context_is_clean() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1681,6 +1710,7 @@ fn secret_bytes_safelist_does_not_suppress_high_entropy_secret() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1719,6 +1749,7 @@ fn secret_bytes_safelist_suppresses_decoded_placeholder() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -1773,6 +1804,7 @@ fn secret_bytes_safelist_counter_resets_between_scans() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1824,6 +1856,7 @@ fn secret_bytes_safelist_suppressed_findings_dont_consume_cap() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1875,6 +1908,7 @@ fn secret_bytes_suppression_does_not_block_child_transforms() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1953,6 +1987,7 @@ fn secret_bytes_safelist_does_not_suppress_composite_secret_with_placeholder_seg
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -1989,6 +2024,7 @@ fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"ABCD"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2044,6 +2080,7 @@ fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"TOK"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(0),
         offline_validation: None,
@@ -2113,6 +2150,7 @@ fn value_suppressor_filters_in_chunked_scan_path() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2153,6 +2191,7 @@ fn value_suppressor_is_case_sensitive() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"example"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2189,6 +2228,7 @@ fn value_suppressor_works_with_full_match_fallback() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"TOK_AAAABBBB"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -2231,6 +2271,7 @@ fn value_suppressor_single_byte_pattern() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"X"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2279,6 +2320,7 @@ fn value_suppressor_targets_secret_group_not_full_match() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"KEY_"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2323,6 +2365,7 @@ fn value_suppressor_is_substring_match_not_exact() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"ABC"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2382,7 +2425,9 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
             min_bits_per_byte: 3.0,
             min_len: 8,
             max_len: 32,
+            min_entropy_bits_per_byte: None,
         }),
+        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -2445,6 +2490,7 @@ fn value_suppressor_direct_utf16_window() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"TOK"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(0),
         offline_validation: None,
@@ -2499,6 +2545,7 @@ fn multiple_rules_different_suppressors_are_independent() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"FOO"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2514,6 +2561,7 @@ fn multiple_rules_different_suppressors_are_independent() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"BAR"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2568,6 +2616,7 @@ fn value_suppressor_with_explicit_secret_group_0() {
         keywords_any: None,
         value_suppressors_any: Some(&[b"TOK_AAAABBBB"]),
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(0), // Explicit group 0 instead of None
         offline_validation: None,
@@ -2614,7 +2663,9 @@ fn entropy_gate_filters_low_entropy_matches() {
             min_bits_per_byte: 3.0,
             min_len: 8,
             max_len: 32,
+            min_entropy_bits_per_byte: None,
         }),
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -2652,6 +2703,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         min_bits_per_byte: 2.5,
         min_len: 4,
         max_len: 64,
+        min_entropy_bits_per_byte: None,
     });
 
     // --- (a) Reject: full match high entropy, secret zero entropy ----------
@@ -2666,6 +2718,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: entropy.clone(),
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2684,6 +2737,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: entropy.clone(),
+        char_class: None,
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
@@ -2731,6 +2785,7 @@ fn offline_validation_gate_pooled_round_trip() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: Some(OfflineValidationSpec::GithubFinegrainedPat),
@@ -2746,6 +2801,7 @@ fn offline_validation_gate_pooled_round_trip() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -2815,6 +2871,7 @@ fn crc32_rule(name: &'static str, with_ov: bool) -> RuleSpec {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: if with_ov {
@@ -2971,6 +3028,7 @@ fn secret_extraction_prefers_group1_over_full_match() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3014,6 +3072,7 @@ fn secret_extraction_uses_configured_secret_group() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(2), // Use group 2 instead of group 1
         offline_validation: None,
@@ -3059,6 +3118,7 @@ fn secret_extraction_falls_back_to_full_match_without_groups() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3105,6 +3165,7 @@ fn secret_extraction_skips_empty_group1() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3152,6 +3213,7 @@ fn secret_extraction_hash_consistency() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3206,6 +3268,7 @@ fn secret_extraction_utf16le_path() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3268,6 +3331,7 @@ fn local_context_gate_applies_in_utf16_path() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -3420,6 +3484,7 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3477,6 +3542,7 @@ fn secret_extraction_explicit_group0_overrides_group1() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(0), // Explicitly use full match
         offline_validation: None,
@@ -3521,6 +3587,7 @@ fn secret_extraction_empty_configured_group_falls_back() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(2), // Points to group 2 which can be empty
         offline_validation: None,
@@ -3567,6 +3634,7 @@ fn anchor_policy_prefers_derived_over_manual() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3598,6 +3666,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -3917,6 +3986,17 @@ fn scan_rules_reference(
                 Variant::Raw => {
                     for w in windows {
                         let window = &buf[w.clone()];
+                        // char_class gate: reject windows dominated by lowercase ASCII.
+                        if let Some(ref cc) = rule.char_class {
+                            if window.len() >= cc.min_window_len as usize {
+                                let profile = classify_window(window);
+                                if (profile.lower as u64) * 100
+                                    > (window.len() as u64) * (cc.max_lower_pct as u64)
+                                {
+                                    continue;
+                                }
+                            }
+                        }
                         for caps in rule.re.captures_iter(window) {
                             // Extract secret span first so entropy is evaluated
                             // on the secret itself, not the full match (matches
@@ -3928,6 +4008,7 @@ fn scan_rules_reference(
                                     min_bits_per_byte: spec.min_bits_per_byte,
                                     min_len: spec.min_len,
                                     max_len: spec.max_len,
+                                    min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
                                 };
                                 let secret_bytes = &window[secret_start..secret_end];
                                 if !entropy_gate_passes(
@@ -4018,6 +4099,18 @@ fn scan_rules_reference(
                                 return found_any;
                             }
 
+                            // char_class gate on decoded bytes.
+                            if let Some(ref cc) = rule.char_class {
+                                if decoded.len() >= cc.min_window_len as usize {
+                                    let profile = classify_window(&decoded);
+                                    if (profile.lower as u64) * 100
+                                        > (decoded.len() as u64) * (cc.max_lower_pct as u64)
+                                    {
+                                        continue;
+                                    }
+                                }
+                            }
+
                             let parent_is_root = steps.is_empty();
                             let mut steps = steps.to_vec();
                             steps.push(StepKind::Utf16 {
@@ -4035,6 +4128,7 @@ fn scan_rules_reference(
                                         min_bits_per_byte: spec.min_bits_per_byte,
                                         min_len: spec.min_len,
                                         max_len: spec.max_len,
+                                        min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
                                     };
                                     let secret_bytes = &decoded[secret_start..secret_end];
                                     if !entropy_gate_passes(
@@ -4743,6 +4837,7 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -4784,6 +4879,7 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -4846,6 +4942,7 @@ fn utf16le_anchor_odd_offset_near_start_is_detected() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -4894,6 +4991,7 @@ fn utf16be_mixed_parity_anchors_find_both() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -4965,6 +5063,7 @@ fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5047,6 +5146,7 @@ fn test_chunked_scan_trailing_context_not_dropped() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: Some(1), // Capture group 1 is the secret
         offline_validation: None,
@@ -5417,6 +5517,7 @@ fn chunked_transform_root_hint_matches_reference() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5548,6 +5649,7 @@ fn chunked_url_percent_prefix_trigger_kept() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5605,6 +5707,7 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5690,6 +5793,7 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5771,6 +5875,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5894,6 +5999,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -5948,6 +6054,7 @@ fn stream_window_recovers_after_ring_eviction() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -6000,6 +6107,7 @@ fn stream_hit_cap_forces_full_fallback() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -6054,6 +6162,7 @@ fn stream_nested_span_fallback_recovers() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -6495,6 +6604,7 @@ fn offline_crc_rule() -> RuleSpec {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
@@ -6590,6 +6700,7 @@ fn offline_validation_mixed_valid_invalid_and_no_gate() {
         keywords_any: None,
         value_suppressors_any: None,
         entropy: None,
+        char_class: None,
         local_context: None,
         secret_group: None,
         offline_validation: None,
@@ -6811,6 +6922,121 @@ fn offline_invalid_does_not_consume_finding_cap_slot() {
         &hay[recs[0].span_start as usize..recs[0].span_end as usize],
         valid_tok.as_slice(),
         "the surviving finding should be the valid token, not the invalid one"
+    );
+}
+
+#[test]
+fn char_class_gate_rejects_all_lowercase() {
+    let rule = RuleSpec {
+        name: "cc-reject",
+        anchors: &[b"tok_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: Some(CharClassSpec {
+            max_lower_pct: 50,
+            min_window_len: 16,
+        }),
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"tok_([a-z]{20})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    // All-lowercase secret: "tok_" + 20 lowercase chars. Window will be >50% lowercase.
+    let hay = b"prefix tok_abcdefghijklmnopqrst suffix";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+    assert_eq!(
+        scratch.findings().len(),
+        0,
+        "char_class gate should reject all-lowercase window"
+    );
+}
+
+#[test]
+fn char_class_gate_passes_mixed_case() {
+    let rule = RuleSpec {
+        name: "cc-pass",
+        anchors: &[b"TOK_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: Some(CharClassSpec {
+            max_lower_pct: 50,
+            min_window_len: 16,
+        }),
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    // Mixed-case secret: upper+lower+digit. Window should pass the 50% lowercase gate.
+    let hay = b"PREFIX TOK_A1b2C3d4 SUFFIX";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+    assert!(
+        !scratch.findings().is_empty(),
+        "char_class gate should pass for mixed-case window"
+    );
+}
+
+#[test]
+fn char_class_gate_fail_open_short_window() {
+    let rule = RuleSpec {
+        name: "cc-failopen",
+        anchors: &[b"tok_"],
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: Some(CharClassSpec {
+            max_lower_pct: 50,
+            min_window_len: 128, // Very high min_window_len
+        }),
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"tok_([a-z]{8})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    // Short all-lowercase input — gate should fail-open because window < min_window_len.
+    let hay = b"tok_abcdefgh";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+    assert!(
+        !scratch.findings().is_empty(),
+        "char_class gate should fail-open on short window"
     );
 }
 

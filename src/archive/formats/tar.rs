@@ -239,12 +239,6 @@ impl TarCursor {
         }
     }
 
-    /// Backwards-compatible constructor (kept for call sites).
-    #[inline]
-    pub fn new(cfg: &ArchiveConfig) -> Self {
-        Self::with_capacity(cfg)
-    }
-
     /// Reset cursor state for reuse without allocating.
     #[inline]
     pub fn reset(&mut self) {
@@ -1011,7 +1005,7 @@ mod tests {
         let mut budgets = ArchiveBudgets::new(&cfg);
         budgets.enter_archive().unwrap();
 
-        let mut cursor = TarCursor::new(&cfg);
+        let mut cursor = TarCursor::with_capacity(&cfg);
         let mut input = io::Cursor::new(vec![0u8; 10]); // shorter than a header block
 
         match cursor.next_entry(&mut input, &mut budgets, &cfg) {

@@ -30,6 +30,7 @@ struct RuleCase {
     keywords_any: Option<Vec<String>>,
     value_suppressors_any: Option<Vec<String>>,
     entropy: Option<(u16, usize, usize)>,
+    char_class: Option<(u8, u16)>,
     two_phase: Option<(usize, usize, Vec<String>)>,
     local_context: Option<LocalContextCase>,
     secret_group: Option<u16>,
@@ -45,6 +46,12 @@ impl RuleCase {
             must_contain: self.must_contain.clone(),
             keywords_any: self.keywords_any.clone(),
             value_suppressors_any: self.value_suppressors_any.clone(),
+            char_class: self
+                .char_class
+                .map(|(max_lower_pct, min_window_len)| YamlCharClass {
+                    max_lower_pct,
+                    min_window_len,
+                }),
             entropy: self
                 .entropy
                 .as_ref()
@@ -52,6 +59,7 @@ impl RuleCase {
                     min_bits_per_byte: *bits_x10 as f32 / 10.0,
                     min_len: *min_len,
                     max_len: *max_len,
+                    min_entropy_bits_per_byte: None,
                 }),
             two_phase: self
                 .two_phase
@@ -191,6 +199,9 @@ fn arb_rule_case() -> impl Strategy<Value = RuleCase> {
                 keywords_any,
                 value_suppressors_any,
                 entropy,
+                // char_class defaults to None for proptest; auto-enable
+                // is tested separately in unit tests.
+                char_class: None,
                 two_phase,
                 local_context,
                 secret_group,
@@ -257,6 +268,25 @@ proptest! {
             }
             (None, None) => {}
             _ => panic!("entropy presence mismatch"),
+        }
+
+        // char_class: either explicit from the case, or auto-enabled when
+        // entropy >= 3.0 bits/byte.
+        let expect_auto_enable = case.char_class.is_none()
+            && case
+                .entropy
+                .is_some_and(|(bits_x10, _, _)| bits_x10 as f32 / 10.0 >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD);
+        match (&case.char_class, &rule.char_class) {
+            (Some((max_lower_pct, min_window_len)), Some(cc)) => {
+                prop_assert_eq!(cc.max_lower_pct, *max_lower_pct);
+                prop_assert_eq!(cc.min_window_len, *min_window_len);
+            }
+            (None, Some(cc)) if expect_auto_enable => {
+                prop_assert_eq!(cc.max_lower_pct, AUTO_CHAR_CLASS_MAX_LOWER_PCT);
+                prop_assert_eq!(cc.min_window_len, AUTO_CHAR_CLASS_MIN_WINDOW_LEN);
+            }
+            (None, None) if !expect_auto_enable => {}
+            _ => panic!("char_class presence mismatch"),
         }
 
         match (&case.two_phase, &rule.two_phase) {

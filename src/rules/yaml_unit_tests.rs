@@ -4,6 +4,23 @@ use crate::rules::builtin_rules;
 use crate::{demo_tuning, AnchorPolicy, Engine, Finding};
 use std::path::Path;
 
+/// Parse YAML → `RuleSpec` → `rulespec_to_yaml` → serialize → re-parse →
+/// assert `offline_validation` equality on each rule.
+fn assert_offline_validation_roundtrip(yaml: &str) {
+    let original = parse_yaml_rules(yaml).expect("parse");
+    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+    let file = YamlRulesFile { rules: yaml_rules };
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
+    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+    for (orig, reparsed) in original.iter().zip(parsed.iter()) {
+        assert_eq!(
+            orig.offline_validation, reparsed.offline_validation,
+            "round-trip mismatch for {}",
+            orig.name
+        );
+    }
+}
+
 /// Convert `RuleSpec` back to YAML intermediate type for round-trip testing.
 fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
     let anchors: Vec<String> = rule
@@ -37,6 +54,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         min_bits_per_byte: e.min_bits_per_byte,
         min_len: e.min_len,
         max_len: e.max_len,
+        min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
     });
 
     let two_phase = rule.two_phase.as_ref().map(|tp| YamlTwoPhase {
@@ -59,6 +77,11 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
                 .map(|k| String::from_utf8(k.to_vec()).expect("key_names should be ASCII"))
                 .collect()
         }),
+    });
+
+    let char_class = rule.char_class.map(|cc| YamlCharClass {
+        max_lower_pct: cc.max_lower_pct,
+        min_window_len: cc.min_window_len,
     });
 
     let offline_validation = rule.offline_validation.map(|ov| match ov {
@@ -96,6 +119,18 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
             payload_len: None,
             checksum_len: None,
         },
+        OfflineValidationSpec::PyPiToken => YamlOfflineValidation {
+            kind: "pypi_token".into(),
+            prefix_skip: None,
+            payload_len: None,
+            checksum_len: None,
+        },
+        OfflineValidationSpec::SlackToken => YamlOfflineValidation {
+            kind: "slack_token".into(),
+            prefix_skip: None,
+            payload_len: None,
+            checksum_len: None,
+        },
     });
 
     YamlRule {
@@ -107,6 +142,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         keywords_any,
         value_suppressors_any,
         entropy,
+        char_class,
         two_phase,
         local_context,
         offline_validation,
@@ -280,6 +316,24 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
             _ => panic!("local_context presence mismatch for {}", orig.name),
         }
 
+        // Char class.
+        match (orig.char_class, parsed.char_class) {
+            (Some(occ), Some(pcc)) => {
+                assert_eq!(
+                    occ.max_lower_pct, pcc.max_lower_pct,
+                    "char_class max_lower_pct mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    occ.min_window_len, pcc.min_window_len,
+                    "char_class min_window_len mismatch for {}",
+                    orig.name
+                );
+            }
+            (None, None) => {}
+            _ => panic!("char_class presence mismatch for {}", orig.name),
+        }
+
         // Offline validation.
         assert_eq!(
             orig.offline_validation, parsed.offline_validation,
@@ -379,6 +433,61 @@ fn deterministic_secret(state: &mut u64, len: usize) -> String {
         out.push(ALPHABET[idx] as char);
     }
     out
+}
+
+/// Shared loop logic for random-high-entropy suppressor tests.
+fn assert_random_high_entropy_not_suppressed(
+    rule_name: &str,
+    seed: u64,
+    distinct_min: usize,
+    secret_gen: &dyn Fn(&mut u64) -> String,
+    haystack_fmt: &dyn Fn(&str) -> String,
+) {
+    let rule = builtin_rule_by_name(rule_name);
+    let suppressors = rule
+        .value_suppressors_any
+        .unwrap_or_else(|| panic!("{rule_name} should have value suppressors"));
+    let suppressors: Vec<&str> = suppressors
+        .iter()
+        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
+        .collect();
+
+    let mut scan = make_rule_scanner(rule_name);
+    let mut state = seed;
+    let mut checked = 0usize;
+    for _ in 0..192 {
+        let secret = secret_gen(&mut state);
+        if suppressors.iter().any(|sup| {
+            secret
+                .to_ascii_lowercase()
+                .contains(&sup.to_ascii_lowercase())
+        }) {
+            continue;
+        }
+
+        let distinct = secret
+            .as_bytes()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<u8>>()
+            .len();
+        if distinct < distinct_min {
+            continue;
+        }
+
+        let hay = haystack_fmt(&secret);
+        let hits = scan(hay.as_bytes());
+        assert!(
+            has_rule_hit(&hits, rule_name),
+            "expected randomized secret '{secret}' to be reported for {rule_name}"
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 96,
+        "expected >=96 validated secrets for {rule_name}, got {checked}"
+    );
 }
 
 #[test]
@@ -565,74 +674,166 @@ fn structured_prefix_rules_keep_value_suppressors_unset() {
 }
 
 #[test]
-/// Regression: adafruit now carries the shared placeholder suppressor baseline.
-fn adafruit_api_key_suppresses_placeholder_value() {
-    let rule_name = "adafruit-api-key";
-    let hay = b"adafruit_token=exampleexampleexampleexampleabcd";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder adafruit API key to be suppressed"
-    );
-}
+fn suppressor_value_cases() {
+    // Each entry: (rule_name, haystack, expect_hit, label).
+    const CASES: &[(&str, &[u8], bool, &str)] = &[
+        // Formerly: adafruit_api_key_suppresses_placeholder_value
+        (
+            "adafruit-api-key",
+            b"adafruit_token=exampleexampleexampleexampleabcd",
+            false,
+            "placeholder adafruit API key should be suppressed",
+        ),
+        // Formerly: adafruit_api_key_allows_real_value
+        (
+            "adafruit-api-key",
+            b"adafruit_token=a8f2k9x7m4p1q6w3b5n0j4c9d2e7h6m1",
+            true,
+            "real-looking adafruit API key should be reported",
+        ),
+        // Formerly: heroku_api_key_suppresses_placeholder_uuid
+        (
+            "heroku-api-key",
+            b"heroku_key=00000000-0000-0000-0000-000000000000",
+            false,
+            "all-zeros placeholder UUID should be suppressed",
+        ),
+        // Formerly: heroku_api_key_allows_real_uuid
+        (
+            "heroku-api-key",
+            b"heroku_key=7e2f19c4-83d1-4a56-b7e9-1f3c8d2a5b60",
+            true,
+            "real-looking Heroku UUID should be reported",
+        ),
+        // Formerly: discord_client_secret_suppresses_placeholder_value
+        (
+            "discord-client-secret",
+            b"discord_app_key=exampleexampleexampleexampleabcd",
+            false,
+            "placeholder discord client secret should be suppressed",
+        ),
+        // Formerly: discord_client_secret_allows_real_value
+        (
+            "discord-client-secret",
+            b"discord_app_key=\"a8f2c9d7e4b1063895fa2d7c4e0b1a39\"",
+            true,
+            "real-looking discord client secret should be reported",
+        ),
+        // Formerly: generic_api_key_suppresses_placeholder_value
+        (
+            "generic-api-key",
+            b"API_KEY=YOUR_EXAMPLE_1",
+            false,
+            "placeholder API key should be suppressed",
+        ),
+        // Formerly: generic_api_key_allows_real_value
+        (
+            "generic-api-key",
+            b"API_KEY=a8f2k9x7m4p1q6w3",
+            true,
+            "real-looking API key should be reported",
+        ),
+        // Formerly: hashicorp_tf_password_suppresses_placeholder_value
+        (
+            "hashicorp-tf-password",
+            b"password = \"changeme123\"",
+            false,
+            "placeholder terraform password should be suppressed",
+        ),
+        // Formerly: hashicorp_tf_password_allows_real_value
+        (
+            "hashicorp-tf-password",
+            b"password = \"a8f2k9x7m4p1q6w3\"",
+            true,
+            "real-looking terraform password should be reported",
+        ),
+        // Formerly: hashicorp_tf_password_allows_real_value_with_password_substring
+        (
+            "hashicorp-tf-password",
+            b"password = \"prodpassword19\"",
+            true,
+            "terraform password containing 'password' should be reported",
+        ),
+        // Formerly: curl_auth_header_suppresses_placeholder_bearer_token
+        (
+            "curl-auth-header",
+            b"curl -H \"Authorization: Bearer YOUR_TOKEN_HERE\" https://api.example.com",
+            false,
+            "placeholder bearer token should be suppressed",
+        ),
+        // Formerly: curl_auth_header_allows_real_bearer_token
+        (
+            "curl-auth-header",
+            b"curl -H \"Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9\" https://api.internal",
+            true,
+            "real-looking bearer token should be reported",
+        ),
+        // Formerly: curl_auth_header_suppresses_placeholder_api_key
+        (
+            "curl-auth-header",
+            b"curl -H \"X-Api-Key: EXAMPLE_KEY_12345\" https://api.example.com",
+            false,
+            "placeholder X-Api-Key value should be suppressed",
+        ),
+        // Formerly: curl_auth_user_suppresses_placeholder_user_password
+        (
+            "curl-auth-user",
+            b"curl -u admin:changeme https://api.example.com",
+            false,
+            "placeholder user:password should be suppressed",
+        ),
+        // Formerly: curl_auth_user_allows_real_user_password
+        (
+            "curl-auth-user",
+            b"curl -u deploy_bot:a8f2k9x7m4p1q6w3 https://registry.internal",
+            true,
+            "real-looking curl -u credentials should be reported",
+        ),
+        // Formerly: curl_auth_user_allows_real_password_with_password_substring
+        (
+            "curl-auth-user",
+            b"curl -u deploy_bot:password1234 https://registry.internal",
+            true,
+            "curl -u credentials containing 'password' should be reported",
+        ),
+        // Formerly: curl_auth_user_suppresses_literal_password_example
+        (
+            "curl-auth-user",
+            b"curl -u 'user:password' https://api.example.com",
+            false,
+            "user:password literal example should be suppressed",
+        ),
+        // Formerly: atlassian_api_token_suppresses_placeholder_value
+        (
+            "atlassian-api-token",
+            b"JIRA_TOKEN=yourexampletokenabcd1234",
+            false,
+            "placeholder atlassian token should be suppressed",
+        ),
+        // Formerly: atlassian_api_token_allows_real_value
+        (
+            "atlassian-api-token",
+            b"JIRA_TOKEN=a8f2k9x7m4p1q6w3b5n0c1d2",
+            true,
+            "real-looking atlassian token should be reported",
+        ),
+        // Formerly: curl_auth_header_non_safelisted_url_does_not_suppress_real_token
+        (
+            "curl-auth-header",
+            br#"curl https://api.internal -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#,
+            true,
+            "non-safelisted URL must not suppress a real bearer token",
+        ),
+    ];
 
-#[test]
-fn adafruit_api_key_allows_real_value() {
-    let rule_name = "adafruit-api-key";
-    let hay = b"adafruit_token=a8f2k9x7m4p1q6w3b5n0j4c9d2e7h6m1";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking adafruit API key to be reported"
-    );
-}
-
-#[test]
-fn heroku_api_key_suppresses_placeholder_uuid() {
-    let rule_name = "heroku-api-key";
-    let hay = b"heroku_key=00000000-0000-0000-0000-000000000000";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected all-zeros placeholder UUID to be suppressed"
-    );
-}
-
-#[test]
-fn heroku_api_key_allows_real_uuid() {
-    let rule_name = "heroku-api-key";
-    let hay = b"heroku_key=7e2f19c4-83d1-4a56-b7e9-1f3c8d2a5b60";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking Heroku UUID to be reported"
-    );
-}
-
-#[test]
-fn discord_client_secret_suppresses_placeholder_value() {
-    let rule_name = "discord-client-secret";
-    // 32-char value containing "example" (suppressor substring).
-    // Uses "discord_app_key" to avoid triggering the global safelist on `secret[:=]`.
-    let hay = b"discord_app_key=exampleexampleexampleexampleabcd";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder discord client secret to be suppressed"
-    );
-}
-
-#[test]
-fn discord_client_secret_allows_real_value() {
-    let rule_name = "discord-client-secret";
-    // Use "discord_app_key" instead of "discord_secret" to avoid
-    // triggering the global safelist pattern `secret[:=]`.
-    let hay = b"discord_app_key=\"a8f2c9d7e4b1063895fa2d7c4e0b1a39\"";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking discord client secret to be reported"
-    );
+    for &(rule_name, hay, expect_hit, label) in CASES {
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert_eq!(
+            has_rule_hit(&hits, rule_name),
+            expect_hit,
+            "{rule_name}: {label}"
+        );
+    }
 }
 
 #[test]
@@ -652,6 +853,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
         "keywords_any",
         "value_suppressors_any",
         "entropy",
+        "char_class",
         "two_phase",
         "local_context",
         "offline_validation",
@@ -659,7 +861,12 @@ fn default_rules_yaml_has_no_unknown_fields() {
     ];
     let offline_validation_fields: &[&str] =
         &["type", "prefix_skip", "payload_len", "checksum_len"];
-    let entropy_fields: &[&str] = &["min_bits_per_byte", "min_len", "max_len"];
+    let entropy_fields: &[&str] = &[
+        "min_bits_per_byte",
+        "min_len",
+        "max_len",
+        "min_entropy_bits_per_byte",
+    ];
     let two_phase_fields: &[&str] = &["seed_radius", "full_radius", "confirm_any"];
     let local_ctx_fields: &[&str] = &[
         "lookbehind",
@@ -687,8 +894,10 @@ fn default_rules_yaml_has_no_unknown_fields() {
             );
         }
         // Check nested section fields.
+        let char_class_fields: &[&str] = &["max_lower_pct", "min_window_len"];
         let nested_sections: &[(&str, &[&str])] = &[
             ("entropy", entropy_fields),
+            ("char_class", char_class_fields),
             ("two_phase", two_phase_fields),
             ("local_context", local_ctx_fields),
             ("offline_validation", offline_validation_fields),
@@ -700,317 +909,74 @@ fn default_rules_yaml_has_no_unknown_fields() {
 }
 
 #[test]
-fn generic_api_key_suppresses_placeholder_value() {
-    let rule_name = "generic-api-key";
-    let hay = b"API_KEY=YOUR_EXAMPLE_1";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder API key to be suppressed"
+fn random_high_entropy_values_are_not_suppressed() {
+    // Formerly: generic_api_key_random_high_entropy_values_are_not_suppressed,
+    //           hashicorp_tf_password_random_high_entropy_values_are_not_suppressed,
+    //           atlassian_api_token_random_high_entropy_values_are_not_suppressed,
+    //           curl_auth_header_random_high_entropy_values_are_not_suppressed,
+    //           curl_auth_user_random_high_entropy_values_are_not_suppressed.
+
+    // generic-api-key: 24-char alphanumeric, distinct >= 8.
+    assert_random_high_entropy_not_suppressed(
+        "generic-api-key",
+        0x9E3779B97F4A7C15,
+        8,
+        &|state| deterministic_secret(state, 24),
+        &|secret| format!("API_KEY={secret}"),
     );
-}
 
-#[test]
-fn generic_api_key_allows_real_value() {
-    let rule_name = "generic-api-key";
-    let hay = b"API_KEY=a8f2k9x7m4p1q6w3";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking API key to be reported"
+    // hashicorp-tf-password: 12-char alphanumeric, distinct >= 6.
+    assert_random_high_entropy_not_suppressed(
+        "hashicorp-tf-password",
+        0xA5A5A5A5A5A5A5A5,
+        6,
+        &|state| deterministic_secret(state, 12),
+        &|secret| format!("password = \"{secret}\""),
     );
-}
 
-#[test]
-fn generic_api_key_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "generic-api-key";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("generic-api-key should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0x9E3779B97F4A7C15_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 24);
-        // Skip generated values that happen to contain a suppressor substring.
-        if suppressors.iter().any(|sup| secret.contains(sup)) {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 8 {
-            continue;
-        }
-
-        let hay = format!("API_KEY={secret}");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized secret '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized secrets, got {checked}"
-    );
-}
-
-#[test]
-fn hashicorp_tf_password_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "hashicorp-tf-password";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("hashicorp-tf-password should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xA5A5A5A5A5A5A5A5_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 12);
-        if suppressors
-            .iter()
-            .any(|sup| secret.to_lowercase().contains(&sup.to_lowercase()))
-        {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 6 {
-            continue;
-        }
-
-        let hay = format!("password = \"{secret}\"");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized terraform password '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized secrets, got {checked}"
-    );
-}
-
-#[test]
-fn atlassian_api_token_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "atlassian-api-token";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("atlassian-api-token should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    // The atlassian rule's group 1 expects [a-z0-9]{20}[a-f0-9]{4} — 24 lowercase hex-ish chars.
+    // atlassian-api-token: 20 [a-z0-9] + 4 [a-f0-9], distinct >= 6.
     let hex_alphabet: &[u8] = b"0123456789abcdef";
     let alnum_alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    assert_random_high_entropy_not_suppressed(
+        "atlassian-api-token",
+        0xCAFEBABEDEAD5678,
+        6,
+        &|state| {
+            let mut secret = String::with_capacity(24);
+            for _ in 0..20 {
+                let next = lcg_next(state);
+                secret.push(alnum_alphabet[(next % alnum_alphabet.len() as u64) as usize] as char);
+            }
+            for _ in 0..4 {
+                let next = lcg_next(state);
+                secret.push(hex_alphabet[(next % hex_alphabet.len() as u64) as usize] as char);
+            }
+            secret
+        },
+        &|secret| format!("JIRA_TOKEN={secret}"),
+    );
 
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xCAFEBABEDEAD5678_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        // Build a valid secret: 20 [a-z0-9] chars + 4 [a-f0-9] chars.
-        let mut secret = String::with_capacity(24);
-        for _ in 0..20 {
-            let next = lcg_next(&mut seed);
-            secret.push(alnum_alphabet[(next % alnum_alphabet.len() as u64) as usize] as char);
-        }
-        for _ in 0..4 {
-            let next = lcg_next(&mut seed);
-            secret.push(hex_alphabet[(next % hex_alphabet.len() as u64) as usize] as char);
-        }
+    // curl-auth-header: 24-char alphanumeric, distinct >= 8.
+    assert_random_high_entropy_not_suppressed(
+        "curl-auth-header",
+        0xDEADBEEFCAFEBABE,
+        8,
+        &|state| deterministic_secret(state, 24),
+        &|secret| format!("curl -H \"Authorization: Bearer {secret}\" https://api.internal"),
+    );
 
-        if suppressors
-            .iter()
-            .any(|sup| secret.to_lowercase().contains(&sup.to_lowercase()))
-        {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 6 {
-            continue;
-        }
-
-        let hay = format!("JIRA_TOKEN={secret}");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized atlassian token '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized secrets, got {checked}"
+    // curl-auth-user: 20-char alphanumeric, distinct >= 8.
+    assert_random_high_entropy_not_suppressed(
+        "curl-auth-user",
+        0xA5A5A5A5B4B4B4B4,
+        8,
+        &|state| deterministic_secret(state, 20),
+        &|secret| format!("curl -u deploy_svc:{secret} https://registry.internal"),
     );
 }
 
-#[test]
-fn hashicorp_tf_password_suppresses_placeholder_value() {
-    let rule_name = "hashicorp-tf-password";
-    let hay = br#"password = "changeme123""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder terraform password to be suppressed"
-    );
-}
-
-#[test]
-fn hashicorp_tf_password_allows_real_value() {
-    let rule_name = "hashicorp-tf-password";
-    let hay = br#"password = "a8f2k9x7m4p1q6w3""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking terraform password to be reported"
-    );
-}
-
-#[test]
-fn hashicorp_tf_password_allows_real_value_with_password_substring() {
-    let rule_name = "hashicorp-tf-password";
-    let hay = br#"password = "prodpassword19""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected terraform password containing 'password' to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_header_suppresses_placeholder_bearer_token() {
-    let rule_name = "curl-auth-header";
-    let hay = br#"curl -H "Authorization: Bearer YOUR_TOKEN_HERE" https://api.example.com"#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder bearer token to be suppressed"
-    );
-}
-
-#[test]
-fn curl_auth_header_allows_real_bearer_token() {
-    let rule_name = "curl-auth-header";
-    let hay = br#"curl -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9" https://api.internal"#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking bearer token to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_header_suppresses_placeholder_api_key() {
-    let rule_name = "curl-auth-header";
-    let hay = br#"curl -H "X-Api-Key: EXAMPLE_KEY_12345" https://api.example.com"#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder X-Api-Key value to be suppressed"
-    );
-}
-
-#[test]
-fn curl_auth_user_suppresses_placeholder_user_password() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u admin:changeme https://api.example.com";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder user:password to be suppressed"
-    );
-}
-
-#[test]
-fn curl_auth_user_allows_real_user_password() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u deploy_bot:a8f2k9x7m4p1q6w3 https://registry.internal";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking curl -u credentials to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_user_allows_real_password_with_password_substring() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u deploy_bot:password1234 https://registry.internal";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected curl -u credentials containing 'password' to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_user_suppresses_literal_password_example() {
-    let rule_name = "curl-auth-user";
-    let hay = b"curl -u 'user:password' https://api.example.com";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected user:password literal example to be suppressed"
-    );
-}
-
-/// Regression test for PR #43 review comment:
-/// Reviewer claimed URL text could trigger the "example" suppressor and
-/// hide a real bearer token. With emit-time safelist enabled, `example`
-/// hosts are intentionally suppressed; this test uses a non-safelisted
-/// host to keep value suppressor behavior isolated.
-#[test]
-fn curl_auth_header_non_safelisted_url_does_not_suppress_real_token() {
-    let rule_name = "curl-auth-header";
-    // Real token + non-safelisted URL should still be reported.
-    let hay = br#"curl https://api.internal -H "Authorization: Bearer a8f2k9x7m4p1q6w3b5n0j4c9""#;
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "non-safelisted URL must not suppress a real bearer token"
-    );
-}
-
-/// Regression test for PR #43 review comment:
-/// Reviewer claimed "password" was in hashicorp-tf-password's
-/// value_suppressors_any, which would suppress real passwords containing
-/// that substring. In fact, "password" is NOT a suppressor for this rule.
+/// "password" must not appear in hashicorp-tf-password's value_suppressors_any,
+/// as it would suppress real passwords containing that substring.
 #[test]
 fn hashicorp_tf_password_suppressors_do_not_include_password() {
     let rule = builtin_rule_by_name("hashicorp-tf-password");
@@ -1020,130 +986,6 @@ fn hashicorp_tf_password_suppressors_do_not_include_password() {
     assert!(
         !suppressors.iter().any(|s| s == b"password"),
         "literal 'password' must not be a value suppressor — it would cause false negatives"
-    );
-}
-
-#[test]
-fn atlassian_api_token_suppresses_placeholder_value() {
-    let rule_name = "atlassian-api-token";
-    let hay = b"JIRA_TOKEN=yourexampletokenabcd1234";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        !has_rule_hit(&hits, rule_name),
-        "expected placeholder atlassian token to be suppressed"
-    );
-}
-
-#[test]
-fn atlassian_api_token_allows_real_value() {
-    let rule_name = "atlassian-api-token";
-    let hay = b"JIRA_TOKEN=a8f2k9x7m4p1q6w3b5n0c1d2";
-    let hits = scan_single_builtin_rule(rule_name, hay);
-    assert!(
-        has_rule_hit(&hits, rule_name),
-        "expected real-looking atlassian token to be reported"
-    );
-}
-
-#[test]
-fn curl_auth_header_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "curl-auth-header";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("curl-auth-header should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xDEADBEEFCAFEBABE_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 24);
-        // Skip generated values that happen to contain a suppressor substring.
-        if suppressors.iter().any(|sup| {
-            secret
-                .to_ascii_lowercase()
-                .contains(&sup.to_ascii_lowercase())
-        }) {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 8 {
-            continue;
-        }
-
-        let hay = format!("curl -H \"Authorization: Bearer {secret}\" https://api.internal");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized bearer token '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized bearer tokens, got {checked}"
-    );
-}
-
-#[test]
-fn curl_auth_user_random_high_entropy_values_are_not_suppressed() {
-    let rule_name = "curl-auth-user";
-    let rule = builtin_rule_by_name(rule_name);
-    let suppressors = rule
-        .value_suppressors_any
-        .expect("curl-auth-user should have value suppressors");
-    let suppressors: Vec<&str> = suppressors
-        .iter()
-        .map(|s| std::str::from_utf8(s).expect("suppressor should be valid UTF-8"))
-        .collect();
-
-    let mut scan = make_rule_scanner(rule_name);
-    let mut seed = 0xA5A5A5A5B4B4B4B4_u64;
-    let mut checked = 0usize;
-    for _ in 0..192 {
-        let secret = deterministic_secret(&mut seed, 20);
-        // Skip generated values that happen to contain a suppressor substring.
-        if suppressors.iter().any(|sup| {
-            secret
-                .to_ascii_lowercase()
-                .contains(&sup.to_ascii_lowercase())
-        }) {
-            continue;
-        }
-
-        let distinct = secret
-            .as_bytes()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<u8>>()
-            .len();
-        if distinct < 8 {
-            continue;
-        }
-
-        let hay = format!("curl -u deploy_svc:{secret} https://registry.internal");
-        let hits = scan(hay.as_bytes());
-        assert!(
-            has_rule_hit(&hits, rule_name),
-            "expected randomized curl -u password '{secret}' to be reported"
-        );
-        checked += 1;
-    }
-
-    assert!(
-        checked >= 96,
-        "expected to validate at least 96 randomized curl -u passwords, got {checked}"
     );
 }
 
@@ -1388,100 +1230,57 @@ rules:
 // ---- offline_validation YAML parsing tests ----
 
 #[test]
-fn parse_offline_validation_crc32_base62() {
-    let yaml = r#"
-rules:
-  - name: "ov-crc32"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      prefix_skip: 4
-      payload_len: 30
-      checksum_len: 6
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse crc32_base62");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::Crc32Base62 {
-            prefix_skip: 4,
-            payload_len: 30,
-            checksum_len: 6,
-        })
-    );
-}
+fn parse_offline_validation_valid_types() {
+    // Formerly: parse_offline_validation_crc32_base62,
+    //           parse_offline_validation_github_fine_grained_pat,
+    //           parse_offline_validation_grafana_service_account,
+    //           parse_offline_validation_aws_access_key,
+    //           parse_offline_validation_sentry_org_token,
+    //           parse_offline_validation_pypi_token,
+    //           parse_offline_validation_slack_token.
+    let cases: &[(&str, OfflineValidationSpec)] = &[
+        (
+            "type: crc32_base62\n      prefix_skip: 4\n      payload_len: 30\n      checksum_len: 6",
+            OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 30,
+                checksum_len: 6,
+            },
+        ),
+        (
+            "type: github_fine_grained_pat",
+            OfflineValidationSpec::GithubFinegrainedPat,
+        ),
+        (
+            "type: grafana_service_account",
+            OfflineValidationSpec::GrafanaServiceAccount,
+        ),
+        (
+            "type: aws_access_key",
+            OfflineValidationSpec::AwsAccessKey,
+        ),
+        (
+            "type: sentry_org_token",
+            OfflineValidationSpec::SentryOrgToken,
+        ),
+        ("type: pypi_token", OfflineValidationSpec::PyPiToken),
+        ("type: slack_token", OfflineValidationSpec::SlackToken),
+    ];
 
-#[test]
-fn parse_offline_validation_github_fine_grained_pat() {
-    let yaml = r#"
-rules:
-  - name: "ov-ghpat"
-    regex: 'github_pat_[A-Za-z0-9_]{82}'
-    anchors: ["github_pat_"]
-    radius: 128
-    offline_validation:
-      type: github_fine_grained_pat
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse github_fine_grained_pat");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::GithubFinegrainedPat)
-    );
-}
-
-#[test]
-fn parse_offline_validation_grafana_service_account() {
-    let yaml = r#"
-rules:
-  - name: "ov-grafana"
-    regex: 'glsa_[A-Za-z0-9]{32}_[a-f0-9]{8}'
-    anchors: ["glsa_"]
-    radius: 64
-    offline_validation:
-      type: grafana_service_account
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse grafana_service_account");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::GrafanaServiceAccount)
-    );
-}
-
-#[test]
-fn parse_offline_validation_aws_access_key() {
-    let yaml = r#"
-rules:
-  - name: "ov-aws"
-    regex: 'AKIA[0-9A-Z]{16}'
-    anchors: ["AKIA"]
-    radius: 32
-    offline_validation:
-      type: aws_access_key
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse aws_access_key");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::AwsAccessKey)
-    );
-}
-
-#[test]
-fn parse_offline_validation_sentry_org_token() {
-    let yaml = r#"
-rules:
-  - name: "ov-sentry"
-    regex: 'sntrys_[A-Za-z0-9+/=]{64,}'
-    anchors: ["sntrys_"]
-    radius: 128
-    offline_validation:
-      type: sentry_org_token
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse sentry_org_token");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::SentryOrgToken)
-    );
+    for (ov_body, expected) in cases {
+        let yaml = format!(
+            "rules:\n  - name: \"ov-test\"\n    regex: 'tok_[a-z0-9]{{40}}'\n    \
+             anchors: [\"tok_\"]\n    radius: 64\n    offline_validation:\n      {ov_body}\n"
+        );
+        let rules = parse_yaml_rules(&yaml).unwrap_or_else(|e| {
+            panic!("parse failed for {ov_body}: {e}");
+        });
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(*expected),
+            "mismatch for {ov_body}"
+        );
+    }
 }
 
 #[test]
@@ -1521,83 +1320,58 @@ rules:
 }
 
 #[test]
-fn parse_offline_validation_crc32_missing_payload_len_fails() {
-    let yaml = r#"
-rules:
-  - name: "ov-incomplete"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      prefix_skip: 4
-      checksum_len: 6
-"#;
-    match parse_yaml_rules(yaml) {
-        Err(RulesError::OfflineValidation { rule_name, message }) => {
-            assert_eq!(rule_name, "ov-incomplete");
-            assert!(
-                message.contains("payload_len"),
-                "error should mention missing field: {message}"
-            );
+fn parse_offline_validation_crc32_missing_fields() {
+    // Formerly: parse_offline_validation_crc32_missing_payload_len_fails,
+    //           parse_offline_validation_crc32_missing_prefix_skip_fails,
+    //           parse_offline_validation_crc32_missing_checksum_len_fails.
+    let cases: &[(&str, &str, &str)] = &[
+        // (rule_name, present_fields, expected_missing_field)
+        (
+            "ov-incomplete",
+            "prefix_skip: 4\n      checksum_len: 6",
+            "payload_len",
+        ),
+        (
+            "ov-no-prefix",
+            "payload_len: 30\n      checksum_len: 6",
+            "prefix_skip",
+        ),
+        (
+            "ov-no-crc",
+            "prefix_skip: 4\n      payload_len: 30",
+            "checksum_len",
+        ),
+    ];
+
+    for &(rule_name, fields, expected_field) in cases {
+        let yaml = format!(
+            "rules:\n  - name: \"{rule_name}\"\n    regex: 'tok_[a-z0-9]{{40}}'\n    \
+             anchors: [\"tok_\"]\n    radius: 64\n    offline_validation:\n      \
+             type: crc32_base62\n      {fields}\n"
+        );
+        match parse_yaml_rules(&yaml) {
+            Err(RulesError::OfflineValidation {
+                rule_name: got_name,
+                message,
+            }) => {
+                assert_eq!(got_name, rule_name);
+                assert!(
+                    message.contains(expected_field),
+                    "error for {rule_name} should mention '{expected_field}': {message}"
+                );
+            }
+            other => panic!("expected OfflineValidation error for {rule_name}, got: {other:?}"),
         }
-        other => panic!("expected OfflineValidation error, got: {other:?}"),
     }
 }
 
 #[test]
-fn parse_offline_validation_crc32_missing_prefix_skip_fails() {
-    let yaml = r#"
-rules:
-  - name: "ov-no-prefix"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      payload_len: 30
-      checksum_len: 6
-"#;
-    match parse_yaml_rules(yaml) {
-        Err(RulesError::OfflineValidation { rule_name, message }) => {
-            assert_eq!(rule_name, "ov-no-prefix");
-            assert!(
-                message.contains("prefix_skip"),
-                "error should mention missing field: {message}"
-            );
-        }
-        other => panic!("expected OfflineValidation error, got: {other:?}"),
-    }
-}
-
-#[test]
-fn parse_offline_validation_crc32_missing_checksum_len_fails() {
-    let yaml = r#"
-rules:
-  - name: "ov-no-crc"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      prefix_skip: 4
-      payload_len: 30
-"#;
-    match parse_yaml_rules(yaml) {
-        Err(RulesError::OfflineValidation { rule_name, message }) => {
-            assert_eq!(rule_name, "ov-no-crc");
-            assert!(
-                message.contains("checksum_len"),
-                "error should mention missing field: {message}"
-            );
-        }
-        other => panic!("expected OfflineValidation error, got: {other:?}"),
-    }
-}
-
-#[test]
-fn roundtrip_offline_validation_crc32_base62() {
-    let yaml = r#"
+fn roundtrip_offline_validation_all_types() {
+    // Formerly: roundtrip_offline_validation_crc32_base62,
+    //           roundtrip_offline_validation_unit_variants,
+    //           roundtrip_offline_validation_pypi_and_slack.
+    assert_offline_validation_roundtrip(
+        r#"
 rules:
   - name: "rt-crc32"
     regex: 'tok_[a-z0-9]{40}'
@@ -1608,19 +1382,6 @@ rules:
       prefix_skip: 4
       payload_len: 30
       checksum_len: 6
-"#;
-    let original = parse_yaml_rules(yaml).expect("parse");
-    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
-    let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_norway::to_string(&file).expect("serialize");
-    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
-    assert_eq!(original[0].offline_validation, parsed[0].offline_validation);
-}
-
-#[test]
-fn roundtrip_offline_validation_unit_variants() {
-    let yaml = r#"
-rules:
   - name: "rt-ghpat"
     regex: 'github_pat_[A-Za-z0-9_]{82}'
     anchors: ["github_pat_"]
@@ -1645,20 +1406,20 @@ rules:
     radius: 128
     offline_validation:
       type: sentry_org_token
-"#;
-    let original = parse_yaml_rules(yaml).expect("parse");
-    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
-    let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_norway::to_string(&file).expect("serialize");
-    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
-
-    for (orig, reparsed) in original.iter().zip(parsed.iter()) {
-        assert_eq!(
-            orig.offline_validation, reparsed.offline_validation,
-            "round-trip mismatch for {}",
-            orig.name
-        );
-    }
+  - name: "rt-pypi"
+    regex: 'pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}'
+    anchors: ["pypi-ageichlwas5vcmc"]
+    radius: 1064
+    offline_validation:
+      type: pypi_token
+  - name: "rt-slack"
+    regex: 'xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*'
+    anchors: ["xoxb"]
+    radius: 2048
+    offline_validation:
+      type: slack_token
+"#,
+    );
 }
 
 // ---- default_rules.yaml offline validation spec assertions ----
@@ -1710,6 +1471,37 @@ fn default_rules_offline_validation_specs() {
     assert_eq!(
         find("sentry-org-token").offline_validation,
         Some(OfflineValidationSpec::SentryOrgToken),
+    );
+
+    // PyPI upload token.
+    assert_eq!(
+        find("pypi-upload-token").offline_validation,
+        Some(OfflineValidationSpec::PyPiToken),
+    );
+
+    // Slack token rules (8 rules, excluding slack-webhook-url).
+    for rule_name in [
+        "slack-app-token",
+        "slack-bot-token",
+        "slack-config-access-token",
+        "slack-config-refresh-token",
+        "slack-legacy-bot-token",
+        "slack-legacy-token",
+        "slack-legacy-workspace-token",
+        "slack-user-token",
+    ] {
+        assert_eq!(
+            find(rule_name).offline_validation,
+            Some(OfflineValidationSpec::SlackToken),
+            "{rule_name} should have slack_token offline validation"
+        );
+    }
+
+    // slack-webhook-url is a URL, not a token — no offline validation.
+    assert_eq!(
+        find("slack-webhook-url").offline_validation,
+        None,
+        "slack-webhook-url should NOT have offline validation"
     );
 
     // Unrelated rules should have no offline validation.
@@ -1801,45 +1593,154 @@ fn default_rules_offline_validators_reject_bad_tokens() {
         offline_validate::validate(spec, &bad_sentry),
         OfflineVerdict::Invalid,
     );
-}
 
-/// The dropbox-api-token regex captures exactly `[a-z0-9]{15}` (15 bytes).
-/// The entropy gate should reject low-entropy tokens like "aaaaaaaaaaaaaaa".
-#[test]
-fn dropbox_api_token_entropy_gate_rejects_low_entropy() {
-    // "aaaaaaaaaaaaaaa" is 15 chars of zero entropy — should be rejected.
-    let low_entropy = b"dropbox_key = aaaaaaaaaaaaaaa\n";
-    let hits = scan_single_builtin_rule("dropbox-api-token", low_entropy);
-    assert!(
-        !hits.iter().any(|h| h.rule == "dropbox-api-token"),
-        "low-entropy dropbox token should be filtered by entropy gate"
+    // PyPI: valid base64url but decodes to wrong header.
+    let mut bad_pypi = Vec::new();
+    bad_pypi.extend_from_slice(b"pypi-AAAAAAAAAAAAAAAA"); // decodes to 12 zero bytes
+    bad_pypi.extend_from_slice(&[b'B'; 50]);
+    let spec = find("pypi-upload-token").offline_validation.unwrap();
+    assert_eq!(
+        offline_validate::validate(spec, &bad_pypi),
+        OfflineVerdict::Invalid,
+    );
+
+    // Slack: xoxb with unrecognised segment structure — Indeterminate (not
+    // Invalid) so unknown future token formats are not suppressed.
+    let bad_slack = b"xoxb-123-abc";
+    let spec = find("slack-bot-token").offline_validation.unwrap();
+    assert_eq!(
+        offline_validate::validate(spec, bad_slack),
+        OfflineVerdict::Indeterminate,
     );
 }
 
-/// The linkedin-client-id regex captures exactly `[a-z0-9]{14}` (14 bytes).
-/// The entropy gate should reject low-entropy tokens like "aaaaaaaaaaaaaa".
 #[test]
-fn linkedin_client_id_entropy_gate_rejects_low_entropy() {
-    // "aaaaaaaaaaaaaa" is 14 chars of zero entropy — should be rejected.
-    let low_entropy = b"linkedin_key = aaaaaaaaaaaaaa\n";
-    let hits = scan_single_builtin_rule("linkedin-client-id", low_entropy);
-    assert!(
-        !hits.iter().any(|h| h.rule == "linkedin-client-id"),
-        "low-entropy linkedin client id should be filtered by entropy gate"
-    );
-}
+fn entropy_boundary_cases() {
+    // Formerly: dropbox_api_token_entropy_gate_rejects_low_entropy,
+    //           linkedin_client_id_entropy_gate_rejects_low_entropy,
+    //           sumologic_access_id_entropy_gate_rejects_low_entropy,
+    //           sendgrid_api_token_entropy_{rejects_below,accepts_above}_threshold,
+    //           adobe_client_secret_entropy_{rejects_below,accepts_above}_threshold,
+    //           alibaba_access_key_id_entropy_{rejects_below,accepts_above}_threshold,
+    //           asana_client_id_entropy_{rejects_degenerate,rejects_low,accepts_high}_entropy,
+    //           discord_client_id_entropy_{rejects_degenerate,rejects_low,accepts_high}_entropy.
 
-/// The sumologic-access-id regex captures exactly `su[a-zA-Z0-9]{12}` (14 bytes).
-/// The entropy gate should reject low-entropy tokens like "suaaaaaaaaaaaa".
-#[test]
-fn sumologic_access_id_entropy_gate_rejects_low_entropy() {
-    // "suaaaaaaaaaaaa" is 14 bytes with near-zero entropy — should be rejected.
-    let low_entropy = b"sumo_key = suaaaaaaaaaaaa\n";
-    let hits = scan_single_builtin_rule("sumologic-access-id", low_entropy);
-    assert!(
-        !hits.iter().any(|h| h.rule == "sumologic-access-id"),
-        "low-entropy sumologic access id should be filtered by entropy gate"
+    // (rule_name, haystack, expect_hit, label)
+    let sendgrid_low = format!("secret = SG.{}\n", "abcd".repeat(16) + "ab");
+    let sendgrid_high_base = "abcdefghijklmnopqrstuvwxyz012345";
+    let sendgrid_high = format!(
+        "secret = SG.{}\n",
+        sendgrid_high_base.repeat(2).to_string() + &sendgrid_high_base[..2]
     );
+    let adobe_low = format!("secret = p8e-{}\n", "abcd".repeat(8));
+    let adobe_high = format!("secret = p8e-{}\n", "abcdefghijklmnopqrstuvwxyz012345");
+    let alibaba_low = format!("secret = LTAI{}\n", "abcd".repeat(5));
+    let alibaba_high = format!("secret = LTAI{}\n", "abcdefghijklmnopqrst");
+
+    let cases: &[(&str, &[u8], bool, &str)] = &[
+        // Zero-entropy rejection (degenerate inputs).
+        (
+            "dropbox-api-token",
+            b"dropbox_key = aaaaaaaaaaaaaaa\n",
+            false,
+            "zero-entropy dropbox token should be rejected",
+        ),
+        (
+            "linkedin-client-id",
+            b"linkedin_key = aaaaaaaaaaaaaa\n",
+            false,
+            "zero-entropy linkedin client id should be rejected",
+        ),
+        (
+            "sumologic-access-id",
+            b"sumo_key = suaaaaaaaaaaaa\n",
+            false,
+            "near-zero entropy sumologic access id should be rejected",
+        ),
+        // Threshold 3.0: below/above pairs.
+        (
+            "sendgrid-api-token",
+            sendgrid_low.as_bytes(),
+            false,
+            "~2.24 bits/byte should be rejected by 3.0 threshold",
+        ),
+        (
+            "sendgrid-api-token",
+            sendgrid_high.as_bytes(),
+            true,
+            "~5.1 bits/byte should pass the 3.0 threshold",
+        ),
+        (
+            "adobe-client-secret",
+            adobe_low.as_bytes(),
+            false,
+            "~2.50 bits/byte should be rejected by 3.0 threshold",
+        ),
+        (
+            "adobe-client-secret",
+            adobe_high.as_bytes(),
+            true,
+            "~5.1 bits/byte should pass the 3.0 threshold",
+        ),
+        (
+            "alibaba-access-key-id",
+            alibaba_low.as_bytes(),
+            false,
+            "~2.65 bits/byte should be rejected by 3.0 threshold",
+        ),
+        (
+            "alibaba-access-key-id",
+            alibaba_high.as_bytes(),
+            true,
+            "~4.58 bits/byte should pass the 3.0 threshold",
+        ),
+        // Threshold 2.5: digit-only rules.
+        (
+            "asana-client-id",
+            b"asana_key = 1111111111111111\n",
+            false,
+            "0.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "asana-client-id",
+            b"asana_key = 1234123412341234\n",
+            false,
+            "2.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "asana-client-id",
+            b"asana_key = 1122334455667788\n",
+            true,
+            "3.0 bits/byte should pass the 2.5 threshold",
+        ),
+        (
+            "discord-client-id",
+            b"discord_id = 111111111111111111\n",
+            false,
+            "0.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "discord-client-id",
+            b"discord_id = 123412341234123412\n",
+            false,
+            "~2.0 bits/byte should be rejected by 2.5 threshold",
+        ),
+        (
+            "discord-client-id",
+            b"discord_id = 112233445566778899\n",
+            true,
+            "3.17 bits/byte should pass the 2.5 threshold",
+        ),
+    ];
+
+    for &(rule_name, hay, expect_hit, label) in cases {
+        let hits = scan_single_builtin_rule(rule_name, hay);
+        assert_eq!(
+            has_rule_hit(&hits, rule_name),
+            expect_hit,
+            "{rule_name}: {label}"
+        );
+    }
 }
 
 /// CI guard: for every builtin rule with an entropy gate, the capture group's
@@ -1933,190 +1834,6 @@ fn entropy_min_len_does_not_exceed_capture_maximum() {
         "entropy min_len exceeds capture maximum for {} rule(s):\n  {}",
         failures.len(),
         failures.join("\n  "),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Boundary-aware entropy threshold tests
-//
-// These test that specific entropy values between the old (2.0) and new (3.0
-// or 2.5) thresholds are correctly rejected, and high-entropy strings are
-// accepted. This closes the gap where the existing zero-entropy tests (all
-// `a`s) would pass at any positive threshold.
-// ---------------------------------------------------------------------------
-
-/// Boundary test: sendgrid-api-token with body below 3.0 bits/byte threshold.
-///
-/// The capture `SG.` + (`abcd` × 16 + `ab`) has 7 distinct bytes in 69
-/// positions ≈ 2.24 bits/byte — above the old 2.0 threshold, below the new 3.0.
-#[test]
-fn sendgrid_api_token_entropy_rejects_below_threshold() {
-    let body = "abcd".repeat(16) + "ab"; // 66 chars
-    let hay = format!("secret = SG.{body}\n");
-    let hits = scan_single_builtin_rule("sendgrid-api-token", hay.as_bytes());
-    assert!(
-        !hits.iter().any(|h| h.rule == "sendgrid-api-token"),
-        "sendgrid token with ~2.24 bits/byte should be rejected by 3.0 threshold"
-    );
-}
-
-/// Boundary test: sendgrid-api-token with body above 3.0 bits/byte threshold.
-///
-/// The capture `SG.` + 32 distinct `[a-z0-9]` chars repeated to 66 has 35
-/// distinct bytes in 69 positions ≈ 5.1 bits/byte.
-#[test]
-fn sendgrid_api_token_entropy_accepts_above_threshold() {
-    let base = "abcdefghijklmnopqrstuvwxyz012345"; // 32 distinct chars
-    let body = base.repeat(2) + &base[..2]; // 66 chars
-    let hay = format!("secret = SG.{body}\n");
-    let hits = scan_single_builtin_rule("sendgrid-api-token", hay.as_bytes());
-    assert!(
-        hits.iter().any(|h| h.rule == "sendgrid-api-token"),
-        "sendgrid token with ~5.1 bits/byte should pass the 3.0 threshold"
-    );
-}
-
-/// Boundary test: adobe-client-secret with body below 3.0 bits/byte threshold.
-///
-/// The capture `p8e-` + (`abcd` × 8) has 8 distinct bytes in 36 positions
-/// ≈ 2.50 bits/byte — below the 3.0 threshold.
-#[test]
-fn adobe_client_secret_entropy_rejects_below_threshold() {
-    let body = "abcd".repeat(8); // 32 chars
-    let hay = format!("secret = p8e-{body}\n");
-    let hits = scan_single_builtin_rule("adobe-client-secret", hay.as_bytes());
-    assert!(
-        !hits.iter().any(|h| h.rule == "adobe-client-secret"),
-        "adobe token with ~2.50 bits/byte should be rejected by 3.0 threshold"
-    );
-}
-
-/// Boundary test: adobe-client-secret with body above 3.0 bits/byte threshold.
-///
-/// The capture `p8e-` + 32 distinct `[a-z0-9]` chars has 35 distinct bytes
-/// in 36 positions ≈ 5.1 bits/byte.
-#[test]
-fn adobe_client_secret_entropy_accepts_above_threshold() {
-    let body = "abcdefghijklmnopqrstuvwxyz012345"; // 32 distinct chars
-    let hay = format!("secret = p8e-{body}\n");
-    let hits = scan_single_builtin_rule("adobe-client-secret", hay.as_bytes());
-    assert!(
-        hits.iter().any(|h| h.rule == "adobe-client-secret"),
-        "adobe token with ~5.1 bits/byte should pass the 3.0 threshold"
-    );
-}
-
-/// Boundary test: alibaba-access-key-id with body below 3.0 bits/byte threshold.
-///
-/// The capture `LTAI` + (`abcd` × 5) has 8 distinct bytes in 24 positions
-/// ≈ 2.65 bits/byte — below the 3.0 threshold.
-#[test]
-fn alibaba_access_key_id_entropy_rejects_below_threshold() {
-    let body = "abcd".repeat(5); // 20 chars
-    let hay = format!("secret = LTAI{body}\n");
-    let hits = scan_single_builtin_rule("alibaba-access-key-id", hay.as_bytes());
-    assert!(
-        !hits.iter().any(|h| h.rule == "alibaba-access-key-id"),
-        "alibaba key with ~2.65 bits/byte should be rejected by 3.0 threshold"
-    );
-}
-
-/// Boundary test: alibaba-access-key-id with body above 3.0 bits/byte threshold.
-///
-/// The capture `LTAI` + 20 distinct lowercase chars has 24 distinct bytes
-/// in 24 positions ≈ 4.58 bits/byte.
-#[test]
-fn alibaba_access_key_id_entropy_accepts_above_threshold() {
-    let body = "abcdefghijklmnopqrst"; // 20 distinct chars
-    let hay = format!("secret = LTAI{body}\n");
-    let hits = scan_single_builtin_rule("alibaba-access-key-id", hay.as_bytes());
-    assert!(
-        hits.iter().any(|h| h.rule == "alibaba-access-key-id"),
-        "alibaba key with ~4.58 bits/byte should pass the 3.0 threshold"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Boundary tests for digit-only rules at threshold 2.5
-// ---------------------------------------------------------------------------
-
-/// Boundary test: asana-client-id (digit-only, threshold 2.5) rejects
-/// degenerate input. All-same digits have 0.0 bits/byte entropy.
-#[test]
-fn asana_client_id_entropy_rejects_degenerate() {
-    let hay = b"asana_key = 1111111111111111\n";
-    let hits = scan_single_builtin_rule("asana-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "asana-client-id"),
-        "asana id with 0.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: asana-client-id rejects low-entropy digits.
-///
-/// `1234` × 4 = 4 distinct digits, each appearing 4 times in 16 bytes
-/// → 2.0 bits/byte, below the 2.5 threshold.
-#[test]
-fn asana_client_id_entropy_rejects_low_entropy() {
-    let hay = b"asana_key = 1234123412341234\n";
-    let hits = scan_single_builtin_rule("asana-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "asana-client-id"),
-        "asana id with 2.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: asana-client-id accepts high-entropy digits.
-///
-/// 8 distinct digits, each appearing twice in 16 bytes → 3.0 bits/byte,
-/// above the 2.5 threshold.
-#[test]
-fn asana_client_id_entropy_accepts_high_entropy() {
-    let hay = b"asana_key = 1122334455667788\n";
-    let hits = scan_single_builtin_rule("asana-client-id", hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "asana-client-id"),
-        "asana id with 3.0 bits/byte should pass the 2.5 threshold"
-    );
-}
-
-/// Boundary test: discord-client-id (digit-only, threshold 2.5) rejects
-/// degenerate input. All-same digits have 0.0 bits/byte entropy.
-#[test]
-fn discord_client_id_entropy_rejects_degenerate() {
-    let hay = b"discord_id = 111111111111111111\n";
-    let hits = scan_single_builtin_rule("discord-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "discord-client-id"),
-        "discord id with 0.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: discord-client-id rejects low-entropy digits.
-///
-/// `1234` repeated to 18 chars = 4 distinct digits with uneven distribution
-/// → ~2.0 bits/byte, below the 2.5 threshold.
-#[test]
-fn discord_client_id_entropy_rejects_low_entropy() {
-    let hay = b"discord_id = 123412341234123412\n";
-    let hits = scan_single_builtin_rule("discord-client-id", hay);
-    assert!(
-        !hits.iter().any(|h| h.rule == "discord-client-id"),
-        "discord id with ~2.0 bits/byte should be rejected by 2.5 threshold"
-    );
-}
-
-/// Boundary test: discord-client-id accepts high-entropy digits.
-///
-/// 9 distinct digits, each appearing twice in 18 bytes → 3.17 bits/byte,
-/// above the 2.5 threshold.
-#[test]
-fn discord_client_id_entropy_accepts_high_entropy() {
-    let hay = b"discord_id = 112233445566778899\n";
-    let hits = scan_single_builtin_rule("discord-client-id", hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "discord-client-id"),
-        "discord id with 3.17 bits/byte should pass the 2.5 threshold"
     );
 }
 
@@ -2227,4 +1944,123 @@ fn entropy_min_bits_per_byte_within_sane_bounds() {
         failures.len(),
         failures.join("\n  "),
     );
+}
+
+#[test]
+fn roundtrip_min_entropy_bits_per_byte() {
+    let yaml = r#"
+rules:
+  - name: "rt-min-entropy"
+    regex: '[A-Za-z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 20
+      max_len: 128
+      min_entropy_bits_per_byte: 2.0
+"#;
+    let original = parse_yaml_rules(yaml).expect("parse");
+    let ent = original[0].entropy.as_ref().expect("entropy present");
+    assert_eq!(
+        ent.min_entropy_bits_per_byte,
+        Some(2.0),
+        "parsed min_entropy_bits_per_byte should be Some(2.0)"
+    );
+
+    // Round-trip through YAML serialization.
+    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+    let file = YamlRulesFile { rules: yaml_rules };
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
+    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+    let reparsed_ent = parsed[0]
+        .entropy
+        .as_ref()
+        .expect("entropy present after roundtrip");
+    assert_eq!(
+        reparsed_ent.min_entropy_bits_per_byte,
+        Some(2.0),
+        "round-tripped min_entropy_bits_per_byte should be Some(2.0)"
+    );
+}
+
+#[test]
+fn char_class_auto_enable_cases() {
+    // Formerly: char_class_auto_enabled_for_high_entropy_rule_without_explicit_field,
+    //           char_class_not_auto_enabled_for_low_entropy_rule,
+    //           explicit_char_class_not_overridden_by_auto_enable.
+
+    // (yaml, expected char_class as Option<(max_lower_pct, min_window_len)>, label)
+    #[allow(clippy::type_complexity)]
+    const CASES: &[(&str, Option<(u8, u16)>, &str)] = &[
+        (
+            "rules:\n  - name: high-entropy-no-cc\n    regex: 'tok_[a-zA-Z0-9]{40}'\n    anchors: [\"tok_\"]\n    radius: 64\n    entropy:\n      min_bits_per_byte: 3.5\n      min_len: 8\n      max_len: 64\n",
+            Some((95, 32)),
+            "high entropy without explicit char_class → auto-enabled with defaults",
+        ),
+        (
+            "rules:\n  - name: low-entropy-no-cc\n    regex: 'password=[a-z]{8}'\n    anchors: [\"password=\"]\n    radius: 64\n    entropy:\n      min_bits_per_byte: 1.0\n      min_len: 4\n      max_len: 32\n",
+            None,
+            "low entropy without explicit char_class → not auto-enabled",
+        ),
+        (
+            "rules:\n  - name: explicit-cc\n    regex: 'tok_[a-zA-Z0-9]{40}'\n    anchors: [\"tok_\"]\n    radius: 64\n    entropy:\n      min_bits_per_byte: 4.0\n      min_len: 8\n      max_len: 64\n    char_class:\n      max_lower_pct: 80\n      min_window_len: 16\n",
+            Some((80, 16)),
+            "high entropy with explicit char_class → explicit values preserved",
+        ),
+    ];
+
+    for &(yaml, expected, label) in CASES {
+        let rules = parse_yaml_rules(yaml).unwrap_or_else(|e| panic!("[{label}] parse: {e}"));
+        let cc = rules[0]
+            .char_class
+            .as_ref()
+            .map(|c| (c.max_lower_pct, c.min_window_len));
+        assert_eq!(cc, expected, "[{label}]");
+    }
+}
+
+#[test]
+fn char_class_null_in_yaml_is_equivalent_to_absent() {
+    // Verify that `char_class: null` and absent `char_class` both trigger
+    // auto-enable for high-entropy rules. In serde YAML, `null` and absent
+    // both deserialize to `None` for `Option<T>` with `#[serde(default)]`.
+    // This is standard YAML/serde semantics, not a bug.
+    let yaml_with_null = r#"
+rules:
+  - name: "cc-null"
+    regex: 'tok_[a-zA-Z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    char_class: null
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 8
+      max_len: 64
+"#;
+    let yaml_absent = r#"
+rules:
+  - name: "cc-absent"
+    regex: 'tok_[a-zA-Z0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.5
+      min_len: 8
+      max_len: 64
+"#;
+    let with_null = parse_yaml_rules(yaml_with_null).expect("parse null");
+    let absent = parse_yaml_rules(yaml_absent).expect("parse absent");
+
+    // Both should have auto-enabled char_class with identical defaults.
+    let cc_null = with_null[0]
+        .char_class
+        .as_ref()
+        .expect("null should auto-enable");
+    let cc_absent = absent[0]
+        .char_class
+        .as_ref()
+        .expect("absent should auto-enable");
+    assert_eq!(cc_null.max_lower_pct, cc_absent.max_lower_pct);
+    assert_eq!(cc_null.min_window_len, cc_absent.min_window_len);
 }
