@@ -886,90 +886,67 @@ mod tests {
         );
         assert!(ended_at.is_some(), "ended_at must be set after end_run");
     }
+}
 
-    #[test]
-    fn confidence_score_persists_in_sqlite() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let producer = SqliteStoreProducer::open(config).expect("open");
+// Property-based tests: continuous coverage for derive_status and confidence
+// score persistence. Gated behind `property-tests` to keep `cargo test` fast.
+#[cfg(all(test, feature = "property-tests"))]
+mod writer_proptests {
+    use super::*;
+    use crate::store::fs::{FsFindingBatch, FsFindingRecord};
+    use proptest::prelude::*;
 
-        let rec = FsFindingRecord {
-            rule_id: 1,
-            root_hint_start: 10,
-            root_hint_end: 20,
-            span_start: 12,
-            span_end: 18,
-            norm_hash: [0xCC; 32],
-            confidence_score: 7,
-        };
-        let batch = FsFindingBatch {
-            object_path: b"src/secret.rs",
-            findings: &[rec],
-        };
-        producer.emit_fs_batch(batch).expect("emit");
-
-        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
-        let score: i64 = conn
-            .query_row(
-                "SELECT confidence_score FROM occurrences LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(score, 7);
+    fn test_config(dir: &std::path::Path) -> SqliteStoreConfig {
+        SqliteStoreConfig {
+            db_path: dir.join("findings.db"),
+            root_id: [0xAA; 32],
+            root_kind: RootKind::Fs,
+            identity_scheme: "fs_device_inode_v1".to_string(),
+            canonical_identity: b"/home/user/project".to_vec(),
+            display_name: Some("test-project".to_string()),
+            id_hash_mode: IdHashMode::Keyed,
+            scanner_version: Some("0.1.0-test".to_string()),
+        }
     }
 
-    #[test]
-    fn confidence_score_max_update() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let producer = SqliteStoreProducer::open(config).expect("open");
+    const PROPTEST_CASES: u32 = 64;
 
-        let rec_low = FsFindingRecord {
-            rule_id: 1,
-            root_hint_start: 10,
-            root_hint_end: 20,
-            span_start: 12,
-            span_end: 18,
-            norm_hash: [0xDD; 32],
-            confidence_score: 3,
-        };
-        producer
-            .emit_fs_batch(FsFindingBatch {
-                object_path: b"src/update.rs",
-                findings: &[rec_low],
-            })
-            .expect("emit low");
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
 
-        let rec_high = FsFindingRecord {
-            confidence_score: 7,
-            ..rec_low
-        };
-        producer
-            .emit_fs_batch(FsFindingBatch {
-                object_path: b"src/update.rs",
-                findings: &[rec_high],
-            })
-            .expect("emit high");
+        /// For any `(dropped, failures, had_coverage_limits)` triple the status
+        /// invariant holds: loss → Incomplete, else coverage → CoverageLimits,
+        /// else Complete.
+        #[test]
+        fn prop_derive_status_precedence(
+            dropped in 0u64..100,
+            failures in 0u64..100,
+            had_coverage_limits: bool,
+        ) {
+            let c = RunCounters {
+                dropped_findings: dropped,
+                emit_failures: failures,
+                ..Default::default()
+            };
+            let status = c.derive_status(had_coverage_limits);
+            if dropped > 0 || failures > 0 {
+                prop_assert_eq!(status, RunStatus::Incomplete);
+            } else if had_coverage_limits {
+                prop_assert_eq!(status, RunStatus::CompleteWithCoverageLimits);
+            } else {
+                prop_assert_eq!(status, RunStatus::Complete);
+            }
+        }
 
-        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
-        let score: i64 = conn
-            .query_row(
-                "SELECT confidence_score FROM occurrences LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(score, 7, "MAX(3, 7) should yield 7");
-    }
+        /// Any `i8` confidence score survives the write→read roundtrip.
+        #[test]
+        fn prop_confidence_score_roundtrip(score: i8) {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let producer = SqliteStoreProducer::open(config).expect("open");
 
-    #[test]
-    fn confidence_score_boundary_values() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let producer = SqliteStoreProducer::open(config).expect("open");
-
-        for &score in &[i8::MIN, -1, 0, 1, 10, i8::MAX] {
             let mut hash = [0u8; 32];
             hash[0] = score as u8;
             hash[1] = score.wrapping_add(42) as u8;
@@ -982,28 +959,68 @@ mod tests {
                 norm_hash: hash,
                 confidence_score: score,
             };
-            let path = format!("score_{}.rs", score);
             producer
                 .emit_fs_batch(FsFindingBatch {
-                    object_path: path.as_bytes(),
+                    object_path: b"roundtrip.rs",
                     findings: &[rec],
                 })
                 .expect("emit");
+
+            let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+            let stored: i64 = conn
+                .query_row(
+                    "SELECT confidence_score FROM occurrences LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(stored, i64::from(score));
         }
 
-        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT confidence_score FROM occurrences ORDER BY occ_pk")
-            .unwrap();
-        let scores: Vec<i64> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(
-            scores,
-            vec![i8::MIN as i64, -1, 0, 1, 10, i8::MAX as i64],
-            "all i8 boundary values must survive write→read",
-        );
+        /// For any two `i8` scores emitted to the same occurrence, the DB
+        /// retains `max(a, b)`.
+        #[test]
+        fn prop_confidence_score_max_semantics(a: i8, b: i8) {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let producer = SqliteStoreProducer::open(config).expect("open");
+
+            let rec_a = FsFindingRecord {
+                rule_id: 1,
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: [0xEE; 32],
+                confidence_score: a,
+            };
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: b"max.rs",
+                    findings: &[rec_a],
+                })
+                .expect("emit a");
+
+            let rec_b = FsFindingRecord {
+                confidence_score: b,
+                ..rec_a
+            };
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: b"max.rs",
+                    findings: &[rec_b],
+                })
+                .expect("emit b");
+
+            let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+            let stored: i64 = conn
+                .query_row(
+                    "SELECT confidence_score FROM occurrences LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(stored, i64::from(a.max(b)));
+        }
     }
 }
