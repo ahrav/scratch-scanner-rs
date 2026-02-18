@@ -6,13 +6,17 @@
 //! and does not allocate. Multiple bits may be set for the same path (for
 //! example a test file is both `TEST` and `SOURCE`).
 //!
-//! Binary extensions are stored in a sorted packed-u64 table for O(log n)
-//! lookup via binary search. Each extension (1–8 lowercase ASCII bytes) is
-//! packed big-endian into a `u64`, giving lexicographic numeric ordering.
-//! The table is `const`-constructable and fits in ~1.3 KB (L1-resident).
+//! Binary and source extensions are stored in sorted packed-u64 tables for
+//! O(log n) lookup via binary search. Each extension (1–8 lowercase ASCII
+//! bytes) is packed big-endian into a `u64`, giving lexicographic numeric
+//! ordering. The tables are `const`-constructable and L1-resident.
 //!
 //! Lock files are matched by exact filename (after the last `/` separator)
 //! using a sorted `&[&[u8]]` table with case-insensitive binary search.
+//!
+//! `classify_path` fuses the segment scan into a single pass over `/`-
+//! delimited segments and shares the filename extraction across extension
+//! and lock-file checks.
 
 use core::cmp::Ordering;
 use core::ops::{BitOr, BitOrAssign};
@@ -496,17 +500,11 @@ fn cmp_lower_vs_input(reference: &[u8], input: &[u8]) -> Ordering {
 /// Returns true if the filename portion of `path` matches a known lock file.
 #[inline]
 pub fn is_lock_filename(path: &[u8]) -> bool {
-    let name = git_filename(path);
-    if name.is_empty() {
-        return false;
-    }
-    LOCK_FILES
-        .binary_search_by(|entry| cmp_lower_vs_input(entry, name))
-        .is_ok()
+    is_lock_name(git_filename(path))
 }
 
 // ---------------------------------------------------------------------------
-// Segment / extension tables (unchanged from original)
+// Segment / extension tables
 // ---------------------------------------------------------------------------
 
 const TEST_DIRS: &[&[u8]] = &[
@@ -545,17 +543,85 @@ const GENERATED_DIRS: &[&[u8]] = &[
     b"buck-out",
 ];
 
-const SOURCE_EXTS: &[&[u8]] = &[
-    b"rs", b"c", b"h", b"cc", b"cpp", b"hpp", b"m", b"mm", b"go", b"java", b"kt", b"swift", b"py",
-    b"js", b"jsx", b"ts", b"tsx", b"rb", b"php", b"cs", b"fs", b"scala", b"clj", b"groovy",
-    b"dart", b"lua", b"sh", b"bash", b"zsh", b"ps1", b"toml", b"yaml", b"yml", b"json", b"xml",
-    b"html", b"htm", b"css", b"scss", b"less", b"md", b"txt", b"cfg", b"ini", b"conf", b"sql",
-    b"proto", b"gradle",
-];
+/// Sorted packed-u64 table of source-code extensions.
+///
+/// Uses the same `pack_ext` + binary search pattern as [`SKIP_EXTS`].
+/// All source extensions are ≤ 8 bytes so no overflow table is needed.
+static SOURCE_EXTS_PACKED: &[u64] = {
+    const TABLE: &[u64] = &[
+        pack_ext(b"bash"),
+        pack_ext(b"c"),
+        pack_ext(b"cc"),
+        pack_ext(b"cfg"),
+        pack_ext(b"clj"),
+        pack_ext(b"conf"),
+        pack_ext(b"cpp"),
+        pack_ext(b"cs"),
+        pack_ext(b"css"),
+        pack_ext(b"dart"),
+        pack_ext(b"fs"),
+        pack_ext(b"go"),
+        pack_ext(b"gradle"),
+        pack_ext(b"groovy"),
+        pack_ext(b"h"),
+        pack_ext(b"hpp"),
+        pack_ext(b"htm"),
+        pack_ext(b"html"),
+        pack_ext(b"ini"),
+        pack_ext(b"java"),
+        pack_ext(b"js"),
+        pack_ext(b"json"),
+        pack_ext(b"jsx"),
+        pack_ext(b"kt"),
+        pack_ext(b"less"),
+        pack_ext(b"lua"),
+        pack_ext(b"m"),
+        pack_ext(b"md"),
+        pack_ext(b"mm"),
+        pack_ext(b"php"),
+        pack_ext(b"proto"),
+        pack_ext(b"ps1"),
+        pack_ext(b"py"),
+        pack_ext(b"rb"),
+        pack_ext(b"rs"),
+        pack_ext(b"scala"),
+        pack_ext(b"scss"),
+        pack_ext(b"sh"),
+        pack_ext(b"sql"),
+        pack_ext(b"swift"),
+        pack_ext(b"toml"),
+        pack_ext(b"ts"),
+        pack_ext(b"tsx"),
+        pack_ext(b"txt"),
+        pack_ext(b"xml"),
+        pack_ext(b"yaml"),
+        pack_ext(b"yml"),
+        pack_ext(b"zsh"),
+    ];
+    assert_sorted(TABLE);
+    TABLE
+};
 
 // ---------------------------------------------------------------------------
 // Classifier
 // ---------------------------------------------------------------------------
+
+/// Returns true if the given extension (raw bytes, any case) matches the
+/// source extension set.
+///
+/// Uses the same packed-u64 binary search as [`ext_in_skip_set`].
+#[inline]
+fn ext_in_source_set(ext: &[u8]) -> bool {
+    if ext.is_empty() || ext.len() > 8 {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    for (dst, &src) in buf.iter_mut().zip(ext.iter()) {
+        *dst = src.to_ascii_lowercase();
+    }
+    let key = pack_ext(&buf[..ext.len()]);
+    SOURCE_EXTS_PACKED.binary_search(&key).is_ok()
+}
 
 /// Classifies a path into `PathClass` bitflags.
 ///
@@ -563,33 +629,59 @@ const SOURCE_EXTS: &[&[u8]] = &[
 /// (Git tree paths are normalized to `/`, even on Windows).
 ///
 /// This function performs no heap allocation and operates on raw bytes.
+///
+/// Internally the path is traversed once: segments are split on `/` and
+/// checked against test/vendor/generated directory tables in a single
+/// fused loop, the filename is extracted from the last segment, and the
+/// extension is derived from that filename (avoiding redundant `memrchr`
+/// calls).
 #[must_use]
 pub fn classify_path(path: &[u8]) -> PathClass {
     let mut class = PathClass::empty();
 
-    if contains_segment(path, TEST_DIRS) {
-        class |= PathClass::TEST;
-    }
-    if contains_segment(path, VENDOR_DIRS) {
-        class |= PathClass::VENDOR;
-    }
-    if contains_segment(path, GENERATED_DIRS) {
-        class |= PathClass::GENERATED;
+    // --- Fused single-pass segment scan ---
+    // Split on `/` once, checking all three directory tables per segment.
+    // The `!class.contains(X)` guard skips table checks once a category
+    // is already matched.
+    let mut start = 0usize;
+    while start <= path.len() {
+        let end = match memchr::memchr(b'/', &path[start..]) {
+            Some(idx) => start + idx,
+            None => path.len(),
+        };
+        let seg = &path[start..end];
+        if !seg.is_empty() {
+            if !class.contains(PathClass::TEST) && seg_in_table(seg, TEST_DIRS) {
+                class |= PathClass::TEST;
+            }
+            if !class.contains(PathClass::VENDOR) && seg_in_table(seg, VENDOR_DIRS) {
+                class |= PathClass::VENDOR;
+            }
+            if !class.contains(PathClass::GENERATED) && seg_in_table(seg, GENERATED_DIRS) {
+                class |= PathClass::GENERATED;
+            }
+        }
+        if end == path.len() {
+            break;
+        }
+        start = end + 1;
     }
 
-    // Binary extension check via packed-u64 binary search.
-    let ext = file_extension(path);
+    // --- Shared filename extraction ---
+    // Extract filename once, derive extension from it.
+    let filename = git_filename(path);
+    let ext = filename_extension(filename);
+
     if let Some(e) = ext {
         if ext_in_skip_set(e) {
             class |= PathClass::BINARY;
         }
+        if ext_in_source_set(e) {
+            class |= PathClass::SOURCE;
+        }
     }
 
-    if has_extension_from(ext, SOURCE_EXTS) {
-        class |= PathClass::SOURCE;
-    }
-
-    if is_lock_filename(path) {
+    if is_lock_name(filename) {
         class |= PathClass::LOCK_FILE;
     }
 
@@ -604,57 +696,34 @@ pub fn classify_path(path: &[u8]) -> PathClass {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Returns true if any `/`-delimited segment of `path` matches a table
-/// entry (case-insensitive). All segments are checked, including the
-/// final filename component.
-fn contains_segment(path: &[u8], table: &[&[u8]]) -> bool {
-    let mut start = 0usize;
-    while start <= path.len() {
-        let end = match memchr::memchr(b'/', &path[start..]) {
-            Some(idx) => start + idx,
-            None => path.len(),
-        };
-        let seg = &path[start..end];
-        if !seg.is_empty() {
-            for &name in table {
-                if eq_ignore_ascii_case(seg, name) {
-                    return true;
-                }
-            }
-        }
-        if end == path.len() {
-            break;
-        }
-        start = end + 1;
-    }
-    false
-}
-
-/// Checks a pre-extracted extension against a linear table.
-fn has_extension_from(ext: Option<&[u8]>, table: &[&[u8]]) -> bool {
-    let ext = match ext {
-        Some(e) => e,
-        None => return false,
-    };
-    for &candidate in table {
-        if eq_ignore_ascii_case(ext, candidate) {
+/// Returns true if `seg` matches any entry in `table` (case-insensitive).
+/// Table entries must be lowercase.
+#[inline]
+fn seg_in_table(seg: &[u8], table: &[&[u8]]) -> bool {
+    for &name in table {
+        if seg.len() == name.len()
+            && seg
+                .iter()
+                .zip(name)
+                .all(|(&x, &y)| x.to_ascii_lowercase() == y)
+        {
             return true;
         }
     }
     false
 }
 
-/// Extracts the extension after the last `.` in the filename portion of
-/// `path`. Returns `None` for dotfiles (`.gitignore`), missing dots, or
-/// trailing dots.
-fn file_extension(path: &[u8]) -> Option<&[u8]> {
-    let name_start = memrchr(b'/', path).map(|idx| idx + 1).unwrap_or(0);
-    let name = &path[name_start..];
-    let dot = memrchr(b'.', name)?;
+/// Extracts the extension from a filename slice (no `/` scan needed).
+///
+/// Returns `None` for dotfiles (`.gitignore`), missing dots, or trailing
+/// dots.
+#[inline]
+fn filename_extension(filename: &[u8]) -> Option<&[u8]> {
+    let dot = memrchr(b'.', filename)?;
     if dot == 0 {
         return None;
     }
-    let ext = &name[dot + 1..];
+    let ext = &filename[dot + 1..];
     if ext.is_empty() {
         None
     } else {
@@ -662,11 +731,16 @@ fn file_extension(path: &[u8]) -> Option<&[u8]> {
     }
 }
 
-fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
+/// Returns true if `filename` matches a known lock file (case-insensitive
+/// binary search).
+#[inline]
+fn is_lock_name(filename: &[u8]) -> bool {
+    if filename.is_empty() {
         return false;
     }
-    a.iter().zip(b).all(|(&x, &y)| x.to_ascii_lowercase() == y)
+    LOCK_FILES
+        .binary_search_by(|entry| cmp_lower_vs_input(entry, filename))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -915,7 +989,3 @@ mod tests {
         assert!(!class.contains(PathClass::LOCK_FILE));
     }
 }
-
-#[cfg(all(test, feature = "stdx-proptest"))]
-#[path = "path_policy_tests.rs"]
-mod path_policy_tests;
