@@ -34,6 +34,72 @@
 # - Unknown fields are silently ignored by the parser.
 # - ValidatorKind is not expressible in YAML; it is set programmatically.
 # - Rules are tested by `cargo test` (yaml.rs round-trip + integration tests).
+#
+# --------------------------------------------------------------------------
+# Min-entropy gate (min_entropy_bits_per_byte)
+#
+# A second entropy check based on NIST SP 800-90B min-entropy [1]:
+#
+#     H_inf = log2(n) - log2(max_bin_count)
+#
+# Shannon entropy measures average information per byte; min-entropy
+# measures worst-case predictability by focusing on the single most
+# frequent byte value. By the Rényi entropy ordering theorem [2],
+# H_inf <= H_Shannon always holds, with equality only for perfectly
+# uniform distributions. This means min-entropy catches skewed byte
+# distributions (repeated substrings, character-frequency bias) that
+# pass Shannon checks — the gap grows with alphabet size, making this
+# gate especially effective for alphanumeric (k=36) tokens.
+#
+# Implementation cost: near-zero. max_bin_count is already computed in the
+# fused histogram pass (src/engine/helpers/entropy.rs). Adding this gate is
+# 1 table lookup + 1 subtraction + 1 comparison (~5 ns), evaluated
+# only for candidates that already pass Shannon (which rejects an
+# estimated 80-90% first).
+#
+# Threshold: 2.0 bits/byte
+#   Rejects strings where any single byte appears > n/4 times.
+#   For alphabets k >= 16 at token lengths n >= 32, the false-rejection
+#   probability for truly random tokens is negligible. At shorter lengths
+#   (n < 20) with small alphabets (k = 16), birthday collisions make
+#   the estimate unstable — such rules should not use this gate.
+#
+# Coverage tiers (97 rules total):
+#
+#   Tier 0 (43 rules, original) — Hex-alphabet rules ([a-f0-9] patterns).
+#     Small alphabet (k=16) where single-character repetition is the
+#     dominant false-positive pattern.
+#
+#   Tier 1 (48 rules, added) — Keyword + alphanumeric, no checksum.
+#     Highest FP-risk category: match `keyword + [a-z0-9]{N}` with no
+#     prefix or checksum defense. Min-entropy provides a complementary
+#     statistical gate alongside Shannon and value suppressors.
+#
+#   Tier 2 (6 rules, added) — Prefix-structured alphanumeric, no checksum.
+#     Known prefix (e.g. "CLOJARS_", "lin_api_") but no checksum
+#     validator. Min-entropy adds a secondary defense layer.
+#
+# Rules excluded from min-entropy (and why):
+#   - Short hex (n<=17, k=16)   sidekiq-secret, sidekiq-sensitive-url.
+#                                At n=17, P(max_count >= 5) ~ 3.7% for
+#                                uniformly random tokens -- unacceptable FN.
+#   - entropy: null             Structural patterns, not random tokens.
+#   - offline_validation        Checksum already validates authenticity.
+#   - Numeric-only (k=10)       Alphabet too small; threshold 2.0 too
+#                                restrictive for base-10 tokens.
+#   - Intentional low-entropy   Tokens with fixed segments like
+#                                "AAAAAAAAAA" or "A{22}" by design.
+#   - Base64 / structured       Non-uniform byte distribution by design;
+#                                padding and encoding skew min-entropy.
+#   - High Shannon (>= 4.0)     Shannon already filters effectively.
+#   - Very short (< 20 chars)   Insufficient length for stable estimate.
+#
+# References:
+#   [1] NIST SP 800-90B §6.3, "Recommendation for the Entropy Sources
+#       Used for Random Bit Generation" (2018).
+#   [2] Rényi, A. "On Measures of Entropy and Information," Proc. 4th
+#       Berkeley Symposium on Math. Stat. and Prob. (1961), pp. 547-561.
+# --------------------------------------------------------------------------
 # ==========================================================================
 rules:
 - name: '1password-secret-key'
@@ -111,6 +177,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -271,6 +338,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -305,6 +373,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -399,6 +468,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -461,6 +531,7 @@ rules:
     min_bits_per_byte: 3.5
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -605,6 +676,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -622,6 +694,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -639,6 +712,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -656,6 +730,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -706,6 +781,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
   two_phase: null
   local_context: null
   secret_group: null
@@ -723,6 +799,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -776,6 +853,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -812,6 +890,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -858,6 +937,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -904,6 +984,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -921,6 +1002,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1062,6 +1144,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1239,6 +1322,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1273,6 +1357,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1409,6 +1494,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1478,6 +1564,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1513,6 +1600,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1530,6 +1618,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1547,6 +1636,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -1668,6 +1758,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2121,6 +2212,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2138,6 +2230,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2446,6 +2539,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2501,6 +2595,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2530,6 +2625,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2644,6 +2740,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2662,6 +2759,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2759,6 +2857,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2824,6 +2923,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2841,6 +2941,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2946,6 +3047,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -2986,6 +3088,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3045,6 +3148,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3105,6 +3209,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3201,6 +3306,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3333,6 +3439,7 @@ rules:
     min_bits_per_byte: 3.5
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3350,6 +3457,7 @@ rules:
     min_bits_per_byte: 3.5
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3469,6 +3577,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3519,6 +3628,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3534,6 +3644,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
   two_phase: null
   local_context: null
   secret_group: null
@@ -3616,6 +3727,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4051,6 +4163,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
   two_phase: null
   local_context: null
   secret_group: 2
@@ -4165,6 +4278,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4199,6 +4313,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4253,6 +4368,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4270,6 +4386,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4304,6 +4421,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4321,6 +4439,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
@@ -4505,6 +4624,7 @@ rules:
     min_bits_per_byte: 3.0
     min_len: 16
     max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
