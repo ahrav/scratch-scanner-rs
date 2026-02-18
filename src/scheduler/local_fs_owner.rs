@@ -1030,7 +1030,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         ctx.metrics.findings_emitted = ctx
             .metrics
             .findings_emitted
-            .wrapping_add(scratch.pending.len() as u64);
+            .saturating_add(scratch.pending.len() as u64);
 
         emit_persistence_batch(
             scratch.store_producer.as_deref(),

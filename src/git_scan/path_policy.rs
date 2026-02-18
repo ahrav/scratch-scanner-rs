@@ -691,6 +691,9 @@ pub fn classify_path(path: &[u8]) -> PathClass {
 
     if is_lock_name(filename) {
         class |= PathClass::LOCK_FILE;
+        // Lock files are not source code even if they have a source-like
+        // extension (e.g. pnpm-lock.yaml → .yaml is in SOURCE_EXTS).
+        class.0 &= !PathClass::SOURCE.0;
     }
 
     if class.is_empty() {
@@ -956,6 +959,27 @@ mod tests {
         let class = classify_path(b"vendor/Gemfile.lock");
         assert!(class.contains(PathClass::LOCK_FILE));
         assert!(class.contains(PathClass::VENDOR));
+    }
+
+    #[test]
+    fn pnpm_lock_yaml_not_source() {
+        // pnpm-lock.yaml has .yaml extension (in SOURCE_EXTS) and its
+        // filename is in LOCK_FILES. LOCK_FILE must suppress SOURCE —
+        // lock files are not source code.
+        let class = classify_path(b"pnpm-lock.yaml");
+        assert!(class.contains(PathClass::LOCK_FILE));
+        assert!(
+            !class.contains(PathClass::SOURCE),
+            "LOCK_FILE and SOURCE both set for pnpm-lock.yaml: {:#04x}",
+            class.bits()
+        );
+    }
+
+    #[test]
+    fn pnpm_lock_yaml_in_subdir_not_source() {
+        let class = classify_path(b"frontend/pnpm-lock.yaml");
+        assert!(class.contains(PathClass::LOCK_FILE));
+        assert!(!class.contains(PathClass::SOURCE));
     }
 
     // ------------------------------------------------------------------
