@@ -715,6 +715,9 @@ fn validate_pypi_token(secret: &[u8]) -> OfflineVerdict {
     }
 
     let body = &secret[PYPI_PREFIX.len()..];
+    // Safety: PYPI_MIN_LEN == PYPI_PREFIX.len() + PYPI_B64URL_HEADER_CHARS,
+    // so the length check above guarantees body.len() >= PYPI_B64URL_HEADER_CHARS.
+    debug_assert!(body.len() >= PYPI_B64URL_HEADER_CHARS);
 
     // Decode 16 base64url chars → 12 bytes using deferred-invalidity loop.
     // Each group of 4 chars produces 3 bytes: 16 chars → 12 bytes exactly.

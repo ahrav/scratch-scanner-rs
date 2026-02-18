@@ -629,6 +629,10 @@ pub struct RuleSpec {
     /// When present, windows whose lowercase ASCII percentage exceeds the
     /// configured threshold are rejected without running the regex. This
     /// cheaply eliminates prose-dominated windows that are clearly not secrets.
+    ///
+    /// When `None` and the YAML parser detects `entropy.min_bits_per_byte >= 3.0`,
+    /// the parser auto-enables this gate with `max_lower_pct: 95, min_window_len: 32`.
+    /// See [`crate::rules::yaml::AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`].
     pub char_class: Option<CharClassSpec>,
 
     /// Optional local context gate evaluated after secret extraction.
