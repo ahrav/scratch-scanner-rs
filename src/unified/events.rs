@@ -161,7 +161,9 @@ pub struct FindingEvent<'a> {
     /// Additive confidence score from Phase 1 gate evaluation (0–10).
     ///
     /// Each confirming gate (entropy, keyword, assignment shape, offline
-    /// validation) adds its weight. A score of 0 means no gates fired.
+    /// validation) adds its weight. A score of 0 means either no confirming
+    /// gates fired or that confidence was not evaluated at this layer (e.g.
+    /// git adapter, remote scheduler do not yet run gate evaluation).
     pub confidence_score: i8,
 }
 

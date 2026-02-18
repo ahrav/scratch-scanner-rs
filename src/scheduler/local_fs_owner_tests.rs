@@ -1147,3 +1147,33 @@ fn small_file_below_tar_block_len_scans_normally() {
     );
     assert_perf_u64(report.metrics.archive.archives_seen, 0);
 }
+
+// ---------------------------------------------------------------------------
+// account_effective_dropped_findings regression tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn account_effective_dropped_subtracts_pruned() {
+    let mut m = WorkerMetricsLocal::new();
+
+    // Normal: 10 engine drops - 3 scheduler pruned = 7 effective.
+    account_effective_dropped_findings(&mut m, 10, 3);
+    assert_eq!(m.findings_dropped, 7);
+
+    // Accumulates: 7 + (5 - 2) = 10.
+    account_effective_dropped_findings(&mut m, 5, 2);
+    assert_eq!(m.findings_dropped, 10);
+}
+
+#[test]
+fn account_effective_dropped_saturates_when_pruned_exceeds_dropped() {
+    let mut m = WorkerMetricsLocal::new();
+
+    // Pruned > dropped: saturating_sub gives 0 (this was the bug).
+    account_effective_dropped_findings(&mut m, 2, 5);
+    assert_eq!(m.findings_dropped, 0);
+
+    // Equal: also 0.
+    account_effective_dropped_findings(&mut m, 3, 3);
+    assert_eq!(m.findings_dropped, 0);
+}

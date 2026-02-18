@@ -474,7 +474,7 @@ fn compute_confidence_score(
     }
     debug_assert!(s >= 0, "Phase 1 score must be non-negative: {s}");
     debug_assert!(s <= 10, "Phase 1 score exceeds max: {s}");
-    s
+    s.clamp(0, 10)
 }
 
 impl Engine {

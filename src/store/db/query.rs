@@ -51,6 +51,9 @@ pub struct FindingRow {
     pub end_byte: i64,
     pub secret_hash_hex: String,
     /// Additive confidence score from gate signals (0–10 for Phase 1).
+    ///
+    /// A value of 0 may indicate no gates fired or that confidence was not
+    /// evaluated at the producing layer (e.g. git adapter, remote scheduler).
     pub confidence_score: i8,
 }
 
@@ -211,7 +214,13 @@ fn map_finding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FindingRow> {
         start_byte: row.get(3)?,
         end_byte: row.get(4)?,
         secret_hash_hex: hex_encode(&secret),
-        confidence_score: i8::try_from(raw_score).unwrap_or(0),
+        confidence_score: i8::try_from(raw_score).unwrap_or_else(|_| {
+            debug_assert!(
+                false,
+                "confidence_score {raw_score} out of i8 range in DB row; falling back to 0"
+            );
+            0
+        }),
     })
 }
 
