@@ -59,29 +59,29 @@
 #
 # Threshold: 2.0 bits/byte
 #   Rejects strings where any single byte appears > n/4 times.
-#   For alphabets k >= 16 at token lengths n >= 16, the false-rejection
+#   For alphabets k >= 16 at token lengths n >= 32, the false-rejection
 #   probability for truly random tokens is negligible (< 10^-6) [3].
+#   Caution: at n ~ 17 with k = 16, FN rate is ~ 3.7% -- too high to gate.
 #
-# Coverage tiers (99 rules total):
+# Coverage tiers (97 rules total):
 #
 #   Tier 0 (43 rules, original) — Hex-alphabet rules ([a-f0-9] patterns).
 #     Small alphabet (k=16) where single-character repetition is the
 #     dominant false-positive pattern.
 #
-#   Tier 1 (2 rules, added) — Remaining hex-alphabet rules.
-#     sidekiq-secret, sidekiq-sensitive-url.
-#     Completes hex coverage with same rationale as Tier 0.
-#
-#   Tier 2 (48 rules, added) — Keyword + alphanumeric, no checksum.
+#   Tier 1 (48 rules, added) — Keyword + alphanumeric, no checksum.
 #     Highest FP-risk category: match `keyword + [a-z0-9]{N}` with no
 #     prefix or checksum defense. Min-entropy provides a complementary
 #     statistical gate alongside Shannon and value suppressors [3].
 #
-#   Tier 3 (6 rules, added) — Prefix-structured alphanumeric, no checksum.
+#   Tier 2 (6 rules, added) — Prefix-structured alphanumeric, no checksum.
 #     Known prefix (e.g. "CLOJARS_", "lin_api_") but no checksum
 #     validator. Min-entropy adds a secondary defense layer [3].
 #
 # Rules excluded from min-entropy (and why):
+#   - Short hex (n<=17, k=16)   sidekiq-secret, sidekiq-sensitive-url.
+#                                At n=17, P(max_count >= 5) ~ 3.7% for
+#                                uniformly random tokens -- unacceptable FN.
 #   - entropy: null             Structural patterns, not random tokens.
 #   - offline_validation        Checksum already validates authenticity.
 #   - Numeric-only (k=10)       Alphabet too small; threshold 2.0 too
@@ -3942,7 +3942,6 @@ rules:
     min_bits_per_byte: 2.5
     min_len: 16
     max_len: 256
-    min_entropy_bits_per_byte: 2.0  # hex-alphabet completion
   two_phase: null
   local_context: null
   secret_group: null
@@ -3964,7 +3963,6 @@ rules:
     min_bits_per_byte: 2.5
     min_len: 16
     max_len: 256
-    min_entropy_bits_per_byte: 2.0  # hex-alphabet completion
   two_phase: null
   local_context: null
   secret_group: null

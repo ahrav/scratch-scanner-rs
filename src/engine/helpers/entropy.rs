@@ -344,4 +344,31 @@ mod tests {
         // Capped to first 10 bytes (all unique) -> max entropy -> passes.
         assert!(entropy_gate_passes(&spec, &input, &mut scratch, &table));
     }
+
+    /// Short hex tokens (n=17, k=16) without min-entropy pass the gate.
+    ///
+    /// `sidekiq-secret` / `sidekiq-sensitive-url` match `[a-f0-9]{8}:[a-f0-9]{8}`
+    /// (17 bytes). At this length, a 2.0 bpb min-entropy gate rejects ~3.7%
+    /// of uniformly random valid tokens (any hex nibble appearing 5+ times
+    /// drives H_inf below 2.0). The production rule therefore omits the
+    /// min-entropy gate and relies on Shannon + keyword alone.
+    #[test]
+    fn short_hex_token_passes_without_min_entropy_gate() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 2.5,
+            min_len: 16,
+            max_len: 256,
+            min_entropy_bits_per_byte: None, // No min-entropy for short hex
+        };
+        let table = build_log2_table(256);
+        let mut scratch = EntropyScratch::new();
+
+        // Token with repeated nibble ('6' appears 5 times) -- would fail a
+        // 2.0 bpb min-entropy gate but must pass Shannon-only.
+        let token = b"66609066:7d494d16";
+        assert!(
+            entropy_gate_passes(&spec, token, &mut scratch, &table),
+            "short hex token with repeated nibble should pass without min-entropy gate"
+        );
+    }
 }

@@ -17,7 +17,7 @@ The values below are from the current repository snapshot:
 - Built-in rules: `223`
 - `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
 - `entropy` enabled: `218` rules
-- `min_entropy_bits_per_byte` enabled: `99` rules (Tier 0: 43 hex, Tier 1: 3 hex, Tier 2: 47 keyword+alphanum, Tier 3: 6 prefix-structured)
+- `min_entropy_bits_per_byte` enabled: `97` rules (Tier 0: 43 hex, Tier 1: 48 keyword+alphanum, Tier 2: 6 prefix-structured)
 - `local_context` enabled: `1` rule (`generic-api-key`)
 - `value_suppressors_any` enabled: `15` rules (`adafruit-api-key`, `adobe-client-id`, `algolia-api-key`, `atlassian-api-token`, `confluent-access-token`, `confluent-secret-key`, `curl-auth-header`, `curl-auth-user`, `discord-api-token`, `discord-client-secret`, `generic-api-key`, `hashicorp-tf-password`, `heroku-api-key`, `linear-client-secret`, `zendesk-secret-key`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
