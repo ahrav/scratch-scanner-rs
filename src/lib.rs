@@ -91,9 +91,9 @@ compile_error!(
 pub use api::Base64DecodeStats;
 pub use api::{
     AnchorPolicy, CharClassSpec, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding,
-    FindingRec, Gate, LocalContextSpec, OfflineValidationSpec, RuleSpec, StepId, TailCharset,
-    TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness,
-    ValidatorKind, LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
+    FindingRec, Gate, LocalContextSpec, OfflineValidationSpec, OfflineVerdict, RuleSpec, StepId,
+    TailCharset, TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec,
+    Utf16Endianness, ValidatorKind, LOCAL_CONTEXT_MAX_LOOKAROUND, MAX_DECODE_STEPS,
 };
 
 pub use demo::{
@@ -111,17 +111,19 @@ pub use engine::FuzzHitAccPool;
 #[cfg(feature = "bench")]
 pub use engine::{
     bench_build_entropy_state, bench_build_merge_ranges_state, bench_build_utf16_decode_state,
-    bench_contains_all_memmem, bench_contains_any_memmem, bench_decode_utf16be,
-    bench_decode_utf16be_with_state, bench_decode_utf16le, bench_decode_utf16le_with_state,
-    bench_entropy_gate_passes, bench_entropy_gate_passes_with_state,
-    bench_extract_secret_span_locs, bench_find_spans_into, bench_hash128,
-    bench_map_utf16_decoded_offset, bench_merge_ranges, bench_merge_ranges_load,
+    bench_classify_window, bench_contains_all_memmem, bench_contains_any_memmem,
+    bench_decode_utf16be, bench_decode_utf16be_with_state, bench_decode_utf16le,
+    bench_decode_utf16le_with_state, bench_entropy_gate_passes,
+    bench_entropy_gate_passes_with_state, bench_extract_secret_span_locs, bench_find_spans_into,
+    bench_hash128, bench_map_utf16_decoded_offset, bench_merge_ranges, bench_merge_ranges_load,
     bench_merge_ranges_run, bench_offline_validate_aws_access_key,
     bench_offline_validate_pypi_token, bench_offline_validate_sentry_org_token,
     bench_offline_validate_slack_token, bench_pack_patterns_raw, bench_shannon_entropy,
     bench_shannon_entropy_with_state, bench_stream_decode_base64, bench_stream_decode_url,
     BenchEntropyState, BenchMergeRangesState, BenchPackedPatterns, BenchUtf16DecodeState,
 };
+#[cfg(feature = "tiger-harness")]
+pub use engine::{fuzz_classify_window, fuzz_offline_validate};
 #[cfg(feature = "stats")]
 pub use engine::{AnchorPlanStats, VectorscanStats};
 pub use engine::{Engine, NormHash, ScanScratch};

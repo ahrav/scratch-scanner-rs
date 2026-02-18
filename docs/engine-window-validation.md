@@ -223,7 +223,7 @@ if let Some(cc) = gates.char_class {
 
 **Algorithm**: SIMD-accelerated byte classification (NEON on aarch64, SSE2 on x86_64) counts lowercase/uppercase/digit/special bytes. If `lower_count * 100 > total * max_lower_pct`, the window is rejected. Integer cross-multiply avoids float division on the hot path.
 
-**Fail-open**: Windows shorter than `min_window_len` pass unconditionally — small samples produce noisy statistics.
+**Fail-open**: Windows shorter than `min_window_len` pass unconditionally. This is intentional: the char_class gate is a false-positive filter, not a security boundary. Failing open on short windows prevents suppressing true positives whose windows happen to be narrow. The default `min_window_len >= 16` ensures the gate only activates when there are enough bytes for statistically meaningful class proportions.
 
 **When enabled**: Rules with `char_class` configured, or auto-enabled for entropy-gated rules with `min_bits_per_byte >= 3.0` (defaults: `max_lower_pct: 95`, `min_window_len: 32`).
 
@@ -668,8 +668,8 @@ Accounts for patterns with backward context or mid-match anchors. 64 bytes balan
 
 Gates progress from cheapest (memmem) to most expensive (regex), with slight
 variant-specific ordering:
-1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape
-2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape
+1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape -> char_class
+2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape -> char_class
 3. Regex: O(n x complexity)
 4. Post-match: secret extraction -> entropy -> value suppressors -> local context
 

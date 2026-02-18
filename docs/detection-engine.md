@@ -385,6 +385,13 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
   such as assignment separators, required key names, and/or matching quotes.
   This gate is fail-open when line boundaries are missing in the window to
   avoid false negatives at chunk edges.
+- **Character-class gate (pre-regex)**: before regex matching, SIMD-accelerated
+  byte classification counts lowercase/uppercase/digit/special bytes in the
+  validation window. If the lowercase proportion exceeds `max_lower_pct`, the
+  window is rejected as likely prose or variable names. This gate is auto-enabled
+  for entropy-gated rules with `min_bits_per_byte >= 3.0` (defaults:
+  `max_lower_pct: 95`, `min_window_len: 32`). Runs on the full window (not
+  extracted secret) and fails open on windows shorter than `min_window_len`.
 
 These gates are designed to be **local and bounded**:
 - Keywords are checked *before* regex, and for UTF-16 windows the check happens
@@ -395,6 +402,8 @@ These gates are designed to be **local and bounded**:
   they add minimal cost per finding but do not reduce regex work.
 - Local context uses bounded lookaround windows and operates on decoded UTF-8
   bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
+- Char-class runs before regex on the full window using 16-byte SIMD throughput;
+  cost is O(window_len) and fully amortized when it rejects the window.
 
 ## Tuning Parameters
 

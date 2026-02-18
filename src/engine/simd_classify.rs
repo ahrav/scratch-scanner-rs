@@ -413,6 +413,26 @@ mod tests {
         assert_eq!(p.lower, 4096);
         assert_eq!(p.upper + p.digit + p.special, 0);
     }
+
+    /// Deterministic test that forces all four accumulator lanes to flush,
+    /// verifying counts are correct across multiple flush epochs.
+    #[test]
+    fn large_input_flush_all_lanes() {
+        // Cycling pattern: one byte from each class, repeated to 4096+ bytes.
+        let pattern = [b'a', b'A', b'0', b'!'];
+        let input: Vec<u8> = pattern.iter().copied().cycle().take(4100).collect();
+        let p = classify_window(&input);
+        // 4100 / 4 = 1025 of each class.
+        assert_eq!(p.lower, 1025, "lower count");
+        assert_eq!(p.upper, 1025, "upper count");
+        assert_eq!(p.digit, 1025, "digit count");
+        assert_eq!(p.special, 1025, "special count");
+        assert_eq!(
+            p.lower + p.upper + p.digit + p.special,
+            4100,
+            "sum must equal length"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
