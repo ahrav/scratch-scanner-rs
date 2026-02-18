@@ -49,9 +49,9 @@
 # uniform distributions. This means min-entropy catches skewed byte
 # distributions (repeated substrings, character-frequency bias) that
 # pass Shannon checks — the gap grows with alphabet size, making this
-# gate especially effective for alphanumeric (k=36) tokens [3].
+# gate especially effective for alphanumeric (k=36) tokens.
 #
-# Implementation cost: zero. max_bin_count is already computed in the
+# Implementation cost: near-zero. max_bin_count is already computed in the
 # fused histogram pass (src/engine/helpers/entropy.rs). Adding this gate is
 # 1 table lookup + 1 subtraction + 1 comparison (~5 ns), evaluated
 # only for candidates that already pass Shannon (which rejects an
@@ -60,7 +60,7 @@
 # Threshold: 2.0 bits/byte
 #   Rejects strings where any single byte appears > n/4 times.
 #   For alphabets k >= 16 at token lengths n >= 32, the false-rejection
-#   probability for truly random tokens is negligible (< 10^-6) [3].
+#   probability for truly random tokens is negligible (< 10^-6).
 #   Caution: at n ~ 17 with k = 16, FN rate is ~ 3.7% -- too high to gate.
 #
 # Coverage tiers (97 rules total):
@@ -72,11 +72,11 @@
 #   Tier 1 (48 rules, added) — Keyword + alphanumeric, no checksum.
 #     Highest FP-risk category: match `keyword + [a-z0-9]{N}` with no
 #     prefix or checksum defense. Min-entropy provides a complementary
-#     statistical gate alongside Shannon and value suppressors [3].
+#     statistical gate alongside Shannon and value suppressors.
 #
 #   Tier 2 (6 rules, added) — Prefix-structured alphanumeric, no checksum.
 #     Known prefix (e.g. "CLOJARS_", "lin_api_") but no checksum
-#     validator. Min-entropy adds a secondary defense layer [3].
+#     validator. Min-entropy adds a secondary defense layer.
 #
 # Rules excluded from min-entropy (and why):
 #   - Short hex (n<=17, k=16)   sidekiq-secret, sidekiq-sensitive-url.
@@ -85,11 +85,11 @@
 #   - entropy: null             Structural patterns, not random tokens.
 #   - offline_validation        Checksum already validates authenticity.
 #   - Numeric-only (k=10)       Alphabet too small; threshold 2.0 too
-#                                restrictive for base-10 tokens [3].
+#                                restrictive for base-10 tokens.
 #   - Intentional low-entropy   Tokens with fixed segments like
 #                                "AAAAAAAAAA" or "A{22}" by design.
 #   - Base64 / structured       Non-uniform byte distribution by design;
-#                                padding and encoding skew min-entropy [3].
+#                                padding and encoding skew min-entropy.
 #   - High Shannon (>= 4.0)     Shannon already filters effectively.
 #   - Very short (< 20 chars)   Insufficient length for stable estimate.
 #
