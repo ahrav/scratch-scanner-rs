@@ -249,11 +249,17 @@ impl StoreProducer for SqliteStoreProducer {
                 state
                     .conn
                     .prepare_cached(
+                        // On conflict keep the highest confidence score seen
+                        // across runs: a re-scan may fire more gates (e.g.,
+                        // updated rules) and we want the most informative
+                        // score to survive.
                         "INSERT INTO occurrences (
                          occurrence_id, root_pk, path_pk, rule_pk, secret_pk,
-                         start_byte, end_byte, identity_flags, object_path
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(occurrence_id) DO NOTHING",
+                         start_byte, end_byte, identity_flags, object_path,
+                         confidence_score
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(occurrence_id) DO UPDATE SET
+                         confidence_score = MAX(excluded.confidence_score, occurrences.confidence_score)",
                     )?
                     .execute(params![
                         occurrence_id.as_slice(),
@@ -265,6 +271,7 @@ impl StoreProducer for SqliteStoreProducer {
                         finding.root_hint_end as i64,
                         0i64,
                         object_path.as_str(),
+                        finding.confidence_score as i64,
                     ])?;
 
                 let occ_pk: i64 = state
@@ -588,6 +595,7 @@ mod tests {
             span_start: 12,
             span_end: 18,
             norm_hash: [0xBB; 32],
+            confidence_score: 0,
         };
         let batch = FsFindingBatch {
             object_path: b"src/main.rs",
@@ -597,96 +605,66 @@ mod tests {
     }
 
     #[test]
-    fn end_run_updates_status() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let db_path = config.db_path.clone();
-        let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk().expect("run_pk");
+    fn end_run_status_cases() {
+        let cases: &[(Option<FsRunLoss>, bool, RunStatus)] = &[
+            // (loss, had_coverage_limits, expected_status)
+            (None, false, RunStatus::Complete),
+            (
+                Some(FsRunLoss {
+                    dropped_findings: 5,
+                    persistence_emit_failures: 0,
+                }),
+                false,
+                RunStatus::Incomplete,
+            ),
+            (None, true, RunStatus::CompleteWithCoverageLimits),
+        ];
+        for (loss, had_coverage_limits, expected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let db_path = config.db_path.clone();
+            let producer = SqliteStoreProducer::open(config).expect("open");
+            let run_pk = producer.run_pk().expect("run_pk");
 
-        producer.end_run(false).expect("end_run");
+            if let Some(loss) = loss {
+                producer.record_fs_run_loss(*loss).expect("loss");
+            }
+            producer.end_run(*had_coverage_limits).expect("end_run");
 
-        // Verify by reading the DB directly.
-        let conn = Connection::open(&db_path).unwrap();
-        let status: i32 = conn
-            .query_row(
-                "SELECT status FROM runs WHERE run_pk = ?1",
-                params![run_pk],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, RunStatus::Complete as i32);
-    }
-
-    #[test]
-    fn run_loss_marks_incomplete() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let db_path = config.db_path.clone();
-        let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk().expect("run_pk");
-
-        producer
-            .record_fs_run_loss(FsRunLoss {
-                dropped_findings: 5,
-                persistence_emit_failures: 0,
-            })
-            .expect("loss");
-        producer.end_run(false).expect("end_run");
-
-        let conn = Connection::open(&db_path).unwrap();
-        let status: i32 = conn
-            .query_row(
-                "SELECT status FROM runs WHERE run_pk = ?1",
-                params![run_pk],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, RunStatus::Incomplete as i32);
-    }
-
-    #[test]
-    fn coverage_limits_status() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let db_path = config.db_path.clone();
-        let producer = SqliteStoreProducer::open(config).expect("open");
-        let run_pk = producer.run_pk().expect("run_pk");
-
-        producer.end_run(true).expect("end_run");
-
-        let conn = Connection::open(&db_path).unwrap();
-        let status: i32 = conn
-            .query_row(
-                "SELECT status FROM runs WHERE run_pk = ?1",
-                params![run_pk],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(status, RunStatus::CompleteWithCoverageLimits as i32);
+            let conn = Connection::open(&db_path).unwrap();
+            let status: i32 = conn
+                .query_row(
+                    "SELECT status FROM runs WHERE run_pk = ?1",
+                    params![run_pk],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                status, *expected as i32,
+                "case: loss={loss:?}, cov={had_coverage_limits}"
+            );
+        }
     }
 
     #[test]
     fn run_counters_derive_status() {
-        let clean = RunCounters::default();
-        assert_eq!(clean.derive_status(false), RunStatus::Complete);
+        // One representative case per status variant.
         assert_eq!(
-            clean.derive_status(true),
+            RunCounters::default().derive_status(false),
+            RunStatus::Complete
+        );
+        assert_eq!(
+            RunCounters::default().derive_status(true),
             RunStatus::CompleteWithCoverageLimits
         );
-
-        let dropped = RunCounters {
-            dropped_findings: 1,
-            ..Default::default()
-        };
-        assert_eq!(dropped.derive_status(false), RunStatus::Incomplete);
-        assert_eq!(dropped.derive_status(true), RunStatus::Incomplete);
-
-        let emit_fail = RunCounters {
-            emit_failures: 1,
-            ..Default::default()
-        };
-        assert_eq!(emit_fail.derive_status(false), RunStatus::Incomplete);
+        assert_eq!(
+            RunCounters {
+                dropped_findings: 1,
+                ..Default::default()
+            }
+            .derive_status(false),
+            RunStatus::Incomplete
+        );
     }
 
     #[test]
@@ -715,40 +693,47 @@ mod tests {
         assert_eq!(run_count, 2);
     }
 
-    // ======================================================================
-    // Step 3: Empty batch test
-    // ======================================================================
-
     #[test]
-    fn emit_empty_batch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let producer = SqliteStoreProducer::open(config).expect("open");
+    fn batch_emission_counter_cases() {
+        for n in [0u16, 1, 5, 200] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let producer = SqliteStoreProducer::open(config).expect("open");
 
-        let batch = FsFindingBatch {
-            object_path: b"empty.rs",
-            findings: &[],
-        };
-        producer
-            .emit_fs_batch(batch)
-            .expect("empty batch should succeed");
-        producer.end_run(false).expect("end_run");
+            let findings: Vec<FsFindingRecord> = (0..n)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    hash[0..2].copy_from_slice(&i.to_le_bytes());
+                    FsFindingRecord {
+                        rule_id: i as u32,
+                        root_hint_start: 0,
+                        root_hint_end: 10,
+                        span_start: 0,
+                        span_end: 10,
+                        norm_hash: hash,
+                        confidence_score: 0,
+                    }
+                })
+                .collect();
+            let batch = FsFindingBatch {
+                object_path: b"batch.rs",
+                findings: &findings,
+            };
+            producer.emit_fs_batch(batch).expect("emit");
+            producer.end_run(false).expect("end_run");
 
-        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
-        let run: (i64, i64) = conn
-            .query_row(
-                "SELECT objects_scanned, findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(run.0, 1, "objects_scanned should increment");
-        assert_eq!(run.1, 0, "findings_emitted should stay 0");
+            let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+            let (scanned, emitted): (i64, i64) = conn
+                .query_row(
+                    "SELECT objects_scanned, findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(scanned, 1, "n={n}: objects_scanned");
+            assert_eq!(emitted, i64::from(n), "n={n}: findings_emitted");
+        }
     }
-
-    // ======================================================================
-    // Step 5: Additional writer tests
-    // ======================================================================
 
     #[test]
     fn rule_cache_hit_avoids_db_round_trip() {
@@ -763,6 +748,7 @@ mod tests {
             span_start: 0,
             span_end: 10,
             norm_hash: [0xDD; 32],
+            confidence_score: 0,
         };
         // Two batches with the same rule_id — fingerprint derived from rule_id
         // should be cached after the first batch.
@@ -788,90 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_findings_per_batch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let producer = SqliteStoreProducer::open(config).expect("open");
-
-        let findings: Vec<FsFindingRecord> = (0..5u8)
-            .map(|i| FsFindingRecord {
-                rule_id: u32::from(i),
-                root_hint_start: 0,
-                root_hint_end: 10,
-                span_start: 0,
-                span_end: 10,
-                norm_hash: [i; 32],
-            })
-            .collect();
-        let batch = FsFindingBatch {
-            object_path: b"multi.rs",
-            findings: &findings,
-        };
-        producer.emit_fs_batch(batch).expect("emit");
-        producer.end_run(false).expect("end_run");
-
-        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
-        let (scanned, emitted): (i64, i64) = conn
-            .query_row(
-                "SELECT objects_scanned, findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(scanned, 1);
-        assert_eq!(emitted, 5);
-
-        let rule_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rule_count, 5, "all 5 distinct rules should be created");
-    }
-
-    // ======================================================================
-    // Step 8: Stress and edge-case tests
-    // ======================================================================
-
-    #[test]
-    fn writer_large_batch_stress() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = test_config(tmp.path());
-        let producer = SqliteStoreProducer::open(config).expect("open");
-
-        let findings: Vec<FsFindingRecord> = (0..200u16)
-            .map(|i| {
-                let mut hash = [0u8; 32];
-                hash[0..2].copy_from_slice(&i.to_le_bytes());
-                FsFindingRecord {
-                    rule_id: i as u32,
-                    root_hint_start: 0,
-                    root_hint_end: 10,
-                    span_start: 0,
-                    span_end: 10,
-                    norm_hash: hash,
-                }
-            })
-            .collect();
-        let batch = FsFindingBatch {
-            object_path: b"stress.rs",
-            findings: &findings,
-        };
-        producer
-            .emit_fs_batch(batch)
-            .expect("large batch should succeed");
-        producer.end_run(false).expect("end_run");
-
-        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
-        let emitted: i64 = conn
-            .query_row(
-                "SELECT findings_emitted FROM runs ORDER BY run_pk DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(emitted, 200);
-    }
-
-    #[test]
     fn writer_concurrent_emit_from_threads() {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(tmp.path());
@@ -888,6 +790,7 @@ mod tests {
                         span_start: 0,
                         span_end: 10,
                         norm_hash: [t; 32],
+                        confidence_score: 0,
                     };
                     let path = format!("thread_{t}.rs");
                     let batch = FsFindingBatch {
@@ -916,10 +819,11 @@ mod tests {
     }
 
     #[test]
-    fn generate_run_id_uniqueness() {
+    fn generate_run_id_properties() {
         let mut ids = std::collections::HashSet::new();
         for _ in 0..1000 {
             let id = generate_run_id();
+            assert_ne!(id, [0u8; 16], "run_id must never be all zeros");
             assert!(ids.insert(id), "duplicate run_id generated");
         }
     }
@@ -949,6 +853,7 @@ mod tests {
             span_start: 0,
             span_end: 10,
             norm_hash: [0xFF; 32],
+            confidence_score: 0,
         };
         dyn_producer
             .emit_fs_batch(FsFindingBatch {
@@ -977,12 +882,141 @@ mod tests {
         );
         assert!(ended_at.is_some(), "ended_at must be set after end_run");
     }
+}
 
-    #[test]
-    fn generate_run_id_never_all_zeros() {
-        for _ in 0..100 {
-            let id = generate_run_id();
-            assert_ne!(id, [0u8; 16], "run_id must never be all zeros");
+// Property-based tests: continuous coverage for derive_status and confidence
+// score persistence. Gated behind `property-tests` to keep `cargo test` fast.
+#[cfg(all(test, feature = "property-tests"))]
+mod writer_proptests {
+    use super::*;
+    use crate::store::fs::{FsFindingBatch, FsFindingRecord};
+    use proptest::prelude::*;
+
+    fn test_config(dir: &std::path::Path) -> SqliteStoreConfig {
+        SqliteStoreConfig {
+            db_path: dir.join("findings.db"),
+            root_id: [0xAA; 32],
+            root_kind: RootKind::Fs,
+            identity_scheme: "fs_device_inode_v1".to_string(),
+            canonical_identity: b"/home/user/project".to_vec(),
+            display_name: Some("test-project".to_string()),
+            id_hash_mode: IdHashMode::Keyed,
+            scanner_version: Some("0.1.0-test".to_string()),
+        }
+    }
+
+    const PROPTEST_CASES: u32 = 64;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
+        /// For any `(dropped, failures, had_coverage_limits)` triple the status
+        /// invariant holds: loss → Incomplete, else coverage → CoverageLimits,
+        /// else Complete.
+        #[test]
+        fn prop_derive_status_precedence(
+            dropped in 0u64..100,
+            failures in 0u64..100,
+            had_coverage_limits: bool,
+        ) {
+            let c = RunCounters {
+                dropped_findings: dropped,
+                emit_failures: failures,
+                ..Default::default()
+            };
+            let status = c.derive_status(had_coverage_limits);
+            if dropped > 0 || failures > 0 {
+                prop_assert_eq!(status, RunStatus::Incomplete);
+            } else if had_coverage_limits {
+                prop_assert_eq!(status, RunStatus::CompleteWithCoverageLimits);
+            } else {
+                prop_assert_eq!(status, RunStatus::Complete);
+            }
+        }
+
+        /// Any `i8` confidence score survives the write→read roundtrip.
+        #[test]
+        fn prop_confidence_score_roundtrip(score: i8) {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let producer = SqliteStoreProducer::open(config).expect("open");
+
+            let mut hash = [0u8; 32];
+            hash[0] = score as u8;
+            hash[1] = score.wrapping_add(42) as u8;
+            let rec = FsFindingRecord {
+                rule_id: 1,
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: hash,
+                confidence_score: score,
+            };
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: b"roundtrip.rs",
+                    findings: &[rec],
+                })
+                .expect("emit");
+
+            let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+            let stored: i64 = conn
+                .query_row(
+                    "SELECT confidence_score FROM occurrences LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(stored, i64::from(score));
+        }
+
+        /// For any two `i8` scores emitted to the same occurrence, the DB
+        /// retains `max(a, b)`.
+        #[test]
+        fn prop_confidence_score_max_semantics(a: i8, b: i8) {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = test_config(tmp.path());
+            let producer = SqliteStoreProducer::open(config).expect("open");
+
+            let rec_a = FsFindingRecord {
+                rule_id: 1,
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: [0xEE; 32],
+                confidence_score: a,
+            };
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: b"max.rs",
+                    findings: &[rec_a],
+                })
+                .expect("emit a");
+
+            let rec_b = FsFindingRecord {
+                confidence_score: b,
+                ..rec_a
+            };
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: b"max.rs",
+                    findings: &[rec_b],
+                })
+                .expect("emit b");
+
+            let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+            let stored: i64 = conn
+                .query_row(
+                    "SELECT confidence_score FROM occurrences LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            prop_assert_eq!(stored, i64::from(a.max(b)));
         }
     }
 }

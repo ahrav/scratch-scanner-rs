@@ -174,6 +174,7 @@ fn write_finding_compact(f: &FindingEvent<'_>, w: &mut impl Write) -> io::Result
 ///   path:   {object_path}
 ///   range:  {start}-{end}
 ///   source: {fs|git}
+///   confidence: {score}     // omitted when 0
 ///   commit: {commit_id}     // Git findings only
 ///   change: {change_kind}   // Git findings only
 /// ```
@@ -183,6 +184,9 @@ fn write_finding_verbose(f: &FindingEvent<'_>, w: &mut impl Write) -> io::Result
     writeln!(w, "  path:   {}", sanitize_path(f.object_path))?;
     writeln!(w, "  range:  {}-{}", f.start, f.end)?;
     writeln!(w, "  source: {}", source_label(f.source))?;
+    if f.confidence_score != 0 {
+        writeln!(w, "  confidence: {}", f.confidence_score)?;
+    }
     if let Some(cid) = f.commit_id {
         writeln!(w, "  commit: {}", cid)?;
     }
@@ -265,6 +269,7 @@ mod tests {
                 rule_name: "aws-access-key",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -283,6 +288,7 @@ mod tests {
                 rule_name: "generic-secret",
                 commit_id: Some(12),
                 change_kind: Some("add"),
+                confidence_score: 0,
             }),
             true,
         );
@@ -394,6 +400,7 @@ mod tests {
                 rule_name: "test",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -414,6 +421,7 @@ mod tests {
                 rule_name: "rule",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -438,6 +446,7 @@ mod tests {
                 rule_name: "rule",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -462,6 +471,7 @@ mod tests {
                 rule_name: "rule",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -538,6 +548,7 @@ mod tests {
                 rule_name: "rule",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -594,6 +605,7 @@ mod tests {
                 rule_name: "r",
                 commit_id: Some(u32::MAX),
                 change_kind: None,
+                confidence_score: 0,
             }),
             false,
         );
@@ -668,6 +680,7 @@ mod tests {
                 rule_name: "test-rule",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }),
             true,
         );
@@ -748,6 +761,7 @@ mod tests {
             rule_name: "rule",
             commit_id: None,
             change_kind: None,
+            confidence_score: 0,
         }));
         // flush() calls BrokenPipeWriter::flush() → BrokenPipe → must not panic.
         sink.flush();
@@ -810,6 +824,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn confidence_score_in_verbose_text() {
+        // Score 7 → should appear.
+        let out = collect_text(
+            ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"src/secret.rs",
+                start: 10,
+                end: 50,
+                rule_id: 1,
+                rule_name: "api-key",
+                commit_id: None,
+                change_kind: None,
+                confidence_score: 7,
+            }),
+            true,
+        );
+        assert!(
+            out.contains("confidence: 7"),
+            "verbose output must show confidence when non-zero: {out}"
+        );
+
+        // Score 0 → suppressed.
+        let out_zero = collect_text(
+            ScanEvent::Finding(FindingEvent {
+                source: SourceKind::Fs,
+                object_path: b"src/other.rs",
+                start: 0,
+                end: 10,
+                rule_id: 1,
+                rule_name: "rule",
+                commit_id: None,
+                change_kind: None,
+                confidence_score: 0,
+            }),
+            true,
+        );
+        assert!(
+            !out_zero.contains("confidence:"),
+            "verbose output must suppress confidence when 0: {out_zero}"
+        );
+    }
+
     /// Exercises the panic-on-write-failure contract with a realistic
     /// buffered-I/O failure scenario.
     ///
@@ -845,6 +902,7 @@ mod tests {
                 rule_name: "generic-api-key",
                 commit_id: None,
                 change_kind: None,
+                confidence_score: 0,
             }));
         }
         // Belt-and-suspenders: flush in case the buffer hasn't spilled yet.
@@ -915,6 +973,7 @@ mod prop_tests {
                     rule_name: &rule_name,
                     commit_id: None,
                     change_kind: None,
+                    confidence_score: 0,
                 }),
                 false,
             );
@@ -949,6 +1008,7 @@ mod prop_tests {
                     rule_name: &rule_name,
                     commit_id: None,
                     change_kind: None,
+                    confidence_score: 0,
                 }),
                 true,
             );

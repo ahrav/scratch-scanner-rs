@@ -7,7 +7,7 @@
 //!
 //! # Assumptions
 //! - Findings are emitted as JSONL via the `VecEventSink`:
-//!   `{"type":"finding","source":"fs","path":"...","start":N,"end":N,"rule_id":N,"rule":"..."}`.
+//!   `{"type":"finding","source":"fs","path":"...","start":N,"end":N,"rule_id":N,"rule":"...","confidence_score":N}`.
 //! - Virtual paths are displayed as `parent::entry`.
 //! - Archive bytes are synthesized with minimal headers plus targeted
 //!   corruption for ZIP edge cases.
@@ -585,6 +585,9 @@ impl FindingRecord for DummyFinding {
         0
     }
     fn span_end(&self) -> u64 {
+        0
+    }
+    fn confidence_score(&self) -> i8 {
         0
     }
 }

@@ -100,7 +100,7 @@ pub(super) struct ResolvedGates<'e> {
 }
 
 impl Engine {
-    /// Resolves the six per-window gates for a rule into stack-local references.
+    /// Resolves all per-window gates for a rule into stack-local references.
     ///
     /// Called once per (rule, variant) pair in `scan_rules_on_buffer` and the
     /// `*_into` staging paths, then the result is passed into every
@@ -472,7 +472,9 @@ fn compute_confidence_score(
     if outcome.offline_verdict_valid {
         s = s.saturating_add(confidence::OFFLINE_VALID);
     }
-    s
+    debug_assert!(s >= 0, "Phase 1 score must be non-negative: {s}");
+    debug_assert!(s <= 10, "Phase 1 score exceeds max: {s}");
+    s.clamp(0, 10)
 }
 
 impl Engine {

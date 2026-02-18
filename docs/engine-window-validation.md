@@ -496,6 +496,7 @@ scratch.push_finding_with_drop_hint(
     root_hint_end: base_offset + root_span_hint.end as u64,
     dedupe_with_span,
     step_id,
+    confidence_score,
     },
     norm_hash,
     drop_hint_end,
@@ -515,6 +516,7 @@ scratch.push_finding_with_drop_hint(
 | `root_hint_end` | `u64` | Full match end (file offset for deduplication) |
 | `step_id` | `StepId` | Decode chain reference (enables span mapping) |
 | `dedupe_with_span` | `bool` | Whether `span_start`/`span_end` participate in dedupe |
+| `confidence_score` | `i8` | Additive 0–10 score computed from gate signals that fired |
 
 ### Capacity Management
 

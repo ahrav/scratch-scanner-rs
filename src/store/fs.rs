@@ -52,7 +52,12 @@ pub struct FsFindingRecord {
     pub span_end: u64,
     /// BLAKE3 digest of the normalized secret value (32 bytes).
     pub norm_hash: NormHash,
+    /// Additive confidence score from gate signals (Phase 1 range: 0–10).
+    pub confidence_score: i8,
 }
+
+/// Compile-time guard: `FsFindingRecord` must fit in 80 bytes to stay cache-friendly.
+const _: () = assert!(std::mem::size_of::<FsFindingRecord>() <= 80);
 
 /// Borrowed finding batch produced by one scan loop iteration.
 ///
@@ -339,6 +344,7 @@ mod tests {
             span_start: 12,
             span_end: 18,
             norm_hash: [0xAA; 32],
+            confidence_score: 0,
         };
         let batch1 = FsFindingBatch {
             object_path: b"/file1.txt",

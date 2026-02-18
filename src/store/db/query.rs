@@ -50,6 +50,11 @@ pub struct FindingRow {
     pub start_byte: i64,
     pub end_byte: i64,
     pub secret_hash_hex: String,
+    /// Additive confidence score from gate signals (0–10 for Phase 1).
+    ///
+    /// A value of 0 may indicate no gates fired or that confidence was not
+    /// evaluated at the producing layer (e.g. git adapter, remote scheduler).
+    pub confidence_score: i8,
 }
 
 /// Set-difference result of comparing two runs by their observations.
@@ -140,7 +145,8 @@ pub fn list_findings(
     limit: usize,
 ) -> rusqlite::Result<Vec<FindingRow>> {
     let mut sql = String::from(
-        "SELECT o.occurrence_id, o.object_path, ru.rule_name, o.start_byte, o.end_byte, s.secret_hash
+        "SELECT o.occurrence_id, o.object_path, ru.rule_name, o.start_byte, o.end_byte,
+                s.secret_hash, o.confidence_score
          FROM observations ob
          JOIN occurrences o  ON o.occ_pk = ob.occ_pk
          JOIN rules ru       ON ru.rule_pk = o.rule_pk
@@ -196,6 +202,11 @@ pub fn list_findings(
 fn map_finding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FindingRow> {
     let occ_id: Vec<u8> = row.get(0)?;
     let secret: Vec<u8> = row.get(5)?;
+    let raw_score: i64 = row.get(6)?;
+    debug_assert!(
+        i8::try_from(raw_score).is_ok(),
+        "confidence_score out of i8 range in DB: {raw_score}"
+    );
     Ok(FindingRow {
         occurrence_id_hex: hex_encode(&occ_id),
         object_path: row.get(1)?,
@@ -203,6 +214,13 @@ fn map_finding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FindingRow> {
         start_byte: row.get(3)?,
         end_byte: row.get(4)?,
         secret_hash_hex: hex_encode(&secret),
+        confidence_score: i8::try_from(raw_score).unwrap_or_else(|_| {
+            if raw_score > i64::from(i8::MAX) {
+                i8::MAX
+            } else {
+                i8::MIN
+            }
+        }),
     })
 }
 
@@ -229,7 +247,8 @@ pub fn diff_runs(
     };
 
     let new_sql = format!(
-        "SELECT o.occurrence_id, o.object_path, ru.rule_name, o.start_byte, o.end_byte, s.secret_hash
+        "SELECT o.occurrence_id, o.object_path, ru.rule_name, o.start_byte, o.end_byte,
+                s.secret_hash, o.confidence_score
          FROM observations ob
          JOIN occurrences o  ON o.occ_pk = ob.occ_pk
          JOIN rules ru       ON ru.rule_pk = o.rule_pk

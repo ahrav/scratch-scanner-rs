@@ -192,7 +192,8 @@ fn apply_v1(conn: &Connection) -> rusqlite::Result<()> {
             start_byte       INTEGER NOT NULL CHECK(start_byte >= 0),
             end_byte         INTEGER NOT NULL CHECK(end_byte > start_byte),
             identity_flags   INTEGER NOT NULL DEFAULT 0,
-            object_path      TEXT    NOT NULL
+            object_path      TEXT    NOT NULL,
+            confidence_score INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_occ_secret ON occurrences(secret_pk);
         CREATE INDEX IF NOT EXISTS idx_occ_rule   ON occurrences(rule_pk);

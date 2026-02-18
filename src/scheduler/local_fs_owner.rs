@@ -581,6 +581,7 @@ pub(super) fn emit_findings<E: ScanEngine, F: FindingRecord>(
                 rule_name: engine.rule_name(rec.rule_id()),
                 commit_id: None,
                 change_kind: None,
+                confidence_score: rec.confidence_score(),
             },
         ));
     }
@@ -613,6 +614,7 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
             span_start: finding.span_start(),
             span_end: finding.span_end(),
             norm_hash: *finding.norm_hash(),
+            confidence_score: finding.confidence_score(),
         });
     }
 }

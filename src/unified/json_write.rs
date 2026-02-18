@@ -383,6 +383,20 @@ impl<'a> BufCursor<'a> {
         }
     }
 
+    /// Write a signed 8-bit integer as decimal ASCII into the cursor.
+    ///
+    /// Negative values emit a leading `-` followed by the absolute value.
+    /// Worst case: 1 (sign) + 20 (digits via `push_u64`) = 21 bytes.
+    #[inline(always)]
+    pub(crate) fn push_i8(&mut self, n: i8) {
+        if n < 0 {
+            self.push_byte(b'-');
+            self.push_u64(n.unsigned_abs() as u64);
+        } else {
+            self.push_u64(n as u64);
+        }
+    }
+
     /// Commit cursor writes and return a mutable reference to the underlying
     /// buffer for external operations (e.g. `write_json_str`).
     ///

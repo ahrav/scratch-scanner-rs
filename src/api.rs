@@ -17,6 +17,8 @@
 //! # Algorithm
 //! 1. Findings are accumulated as compact `FindingRec` values on the hot path.
 //! 2. `FindingRec` is later materialized into `Finding` by expanding the decode-step chain.
+//!    `confidence_score` is **not** carried into `Finding`; it flows separately through
+//!    the scheduler and unified event layers.
 //! 3. Optional transform decoding is bounded by per-rule and global budgets.
 //!
 //! # Design Notes
@@ -496,7 +498,7 @@ pub enum TailCharset {
     AlnumDashUnderscore,
     /// `[A-Za-z0-9=_\-.]`
     Sendgrid66Set,
-    /// `[a-h0-9]` (case-insensitive)
+    /// `[a-hA-H0-9]` (case-insensitive; validator not yet wired — charset defined only)
     DatabricksSet,
     /// `[A-Za-z0-9+/]` (standard base64 alphabet, no padding)
     Base64Std,
@@ -975,6 +977,16 @@ pub mod confidence {
     /// Offline structural validation returned Valid (CRC, charset, etc.).
     pub const OFFLINE_VALID: i8 = 5;
 }
+
+/// Compile-time guard: Phase 1 weights must sum to at most 10 (the documented ceiling).
+/// Any value ≤ 10 trivially fits in `i8`, so a separate `i8::MAX` check is unnecessary.
+const _: () = assert!(
+    (confidence::ENTROPY_PASS as i16
+        + confidence::KEYWORD_PRESENT as i16
+        + confidence::ASSIGNMENT_SHAPE as i16
+        + confidence::OFFLINE_VALID as i16)
+        <= 10
+);
 
 #[cfg(test)]
 mod tests {

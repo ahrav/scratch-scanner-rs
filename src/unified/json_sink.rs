@@ -202,6 +202,7 @@ mod tests {
             rule_name: "aws-access-key",
             commit_id: None,
             change_kind: None,
+            confidence_score: 0,
         })
     }
 

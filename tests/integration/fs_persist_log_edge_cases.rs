@@ -46,6 +46,7 @@ fn sample_finding(rule_id: u32, start: u64) -> FsFindingRecord {
         span_start: start + 1,
         span_end: start + 15,
         norm_hash: [rule_id as u8; 32],
+        confidence_score: 0,
     }
 }
 

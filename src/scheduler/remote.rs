@@ -451,8 +451,8 @@ fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
 /// Emit findings as structured events.
 ///
 /// NOTE: Uses `SourceKind::Fs` because this module currently uses `MockEngine`
-/// for testing. When wired to a real remote backend, the source kind should
-/// be updated to reflect the actual origin (e.g., `SourceKind::Remote`).
+/// for testing. When wired to a real remote backend, a new `SourceKind`
+/// variant (e.g., `Remote`) would need to be added and used here.
 fn emit_findings(
     engine: &MockEngine,
     event_sink: &dyn EventSink,
@@ -473,6 +473,12 @@ fn emit_findings(
             rule_name: engine.rule_name(rec.rule_id),
             commit_id: None,
             change_kind: None,
+            // Remote scheduler receives pre-serialized findings without
+            // gate context — confidence_score is hardcoded to 0
+            // (indistinguishable from "zero gates fired").
+            // TODO: propagate confidence_score from the remote scan
+            // response when gate evaluation is available.
+            confidence_score: 0,
         }));
     }
 }

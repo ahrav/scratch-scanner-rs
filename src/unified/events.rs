@@ -158,6 +158,13 @@ pub struct FindingEvent<'a> {
     pub commit_id: Option<u32>,
     /// Change kind (`"add"` / `"modify"`) for Git findings; `None` for FS.
     pub change_kind: Option<&'a str>,
+    /// Additive confidence score from Phase 1 gate evaluation (0–10).
+    ///
+    /// Each confirming gate (entropy, keyword, assignment shape, offline
+    /// validation) adds its weight. A score of 0 means either no confirming
+    /// gates fired or that confidence was not evaluated at this layer (e.g.
+    /// git adapter, remote scheduler do not yet run gate evaluation).
+    pub confidence_score: i8,
 }
 
 /// Progress checkpoint emitted periodically during scanning.
@@ -357,9 +364,13 @@ pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
     cur.push_static(b",\"rule\":\"");
     // Commit and borrow buf for dynamic write_json_str (may reallocate).
     write_json_str(f.rule_name, cur.commit_to_buf());
-    // Re-reserve for optional tail: `"` + optional fields + `}`.
-    cur.resume(80);
+    // Re-reserve for optional tail: `"` + confidence_score + optional fields + `}`.
+    cur.resume(110);
     cur.push_byte(b'"');
+
+    // Confidence score: always emitted (non-optional).
+    cur.push_static(b",\"confidence_score\":");
+    cur.push_i8(f.confidence_score);
 
     if let Some(cid) = f.commit_id {
         cur.push_static(b",\"commit_id\":");
@@ -523,24 +534,30 @@ const _: () = {
             <= 170
     );
 
-    // encode_finding segment 3: cur.resume(80)
-    // Worst-case path: both commit_id and change_kind are Some.
+    // encode_finding segment 3: cur.resume(110)
+    // Worst-case path: confidence_score negative, both commit_id and change_kind Some.
     // The closing `}` is written in segment 3b (after commit_to_buf for
     // change_kind's dynamic write), so it is NOT counted here.
     assert!(
         1 // push_byte(b'"')
+            + b",\"confidence_score\":".len()
+            + 1  // push_byte(b'-') worst case
+            + 20 // push_u64
             + b",\"commit_id\":".len()
             + 20 // push_u64
             + b",\"change_kind\":\"".len()
-            <= 80
+            <= 110
     );
-    // Alternate path: commit_id Some, change_kind None — closing `}` here.
+    // Alternate path: confidence_score + commit_id Some, change_kind None — closing `}` here.
     assert!(
         1 // push_byte(b'"')
+            + b",\"confidence_score\":".len()
+            + 1  // push_byte(b'-') worst case
+            + 20 // push_u64
             + b",\"commit_id\":".len()
             + 20 // push_u64
             + 1  // push_byte(b'}')
-            <= 80
+            <= 110
     );
 
     // encode_finding segment 3b: cur.resume(2) — change_kind Some branch
@@ -712,6 +729,7 @@ mod tests {
             rule_name: "aws-access-key",
             commit_id: None,
             change_kind: None,
+            confidence_score: 0,
         }));
         assert!(line.starts_with('{'));
         assert!(line.ends_with("}\n"));
@@ -721,6 +739,10 @@ mod tests {
         assert!(line.contains("\"start\":42"));
         assert!(line.contains("\"end\":80"));
         assert!(line.contains("\"rule\":\"aws-access-key\""));
+        assert!(
+            line.contains("\"confidence_score\":0"),
+            "zero confidence_score must appear in JSONL: {line}"
+        );
         assert!(!line.contains("commit_id"));
     }
 
@@ -735,6 +757,7 @@ mod tests {
             rule_name: "generic-secret",
             commit_id: Some(12),
             change_kind: Some("add"),
+            confidence_score: 0,
         }));
         assert!(line.contains("\"source\":\"git\""));
         assert!(line.contains("\"commit_id\":12"));
@@ -754,6 +777,7 @@ mod tests {
             rule_name: "test",
             commit_id: None,
             change_kind: None,
+            confidence_score: 0,
         }));
         // The invalid byte should be escaped.
         assert!(line.contains("\\u00ff"));
@@ -823,6 +847,7 @@ mod tests {
             rule_name: "generic-api-key",
             commit_id: None,
             change_kind: None,
+            confidence_score: 0,
         }));
         assert!(line.contains("\"source\":\"fs\""));
         assert!(
@@ -848,6 +873,7 @@ mod tests {
             rule_name: "test-rule",
             commit_id: None,
             change_kind: None,
+            confidence_score: 0,
         }));
         sink.flush();
 
@@ -979,5 +1005,61 @@ mod tests {
             value: b"name\xff",
         }));
         assert!(line.contains("\"value\":\"name\\u00ff\""));
+    }
+
+    #[test]
+    fn confidence_score_in_jsonl() {
+        let line = collect_jsonl(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/secret.rs",
+            start: 10,
+            end: 50,
+            rule_id: 1,
+            rule_name: "api-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 7,
+        }));
+        assert!(
+            line.contains("\"confidence_score\":7"),
+            "JSONL must contain confidence_score: {line}"
+        );
+    }
+
+    #[test]
+    fn negative_confidence_score_in_jsonl() {
+        // Mildly negative score.
+        let line = collect_jsonl(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/secret.rs",
+            start: 10,
+            end: 50,
+            rule_id: 1,
+            rule_name: "api-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: -3,
+        }));
+        assert!(
+            line.contains("\"confidence_score\":-3"),
+            "negative confidence_score must round-trip: {line}"
+        );
+
+        // Minimum i8 value.
+        let line = collect_jsonl(ScanEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/secret.rs",
+            start: 10,
+            end: 50,
+            rule_id: 1,
+            rule_name: "api-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: i8::MIN,
+        }));
+        assert!(
+            line.contains("\"confidence_score\":-128"),
+            "i8::MIN confidence_score must round-trip: {line}"
+        );
     }
 }

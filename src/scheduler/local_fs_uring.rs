@@ -634,6 +634,7 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
             rule_name: engine.rule_name(rec.rule_id()),
             commit_id: None,
             change_kind: None,
+            confidence_score: rec.confidence_score(),
         }));
     }
 }
@@ -1002,7 +1003,7 @@ fn extract_worker_loop<E: ScanEngine>(
         let scheduler_pruned = before_prefix
             .saturating_sub(before_dedupe)
             .saturating_add(before_dedupe.saturating_sub(pending.len()));
-        let effective_dropped = engine_dropped.saturating_add(scheduler_pruned as u64);
+        let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
         total_dropped = total_dropped.saturating_add(effective_dropped);
 
         total_findings += pending.len() as u64;

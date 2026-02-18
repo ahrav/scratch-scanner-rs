@@ -1710,14 +1710,18 @@ impl ScanScratch {
             };
 
             if existing_matches {
-                // Transform > RAW (decoded content aids triage);
-                // among same type, prefer wider context (larger root_hint_end).
+                // Dedup replacement priority (highest wins):
+                //   1. Transform > RAW (decoded content aids triage).
+                //   2. Among same type, prefer wider context (larger root_hint_end).
+                //   3. Equal span: keep the higher confidence_score.
                 let should_replace = if rec.step_id != STEP_ROOT && existing.step_id == STEP_ROOT {
                     true
                 } else if rec.step_id == STEP_ROOT && existing.step_id != STEP_ROOT {
                     false
                 } else {
                     rec.root_hint_end > existing.root_hint_end
+                        || (rec.root_hint_end == existing.root_hint_end
+                            && rec.confidence_score > existing.confidence_score)
                 };
 
                 if should_replace {

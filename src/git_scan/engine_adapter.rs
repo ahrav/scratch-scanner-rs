@@ -461,6 +461,11 @@ impl<'a> EngineAdapter<'a> {
                 rule_name: self.engine.rule_name(f.rule_id),
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
+                // Git adapter does not run gate evaluation — confidence_score is
+                // hardcoded to 0 (indistinguishable from "zero gates fired").
+                // TODO: thread confidence_score through FindingKey when gate
+                // evaluation is wired for Git scans.
+                confidence_score: 0,
             }));
         }
     }

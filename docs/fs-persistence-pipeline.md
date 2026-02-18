@@ -102,6 +102,7 @@ absolute byte positions within the scanned object.
 │  span_start: u64                     │  ◄── matched span start
 │  span_end: u64                       │  ◄── matched span end (excl.)
 │  norm_hash: [u8; 32]                 │  ◄── BLAKE3 of normalized secret
+│  confidence_score: i8                │  ◄── additive 0–10 from gate signals
 └──────────────────────────────────────┘
 ```
 
