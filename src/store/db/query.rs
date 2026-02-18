@@ -200,6 +200,10 @@ fn map_finding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FindingRow> {
     let occ_id: Vec<u8> = row.get(0)?;
     let secret: Vec<u8> = row.get(5)?;
     let raw_score: i64 = row.get(6)?;
+    debug_assert!(
+        i8::try_from(raw_score).is_ok(),
+        "confidence_score out of i8 range in DB: {raw_score}"
+    );
     Ok(FindingRow {
         occurrence_id_hex: hex_encode(&occ_id),
         object_path: row.get(1)?,

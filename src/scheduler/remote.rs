@@ -474,7 +474,10 @@ fn emit_findings(
             commit_id: None,
             change_kind: None,
             // Remote scheduler receives pre-serialized findings without
-            // gate context — confidence is unavailable at this layer.
+            // gate context — confidence_score is hardcoded to 0
+            // (indistinguishable from "zero gates fired").
+            // TODO: propagate confidence_score from the remote scan
+            // response when gate evaluation is available.
             confidence_score: 0,
         }));
     }

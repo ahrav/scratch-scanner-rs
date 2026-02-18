@@ -275,22 +275,6 @@ pub(crate) fn write_f64(n: f64, buf: &mut Vec<u8>) {
     write_u64(frac, buf);
 }
 
-/// Write a signed 8-bit integer as a JSON number.
-///
-/// Negative values emit a leading `-` followed by the absolute value.
-/// Used for `confidence_score` in the standalone `write_*` API (the
-/// BufCursor path in `encode_finding` inlines the same logic).
-#[inline]
-#[allow(dead_code)] // reserved for standalone write_* API callers
-pub(crate) fn write_i8(n: i8, buf: &mut Vec<u8>) {
-    if n < 0 {
-        buf.push(b'-');
-        write_u64(n.unsigned_abs() as u64, buf);
-    } else {
-        write_u64(n as u64, buf);
-    }
-}
-
 /// Write a `bool` as `true` or `false`.
 #[cfg(test)]
 #[inline]
@@ -396,6 +380,20 @@ impl<'a> BufCursor<'a> {
         // SAFETY: `digits` bytes were written starting at `self.ptr`.
         unsafe {
             self.ptr = self.ptr.add(digits);
+        }
+    }
+
+    /// Write a signed 8-bit integer as decimal ASCII into the cursor.
+    ///
+    /// Negative values emit a leading `-` followed by the absolute value.
+    /// Worst case: 1 (sign) + 20 (digits via `push_u64`) = 21 bytes.
+    #[inline(always)]
+    pub(crate) fn push_i8(&mut self, n: i8) {
+        if n < 0 {
+            self.push_byte(b'-');
+            self.push_u64(n.unsigned_abs() as u64);
+        } else {
+            self.push_u64(n as u64);
         }
     }
 

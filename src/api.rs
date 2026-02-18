@@ -978,13 +978,14 @@ pub mod confidence {
     pub const OFFLINE_VALID: i8 = 5;
 }
 
-/// Compile-time guard: the sum of all Phase 1 gate weights must fit in `i8`.
+/// Compile-time guard: Phase 1 weights must sum to at most 10 (the documented ceiling).
+/// Any value ≤ 10 trivially fits in `i8`, so a separate `i8::MAX` check is unnecessary.
 const _: () = assert!(
     (confidence::ENTROPY_PASS as i16
         + confidence::KEYWORD_PRESENT as i16
         + confidence::ASSIGNMENT_SHAPE as i16
         + confidence::OFFLINE_VALID as i16)
-        <= i8::MAX as i16
+        <= 10
 );
 
 #[cfg(test)]

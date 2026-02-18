@@ -368,12 +368,7 @@ pub(crate) fn encode_finding(f: &FindingEvent<'_>, buf: &mut Vec<u8>) {
 
     // Confidence score: always emitted (non-optional).
     cur.push_static(b",\"confidence_score\":");
-    if f.confidence_score < 0 {
-        cur.push_byte(b'-');
-        cur.push_u64(f.confidence_score.unsigned_abs() as u64);
-    } else {
-        cur.push_u64(f.confidence_score as u64);
-    }
+    cur.push_i8(f.confidence_score);
 
     if let Some(cid) = f.commit_id {
         cur.push_static(b",\"commit_id\":");
