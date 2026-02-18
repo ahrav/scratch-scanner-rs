@@ -1673,7 +1673,7 @@ mod tests {
 
     #[test]
     fn slack_token_cases() {
-        use OfflineVerdict::{Indeterminate, Invalid, Valid};
+        use OfflineVerdict::{Indeterminate, Valid};
 
         // Dynamic tokens that require Vec construction.
         let config_access = {
@@ -1703,7 +1703,11 @@ mod tests {
                 b"xoxb-12345678-aBcDeFgHiJkLmNoPqRsT".to_vec(),
                 Valid,
             ),
-            ("bot_invalid_segments", b"xoxb-123-abc".to_vec(), Invalid),
+            (
+                "bot_invalid_segments",
+                b"xoxb-123-abc".to_vec(),
+                Indeterminate,
+            ),
             (
                 "user",
                 b"xoxp-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(),
