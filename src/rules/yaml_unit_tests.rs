@@ -4,6 +4,23 @@ use crate::rules::builtin_rules;
 use crate::{demo_tuning, AnchorPolicy, Engine, Finding};
 use std::path::Path;
 
+/// Parse YAML → `RuleSpec` → `rulespec_to_yaml` → serialize → re-parse →
+/// assert `offline_validation` equality on each rule.
+fn assert_offline_validation_roundtrip(yaml: &str) {
+    let original = parse_yaml_rules(yaml).expect("parse");
+    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+    let file = YamlRulesFile { rules: yaml_rules };
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
+    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+    for (orig, reparsed) in original.iter().zip(parsed.iter()) {
+        assert_eq!(
+            orig.offline_validation, reparsed.offline_validation,
+            "round-trip mismatch for {}",
+            orig.name
+        );
+    }
+}
+
 /// Convert `RuleSpec` back to YAML intermediate type for round-trip testing.
 fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
     let anchors: Vec<String> = rule
@@ -1433,100 +1450,57 @@ rules:
 // ---- offline_validation YAML parsing tests ----
 
 #[test]
-fn parse_offline_validation_crc32_base62() {
-    let yaml = r#"
-rules:
-  - name: "ov-crc32"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      prefix_skip: 4
-      payload_len: 30
-      checksum_len: 6
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse crc32_base62");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::Crc32Base62 {
-            prefix_skip: 4,
-            payload_len: 30,
-            checksum_len: 6,
-        })
-    );
-}
+fn parse_offline_validation_valid_types() {
+    // Formerly: parse_offline_validation_crc32_base62,
+    //           parse_offline_validation_github_fine_grained_pat,
+    //           parse_offline_validation_grafana_service_account,
+    //           parse_offline_validation_aws_access_key,
+    //           parse_offline_validation_sentry_org_token,
+    //           parse_offline_validation_pypi_token,
+    //           parse_offline_validation_slack_token.
+    let cases: &[(&str, OfflineValidationSpec)] = &[
+        (
+            "type: crc32_base62\n      prefix_skip: 4\n      payload_len: 30\n      checksum_len: 6",
+            OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 30,
+                checksum_len: 6,
+            },
+        ),
+        (
+            "type: github_fine_grained_pat",
+            OfflineValidationSpec::GithubFinegrainedPat,
+        ),
+        (
+            "type: grafana_service_account",
+            OfflineValidationSpec::GrafanaServiceAccount,
+        ),
+        (
+            "type: aws_access_key",
+            OfflineValidationSpec::AwsAccessKey,
+        ),
+        (
+            "type: sentry_org_token",
+            OfflineValidationSpec::SentryOrgToken,
+        ),
+        ("type: pypi_token", OfflineValidationSpec::PyPiToken),
+        ("type: slack_token", OfflineValidationSpec::SlackToken),
+    ];
 
-#[test]
-fn parse_offline_validation_github_fine_grained_pat() {
-    let yaml = r#"
-rules:
-  - name: "ov-ghpat"
-    regex: 'github_pat_[A-Za-z0-9_]{82}'
-    anchors: ["github_pat_"]
-    radius: 128
-    offline_validation:
-      type: github_fine_grained_pat
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse github_fine_grained_pat");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::GithubFinegrainedPat)
-    );
-}
-
-#[test]
-fn parse_offline_validation_grafana_service_account() {
-    let yaml = r#"
-rules:
-  - name: "ov-grafana"
-    regex: 'glsa_[A-Za-z0-9]{32}_[a-f0-9]{8}'
-    anchors: ["glsa_"]
-    radius: 64
-    offline_validation:
-      type: grafana_service_account
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse grafana_service_account");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::GrafanaServiceAccount)
-    );
-}
-
-#[test]
-fn parse_offline_validation_aws_access_key() {
-    let yaml = r#"
-rules:
-  - name: "ov-aws"
-    regex: 'AKIA[0-9A-Z]{16}'
-    anchors: ["AKIA"]
-    radius: 32
-    offline_validation:
-      type: aws_access_key
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse aws_access_key");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::AwsAccessKey)
-    );
-}
-
-#[test]
-fn parse_offline_validation_sentry_org_token() {
-    let yaml = r#"
-rules:
-  - name: "ov-sentry"
-    regex: 'sntrys_[A-Za-z0-9+/=]{64,}'
-    anchors: ["sntrys_"]
-    radius: 128
-    offline_validation:
-      type: sentry_org_token
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse sentry_org_token");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::SentryOrgToken)
-    );
+    for (ov_body, expected) in cases {
+        let yaml = format!(
+            "rules:\n  - name: \"ov-test\"\n    regex: 'tok_[a-z0-9]{{40}}'\n    \
+             anchors: [\"tok_\"]\n    radius: 64\n    offline_validation:\n      {ov_body}\n"
+        );
+        let rules = parse_yaml_rules(&yaml).unwrap_or_else(|e| {
+            panic!("parse failed for {ov_body}: {e}");
+        });
+        assert_eq!(
+            rules[0].offline_validation,
+            Some(*expected),
+            "mismatch for {ov_body}"
+        );
+    }
 }
 
 #[test]
@@ -1566,83 +1540,58 @@ rules:
 }
 
 #[test]
-fn parse_offline_validation_crc32_missing_payload_len_fails() {
-    let yaml = r#"
-rules:
-  - name: "ov-incomplete"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      prefix_skip: 4
-      checksum_len: 6
-"#;
-    match parse_yaml_rules(yaml) {
-        Err(RulesError::OfflineValidation { rule_name, message }) => {
-            assert_eq!(rule_name, "ov-incomplete");
-            assert!(
-                message.contains("payload_len"),
-                "error should mention missing field: {message}"
-            );
+fn parse_offline_validation_crc32_missing_fields() {
+    // Formerly: parse_offline_validation_crc32_missing_payload_len_fails,
+    //           parse_offline_validation_crc32_missing_prefix_skip_fails,
+    //           parse_offline_validation_crc32_missing_checksum_len_fails.
+    let cases: &[(&str, &str, &str)] = &[
+        // (rule_name, present_fields, expected_missing_field)
+        (
+            "ov-incomplete",
+            "prefix_skip: 4\n      checksum_len: 6",
+            "payload_len",
+        ),
+        (
+            "ov-no-prefix",
+            "payload_len: 30\n      checksum_len: 6",
+            "prefix_skip",
+        ),
+        (
+            "ov-no-crc",
+            "prefix_skip: 4\n      payload_len: 30",
+            "checksum_len",
+        ),
+    ];
+
+    for &(rule_name, fields, expected_field) in cases {
+        let yaml = format!(
+            "rules:\n  - name: \"{rule_name}\"\n    regex: 'tok_[a-z0-9]{{40}}'\n    \
+             anchors: [\"tok_\"]\n    radius: 64\n    offline_validation:\n      \
+             type: crc32_base62\n      {fields}\n"
+        );
+        match parse_yaml_rules(&yaml) {
+            Err(RulesError::OfflineValidation {
+                rule_name: got_name,
+                message,
+            }) => {
+                assert_eq!(got_name, rule_name);
+                assert!(
+                    message.contains(expected_field),
+                    "error for {rule_name} should mention '{expected_field}': {message}"
+                );
+            }
+            other => panic!("expected OfflineValidation error for {rule_name}, got: {other:?}"),
         }
-        other => panic!("expected OfflineValidation error, got: {other:?}"),
     }
 }
 
 #[test]
-fn parse_offline_validation_crc32_missing_prefix_skip_fails() {
-    let yaml = r#"
-rules:
-  - name: "ov-no-prefix"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      payload_len: 30
-      checksum_len: 6
-"#;
-    match parse_yaml_rules(yaml) {
-        Err(RulesError::OfflineValidation { rule_name, message }) => {
-            assert_eq!(rule_name, "ov-no-prefix");
-            assert!(
-                message.contains("prefix_skip"),
-                "error should mention missing field: {message}"
-            );
-        }
-        other => panic!("expected OfflineValidation error, got: {other:?}"),
-    }
-}
-
-#[test]
-fn parse_offline_validation_crc32_missing_checksum_len_fails() {
-    let yaml = r#"
-rules:
-  - name: "ov-no-crc"
-    regex: 'tok_[a-z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    offline_validation:
-      type: crc32_base62
-      prefix_skip: 4
-      payload_len: 30
-"#;
-    match parse_yaml_rules(yaml) {
-        Err(RulesError::OfflineValidation { rule_name, message }) => {
-            assert_eq!(rule_name, "ov-no-crc");
-            assert!(
-                message.contains("checksum_len"),
-                "error should mention missing field: {message}"
-            );
-        }
-        other => panic!("expected OfflineValidation error, got: {other:?}"),
-    }
-}
-
-#[test]
-fn roundtrip_offline_validation_crc32_base62() {
-    let yaml = r#"
+fn roundtrip_offline_validation_all_types() {
+    // Formerly: roundtrip_offline_validation_crc32_base62,
+    //           roundtrip_offline_validation_unit_variants,
+    //           roundtrip_offline_validation_pypi_and_slack.
+    assert_offline_validation_roundtrip(
+        r#"
 rules:
   - name: "rt-crc32"
     regex: 'tok_[a-z0-9]{40}'
@@ -1653,19 +1602,6 @@ rules:
       prefix_skip: 4
       payload_len: 30
       checksum_len: 6
-"#;
-    let original = parse_yaml_rules(yaml).expect("parse");
-    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
-    let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_norway::to_string(&file).expect("serialize");
-    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
-    assert_eq!(original[0].offline_validation, parsed[0].offline_validation);
-}
-
-#[test]
-fn roundtrip_offline_validation_unit_variants() {
-    let yaml = r#"
-rules:
   - name: "rt-ghpat"
     regex: 'github_pat_[A-Za-z0-9_]{82}'
     anchors: ["github_pat_"]
@@ -1690,62 +1626,6 @@ rules:
     radius: 128
     offline_validation:
       type: sentry_org_token
-"#;
-    let original = parse_yaml_rules(yaml).expect("parse");
-    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
-    let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_norway::to_string(&file).expect("serialize");
-    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
-
-    for (orig, reparsed) in original.iter().zip(parsed.iter()) {
-        assert_eq!(
-            orig.offline_validation, reparsed.offline_validation,
-            "round-trip mismatch for {}",
-            orig.name
-        );
-    }
-}
-
-#[test]
-fn parse_offline_validation_pypi_token() {
-    let yaml = r#"
-rules:
-  - name: "ov-pypi"
-    regex: 'pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}'
-    anchors: ["pypi-ageichlwas5vcmc"]
-    radius: 1064
-    offline_validation:
-      type: pypi_token
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse pypi_token");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::PyPiToken)
-    );
-}
-
-#[test]
-fn parse_offline_validation_slack_token() {
-    let yaml = r#"
-rules:
-  - name: "ov-slack"
-    regex: 'xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*'
-    anchors: ["xoxb"]
-    radius: 2048
-    offline_validation:
-      type: slack_token
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse slack_token");
-    assert_eq!(
-        rules[0].offline_validation,
-        Some(OfflineValidationSpec::SlackToken)
-    );
-}
-
-#[test]
-fn roundtrip_offline_validation_pypi_and_slack() {
-    let yaml = r#"
-rules:
   - name: "rt-pypi"
     regex: 'pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}'
     anchors: ["pypi-ageichlwas5vcmc"]
@@ -1758,20 +1638,8 @@ rules:
     radius: 2048
     offline_validation:
       type: slack_token
-"#;
-    let original = parse_yaml_rules(yaml).expect("parse");
-    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
-    let file = YamlRulesFile { rules: yaml_rules };
-    let yaml_str = serde_norway::to_string(&file).expect("serialize");
-    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
-
-    for (orig, reparsed) in original.iter().zip(parsed.iter()) {
-        assert_eq!(
-            orig.offline_validation, reparsed.offline_validation,
-            "round-trip mismatch for {}",
-            orig.name
-        );
-    }
+"#,
+    );
 }
 
 // ---- default_rules.yaml offline validation spec assertions ----
