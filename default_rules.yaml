@@ -52,9 +52,10 @@
 # gate especially effective for alphanumeric (k=36) tokens [3].
 #
 # Implementation cost: zero. max_bin_count is already computed in the
-# fused histogram pass (src/engine/helpers.rs). Adding this gate is
-# 2 table lookups + 1 comparison (~5 ns), evaluated only for
-# candidates that already pass Shannon (which rejects 80-90% first).
+# fused histogram pass (src/engine/helpers/entropy.rs). Adding this gate is
+# 1 table lookup + 1 subtraction + 1 comparison (~5 ns), evaluated
+# only for candidates that already pass Shannon (which rejects an
+# estimated 80-90% first).
 #
 # Threshold: 2.0 bits/byte
 #   Rejects strings where any single byte appears > n/4 times.
@@ -67,11 +68,11 @@
 #     Small alphabet (k=16) where single-character repetition is the
 #     dominant false-positive pattern.
 #
-#   Tier 1 (3 rules, added) — Remaining hex-alphabet rules.
-#     atlassian-api-token, sidekiq-secret, sidekiq-sensitive-url.
+#   Tier 1 (2 rules, added) — Remaining hex-alphabet rules.
+#     sidekiq-secret, sidekiq-sensitive-url.
 #     Completes hex coverage with same rationale as Tier 0.
 #
-#   Tier 2 (47 rules, added) — Keyword + alphanumeric, no checksum.
+#   Tier 2 (48 rules, added) — Keyword + alphanumeric, no checksum.
 #     Highest FP-risk category: match `keyword + [a-z0-9]{N}` with no
 #     prefix or checksum defense. Min-entropy provides a complementary
 #     statistical gate alongside Shannon and value suppressors [3].
@@ -97,9 +98,8 @@
 #       Used for Random Bit Generation" (2018).
 #   [2] Rényi, A. "On Measures of Entropy and Information," Proc. 4th
 #       Berkeley Symposium on Math. Stat. and Prob. (1961), pp. 547-561.
-#   [3] scanner-rs deep-research synthesis — see
-#       .claude/plans/gentle-sniffing-cray-synthesis.md for the full
-#       evidence inventory (34 findings, 5 research agents).
+#   [3] scanner-rs internal deep-research synthesis
+#       (34 findings, 5 research agents).
 # --------------------------------------------------------------------------
 # ==========================================================================
 rules:
@@ -532,7 +532,7 @@ rules:
     min_bits_per_byte: 3.5
     min_len: 16
     max_len: 256
-    min_entropy_bits_per_byte: 2.0  # hex-alphabet completion
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
   two_phase: null
   local_context: null
   secret_group: null
