@@ -441,6 +441,7 @@ fn archive_extension_scans_when_disabled() {
     let source = VecFileSource::new(vec![LocalFile { path, size }]);
     let mut cfg = small_config_with_sink(sink.clone());
     cfg.archive.enabled = false;
+    cfg.skip_binary = false;
 
     let report = scan_local(engine, source, cfg);
 
