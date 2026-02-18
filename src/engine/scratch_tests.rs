@@ -53,6 +53,7 @@ fn make_rec(
         root_hint_end,
         dedupe_with_span: false,
         step_id,
+        confidence_score: 0,
     }
 }
 
@@ -259,6 +260,7 @@ fn dedup_rejects_rule_ids_that_overlap_variant_bits() {
         root_hint_end: 120,
         dedupe_with_span: true,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
     let utf16_le = FindingRec {
         file_id: FileId(0),
@@ -269,6 +271,7 @@ fn dedup_rejects_rule_ids_that_overlap_variant_bits() {
         root_hint_end: 120,
         dedupe_with_span: true,
         step_id: utf16_le_step,
+        confidence_score: 0,
     };
 
     scratch.push_finding_with_drop_hint(
@@ -307,6 +310,7 @@ fn same_scan_raw_duplicate_is_not_replaced_by_equal() {
         root_hint_end: 120,
         dedupe_with_span: true,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
     let hash_a = [0xA1; 32];
     let hash_b = [0xB2; 32];
@@ -358,6 +362,7 @@ fn same_scan_transform_replaces_raw_finding() {
         root_hint_end: 120,
         dedupe_with_span: false,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
     let raw_hash = [0xAA; 32];
     scratch.push_finding_with_drop_hint(raw_rec, raw_hash, raw_rec.root_hint_end, false);
@@ -380,6 +385,7 @@ fn same_scan_transform_replaces_raw_finding() {
         root_hint_end: 120,
         dedupe_with_span: false,
         step_id: transform_step,
+        confidence_score: 0,
     };
     let transform_hash = [0xBB; 32];
     scratch.push_finding_with_drop_hint(
@@ -433,6 +439,7 @@ fn same_scan_raw_does_not_replace_transform_finding() {
         root_hint_end: 120,
         dedupe_with_span: false,
         step_id: transform_step,
+        confidence_score: 0,
     };
     let transform_hash = [0xBB; 32];
     scratch.push_finding_with_drop_hint(
@@ -453,6 +460,7 @@ fn same_scan_raw_does_not_replace_transform_finding() {
         root_hint_end: 120,
         dedupe_with_span: false,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
     let raw_hash = [0xAA; 32];
     scratch.push_finding_with_drop_hint(raw_rec, raw_hash, raw_rec.root_hint_end, false);

@@ -79,7 +79,10 @@ pub struct RuleId(pub u16);
 /// owns them (see [`ScanScratch::drop_prefix_findings`]).
 ///
 /// **Within-chunk** dedupe (in [`local_fs_owner::dedupe_findings`]) uses the
-/// full 6-tuple `(rule_id, root_hint_start, root_hint_end, span_start, span_end, norm_hash)`.
+/// full 6-tuple `(rule_id, root_hint_start, root_hint_end, span_start,
+/// span_end, norm_hash)` from the [`FindingWithHash`] carrier -- not from this
+/// stub struct directly (the stub lacks a `norm_hash` field; the hash is
+/// attached by [`ScanEngine::drain_findings_into`]).
 /// `StepId` (transform chain) is intentionally excluded because the same match
 /// found via different transform paths is still one finding *if* the normalized
 /// secret hash matches. Two findings at the same span with different `norm_hash`
@@ -95,6 +98,9 @@ pub struct FindingRec {
     pub span_start: u64,
     /// Full match span end.
     pub span_end: u64,
+    /// Additive confidence score. The stub engine has no gate pipeline,
+    /// so this is always 0 in mock findings.
+    pub confidence_score: i8,
 }
 
 // ============================================================================
@@ -324,6 +330,7 @@ impl MockEngine {
                         root_hint_end: abs_end,
                         span_start: abs_start,
                         span_end: abs_end,
+                        confidence_score: 0,
                     });
 
                     // Skip past this match

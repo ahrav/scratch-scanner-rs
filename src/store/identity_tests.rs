@@ -123,6 +123,7 @@ fn occurrence_id_normalizes_base64_padding_tail() {
         root_hint_end: 1020, // min + 2 (padding)
         dedupe_with_span: false,
         step_id: StepId(1),
+        confidence_score: 0,
     };
     let finding_min = FindingRec {
         root_hint_end: 1018, // min encoded
@@ -171,6 +172,7 @@ fn occurrence_id_distinguishes_utf16_variants() {
         root_hint_end: 424,
         dedupe_with_span: false,
         step_id: StepId(2),
+        confidence_score: 0,
     };
 
     let le = occurrence_id(
@@ -215,6 +217,7 @@ fn occurrence_id_is_invariant_to_non_root_span_offset() {
         root_hint_end: 10_024,
         dedupe_with_span: false,
         step_id: StepId(3),
+        confidence_score: 0,
     };
     let finding_b = FindingRec {
         span_start: 900,
@@ -264,6 +267,7 @@ fn occurrence_id_distinguishes_non_root_span_when_dedupe_with_span_true() {
         root_hint_end: 20_024,
         dedupe_with_span: true,
         step_id: StepId(4),
+        confidence_score: 0,
     };
     let finding_b = FindingRec {
         span_start: 900,
@@ -311,6 +315,7 @@ fn root_step_with_utf16_variant_is_rejected() {
         root_hint_end: 8,
         dedupe_with_span: true,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
 
     let err = occurrence_id(
@@ -391,6 +396,7 @@ fn occurrence_ids_are_stable_across_order_and_batch_partitions() {
                 root_hint_end,
                 dedupe_with_span: (lcg(&mut seed) & 1) == 1,
                 step_id,
+                confidence_score: 0,
             },
             rule_fingerprint: rand_arr(&mut seed),
             secret_hash: rand_arr(&mut seed),
@@ -443,6 +449,7 @@ fn make_finding(
         root_hint_end,
         dedupe_with_span: false,
         step_id,
+        confidence_score: 0,
     }
 }
 
@@ -620,6 +627,7 @@ fn base_occurrence_case() -> OccurrenceCase {
             root_hint_end: 2024,
             dedupe_with_span: false,
             step_id: StepId(1),
+            confidence_score: 0,
         },
         rule_fingerprint: [0xBB; 32],
         secret_hash: [0xCC; 32],
@@ -709,6 +717,7 @@ fn canonicalize_root_preserves_all_spans() {
         root_hint_end: 200,
         dedupe_with_span: false,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
     let cf = canonicalize_finding(&finding, VariantDiscriminant::None, None).unwrap();
     // Root always includes span
@@ -734,6 +743,7 @@ fn canonicalize_non_root_zeroes_span_when_no_dedupe() {
         root_hint_end: 5024,
         dedupe_with_span: false,
         step_id: StepId(1),
+        confidence_score: 0,
     };
     let cf = canonicalize_finding(
         &finding,
@@ -759,6 +769,7 @@ fn canonicalize_non_root_preserves_span_when_dedupe() {
         root_hint_end: 5024,
         dedupe_with_span: true,
         step_id: StepId(1),
+        confidence_score: 0,
     };
     let cf = canonicalize_finding(
         &finding,
@@ -838,6 +849,7 @@ mod prop {
                                 root_hint_end,
                                 dedupe_with_span: dedupe,
                                 step_id,
+                                confidence_score: 0,
                             },
                             variant,
                             leaf_tf,
@@ -973,6 +985,7 @@ fn url_percent_findings_with_different_hint_end_produce_different_ids() {
         root_hint_end: 1019, // min + 1
         dedupe_with_span: false,
         step_id: StepId(1),
+        confidence_score: 0,
     };
     let finding_b = FindingRec {
         root_hint_end: 1020, // min + 2
@@ -1044,6 +1057,7 @@ fn root_occurrence_includes_span_in_identity() {
         root_hint_end: 66,
         dedupe_with_span: false,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     };
     let finding_b = FindingRec {
         span_start: 100,
