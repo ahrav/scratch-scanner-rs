@@ -15,16 +15,18 @@
 //!    For UTF-16 variants, confirm-all and keywords run on raw bytes *before*
 //!    decode; must-contain runs on decoded UTF-8 *after* decode.
 //! 2. Apply assignment-shape precheck (when configured).
-//! 3. For UTF-16 variants, decode with per-window and total-output budgets.
-//! 4. Run regex with reusable capture locations to access capture groups.
-//! 5. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
-//! 6. Apply entropy gates on the *extracted secret*.
-//! 7. Apply value suppressors (when configured) on the extracted secret bytes.
-//! 8. Apply local context checks (when configured) on the secret span.
-//! 9. Apply root-context safelist suppression for root emit paths.
-//! 10. Apply secret-bytes safelist suppression (all findings, including decoded).
-//! 11. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 12. Record the finding with the extracted secret span.
+//! 3. Apply character-class distribution gate (when configured) — SIMD-accelerated
+//!    rejection of windows dominated by lowercase ASCII.
+//! 4. For UTF-16 variants, decode with per-window and total-output budgets.
+//! 5. Run regex with reusable capture locations to access capture groups.
+//! 6. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
+//! 7. Apply entropy gates on the *extracted secret*.
+//! 8. Apply value suppressors (when configured) on the extracted secret bytes.
+//! 9. Apply local context checks (when configured) on the secret span.
+//! 10. Apply root-context safelist suppression for root emit paths.
+//! 11. Apply secret-bytes safelist suppression (all findings, including decoded).
+//! 12. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 13. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -250,16 +252,25 @@ fn has_assignment_value_shape(window: &[u8]) -> bool {
 /// Fails open for windows shorter than `spec.min_window_len` to avoid false
 /// negatives on short matches. Uses integer cross-multiply to avoid float
 /// division on the hot path.
+///
+/// # Design trade-off
+///
+/// This gate runs on the **full window**, not the extracted secret bytes.
+/// The entropy gate, by contrast, runs post-extraction on secret bytes only.
+/// Running char_class pre-regex avoids the regex cost entirely for prose
+/// windows, but surrounding context (e.g., `password=`) contributes to the
+/// classification. The generous default (`max_lower_pct: 95`) accommodates
+/// this dilution.
 #[inline]
 fn char_class_gate_passes(window: &[u8], spec: CharClassCompiled) -> bool {
     if window.len() < spec.min_window_len as usize {
         return true; // fail-open for short windows
     }
     let profile = super::simd_classify::classify_window(window);
-    let total = window.len() as u32;
     // Integer cross-multiply avoids f32 division:
     // lower / total <= max_lower_pct / 100  ⟺  lower * 100 <= total * max_lower_pct
-    profile.lower * 100 <= total * spec.max_lower_pct as u32
+    // Use u64 throughout to avoid u32 truncation on the (theoretical) >4 GiB path.
+    (profile.lower as u64) * 100 <= (window.len() as u64) * (spec.max_lower_pct as u64)
 }
 
 /// Returns the `(line_start, line_end)` byte offsets of the line containing
@@ -656,14 +667,16 @@ impl Engine {
     ///   decoded offsets back into raw UTF-16 bytes.
     ///
     /// # Behavior
-    /// Applies the same gate order as the raw path (confirm/keyword/must-contain,
-    /// assignment-shape, regex, entropy, value suppressor, local context,
-    /// context-window safelist, secret-bytes safelist, offline validation) while
-    /// enforcing UTF-16 decode budgets. Context-window safelist suppression uses
-    /// the emitted finding step (`utf16_step_id`, checked as
-    /// `step_id == STEP_ROOT`); the secret-bytes safelist runs on all findings.
-    /// Offline validation uses the parent `step_id` so root-level UTF-16
-    /// findings are correctly identified as root-semantic.
+    /// Applies a gate sequence adapted for UTF-16: confirm-all and keywords run
+    /// on raw bytes (pre-decode), then must-contain, assignment-shape, and
+    /// char_class run on decoded bytes (post-decode), followed by regex, entropy,
+    /// value suppressor, local context, context-window safelist, secret-bytes
+    /// safelist, and offline validation. UTF-16 decode budgets are enforced.
+    /// Context-window safelist suppression uses the emitted finding step
+    /// (`utf16_step_id`, checked as `step_id == STEP_ROOT`); the secret-bytes
+    /// safelist runs on all findings. Offline validation uses the parent
+    /// `step_id` so root-level UTF-16 findings are correctly identified as
+    /// root-semantic.
     ///
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(

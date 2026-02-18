@@ -230,6 +230,11 @@ required-features = ["bench"]
 name = "oid_hash_quality"
 harness = false
 
+[[bench]]
+name = "simd_classify"
+harness = false
+required-features = ["bench"]
+
 [profile.dev]
 opt-level = 1
 

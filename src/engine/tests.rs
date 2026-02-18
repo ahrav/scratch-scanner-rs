@@ -15,6 +15,8 @@ use super::rule_repr::EntropyCompiled;
 use super::rule_repr::{utf16be_bytes, utf16le_bytes, PackedPatterns, Variant};
 #[cfg(feature = "stdx-proptest")]
 use super::scratch::EntropyScratch;
+#[cfg(feature = "stdx-proptest")]
+use super::simd_classify::classify_window;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::transform::find_url_spans_into;
 #[cfg(feature = "stdx-proptest")]
@@ -32,9 +34,9 @@ use crate::api::OfflineVerdict;
 #[cfg(feature = "stdx-proptest")]
 use crate::api::Tuning;
 use crate::api::{
-    AnchorPolicy, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate, LocalContextSpec,
-    OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode, Utf16Endianness,
-    ValidatorKind, STEP_ROOT,
+    AnchorPolicy, CharClassSpec, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate,
+    LocalContextSpec, OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode,
+    Utf16Endianness, ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
 use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
@@ -3984,6 +3986,17 @@ fn scan_rules_reference(
                 Variant::Raw => {
                     for w in windows {
                         let window = &buf[w.clone()];
+                        // char_class gate: reject windows dominated by lowercase ASCII.
+                        if let Some(ref cc) = rule.char_class {
+                            if window.len() >= cc.min_window_len as usize {
+                                let profile = classify_window(window);
+                                if (profile.lower as u64) * 100
+                                    > (window.len() as u64) * (cc.max_lower_pct as u64)
+                                {
+                                    continue;
+                                }
+                            }
+                        }
                         for caps in rule.re.captures_iter(window) {
                             // Extract secret span first so entropy is evaluated
                             // on the secret itself, not the full match (matches
@@ -4084,6 +4097,18 @@ fn scan_rules_reference(
                                 > engine.tuning.max_total_decode_output_bytes
                             {
                                 return found_any;
+                            }
+
+                            // char_class gate on decoded bytes.
+                            if let Some(ref cc) = rule.char_class {
+                                if decoded.len() >= cc.min_window_len as usize {
+                                    let profile = classify_window(&decoded);
+                                    if (profile.lower as u64) * 100
+                                        > (decoded.len() as u64) * (cc.max_lower_pct as u64)
+                                    {
+                                        continue;
+                                    }
+                                }
                             }
 
                             let parent_is_root = steps.is_empty();
@@ -6897,6 +6922,121 @@ fn offline_invalid_does_not_consume_finding_cap_slot() {
         &hay[recs[0].span_start as usize..recs[0].span_end as usize],
         valid_tok.as_slice(),
         "the surviving finding should be the valid token, not the invalid one"
+    );
+}
+
+#[test]
+fn char_class_gate_rejects_all_lowercase() {
+    let rule = RuleSpec {
+        name: "cc-reject",
+        anchors: &[b"tok_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: Some(CharClassSpec {
+            max_lower_pct: 50,
+            min_window_len: 16,
+        }),
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"tok_([a-z]{20})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    // All-lowercase secret: "tok_" + 20 lowercase chars. Window will be >50% lowercase.
+    let hay = b"prefix tok_abcdefghijklmnopqrst suffix";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+    assert_eq!(
+        scratch.findings().len(),
+        0,
+        "char_class gate should reject all-lowercase window"
+    );
+}
+
+#[test]
+fn char_class_gate_passes_mixed_case() {
+    let rule = RuleSpec {
+        name: "cc-pass",
+        anchors: &[b"TOK_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: Some(CharClassSpec {
+            max_lower_pct: 50,
+            min_window_len: 16,
+        }),
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    // Mixed-case secret: upper+lower+digit. Window should pass the 50% lowercase gate.
+    let hay = b"PREFIX TOK_A1b2C3d4 SUFFIX";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+    assert!(
+        !scratch.findings().is_empty(),
+        "char_class gate should pass for mixed-case window"
+    );
+}
+
+#[test]
+fn char_class_gate_fail_open_short_window() {
+    let rule = RuleSpec {
+        name: "cc-failopen",
+        anchors: &[b"tok_"],
+        radius: 16,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: Some(CharClassSpec {
+            max_lower_pct: 50,
+            min_window_len: 128, // Very high min_window_len
+        }),
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"tok_([a-z]{8})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    // Short all-lowercase input — gate should fail-open because window < min_window_len.
+    let hay = b"tok_abcdefgh";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    scratch.drop_prefix_findings(0);
+    assert!(
+        !scratch.findings().is_empty(),
+        "char_class gate should fail-open on short window"
     );
 }
 

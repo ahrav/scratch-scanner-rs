@@ -39,21 +39,23 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 3] Apply assignment-shape precheck (if rule-specific)
   ↓
-[Gate 4] Run regex with capture groups
+[Gate 4] Apply character-class distribution gate (SIMD-accelerated, when configured)
   ↓
-[Gate 5] Extract secret span from capture groups
+[Gate 5] Run regex with capture groups
   ↓
-[Gate 6] Check entropy on extracted secret
+[Gate 6] Extract secret span from capture groups
   ↓
-[Gate 7] Apply value suppressors on extracted secret bytes (when configured)
+[Gate 7] Check entropy on extracted secret (Shannon + optional min-entropy)
   ↓
-[Gate 8] Apply local context checks (bounded, fail-open)
+[Gate 8] Apply value suppressors on extracted secret bytes (when configured)
   ↓
-[Gate 9] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
+[Gate 9] Apply local context checks (bounded, fail-open)
   ↓
-[Gate 10] Apply secret-bytes safelist suppression (all findings, including decoded)
+[Gate 10] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
   ↓
-[Gate 11] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+[Gate 11] Apply secret-bytes safelist suppression (all findings, including decoded)
+  ↓
+[Gate 12] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -207,7 +209,27 @@ if rule.needs_assignment_shape_check() && !has_assignment_value_shape(window) {
 
 **When enabled**: When the rule regex expects an assignment-like structure.
 
-### 5. Value Suppressor Gate
+### 5. Character-Class Distribution Gate
+
+```rust
+if let Some(cc) = gates.char_class {
+    if !char_class_gate_passes(window, cc) {
+        return;
+    }
+}
+```
+
+**Purpose**: Reject windows dominated by lowercase ASCII (prose, variable names) that cannot be high-entropy secrets.
+
+**Algorithm**: SIMD-accelerated byte classification (NEON on aarch64, SSE2 on x86_64) counts lowercase/uppercase/digit/special bytes. If `lower_count * 100 > total * max_lower_pct`, the window is rejected. Integer cross-multiply avoids float division on the hot path.
+
+**Fail-open**: Windows shorter than `min_window_len` pass unconditionally. This is intentional: the char_class gate is a false-positive filter, not a security boundary. Failing open on short windows prevents suppressing true positives whose windows happen to be narrow. The default `min_window_len >= 16` ensures the gate only activates when there are enough bytes for statistically meaningful class proportions.
+
+**When enabled**: Rules with `char_class` configured, or auto-enabled for entropy-gated rules with `min_bits_per_byte >= 3.0` (defaults: `max_lower_pct: 95`, `min_window_len: 32`).
+
+**Performance**: O(window.len()) with 16-byte SIMD throughput. Runs before the regex to eliminate ~5–15% of windows cheaply.
+
+### 6. Value Suppressor Gate (Post-Match)
 
 ```rust
 if let Some(vs) = value_suppressors {
@@ -227,7 +249,7 @@ if let Some(vs) = value_suppressors {
 
 **Use case**: Suppressing well-known test/example values that structurally resemble real secrets.
 
-### 6. Local Context Gate (Design A)
+### 7. Local Context Gate (Post-Match)
 
 Local context gates run **after** regex matching and secret extraction. They
 inspect a bounded lookaround slice (same line) to validate micro-context such as
@@ -240,7 +262,7 @@ assignment separators, quoting, or key-name hints. These checks are:
 Local context gates are rule-selective and opt-in via rule config.
 They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
-### 7. Emit-Time Safelist Suppression
+### 8. Emit-Time Safelist Suppression
 
 Emit-time safelist operates in two tiers:
 
@@ -270,7 +292,7 @@ segments (e.g., `key-null-safety-9xK2mB`).
 - Context-anchored patterns and short substrings (e.g., "mock") that risk
   false suppression of real secrets are excluded from this tier.
 
-### 8. Offline Structural Validation
+### 9. Offline Structural Validation
 
 After safelist suppression, findings for rules with an `offline_validation`
 gate are checked by `offline_validation_suppresses()`. This runs inline at
@@ -646,8 +668,8 @@ Accounts for patterns with backward context or mid-match anchors. 64 bytes balan
 
 Gates progress from cheapest (memmem) to most expensive (regex), with slight
 variant-specific ordering:
-1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape
-2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape
+1. Raw: must_contain -> confirm_all -> keywords -> assignment-shape -> char_class
+2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape -> char_class
 3. Regex: O(n x complexity)
 4. Post-match: secret extraction -> entropy -> value suppressors -> local context
 

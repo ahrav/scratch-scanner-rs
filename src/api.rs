@@ -546,8 +546,8 @@ impl LocalContextSpec {
 /// # Invariants
 /// - `name` must be non-empty.
 /// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
-///   `entropy`, `local_context`, `offline_validation`, and `secret_group` must be
-///   valid when present.
+///   `entropy`, `char_class`, `local_context`, `offline_validation`, and
+///   `secret_group` must be valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
@@ -556,9 +556,9 @@ impl LocalContextSpec {
 ///
 /// # Performance
 /// - Smaller `radius` values reduce regex work but can miss matches if too small.
-/// - `must_contain`, `keywords_any`, and `entropy` act as lightweight
-///   pre-/post-regex filters evaluated on the match window (each cheaper
-///   than full regex evaluation).
+/// - `must_contain`, `keywords_any`, `char_class`, and `entropy` act as
+///   lightweight pre-/post-regex filters evaluated on the match window
+///   (each cheaper than full regex evaluation).
 /// - `value_suppressors_any` is a post-extraction filter that runs after regex
 ///   matching and entropy gating; it adds minimal cost per confirmed match but
 ///   does not reduce regex work.
@@ -629,6 +629,10 @@ pub struct RuleSpec {
     /// When present, windows whose lowercase ASCII percentage exceeds the
     /// configured threshold are rejected without running the regex. This
     /// cheaply eliminates prose-dominated windows that are clearly not secrets.
+    ///
+    /// When `None` and the YAML parser detects `entropy.min_bits_per_byte >= 3.0`,
+    /// the parser auto-enables this gate with `max_lower_pct: 95, min_window_len: 32`.
+    /// See [`crate::rules::yaml::AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`].
     pub char_class: Option<CharClassSpec>,
 
     /// Optional local context gate evaluated after secret extraction.
@@ -722,16 +726,19 @@ impl RuleSpec {
     }
 }
 
-/// Shannon-entropy gate configuration.
+/// Entropy-family gate configuration (Shannon + optional min-entropy).
 ///
 /// # Algorithm
 /// - Entropy is computed over the extracted secret span (not the full regex match).
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
+/// - Shannon entropy is checked first. If an optional min-entropy threshold
+///   (`min_entropy_bits_per_byte`) is configured, it is checked second to
+///   catch skewed distributions that Shannon alone misses.
 ///
 /// # Invariants
 /// - Threshold is bits/byte in [0.0, 8.0].
-/// - `min_len <= max_len`.
+/// - `min_len >= 1` and `min_len <= max_len`.
 #[derive(Clone, Debug)]
 pub struct EntropySpec {
     /// Minimum Shannon entropy threshold in bits/byte.
@@ -1066,6 +1073,8 @@ mod tests {
             OfflineValidationSpec::GrafanaServiceAccount,
             OfflineValidationSpec::AwsAccessKey,
             OfflineValidationSpec::SentryOrgToken,
+            OfflineValidationSpec::PyPiToken,
+            OfflineValidationSpec::SlackToken,
         ];
         for v in variants {
             assert!(

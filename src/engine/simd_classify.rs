@@ -47,8 +47,19 @@ pub(crate) struct CharClassProfile {
 ///
 /// Dispatches to NEON (aarch64), SSE2 (x86_64), or scalar fallback.
 /// All paths produce identical results for the same input.
+///
+/// # Panics (debug only)
+///
+/// Debug-asserts that `window.len() <= u32::MAX`. All counts in
+/// [`CharClassProfile`] are `u32`, so inputs exceeding 4 GiB cannot be
+/// represented correctly. In practice, scanning windows are KB-sized.
 #[inline]
 pub(crate) fn classify_window(window: &[u8]) -> CharClassProfile {
+    debug_assert!(
+        window.len() <= u32::MAX as usize,
+        "CharClassProfile uses u32 counts; input length {} exceeds u32::MAX",
+        window.len(),
+    );
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
         // SAFETY: NEON is architecturally guaranteed on all AArch64 targets.
@@ -401,6 +412,26 @@ mod tests {
         let p = classify_window(&input);
         assert_eq!(p.lower, 4096);
         assert_eq!(p.upper + p.digit + p.special, 0);
+    }
+
+    /// Deterministic test that forces all four accumulator lanes to flush,
+    /// verifying counts are correct across multiple flush epochs.
+    #[test]
+    fn large_input_flush_all_lanes() {
+        // Cycling pattern: one byte from each class, repeated to 4096+ bytes.
+        let pattern = [b'a', b'A', b'0', b'!'];
+        let input: Vec<u8> = pattern.iter().copied().cycle().take(4100).collect();
+        let p = classify_window(&input);
+        // 4100 / 4 = 1025 of each class.
+        assert_eq!(p.lower, 1025, "lower count");
+        assert_eq!(p.upper, 1025, "upper count");
+        assert_eq!(p.digit, 1025, "digit count");
+        assert_eq!(p.special, 1025, "special count");
+        assert_eq!(
+            p.lower + p.upper + p.digit + p.special,
+            4100,
+            "sum must equal length"
+        );
     }
 }
 
