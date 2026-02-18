@@ -396,10 +396,10 @@ fn pack_rule_meta(secret_group: Option<u16>, needs_assignment_shape_check: bool)
 ///    regex matches.
 /// 3. **Gate indices**: `confirm_all`, `keywords`, `value_suppressors`,
 ///    `entropy`, `char_class`, `local_context`, `two_phase`,
-///    `offline_validation` —
-///    dereferenced through `Engine` pool accessors only when the
-///    corresponding gate is present (`!= NO_GATE`). Most rules have 0–2
-///    gates, so these are cold for the majority of candidates.
+///    `offline_validation` — dereferenced through `Engine` pool accessors
+///    only when the corresponding gate is present (`!= NO_GATE`). Most
+///    rules have 0–2 gates, so these are cold for the majority of
+///    candidates.
 ///
 /// # Gate pool access
 ///

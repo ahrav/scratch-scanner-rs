@@ -473,8 +473,8 @@ fn blob_introducer_matches_diff_history_unique_oids() {
         &limits,
         state.object_format.oid_len(),
         midx.object_count(),
-        1,
         limits.max_candidates,
+        false,
     );
     let mut intro_candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
     introducer
@@ -521,8 +521,8 @@ fn blob_introducer_prefers_first_non_excluded_path() {
         &limits,
         state.object_format.oid_len(),
         midx.object_count(),
-        2,
         limits.max_candidates,
+        false,
     );
     let mut intro_candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
     introducer
@@ -572,8 +572,8 @@ fn blob_introducer_dedupes_duplicate_oids() {
         &limits,
         state.object_format.oid_len(),
         midx.object_count(),
-        1,
         limits.max_candidates,
+        false,
     );
     let mut intro_candidates = CandidateBuffer::new(&limits, state.object_format.oid_len());
     introducer

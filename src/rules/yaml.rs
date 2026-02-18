@@ -196,8 +196,8 @@ pub(crate) struct YamlLocalContext {
 /// | `grafana_service_account`  | [`OfflineValidationSpec::GrafanaServiceAccount`] |
 /// | `aws_access_key`           | [`OfflineValidationSpec::AwsAccessKey`] |
 /// | `sentry_org_token`         | [`OfflineValidationSpec::SentryOrgToken`] |
-/// | `pypi_token`               | [`OfflineValidationSpec::PyPiToken`] |
-/// | `slack_token`              | [`OfflineValidationSpec::SlackToken`] |
+/// | `pypi_token`               | [`OfflineValidationSpec::PyPiToken`]            |
+/// | `slack_token`              | [`OfflineValidationSpec::SlackToken`]           |
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlOfflineValidation {

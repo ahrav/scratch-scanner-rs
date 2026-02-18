@@ -171,6 +171,10 @@ pub struct GitScanCommonMetrics {
     pub findings_emitted: u64,
     /// Blobs skipped because they were classified as binary.
     pub binary_skipped: u64,
+    /// Blobs skipped pre-scan because extension matched the binary skip set.
+    pub ext_skipped: u64,
+    /// Blobs skipped pre-scan because filename matched the lock-file table.
+    pub lock_skipped: u64,
     /// Blobs scanned via extracted text from binary formats.
     pub binary_extracted: u64,
 }
@@ -183,6 +187,8 @@ impl GitScanCommonMetrics {
         self.bytes_scanned = self.bytes_scanned.saturating_add(other.bytes_scanned);
         self.findings_emitted = self.findings_emitted.saturating_add(other.findings_emitted);
         self.binary_skipped = self.binary_skipped.saturating_add(other.binary_skipped);
+        self.ext_skipped = self.ext_skipped.saturating_add(other.ext_skipped);
+        self.lock_skipped = self.lock_skipped.saturating_add(other.lock_skipped);
         self.binary_extracted = self.binary_extracted.saturating_add(other.binary_extracted);
     }
 }

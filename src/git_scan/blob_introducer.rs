@@ -42,7 +42,7 @@ use super::object_id::OidBytes;
 use super::object_store::{ObjectStore, ObjectStoreLayout, TreeBytes};
 use super::oid_index::OidIndex;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateCollector};
-use super::path_policy::{classify_path, PathClass};
+use super::path_policy::classify_path;
 use super::repo_open::RepoJobState;
 use super::runner::GitScanConfig;
 use super::tree_candidate::{CandidateSink, ChangeKind};
@@ -525,17 +525,25 @@ pub struct BlobIntroducer {
     seen: SeenSets,
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
-    path_policy_version: u32,
+    // TODO: This should be configurabled. We want to be able to scan
+    // binaries and also ignore certain file extensions.
+    /// When true, skip the extension-based nonscannable filter so that
+    /// binary-extension blobs reach the engine adapter for scanning.
+    scan_binary: bool,
 }
 
 impl BlobIntroducer {
     /// Creates a new blob introducer sized to the MIDX object count.
+    ///
+    /// When `scan_binary` is true the extension-based nonscannable filter is
+    /// disabled so that binary-extension blobs are emitted as candidates and
+    /// reach the engine adapter for content scanning.
     pub fn new(
         limits: &TreeDiffLimits,
         oid_len: u8,
         object_count: u32,
-        path_policy_version: u32,
         max_loose_oids: u32,
+        scan_binary: bool,
     ) -> Self {
         assert!(
             oid_len == 20 || oid_len == 32,
@@ -554,7 +562,7 @@ impl BlobIntroducer {
             seen: SeenSets::new(object_count),
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
-            path_policy_version,
+            scan_binary,
         }
     }
 
@@ -725,8 +733,9 @@ impl BlobIntroducer {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    let excluded = matches!(self.path_policy_version, 2..)
-                        && class.contains(PathClass::BINARY);
+                    // When scan_binary is set, honour the user's request to
+                    // scan binary blobs by skipping the extension-based filter.
+                    let excluded = !self.scan_binary && class.is_nonscannable();
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -852,18 +861,18 @@ struct BlobIntroWorker<'a> {
     seen: &'a AtomicSeenSets,
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
-    path_policy_version: u32,
     abort: &'a AtomicBool,
+    scan_binary: bool,
 }
 
 impl<'a> BlobIntroWorker<'a> {
     fn new(
         limits: &TreeDiffLimits,
         oid_len: u8,
-        path_policy_version: u32,
         max_loose_oids: u32,
         seen: &'a AtomicSeenSets,
         abort: &'a AtomicBool,
+        scan_binary: bool,
     ) -> Self {
         Self {
             max_depth: limits.max_tree_depth,
@@ -878,8 +887,8 @@ impl<'a> BlobIntroWorker<'a> {
             seen,
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
-            path_policy_version,
             abort,
+            scan_binary,
         }
     }
 
@@ -1023,8 +1032,7 @@ impl<'a> BlobIntroWorker<'a> {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    let excluded = matches!(self.path_policy_version, 2..)
-                        && class.contains(PathClass::BINARY);
+                    let excluded = !self.scan_binary && class.is_nonscannable();
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -1236,10 +1244,10 @@ pub(super) fn introduce_parallel<'a>(
                     let mut worker = BlobIntroWorker::new(
                         per_worker_limits,
                         repo.object_format.oid_len(),
-                        config.path_policy_version,
                         per_worker_loose,
                         seen,
                         abort,
+                        config.engine_adapter.scan_binary,
                     );
 
                     // Claim and process chunks.

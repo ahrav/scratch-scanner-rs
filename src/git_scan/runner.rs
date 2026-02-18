@@ -141,8 +141,6 @@ pub struct GitScanConfig {
     pub start_set: StartSetConfig,
     /// Merge diff strategy for merge commits.
     pub merge_diff_mode: MergeDiffMode,
-    /// Path-policy version for scan configuration hashing.
-    pub path_policy_version: u32,
     /// Repo-open limits (mmap sizes, ref caps, etc.).
     pub repo_open: RepoOpenLimits,
     /// Commit-walk limits (parents, batching).
@@ -219,7 +217,6 @@ impl Default for GitScanConfig {
             policy_hash: [0u8; 32],
             start_set: StartSetConfig::DefaultBranchOnly,
             merge_diff_mode: MergeDiffMode::AllParents,
-            path_policy_version: 1,
             repo_open: RepoOpenLimits::DEFAULT,
             commit_walk: CommitWalkLimits::DEFAULT,
             tree_diff: TreeDiffLimits::DEFAULT,

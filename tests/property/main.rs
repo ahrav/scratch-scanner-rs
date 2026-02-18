@@ -16,6 +16,7 @@ mod git_pack_delta;
 mod git_pack_plan;
 mod git_spill_dedupe;
 mod git_tree_diff;
+mod path_policy_soundness;
 mod regex2anchor_soundness;
 mod secret_bytes_safelist_soundness;
 mod value_suppressor_soundness;
