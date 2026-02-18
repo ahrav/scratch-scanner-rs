@@ -26,7 +26,8 @@
 //! 10. Apply root-context safelist suppression for root emit paths.
 //! 11. Apply secret-bytes safelist suppression (all findings, including decoded).
 //! 12. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 13. Record the finding with the extracted secret span.
+//! 13. Compute additive confidence score from gate signals that fired.
+//! 14. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -59,7 +60,8 @@
 //! [`extract_secret_span_locs_raw`]: super::helpers::extract_secret_span_locs_raw
 
 use crate::api::{
-    DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness, STEP_ROOT,
+    confidence, DecodeStep, FileId, FindingRec, LocalContextSpec, StepId, Utf16Endianness,
+    STEP_ROOT,
 };
 use memchr::memmem;
 use regex::bytes::CaptureLocations;
@@ -151,6 +153,10 @@ struct EmitPolicyOutcome {
     /// BLAKE3 digest of the raw secret bytes, used for cross-chunk and
     /// cross-run deduplication.
     norm_hash: [u8; 32],
+    /// Whether offline structural validation returned [`OfflineVerdict::Valid`].
+    /// Used by confidence scoring — `true` contributes [`confidence::OFFLINE_VALID`]
+    /// to the finding's additive score.
+    offline_verdict_valid: bool,
 }
 
 /// Iterate capture matches without allocating by reusing `CaptureLocations`.
@@ -201,9 +207,11 @@ fn for_each_capture_match(
 /// token (10+ alphanumeric/underscore/hyphen/dot characters).
 ///
 /// This is a conservative filter with **no false negatives**: a `false` return
-/// guarantees the regex will not match. False positives are acceptable because
-/// the regex will reject them; the goal is to skip the regex entirely on
-/// clearly irrelevant windows.
+/// guarantees the regex will not match. This guarantee holds because the check
+/// is only enabled for rules whose patterns structurally require an assignment
+/// separator and token run (see `needs_assignment_shape_check()`). False
+/// positives are acceptable because the regex will reject them; the goal is to
+/// skip the regex entirely on clearly irrelevant windows.
 ///
 /// # Performance
 /// O(window.len()) single-pass byte scan vs O(regex_complexity × window.len())
@@ -430,6 +438,43 @@ fn post_match_entropy_passes(
     )
 }
 
+/// Computes an additive confidence score for a finding based on which
+/// optional gates were present (and therefore passed) at emission time.
+///
+/// Each gate contributes a fixed weight defined in [`confidence`]:
+/// - Entropy gate present → `ENTROPY_PASS` (+1)
+/// - Keyword gate present → `KEYWORD_PRESENT` (+2)
+/// - Assignment-shape check enabled → `ASSIGNMENT_SHAPE` (+2)
+/// - Offline structural validation passed → `OFFLINE_VALID` (+5)
+///
+/// Suppress-only gates (must-contain, value-suppressors, safelists) contribute
+/// zero because they only filter — they never add positive signal.
+///
+/// `#[inline(always)]` because the function is called on every finding
+/// emission and the body is a short chain of branch-and-add operations
+/// that benefits from inlining into each call-site.
+#[inline(always)]
+fn compute_confidence_score(
+    gates: &ResolvedGates<'_>,
+    rule: &RuleCompiled,
+    outcome: &EmitPolicyOutcome,
+) -> i8 {
+    let mut s: i8 = 0;
+    if gates.entropy.is_some() {
+        s = s.saturating_add(confidence::ENTROPY_PASS);
+    }
+    if gates.keywords.is_some() {
+        s = s.saturating_add(confidence::KEYWORD_PRESENT);
+    }
+    if rule.needs_assignment_shape_check() {
+        s = s.saturating_add(confidence::ASSIGNMENT_SHAPE);
+    }
+    if outcome.offline_verdict_valid {
+        s = s.saturating_add(confidence::OFFLINE_VALID);
+    }
+    s
+}
+
 impl Engine {
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
@@ -598,6 +643,7 @@ impl Engine {
                             ) else {
                                 return;
                             };
+                            let confidence_score = compute_confidence_score(gates, rule, &outcome);
                             scratch.push_finding_with_drop_hint(
                                 FindingRec {
                                     file_id,
@@ -608,6 +654,7 @@ impl Engine {
                                     root_hint_end,
                                     dedupe_with_span: outcome.dedupe_with_span,
                                     step_id,
+                                    confidence_score,
                                 },
                                 outcome.norm_hash,
                                 outcome.drop_hint_end,
@@ -877,6 +924,7 @@ impl Engine {
                     ) else {
                         return;
                     };
+                    let confidence_score = compute_confidence_score(gates, rule, &outcome);
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
                             file_id,
@@ -887,6 +935,7 @@ impl Engine {
                             root_hint_end,
                             dedupe_with_span: outcome.dedupe_with_span,
                             step_id: utf16_step_id,
+                            confidence_score,
                         },
                         outcome.norm_hash,
                         outcome.drop_hint_end,
@@ -1051,6 +1100,7 @@ impl Engine {
                     // (safelist, secret-bytes, offline validation) must not
                     // prevent IfNoFindingsInThisBuffer transforms from running.
                     *found_any = true;
+                    let confidence_score = compute_confidence_score(gates, rule, &outcome);
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1060,6 +1110,7 @@ impl Engine {
                         root_hint_end,
                         dedupe_with_span: outcome.dedupe_with_span,
                         step_id,
+                        confidence_score,
                     });
                     scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
                     scratch.tmp_norm_hash.push(outcome.norm_hash);
@@ -1078,9 +1129,6 @@ impl Engine {
     ///   span in decoded-stream byte offsets.
     /// - `root_hint`, when present, is in the same coordinate space as
     ///   `base_offset` and overrides the default root span.
-    /// - `anchor_hint` is provided for API consistency but is not currently used
-    ///   for offset search in UTF-16 path due to coordinate space differences
-    ///   between raw UTF-16 bytes and decoded UTF-8.
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates AND emit-time policy.
@@ -1288,6 +1336,7 @@ impl Engine {
                     // Set found_any only after emit-time policy confirms
                     // the finding will be emitted (see raw-path comment).
                     *found_any = true;
+                    let confidence_score = compute_confidence_score(gates, rule, &outcome);
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1297,6 +1346,7 @@ impl Engine {
                         root_hint_end,
                         dedupe_with_span: outcome.dedupe_with_span,
                         step_id: utf16_step_id,
+                        confidence_score,
                     });
                     scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
                     scratch.tmp_norm_hash.push(outcome.norm_hash);
@@ -1427,7 +1477,17 @@ impl Engine {
         // boundaries, so dedupe relies solely on the root hint window.
         let dedupe_with_span = emitted_step_id == STEP_ROOT || scratch.root_span_map_ctx.is_none();
 
-        if self.offline_validation_suppresses(rule, secret_bytes, parent_step_id) {
+        // Offline validation: compute the verdict once and use for both
+        // suppression (Invalid + spec opts in) and confidence scoring (Valid).
+        let offline_verdict = self.compute_offline_verdict(rule, secret_bytes, parent_step_id);
+        // Not all Invalid verdicts suppress — `suppresses_on_invalid()` is a
+        // per-spec policy flag.  Specs may detect structural failure but keep
+        // the finding for manual review.
+        if matches!(offline_verdict, Some(crate::api::OfflineVerdict::Invalid))
+            && self
+                .offline_validation_gate(rule.offline_validation)
+                .is_some_and(|spec| spec.suppresses_on_invalid())
+        {
             crate::perf_stats::sat_add_usize(&mut scratch.offline_suppressed, 1);
             return None;
         }
@@ -1437,45 +1497,38 @@ impl Engine {
             drop_hint_end,
             dedupe_with_span,
             norm_hash,
+            offline_verdict_valid: matches!(
+                offline_verdict,
+                Some(crate::api::OfflineVerdict::Valid)
+            ),
         })
     }
 
-    /// Returns `true` if offline structural validation suppresses this finding.
+    /// Computes the offline structural validation verdict for a finding.
+    ///
+    /// Returns `None` when offline validation does not apply (non-root findings
+    /// or rules without an offline validation spec). Otherwise returns the
+    /// verdict from [`offline_validate::validate`].
     ///
     /// Only root-semantic findings (`parent_step_id == STEP_ROOT`) are checked;
-    /// transform-derived findings (parent != `STEP_ROOT`) are unconditionally
-    /// kept because their secret bytes reference decoded buffers, not the
-    /// original input.
+    /// transform-derived findings reference decoded buffers, not original input.
     ///
     /// For UTF-16 paths, callers must pass the **parent** `step_id` (not
     /// `utf16_step_id`), because root-level UTF-16 findings carry a
     /// `Utf16Window` decode step as their own `step_id` while their parent
     /// is `STEP_ROOT`.
-    ///
-    /// Suppression requires two conditions:
-    /// 1. The validator returns [`OfflineVerdict::Invalid`] (positive proof of
-    ///    structural failure — bad CRC, invalid charset, etc.).
-    /// 2. The spec's [`suppresses_on_invalid`](OfflineValidationSpec::suppresses_on_invalid)
-    ///    flag is set.
-    ///
-    /// [`Valid`](OfflineVerdict::Valid) and [`Indeterminate`](OfflineVerdict::Indeterminate)
-    /// verdicts always pass through — only definitive structural failure triggers
-    /// suppression.
     #[inline(always)]
-    fn offline_validation_suppresses(
+    fn compute_offline_verdict(
         &self,
         rule: &RuleCompiled,
         secret_bytes: &[u8],
         parent_step_id: StepId,
-    ) -> bool {
+    ) -> Option<crate::api::OfflineVerdict> {
         if parent_step_id != STEP_ROOT {
-            return false;
+            return None;
         }
-        let Some(spec) = self.offline_validation_gate(rule.offline_validation) else {
-            return false;
-        };
-        let verdict = super::offline_validate::validate(spec, secret_bytes);
-        matches!(verdict, crate::api::OfflineVerdict::Invalid) && spec.suppresses_on_invalid()
+        let spec = self.offline_validation_gate(rule.offline_validation)?;
+        Some(super::offline_validate::validate(spec, secret_bytes))
     }
 }
 

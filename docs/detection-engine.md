@@ -276,7 +276,7 @@ at each finding emission site in `window_validate.rs`, **before** the finding
 occupies a `max_findings_per_chunk` cap slot or triggers dedup computation.
 For each root-semantic finding whose rule has an `OfflineValidationSpec` gate,
 the extracted secret bytes are validated via
-`Engine::offline_validation_suppresses`. Root-semantic detection uses the
+`compute_offline_verdict`. Root-semantic detection uses the
 **parent** `step_id` (`STEP_ROOT`), so root-level UTF-16 findings are correctly
 identified even though their own `step_id` is a `Utf16Window` decode step.
 

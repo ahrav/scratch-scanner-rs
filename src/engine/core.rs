@@ -1313,6 +1313,13 @@ impl Engine {
         base_offset: u64,
         scratch: &mut ScanScratch,
     ) {
+        debug_assert!(
+            root_buf.len() <= u32::MAX as usize,
+            "scan_chunk_into: buffer length {} exceeds u32::MAX; \
+             FindingRec span offsets would truncate",
+            root_buf.len(),
+        );
+
         // ── Step A: ensure VS scratch capacity (first call only) ────────
         scratch.ensure_capacity(self);
 
@@ -1908,7 +1915,7 @@ impl Engine {
             }
         }
 
-        // Offline validation runs inline via `offline_validation_suppresses()`
+        // Offline validation runs inline via `compute_offline_verdict()`
         // at each emission site in window_validate.rs, using the parent
         // step_id to correctly identify root-semantic findings (including
         // UTF-16 variants).

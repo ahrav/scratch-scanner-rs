@@ -348,7 +348,21 @@ pub struct FindingRec {
     /// Decode-step chain id for reconstructing provenance.
     /// Valid only while the originating `ScanScratch` arena is alive and not reset.
     pub step_id: StepId,
+    /// Additive confidence score accumulated from gate signals.
+    ///
+    /// Phase 1 signals: entropy (+1), keyword (+2), assignment shape (+2),
+    /// offline validation valid (+5). Score 0 means no confirming gates fired.
+    ///
+    /// Accumulated via `saturating_add`; no overflow panic.  Phase 1 range
+    /// 0–10 is well within `i8` bounds.  Does **not**
+    /// participate in dedup keys — two findings at the same span with
+    /// different scores still deduplicate normally.
+    pub confidence_score: i8,
 }
+
+/// Compile-time guard: `FindingRec` must fit in 48 bytes to keep the
+/// per-finding arena slot cache-friendly and avoid padding waste.
+const _: () = assert!(std::mem::size_of::<FindingRec>() <= 48);
 
 /// Two-phase rule specification: confirm in a smaller seed window, then expand.
 ///
@@ -912,15 +926,54 @@ impl OfflineValidationSpec {
 /// Result of an offline structural validation check.
 ///
 /// `Valid` and `Indeterminate` allow the finding to be emitted;
-/// `Invalid` suppresses it (see `Engine::offline_validation_suppresses` in `window_validate.rs`).
+/// `Invalid` may suppress it when the rule's
+/// [`OfflineValidationSpec::suppresses_on_invalid`] flag is set
+/// (see `apply_emit_time_policy` in `window_validate.rs`).
+///
+/// Only [`Valid`](Self::Valid) contributes to the finding's
+/// [`confidence_score`](FindingRec::confidence_score); the other
+/// verdicts add 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OfflineVerdict {
-    /// The token passed the structural check.
+    /// The token passed the structural check (CRC, charset, check-digit, etc.).
+    /// Contributes [`confidence::OFFLINE_VALID`] to the finding's score.
     Valid,
     /// The token failed the structural check (likely false positive).
+    /// Contributes 0 to confidence; may suppress the finding if the spec opts in.
     Invalid,
-    /// The check could not be applied (e.g., token too short).
+    /// The check could not be applied (e.g., token too short for CRC).
+    /// Contributes 0 to confidence; finding is always emitted.
     Indeterminate,
+}
+
+/// Score constants for the additive confidence model.
+///
+/// Each confirming gate that fires adds its weight to the finding's
+/// [`confidence_score`](FindingRec::confidence_score). Suppress-only gates
+/// (must-contain, value suppressors, safelists) contribute 0 — they remove
+/// false positives but don't add positive evidence.
+///
+/// # Calibration
+///
+/// Weights reflect relative gate strength as false-positive discriminators:
+/// - Entropy (1): weak baseline — many non-secrets have high entropy.
+/// - Keyword / assignment shape (2 each): moderate — context or structural
+///   match is meaningful but not conclusive.
+/// - Offline valid (5): strong — CRC, check-digit, or charset validation is
+///   near-cryptographic proof of a real token.
+///
+/// Phase 1 range: 0–10. With planned future signals (XOR filter -3,
+/// hotword proximity +2, ML classifier +3, paired credential +2) the
+/// range extends to roughly -3–17, well within `i8`.
+pub mod confidence {
+    /// Entropy gate passed — secret has sufficient randomness.
+    pub const ENTROPY_PASS: i8 = 1;
+    /// Keyword gate matched — context contains expected key name.
+    pub const KEYWORD_PRESENT: i8 = 2;
+    /// Assignment-shape check passed — secret follows `key = value` pattern.
+    pub const ASSIGNMENT_SHAPE: i8 = 2;
+    /// Offline structural validation returned Valid (CRC, charset, etc.).
+    pub const OFFLINE_VALID: i8 = 5;
 }
 
 #[cfg(test)]

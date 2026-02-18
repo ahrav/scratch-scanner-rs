@@ -57,6 +57,8 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 12] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
+[Step 13] Compute additive confidence score from gate signals that fired
+  ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
 
@@ -295,7 +297,7 @@ segments (e.g., `key-null-safety-9xK2mB`).
 ### 9. Offline Structural Validation
 
 After safelist suppression, findings for rules with an `offline_validation`
-gate are checked by `offline_validation_suppresses()`. This runs inline at
+gate are checked by `compute_offline_verdict()`. This runs inline at
 emission time, before the finding consumes a `max_findings_per_chunk` slot.
 
 - Only **root-semantic** findings are validated (`parent_step_id == STEP_ROOT`).

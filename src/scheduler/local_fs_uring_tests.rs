@@ -69,6 +69,7 @@ impl ScanEngine for DuplicateDropEngine {
             root_hint_end: 6,
             span_start: 0,
             span_end: 6,
+            confidence_score: 0,
         };
         // Emit duplicates so scheduler dedupe prunes one finding.
         scratch.findings.push(FindingWithHash::new(rec, [0; 32]));

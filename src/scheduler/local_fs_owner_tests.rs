@@ -146,6 +146,7 @@ impl ScanEngine for DuplicateDropEngine {
                 root_hint_end: 6,
                 span_start: 0,
                 span_end: 6,
+                confidence_score: 0,
             },
             [0xAB; 32],
         );
@@ -465,6 +466,7 @@ fn finding(rule: u16, start: u64, end: u64) -> FindingRec {
         root_hint_end: end,
         span_start: start,
         span_end: end,
+        confidence_score: 0,
     }
 }
 
@@ -976,6 +978,7 @@ fn build_persistence_batch_maps_all_fields() {
         root_hint_end: 200,
         span_start: 110,
         span_end: 190,
+        confidence_score: 0,
     };
     let hash = [0xDE; 32];
     let wrapped = FindingWithHash::new(finding, hash);

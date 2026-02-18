@@ -46,6 +46,7 @@ fn non_root_rec(
         root_hint_end,
         dedupe_with_span: false,
         step_id,
+        confidence_score: 0,
     }
 }
 
@@ -59,6 +60,7 @@ fn root_rec(span_start: u32, span_end: u32) -> FindingRec {
         root_hint_end: span_end as u64,
         dedupe_with_span: true,
         step_id: STEP_ROOT,
+        confidence_score: 0,
     }
 }
 

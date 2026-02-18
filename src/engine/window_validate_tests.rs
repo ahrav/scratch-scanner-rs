@@ -1,4 +1,6 @@
 use super::*;
+use crate::engine::rule_repr::NO_GATE;
+use regex::bytes::Regex;
 
 #[test]
 fn has_assignment_value_shape_cases() {
@@ -212,5 +214,111 @@ fn char_class_gate_cases() {
             *expected,
             "case: {label}"
         );
+    }
+}
+
+// ---- compute_confidence_score tests ----
+
+fn empty_gates() -> ResolvedGates<'static> {
+    ResolvedGates {
+        confirm_all: None,
+        keywords: None,
+        entropy: None,
+        char_class: None,
+        value_suppressors: None,
+        local_context: None,
+    }
+}
+
+fn stub_rule(needs_assignment_shape: bool) -> RuleCompiled {
+    RuleCompiled {
+        re: Regex::new("x").unwrap(),
+        must_contain: None,
+        rule_meta: if needs_assignment_shape { 1 << 16 } else { 0 },
+        confirm_all: NO_GATE,
+        keywords: NO_GATE,
+        value_suppressors: NO_GATE,
+        entropy: NO_GATE,
+        char_class: NO_GATE,
+        local_context: NO_GATE,
+        two_phase: NO_GATE,
+        offline_validation: NO_GATE,
+    }
+}
+
+fn stub_outcome(offline_verdict_valid: bool) -> EmitPolicyOutcome {
+    EmitPolicyOutcome {
+        drop_hint_end: 0,
+        dedupe_with_span: false,
+        norm_hash: [0; 32],
+        offline_verdict_valid,
+    }
+}
+
+#[test]
+fn compute_confidence_score_cases() {
+    let kw = KeywordsCompiled {
+        any: [
+            PackedPatterns {
+                bytes: Box::new([]),
+                offsets: Box::new([]),
+            },
+            PackedPatterns {
+                bytes: Box::new([]),
+                offsets: Box::new([]),
+            },
+            PackedPatterns {
+                bytes: Box::new([]),
+                offsets: Box::new([]),
+            },
+        ],
+    };
+    let entropy_gate = EntropyCompiled {
+        min_bits_per_byte: 3.0,
+        min_len: 4,
+        max_len: 256,
+        min_entropy_bits_per_byte: None,
+    };
+
+    // (label, gates-modifier, assignment_shape, offline_valid, expected)
+    let cases: Vec<(&str, bool, bool, bool, bool, i8)> = vec![
+        // (label, has_entropy, has_keywords, assignment_shape, offline_valid, expected)
+        (
+            "no gates, no shape, no offline",
+            false,
+            false,
+            false,
+            false,
+            0,
+        ),
+        ("entropy only", true, false, false, false, 1),
+        ("keywords only", false, true, false, false, 2),
+        ("entropy + keywords", true, true, false, false, 3),
+        ("assignment shape only", false, false, true, false, 2),
+        ("entropy + assignment shape", true, false, true, false, 3),
+        ("offline valid only", false, false, false, true, 5),
+        (
+            "all signals",
+            true,
+            true,
+            true,
+            true,
+            10, // 1 + 2 + 2 + 5
+        ),
+    ];
+
+    for (label, has_entropy, has_keywords, assignment_shape, offline_valid, expected) in &cases {
+        let mut gates = empty_gates();
+        if *has_entropy {
+            gates.entropy = Some(entropy_gate);
+        }
+        if *has_keywords {
+            gates.keywords = Some(&kw);
+        }
+        let rule = stub_rule(*assignment_shape);
+        let outcome = stub_outcome(*offline_valid);
+
+        let score = compute_confidence_score(&gates, &rule, &outcome);
+        assert_eq!(score, *expected, "case: {label}");
     }
 }
