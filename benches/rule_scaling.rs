@@ -153,6 +153,7 @@ fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
                 keywords_any: None,
                 value_suppressors_any: None,
                 entropy: None,
+                char_class: None,
                 local_context: None,
                 secret_group: None,
                 offline_validation: None,
@@ -214,6 +215,7 @@ fn generate_grouped_rules(count: usize, group_size: usize) -> Vec<RuleSpec> {
                 keywords_any: None,
                 value_suppressors_any: None,
                 entropy: None,
+                char_class: None,
                 local_context: None,
                 secret_group: None,
                 offline_validation: None,
@@ -295,6 +297,7 @@ fn generate_realistic_rules(count: usize) -> Vec<RuleSpec> {
                     min_bits_per_byte: 3.5,
                     min_len: 16,
                     max_len: 256,
+                    min_entropy_bits_per_byte: None,
                 })
             } else {
                 None
@@ -310,6 +313,7 @@ fn generate_realistic_rules(count: usize) -> Vec<RuleSpec> {
                 keywords_any: Some(anchors),
                 value_suppressors_any: None,
                 entropy,
+                char_class: None,
                 local_context: None,
                 secret_group: None,
                 offline_validation: None,

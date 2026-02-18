@@ -13,6 +13,8 @@
 //! | Grafana service-account  | `glsa_<32 alnum>_<8 hex CRC>`         | CRC over `glsa_<32>`                   |
 //! | AWS access key ID        | `(AKIA\|ASIA\|...)[A-Z2-7]{16}`      | Base-32 decode, account-ID range check |
 //! | Sentry org-auth-token    | `sntrys_<b64 payload>_<43 b64 sig>`   | Base64 decode, `{"iat":` prefix check  |
+//! | PyPI upload token        | `pypi-<b64url macaroon V2 body>`      | Base64url decode, 12-byte header match |
+//! | Slack API token          | `xox[bpeos…]-<segments>`              | Prefix dispatch, segment count/charset |
 //!
 //! ## Verdict hierarchy
 //!
@@ -51,13 +53,15 @@
 //!
 //! ## Branchless decode strategy
 //!
-//! All three lookup tables ([`BASE62_LUT`], [`HEX_LUT`], [`BASE64_LUT`])
-//! share a common sentinel convention:
+//! All four lookup tables ([`BASE62_LUT`], [`HEX_LUT`], [`BASE64_LUT`],
+//! [`BASE64URL_LUT`]) share a common sentinel convention:
 //!
 //! - Valid values occupy the low bits (0–61 for base-62, 0–15 for hex,
 //!   0–63 for base64) and **never** set bit 7.
 //! - Invalid bytes map to `0xFF` (bit 7 set).
 //! - Base64 padding (`=`) maps to `0xFE` (bit 7 set, bit 0 clear).
+//! - [`BASE64URL_LUT`] omits the padding sentinel (`0xFE`) entirely because
+//!   its sole caller (PyPI macaroon tokens) never encounters `=` padding.
 //!
 //! Decode loops exploit this by OR-accumulating lookup results into a
 //! single `invalid` flag and deferring the validity branch until after
@@ -83,6 +87,8 @@ pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVer
         OfflineValidationSpec::GrafanaServiceAccount => validate_grafana_service_account(secret),
         OfflineValidationSpec::AwsAccessKey => validate_aws_access_key(secret),
         OfflineValidationSpec::SentryOrgToken => validate_sentry_org_token(secret),
+        OfflineValidationSpec::PyPiToken => validate_pypi_token(secret),
+        OfflineValidationSpec::SlackToken => validate_slack_token(secret),
     }
 }
 
@@ -538,6 +544,35 @@ const BASE64_LUT: [u8; 256] = {
     lut
 };
 
+/// Base64url decode table (256 entries, one per byte value).
+///
+/// Variant of [`BASE64_LUT`] for the URL-safe alphabet (RFC 4648 §5):
+/// `'-'` → 62 (instead of `'+'`), `'_'` → 63 (instead of `'/'`).
+/// No padding sentinel — callers (PyPI macaroon tokens) never encounter `=`.
+///
+/// Valid values (0–63) never set bit 7; the invalid sentinel `0xFF` does.
+/// Decode loops use `invalid |= v` to defer the validity branch.
+const BASE64URL_LUT: [u8; 256] = {
+    let mut lut = [0xFFu8; 256];
+    let mut i: u16 = 0;
+    while i < 256 {
+        let b = i as u8;
+        if b >= b'A' && b <= b'Z' {
+            lut[i as usize] = b - b'A';
+        } else if b >= b'a' && b <= b'z' {
+            lut[i as usize] = b - b'a' + 26;
+        } else if b >= b'0' && b <= b'9' {
+            lut[i as usize] = b - b'0' + 52;
+        } else if b == b'-' {
+            lut[i as usize] = 62;
+        } else if b == b'_' {
+            lut[i as usize] = 63;
+        }
+        i += 1;
+    }
+    lut
+};
+
 /// Reasons a base64-prefix check can fail.
 ///
 /// The Sentry validator maps these to different verdicts:
@@ -632,6 +667,447 @@ fn base64_decoded_starts_with(
 }
 
 // ---------------------------------------------------------------------------
+// PyPI upload token (macaroon V2)
+// ---------------------------------------------------------------------------
+
+/// Literal prefix of a PyPI upload token.
+const PYPI_PREFIX: &[u8] = b"pypi-";
+
+/// Expected first 12 bytes of the base64url-decoded macaroon V2 body.
+///
+/// ```text
+/// Offset  Hex   Meaning
+/// 0       0x02  Macaroon V2 version
+/// 1       0x01  LOCATION field tag
+/// 2       0x08  LOCATION length (8 = len("pypi.org"))
+/// 3-10    ...   "pypi.org" (8 ASCII bytes)
+/// 11      0x02  IDENTIFIER field tag
+/// ```
+const PYPI_HEADER: [u8; 12] = [
+    0x02, 0x01, 0x08, b'p', b'y', b'p', b'i', b'.', b'o', b'r', b'g', 0x02,
+];
+
+/// Number of base64url characters needed to decode [`PYPI_HEADER`] (12 bytes).
+///
+/// `ceil(12 / 3) * 4 = 16`.
+const PYPI_B64URL_HEADER_CHARS: usize = 16;
+
+/// Minimum total token length: `pypi-` (5) + 16 base64url header chars = 21.
+const PYPI_MIN_LEN: usize = PYPI_PREFIX.len() + PYPI_B64URL_HEADER_CHARS;
+
+/// Validate a PyPI upload token (macaroon V2 binary header check).
+///
+/// Layout: `pypi-<base64url-encoded macaroon body>`.
+///
+/// The first 16 base64url characters decode to 12 bytes which must match
+/// the known macaroon V2 header for `pypi.org`. Padding (`=`) is never
+/// present — pymacaroons always strips it.
+///
+/// Returns `Indeterminate` for wrong prefix or insufficient length (the
+/// regex match may have grabbed a wider span). Returns `Invalid` for
+/// bad base64url characters or header mismatch.
+fn validate_pypi_token(secret: &[u8]) -> OfflineVerdict {
+    if secret.len() < PYPI_MIN_LEN {
+        return OfflineVerdict::Indeterminate;
+    }
+    if !secret.starts_with(PYPI_PREFIX) {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    let body = &secret[PYPI_PREFIX.len()..];
+    // Safety: PYPI_MIN_LEN == PYPI_PREFIX.len() + PYPI_B64URL_HEADER_CHARS,
+    // so the length check above guarantees body.len() >= PYPI_B64URL_HEADER_CHARS.
+    debug_assert!(body.len() >= PYPI_B64URL_HEADER_CHARS);
+
+    // Decode 16 base64url chars → 12 bytes using deferred-invalidity loop.
+    // Each group of 4 chars produces 3 bytes: 16 chars → 12 bytes exactly.
+    let mut decoded = [0u8; 12];
+    let mut invalid: u8 = 0;
+    let mut buf: u32 = 0;
+    let mut buf_bits: u32 = 0;
+    let mut out_idx: usize = 0;
+
+    for &b in &body[..PYPI_B64URL_HEADER_CHARS] {
+        let v = BASE64URL_LUT[b as usize];
+        invalid |= v;
+        buf = (buf << 6) | (v & 0x3F) as u32;
+        buf_bits += 6;
+
+        if buf_bits >= 8 {
+            buf_bits -= 8;
+            decoded[out_idx] = (buf >> buf_bits) as u8;
+            buf &= (1u32 << buf_bits) - 1;
+            out_idx += 1;
+        }
+    }
+
+    if invalid & 0x80 != 0 {
+        return OfflineVerdict::Invalid;
+    }
+
+    if decoded == PYPI_HEADER {
+        OfflineVerdict::Valid
+    } else {
+        OfflineVerdict::Invalid
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slack API tokens
+// ---------------------------------------------------------------------------
+
+/// Check that every byte in `seg` satisfies `pred`.
+///
+/// Uses OR-accumulation to minimize branches: the loop body avoids
+/// early-exit, deferring the pass/fail decision until after all bytes are
+/// checked. Whether individual predicate calls compile to branchless
+/// instructions depends on the predicate and target (e.g., range checks
+/// on AArch64 often compile to `cmp + cset`).
+#[inline]
+fn all_bytes(seg: &[u8], pred: fn(u8) -> bool) -> bool {
+    let mut bad: u8 = 0;
+    for &b in seg {
+        bad |= !pred(b) as u8;
+    }
+    bad == 0
+}
+
+/// Check that a byte is ASCII alphanumeric or hyphen.
+#[inline]
+fn is_alnum_or_hyphen(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-'
+}
+
+/// Check that a byte is uppercase ASCII or digit.
+#[inline]
+fn is_upper_or_digit(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit()
+}
+
+/// Check that a byte is lowercase ASCII or digit.
+#[inline]
+fn is_lower_or_digit(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+/// Check that a byte is a hex digit (case-insensitive).
+#[inline]
+fn is_hex(b: u8) -> bool {
+    b.is_ascii_hexdigit()
+}
+
+/// Split `data` on `sep` into at most `N` segments in a stack-local array.
+///
+/// Returns `(segments, count)` where `segments[..count]` are valid slices.
+/// Behaves like `data.splitn(N, |&b| b == sep).collect::<Vec<_>>()` without
+/// heap allocation.
+fn splitn_stack<const N: usize>(data: &[u8], sep: u8) -> ([&[u8]; N], usize) {
+    let mut segs: [&[u8]; N] = [&[]; N];
+    let mut count = 0;
+    let mut start = 0;
+    for (i, &b) in data.iter().enumerate() {
+        if b == sep && count + 1 < N {
+            segs[count] = &data[start..i];
+            count += 1;
+            start = i + 1;
+        }
+    }
+    segs[count] = &data[start..];
+    count += 1;
+    (segs, count)
+}
+
+/// Validate a Slack API token by dispatching on prefix.
+///
+/// Compound prefixes (`xoxe.xoxb-`, `xoxe.xoxp-`) are checked first to
+/// avoid misparse against simpler prefixes. Unknown prefixes return
+/// `Indeterminate` for forward compatibility.
+///
+/// ## Dispatch table
+///
+/// | Prefix             | Sub-validator                         | Rules served                                          | Case        |
+/// |--------------------|---------------------------------------|-------------------------------------------------------|-------------|
+/// | `xoxe.xox[bp]-`   | [`validate_slack_config_access`]      | `slack-config-access-token`                           | insensitive |
+/// | `xoxb-`            | [`validate_slack_xoxb`]               | `slack-bot-token`, `slack-legacy-bot-token`            | sensitive   |
+/// | `xoxp-`            | [`validate_slack_user_token`]         | `slack-user-token`                                    | sensitive   |
+/// | `xoxe-`            | [`validate_slack_xoxe`]               | `slack-config-refresh-token`, `slack-user-token`       | insensitive |
+/// | `xapp-`            | [`validate_slack_xapp`]               | `slack-app-token`                                     | insensitive |
+/// | `xox[os]-`         | [`validate_slack_legacy`]             | `slack-legacy-token`                                  | sensitive   |
+/// | `xox[ar]-`         | [`validate_slack_legacy_workspace`]   | `slack-legacy-workspace-token`                        | sensitive   |
+///
+/// Compound prefixes are checked before simple ones so `xoxe.xoxb-` is not
+/// misrouted through the `xoxe-` path. Unknown prefixes return `Indeterminate`
+/// for forward compatibility with future Slack token formats.
+fn validate_slack_token(secret: &[u8]) -> OfflineVerdict {
+    // Need at least 5 bytes for the shortest prefix (xoxb-, xoxp-, etc.)
+    if secret.len() < 5 {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    // Compound prefixes first (10 bytes: "xoxe.xoxb-" / "xoxe.xoxp-").
+    if secret.len() >= 10 {
+        let compound = &secret[..10];
+        if compound[4] == b'.'
+            && compound[..4].eq_ignore_ascii_case(b"xoxe")
+            && (compound[5..9].eq_ignore_ascii_case(b"xoxb")
+                || compound[5..9].eq_ignore_ascii_case(b"xoxp"))
+            && compound[9] == b'-'
+        {
+            return validate_slack_config_access(&secret[10..]);
+        }
+    }
+
+    // Simple prefixes (5 bytes: 4-char tag + '-').
+    let prefix4 = &secret[..4];
+    if secret[4] != b'-' {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    // At this point secret[4] == b'-', prefix is secret[..4].
+    let p = prefix4;
+
+    // Case-sensitive prefixes.
+    if p == b"xoxb" {
+        return validate_slack_xoxb(&secret[5..]);
+    }
+    if p == b"xoxp" {
+        return validate_slack_user_token(&secret[5..]);
+    }
+    if p == b"xoxo" || p == b"xoxs" {
+        return validate_slack_legacy(&secret[5..]);
+    }
+    if p == b"xoxa" || p == b"xoxr" {
+        return validate_slack_legacy_workspace(&secret[5..]);
+    }
+
+    // Case-insensitive prefixes.
+    if p.eq_ignore_ascii_case(b"xapp") {
+        return validate_slack_xapp(&secret[5..]);
+    }
+    if p.eq_ignore_ascii_case(b"xoxe") {
+        return validate_slack_xoxe(&secret[5..]);
+    }
+
+    OfflineVerdict::Indeterminate
+}
+
+/// Validate `xoxe.xox[bp]-` config access token.
+///
+/// Format after compound prefix: `{1 digit}-{163–166 upper+digit}`.
+fn validate_slack_config_access(after_prefix: &[u8]) -> OfflineVerdict {
+    let (segs, seg_count) = splitn_stack::<3>(after_prefix, b'-');
+    if seg_count < 2 {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    let d = segs[0];
+    if d.len() != 1 || !d[0].is_ascii_digit() {
+        return OfflineVerdict::Invalid;
+    }
+
+    // Remaining body after first segment and hyphen.
+    let body = &after_prefix[d.len() + 1..];
+    if !(163..=166).contains(&body.len()) {
+        return OfflineVerdict::Invalid;
+    }
+    if !all_bytes(body, is_upper_or_digit) {
+        return OfflineVerdict::Invalid;
+    }
+
+    OfflineVerdict::Valid
+}
+
+/// Validate `xapp-` app-level token.
+///
+/// Format after prefix: `{1 digit}-{upper+digit}-{digits}-{lower+digit}`.
+fn validate_slack_xapp(after_prefix: &[u8]) -> OfflineVerdict {
+    let (segs, seg_count) = splitn_stack::<5>(after_prefix, b'-');
+    if seg_count < 4 {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    // Segment 1: single digit.
+    if segs[0].len() != 1 || !segs[0][0].is_ascii_digit() {
+        return OfflineVerdict::Invalid;
+    }
+    // Segment 2: uppercase + digits, non-empty.
+    if segs[1].is_empty() || !all_bytes(segs[1], is_upper_or_digit) {
+        return OfflineVerdict::Invalid;
+    }
+    // Segment 3: digits, non-empty.
+    if segs[2].is_empty() || !all_bytes(segs[2], |b| b.is_ascii_digit()) {
+        return OfflineVerdict::Invalid;
+    }
+    // Segment 4: lowercase + digits, non-empty.
+    if segs[3].is_empty() || !all_bytes(segs[3], is_lower_or_digit) {
+        return OfflineVerdict::Invalid;
+    }
+
+    OfflineVerdict::Valid
+}
+
+/// Validate `xoxb-` bot token (current and legacy formats).
+///
+/// Current: `{d10-13}-{d10-13}-{alnum+hyphen tail}`.
+/// Legacy:  `{d8-14}-{an18-26}`.
+fn validate_slack_xoxb(after_prefix: &[u8]) -> OfflineVerdict {
+    let (segs, seg_count) = splitn_stack::<4>(after_prefix, b'-');
+
+    // Try current format: 3+ segments (d10-13, d10-13, tail with possible hyphens).
+    if seg_count >= 3 {
+        let s1 = segs[0];
+        let s2 = segs[1];
+        if (10..=13).contains(&s1.len())
+            && all_bytes(s1, |b| b.is_ascii_digit())
+            && (10..=13).contains(&s2.len())
+            && all_bytes(s2, |b| b.is_ascii_digit())
+        {
+            // Tail: everything after second hyphen separator.
+            let tail_start = s1.len() + 1 + s2.len() + 1;
+            let tail = &after_prefix[tail_start..];
+            if !tail.is_empty() && all_bytes(tail, is_alnum_or_hyphen) {
+                return OfflineVerdict::Valid;
+            }
+        }
+    }
+
+    // Try legacy format: 2 segments (d8-14, an18-26).
+    if seg_count >= 2 {
+        let s1 = segs[0];
+        if (8..=14).contains(&s1.len()) && all_bytes(s1, |b| b.is_ascii_digit()) {
+            let tail_start = s1.len() + 1;
+            let tail = &after_prefix[tail_start..];
+            if (18..=26).contains(&tail.len()) && all_bytes(tail, |b| b.is_ascii_alphanumeric()) {
+                return OfflineVerdict::Valid;
+            }
+        }
+    }
+
+    // Both current and legacy `xoxb-` formats were attempted and neither
+    // matched. Return Indeterminate (not Invalid) so that unknown future
+    // token layouts are not suppressed as false positives.
+    OfflineVerdict::Indeterminate
+}
+
+/// Validate `xoxp-` / `xoxe-` user token.
+///
+/// Format after prefix: `{d10-13}-{d10-13}-{d10-13}-{an+hyphen 28-34}`.
+///
+/// Called directly for `xoxp-` tokens, and by [`validate_slack_xoxe`] when the
+/// first segment has 10–13 digits (user/enterprise token vs config-refresh).
+fn validate_slack_user_token(after_prefix: &[u8]) -> OfflineVerdict {
+    let (segs, seg_count) = splitn_stack::<5>(after_prefix, b'-');
+    if seg_count < 4 {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    // Three numeric segments (d10-13 each).
+    for &seg in &segs[..3] {
+        if !(10..=13).contains(&seg.len()) || !all_bytes(seg, |b| b.is_ascii_digit()) {
+            return OfflineVerdict::Invalid;
+        }
+    }
+
+    // Tail: everything after the third numeric segment and its hyphen.
+    let tail_start = segs[0].len() + 1 + segs[1].len() + 1 + segs[2].len() + 1;
+    let tail = &after_prefix[tail_start..];
+    if !(28..=34).contains(&tail.len()) || !all_bytes(tail, is_alnum_or_hyphen) {
+        return OfflineVerdict::Invalid;
+    }
+
+    OfflineVerdict::Valid
+}
+
+/// Validate `xoxe-` token (disambiguates config-refresh vs user token).
+///
+/// Config refresh: `{1 digit}-{146 upper+digit}`.
+/// User/enterprise: same as [`validate_slack_user_token`] (3 numeric + tail).
+fn validate_slack_xoxe(after_prefix: &[u8]) -> OfflineVerdict {
+    // Disambiguate by first segment length:
+    // - 1 digit → config refresh token
+    // - 10-13 digits → user/enterprise token
+    let first_seg_end = after_prefix.iter().position(|&b| b == b'-');
+    let first_seg = match first_seg_end {
+        Some(pos) => &after_prefix[..pos],
+        None => return OfflineVerdict::Indeterminate,
+    };
+
+    if first_seg.len() == 1 && first_seg[0].is_ascii_digit() {
+        // Config refresh: body after "digit-" is 146 upper+digit chars.
+        let body = &after_prefix[first_seg.len() + 1..];
+        if body.len() != 146 {
+            return OfflineVerdict::Invalid;
+        }
+        if !all_bytes(body, is_upper_or_digit) {
+            return OfflineVerdict::Invalid;
+        }
+        return OfflineVerdict::Valid;
+    }
+
+    if (10..=13).contains(&first_seg.len()) && all_bytes(first_seg, |b| b.is_ascii_digit()) {
+        // User/enterprise token: delegate to user token validator.
+        return validate_slack_user_token(after_prefix);
+    }
+
+    // First segment matches neither config-refresh (1 digit) nor user token
+    // (10-13 digits). Return Indeterminate so unknown future formats are not
+    // suppressed as false positives.
+    OfflineVerdict::Indeterminate
+}
+
+/// Validate `xox[os]-` legacy token.
+///
+/// Format after prefix: `{d+}-{d+}-{d+}-{hex+}`.
+fn validate_slack_legacy(after_prefix: &[u8]) -> OfflineVerdict {
+    let (segs, seg_count) = splitn_stack::<5>(after_prefix, b'-');
+    if seg_count < 4 {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    // Three digit-only segments.
+    for &seg in &segs[..3] {
+        if seg.is_empty() || !all_bytes(seg, |b| b.is_ascii_digit()) {
+            return OfflineVerdict::Invalid;
+        }
+    }
+
+    // Fourth segment: hex.
+    let hex_start = segs[0].len() + 1 + segs[1].len() + 1 + segs[2].len() + 1;
+    let hex_seg = &after_prefix[hex_start..];
+    if hex_seg.is_empty() || !all_bytes(hex_seg, is_hex) {
+        return OfflineVerdict::Invalid;
+    }
+
+    OfflineVerdict::Valid
+}
+
+/// Validate `xox[ar]-` legacy workspace token.
+///
+/// Format after prefix: `(?:{digit}-)?{an8-48}`.
+fn validate_slack_legacy_workspace(after_prefix: &[u8]) -> OfflineVerdict {
+    if after_prefix.is_empty() {
+        return OfflineVerdict::Indeterminate;
+    }
+
+    // Check for optional leading "digit-" segment.
+    let body =
+        if after_prefix.len() >= 2 && after_prefix[0].is_ascii_digit() && after_prefix[1] == b'-' {
+            &after_prefix[2..]
+        } else {
+            after_prefix
+        };
+
+    if !(8..=48).contains(&body.len()) {
+        return OfflineVerdict::Invalid;
+    }
+    if !all_bytes(body, |b| b.is_ascii_alphanumeric()) {
+        return OfflineVerdict::Invalid;
+    }
+
+    OfflineVerdict::Valid
+}
+
+// ---------------------------------------------------------------------------
 // Bench-only exports
 // ---------------------------------------------------------------------------
 
@@ -647,6 +1123,20 @@ pub fn bench_offline_validate_aws_access_key(secret: &[u8]) -> bool {
 #[inline(always)]
 pub fn bench_offline_validate_sentry_org_token(secret: &[u8]) -> bool {
     matches!(validate_sentry_org_token(secret), OfflineVerdict::Valid)
+}
+
+/// Bench hook for PyPI upload-token offline validation.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_offline_validate_pypi_token(secret: &[u8]) -> bool {
+    matches!(validate_pypi_token(secret), OfflineVerdict::Valid)
+}
+
+/// Bench hook for Slack token offline validation.
+#[cfg(feature = "bench")]
+#[inline(always)]
+pub fn bench_offline_validate_slack_token(secret: &[u8]) -> bool {
+    matches!(validate_slack_token(secret), OfflineVerdict::Valid)
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,41 +1507,33 @@ mod tests {
     }
 
     #[test]
-    fn sentry_invalid_payload_char() {
-        let mut token = Vec::new();
-        token.extend_from_slice(b"sntrys_eyJpYXQiO@==_");
-        token.extend_from_slice(&[b'A'; 43]);
+    fn sentry_literal_cases() {
+        use OfflineVerdict::{Indeterminate, Invalid};
 
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, &token),
-            OfflineVerdict::Invalid,
-        );
-    }
+        let invalid_payload_char = {
+            let mut t = b"sntrys_eyJpYXQiO@==_".to_vec();
+            t.extend_from_slice(&[b'A'; 43]);
+            t
+        };
 
-    #[test]
-    fn sentry_too_short() {
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, b"sntrys_"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
+        let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
+            ("invalid_payload_char", invalid_payload_char, Invalid),
+            ("too_short", b"sntrys_".to_vec(), Indeterminate),
+            ("wrong_prefix", b"sntryu_abc".to_vec(), Indeterminate),
+            (
+                "no_separator",
+                b"sntrys_eyJpYXQiOjEyMzR9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec(),
+                Indeterminate,
+            ),
+        ];
 
-    #[test]
-    fn sentry_wrong_prefix() {
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, b"sntryu_abc"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
-
-    #[test]
-    fn sentry_no_separator() {
-        // No underscore after prefix — payload has no signature separator.
-        let token = b"sntrys_eyJpYXQiOjEyMzR9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, token),
-            OfflineVerdict::Indeterminate,
-        );
+        for (label, token, expected) in &cases {
+            assert_eq!(
+                validate(OfflineValidationSpec::SentryOrgToken, token),
+                *expected,
+                "case: {label}",
+            );
+        }
     }
 
     // ---- Dispatcher ----
@@ -1127,6 +1609,156 @@ mod tests {
         assert_eq!(base62_decode_u32(b"1000000"), None);
     }
 
+    // ---- PyPI upload token ----
+
+    /// Build a PyPI token with the correct base64url-encoded header.
+    fn build_pypi_token(body_suffix: &[u8]) -> Vec<u8> {
+        // base64url of PYPI_HEADER is "AgEIcHlwaS5vcmcC" (16 chars).
+        let mut token = Vec::new();
+        token.extend_from_slice(b"pypi-AgEIcHlwaS5vcmcC");
+        token.extend_from_slice(body_suffix);
+        token
+    }
+
+    #[test]
+    fn pypi_valid_token() {
+        // 16 header chars + 50 body chars → well above minimum.
+        let filler: Vec<u8> = std::iter::repeat_n(b'A', 50).collect();
+        let token = build_pypi_token(&filler);
+        assert_eq!(
+            validate(OfflineValidationSpec::PyPiToken, &token),
+            OfflineVerdict::Valid,
+        );
+    }
+
+    #[test]
+    fn pypi_invalid_body_char() {
+        // '@' is not a valid base64url character.
+        let mut token = build_pypi_token(&[b'A'; 50]);
+        token[5] = b'@'; // corrupt 1st base64url char of body
+        assert_eq!(
+            validate(OfflineValidationSpec::PyPiToken, &token),
+            OfflineVerdict::Invalid,
+        );
+    }
+
+    #[test]
+    fn pypi_literal_cases() {
+        use OfflineVerdict::{Indeterminate, Invalid};
+
+        let wrong_header = {
+            let mut t = b"pypi-AAAAAAAAAAAAAAAA".to_vec();
+            t.extend_from_slice(&[b'B'; 50]);
+            t
+        };
+
+        let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
+            ("wrong_header", wrong_header, Invalid),
+            ("too_short", b"pypi-AgEI".to_vec(), Indeterminate),
+            (
+                "wrong_prefix",
+                b"not-pypi-AgEIcHlwaS5vcmcCxxxxxxxxxxxxxxxxxxxxxxxx".to_vec(),
+                Indeterminate,
+            ),
+            ("empty_body", b"pypi-".to_vec(), Indeterminate),
+        ];
+
+        for (label, token, expected) in &cases {
+            assert_eq!(
+                validate(OfflineValidationSpec::PyPiToken, token),
+                *expected,
+                "case: {label}",
+            );
+        }
+    }
+
+    // ---- Slack tokens (table-driven) ----
+
+    #[test]
+    fn slack_token_cases() {
+        use OfflineVerdict::{Indeterminate, Valid};
+
+        // Dynamic tokens that require Vec construction.
+        let config_access = {
+            let mut t = b"xoxe.xoxb-1-".to_vec();
+            t.extend_from_slice(&[b'A'; 165]);
+            t
+        };
+        let config_refresh = {
+            let mut t = b"xoxe-1-".to_vec();
+            t.extend_from_slice(&[b'A'; 146]);
+            t
+        };
+        let config_access_xoxp = {
+            let mut t = b"xoxe.xoxp-1-".to_vec();
+            t.extend_from_slice(&[b'Z'; 163]);
+            t
+        };
+
+        let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
+            (
+                "bot_current",
+                b"xoxb-1234567890-1234567890-abcDEF12345678901234abcd".to_vec(),
+                Valid,
+            ),
+            (
+                "bot_legacy",
+                b"xoxb-12345678-aBcDeFgHiJkLmNoPqRsT".to_vec(),
+                Valid,
+            ),
+            (
+                "bot_invalid_segments",
+                b"xoxb-123-abc".to_vec(),
+                Indeterminate,
+            ),
+            (
+                "user",
+                b"xoxp-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(),
+                Valid,
+            ),
+            (
+                "xapp",
+                b"xapp-1-ABCD1234567-5678901234-abcdef1234567890".to_vec(),
+                Valid,
+            ),
+            ("config_access", config_access, Valid),
+            ("config_refresh", config_refresh, Valid),
+            ("legacy", b"xoxo-123-456-789-deadbeef".to_vec(), Valid),
+            (
+                "legacy_workspace",
+                b"xoxa-2-abcdefgh12345678".to_vec(),
+                Valid,
+            ),
+            ("unknown_prefix", b"xoxz-something".to_vec(), Indeterminate),
+            ("too_short", b"xox".to_vec(), Indeterminate),
+            (
+                "case_insensitive_xapp",
+                b"XAPP-1-ABCDEF123-456789-abcdef12".to_vec(),
+                Valid,
+            ),
+            (
+                "xoxe_user_format",
+                b"xoxe-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(),
+                Valid,
+            ),
+            ("config_access_xoxp", config_access_xoxp, Valid),
+            ("xoxr_workspace", b"xoxr-abcdefghij12345678".to_vec(), Valid),
+            (
+                "xoxs_legacy",
+                b"xoxs-123-456-789-0123456789abcdef".to_vec(),
+                Valid,
+            ),
+        ];
+
+        for (label, token, expected) in &cases {
+            assert_eq!(
+                validate(OfflineValidationSpec::SlackToken, token),
+                *expected,
+                "case: {label}",
+            );
+        }
+    }
+
     // ---- Test-only helper ----
 
     /// Minimal base64 encoder for constructing test vectors.
@@ -1157,6 +1789,89 @@ mod tests {
             output.push(ALPHABET[((n >> 12) & 63) as usize]);
             output.push(b'=');
             output.push(b'=');
+        }
+    }
+}
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod proptest_offline {
+    use super::*;
+    use proptest::prelude::*;
+
+    const PROPTEST_CASES: u32 = 256;
+
+    const BASE62_CHARS: &[u8; 62] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
+        for slot in buf.iter_mut().rev() {
+            *slot = BASE62_CHARS[(val % 62) as usize];
+            val /= 62;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
+        #[test]
+        fn crc32_base62_roundtrip_valid(payload in prop::collection::vec(any::<u8>(), 10..=10)) {
+            let crc = crc32fast::hash(&payload);
+            let mut checksum = [0u8; 6];
+            base62_encode_u32(crc, &mut checksum);
+
+            let mut token = b"pfx_".to_vec();
+            token.extend_from_slice(&payload);
+            token.extend_from_slice(&checksum);
+
+            let spec = OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 10,
+                checksum_len: 6,
+            };
+            prop_assert_eq!(validate(spec, &token), OfflineVerdict::Valid);
+        }
+
+        #[test]
+        fn github_pat_roundtrip_valid(
+            body in prop::collection::vec(b'A'..=b'z', 76..=76)
+        ) {
+            let mut token = b"github_pat_".to_vec();
+            token.extend_from_slice(&body);
+            let crc = crc32fast::hash(&token);
+            let mut checksum = [0u8; 6];
+            base62_encode_u32(crc, &mut checksum);
+            token.extend_from_slice(&checksum);
+
+            prop_assert_eq!(token.len(), 93);
+            prop_assert_eq!(
+                validate(OfflineValidationSpec::GithubFinegrainedPat, &token),
+                OfflineVerdict::Valid,
+            );
+        }
+
+        #[test]
+        fn grafana_roundtrip_valid(random in "[a-zA-Z0-9]{32}") {
+            let mut token = b"glsa_".to_vec();
+            token.extend_from_slice(random.as_bytes());
+            let crc = crc32fast::hash(&token);
+            token.push(b'_');
+            let hex = format!("{crc:08x}");
+            token.extend_from_slice(hex.as_bytes());
+
+            prop_assert_eq!(token.len(), 46);
+            prop_assert_eq!(
+                validate(OfflineValidationSpec::GrafanaServiceAccount, &token),
+                OfflineVerdict::Valid,
+            );
+        }
+
+        #[test]
+        fn base62_roundtrip(val in any::<u32>()) {
+            let mut buf = [0u8; 6];
+            base62_encode_u32(val, &mut buf);
+            prop_assert_eq!(base62_decode_u32(&buf), Some(val));
         }
     }
 }

@@ -31,13 +31,14 @@ flowchart TB
         MustContain["must_contain check<br/>(optional)"]
         ConfirmAll["confirm_all check<br/>(optional)"]
         Keywords["keyword gate<br/>(optional, any-of memmem)"]
+        CharClass["char_class gate<br/>(optional, SIMD byte classify)"]
         Regex["rule.re.find_iter()"]
         UTF16Dec["UTF-16 Decode<br/>(for UTF-16 variants)"]
     end
 
     subgraph PostMatch["Post-Match Gates"]
         SecretExtract["Secret span extraction"]
-        Entropy["Entropy gate<br/>(optional, on extracted secret)"]
+        Entropy["Entropy gate<br/>(Shannon + optional min-entropy,<br/>on extracted secret)"]
         ValueSuppressors["Value suppressor gate<br/>(optional, any-of)"]
         LocalCtx["Local context gate<br/>(optional, fail-open)"]
     end
@@ -75,7 +76,8 @@ flowchart TB
     RegexConfirm --> MustContain
     MustContain --> ConfirmAll
     ConfirmAll --> Keywords
-    Keywords --> Regex
+    Keywords --> CharClass
+    CharClass --> Regex
     Regex --> |"Raw variant"| SecretExtract
     Regex --> |"UTF-16 variant"| UTF16Dec
     UTF16Dec --> SecretExtract
@@ -366,9 +368,11 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
   validation window as the regex. This is a cheap memmem filter that reduces
   false positives without requiring global context.
 - **Entropy gate**: after regex matching and secret extraction, compute Shannon
-  entropy (bits/byte) of the extracted secret bytes. Low-entropy matches are
-  rejected as likely false positives (e.g., repeated characters or structured
-  IDs).
+  entropy and optional min-entropy (NIST SP 800-90B) of the extracted secret
+  bytes. Shannon catches overall low-randomness; min-entropy catches skewed
+  distributions where one byte dominates even though Shannon looks moderate.
+  Both metrics are computed in a single fused 256-bin histogram pass. Low-entropy
+  matches are rejected as likely false positives.
 - **Value suppressor gate (any-of)**: after regex matching, entropy gating,
   and secret extraction, check if the extracted secret bytes contain any
   configured suppressor pattern. If any pattern matches, the finding is
@@ -381,16 +385,25 @@ Some rules benefit from additional semantic filters beyond anchors + regex:
   such as assignment separators, required key names, and/or matching quotes.
   This gate is fail-open when line boundaries are missing in the window to
   avoid false negatives at chunk edges.
+- **Character-class gate (pre-regex)**: before regex matching, SIMD-accelerated
+  byte classification counts lowercase/uppercase/digit/special bytes in the
+  validation window. If the lowercase proportion exceeds `max_lower_pct`, the
+  window is rejected as likely prose or variable names. This gate is auto-enabled
+  for entropy-gated rules with `min_bits_per_byte >= 3.0` (defaults:
+  `max_lower_pct: 95`, `min_window_len: 32`). Runs on the full window (not
+  extracted secret) and fails open on windows shorter than `min_window_len`.
 
 These gates are designed to be **local and bounded**:
 - Keywords are checked *before* regex, and for UTF-16 windows the check happens
   **before decoding** to avoid wasting decode budget.
-- Entropy runs only on the extracted secret bytes and is capped by `max_len` to
-  keep cost predictable.
+- Entropy (Shannon + min-entropy) runs only on the extracted secret bytes and is
+  capped by `max_len` to keep cost predictable.
 - Value suppressors run only on confirmed matches after secret extraction, so
   they add minimal cost per finding but do not reduce regex work.
 - Local context uses bounded lookaround windows and operates on decoded UTF-8
   bytes for UTF-16 variants, preserving fail-open semantics at boundaries.
+- Char-class runs before regex on the full window using 16-byte SIMD throughput;
+  cost is O(window_len) and fully amortized when it rejects the window.
 
 ## Tuning Parameters
 

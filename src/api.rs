@@ -559,8 +559,8 @@ impl LocalContextSpec {
 /// # Invariants
 /// - `name` must be non-empty.
 /// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
-///   `entropy`, `local_context`, `offline_validation`, and `secret_group` must be
-///   valid when present.
+///   `entropy`, `char_class`, `local_context`, `offline_validation`, and
+///   `secret_group` must be valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
@@ -569,9 +569,9 @@ impl LocalContextSpec {
 ///
 /// # Performance
 /// - Smaller `radius` values reduce regex work but can miss matches if too small.
-/// - `must_contain`, `keywords_any`, and `entropy` act as lightweight
-///   pre-/post-regex filters evaluated on the match window (each cheaper
-///   than full regex evaluation).
+/// - `must_contain`, `keywords_any`, `char_class`, and `entropy` act as
+///   lightweight pre-/post-regex filters evaluated on the match window
+///   (each cheaper than full regex evaluation).
 /// - `value_suppressors_any` is a post-extraction filter that runs after regex
 ///   matching and entropy gating; it adds minimal cost per confirmed match but
 ///   does not reduce regex work.
@@ -636,6 +636,17 @@ pub struct RuleSpec {
     /// likely false positives. Entropy is bounded by min/max length to keep cost
     /// predictable and avoid noisy small-sample statistics.
     pub entropy: Option<EntropySpec>,
+
+    /// Optional character-class distribution gate evaluated before regex.
+    ///
+    /// When present, windows whose lowercase ASCII percentage exceeds the
+    /// configured threshold are rejected without running the regex. This
+    /// cheaply eliminates prose-dominated windows that are clearly not secrets.
+    ///
+    /// When `None` and the YAML parser detects `entropy.min_bits_per_byte >= 3.0`,
+    /// the parser auto-enables this gate with `max_lower_pct: 95, min_window_len: 32`.
+    /// See [`crate::rules::yaml::AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`].
+    pub char_class: Option<CharClassSpec>,
 
     /// Optional local context gate evaluated after secret extraction.
     pub local_context: Option<LocalContextSpec>,
@@ -707,6 +718,9 @@ impl RuleSpec {
         if let Some(ent) = &self.entropy {
             ent.assert_valid();
         }
+        if let Some(cc) = &self.char_class {
+            cc.assert_valid();
+        }
         if let Some(ctx) = &self.local_context {
             ctx.assert_valid();
         }
@@ -725,24 +739,36 @@ impl RuleSpec {
     }
 }
 
-/// Shannon-entropy gate configuration.
+/// Entropy-family gate configuration (Shannon + optional min-entropy).
 ///
 /// # Algorithm
 /// - Entropy is computed over the extracted secret span (not the full regex match).
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
+/// - Shannon entropy is checked first. If an optional min-entropy threshold
+///   (`min_entropy_bits_per_byte`) is configured, it is checked second to
+///   catch skewed distributions that Shannon alone misses.
 ///
 /// # Invariants
 /// - Threshold is bits/byte in [0.0, 8.0].
-/// - `min_len <= max_len`.
+/// - `min_len >= 1` and `min_len <= max_len`.
 #[derive(Clone, Debug)]
 pub struct EntropySpec {
-    /// Minimum entropy threshold in bits/byte.
+    /// Minimum Shannon entropy threshold in bits/byte.
     pub min_bits_per_byte: f32,
     /// Matches shorter than this length pass without entropy checks.
     pub min_len: usize,
     /// Max number of bytes used for entropy calculation.
     pub max_len: usize,
+    /// Lower bound on min-entropy in bits/byte (NIST SP 800-90B).
+    ///
+    /// Min-entropy `H_inf = -log2(p_max)` measures worst-case predictability:
+    /// how likely the single most common byte value is. Unlike Shannon entropy,
+    /// which averages over all symbols, min-entropy catches distributions where
+    /// one byte dominates even though the overall distribution looks diverse.
+    ///
+    /// Candidates below this threshold are rejected. `None` skips the gate.
+    pub min_entropy_bits_per_byte: Option<f32>,
 }
 
 impl EntropySpec {
@@ -760,10 +786,62 @@ impl EntropySpec {
             self.min_bits_per_byte <= 8.0,
             "entropy min_bits_per_byte must be <= 8"
         );
+        assert!(self.min_len >= 1, "entropy min_len must be >= 1");
         assert!(
             self.min_len <= self.max_len,
             "entropy min_len must be <= max_len"
         );
+        if let Some(me) = self.min_entropy_bits_per_byte {
+            assert!(
+                !me.is_nan(),
+                "entropy min_entropy_bits_per_byte must not be NaN"
+            );
+            assert!(me >= 0.0, "entropy min_entropy_bits_per_byte must be >= 0");
+            assert!(me <= 8.0, "entropy min_entropy_bits_per_byte must be <= 8");
+        }
+    }
+}
+
+/// Character-class distribution gate for pre-regex false-positive rejection.
+///
+/// Windows dominated by lowercase ASCII (e.g., English prose) are clearly not
+/// secrets. This gate classifies bytes via SIMD and rejects windows whose
+/// lowercase percentage exceeds `max_lower_pct`, avoiding expensive regex work.
+///
+/// # Fail-open behavior
+/// Windows shorter than `min_window_len` pass unconditionally — small samples
+/// produce noisy statistics and should not gate findings.
+///
+/// # Invariants (enforced by [`assert_valid`](CharClassSpec::assert_valid))
+/// - `max_lower_pct` is in `[0, 100]`.
+/// - `min_window_len >= 16`.
+#[derive(Clone, Copy, Debug)]
+pub struct CharClassSpec {
+    /// Maximum percentage of lowercase ASCII bytes (`a`–`z`) allowed.
+    /// Windows exceeding this threshold are rejected. Range: 0–100.
+    pub max_lower_pct: u8,
+    /// Minimum window length (in bytes) for the gate to apply.
+    /// Shorter windows pass unconditionally.
+    pub min_window_len: u16,
+}
+
+impl CharClassSpec {
+    /// Internal invariant checks used at engine build time.
+    pub(crate) fn assert_valid(&self) {
+        assert!(
+            self.max_lower_pct <= 100,
+            "char_class max_lower_pct must be <= 100"
+        );
+        assert!(
+            self.min_window_len >= 16,
+            "char_class min_window_len must be >= 16"
+        );
+    }
+
+    /// Append a deterministic encoding for policy hashing.
+    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+        out.push(self.max_lower_pct);
+        push_u16_le(out, self.min_window_len);
     }
 }
 
@@ -796,6 +874,10 @@ pub enum OfflineValidationSpec {
     AwsAccessKey,
     /// Sentry org-auth-token base64 format and JSON payload prefix check.
     SentryOrgToken,
+    /// PyPI upload token (macaroon V2 binary header check via base64url decode).
+    PyPiToken,
+    /// Slack API token (prefix-dispatch with per-format segment validation).
+    SlackToken,
 }
 
 impl OfflineValidationSpec {
@@ -817,7 +899,9 @@ impl OfflineValidationSpec {
             Self::GithubFinegrainedPat
             | Self::GrafanaServiceAccount
             | Self::AwsAccessKey
-            | Self::SentryOrgToken => {}
+            | Self::SentryOrgToken
+            | Self::PyPiToken
+            | Self::SlackToken => {}
         }
     }
 
@@ -831,7 +915,9 @@ impl OfflineValidationSpec {
             | Self::GithubFinegrainedPat
             | Self::GrafanaServiceAccount
             | Self::AwsAccessKey
-            | Self::SentryOrgToken => true,
+            | Self::SentryOrgToken
+            | Self::PyPiToken
+            | Self::SlackToken => true,
         }
     }
 }
@@ -904,6 +990,7 @@ mod tests {
             keywords_any: None,
             value_suppressors_any: None,
             entropy: None,
+            char_class: None,
             local_context,
             offline_validation: None,
             secret_group: None,
@@ -1038,6 +1125,8 @@ mod tests {
             OfflineValidationSpec::GrafanaServiceAccount,
             OfflineValidationSpec::AwsAccessKey,
             OfflineValidationSpec::SentryOrgToken,
+            OfflineValidationSpec::PyPiToken,
+            OfflineValidationSpec::SlackToken,
         ];
         for v in variants {
             assert!(
@@ -1173,6 +1262,14 @@ impl RuleSpec {
             }
         }
 
+        match &self.char_class {
+            None => out.push(0),
+            Some(cc) => {
+                out.push(1);
+                cc.encode_policy(out);
+            }
+        }
+
         match self.secret_group {
             None => out.push(0),
             Some(v) => {
@@ -1208,6 +1305,13 @@ impl EntropySpec {
         push_u32_le(out, self.min_bits_per_byte.to_bits());
         push_u64_le(out, self.min_len as u64);
         push_u64_le(out, self.max_len as u64);
+        match self.min_entropy_bits_per_byte {
+            None => out.push(0),
+            Some(v) => {
+                out.push(1);
+                push_u32_le(out, v.to_bits());
+            }
+        }
     }
 }
 
@@ -1229,6 +1333,8 @@ impl OfflineValidationSpec {
             Self::GrafanaServiceAccount => out.push(2),
             Self::AwsAccessKey => out.push(3),
             Self::SentryOrgToken => out.push(4),
+            Self::PyPiToken => out.push(5),
+            Self::SlackToken => out.push(6),
         }
     }
 }
