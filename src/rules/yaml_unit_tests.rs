@@ -1985,76 +1985,39 @@ rules:
 }
 
 #[test]
-fn char_class_auto_enabled_for_high_entropy_rule_without_explicit_field() {
-    let yaml = r#"
-rules:
-  - name: "high-entropy-no-cc"
-    regex: 'tok_[a-zA-Z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    entropy:
-      min_bits_per_byte: 3.5
-      min_len: 8
-      max_len: 64
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse");
-    let cc = rules[0]
-        .char_class
-        .as_ref()
-        .expect("char_class should be auto-enabled for high-entropy rule");
-    assert_eq!(cc.max_lower_pct, 95);
-    assert_eq!(cc.min_window_len, 32);
-}
+fn char_class_auto_enable_cases() {
+    // Formerly: char_class_auto_enabled_for_high_entropy_rule_without_explicit_field,
+    //           char_class_not_auto_enabled_for_low_entropy_rule,
+    //           explicit_char_class_not_overridden_by_auto_enable.
 
-#[test]
-fn char_class_not_auto_enabled_for_low_entropy_rule() {
-    let yaml = r#"
-rules:
-  - name: "low-entropy-no-cc"
-    regex: 'password=[a-z]{8}'
-    anchors: ["password="]
-    radius: 64
-    entropy:
-      min_bits_per_byte: 1.0
-      min_len: 4
-      max_len: 32
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse");
-    assert!(
-        rules[0].char_class.is_none(),
-        "char_class should NOT be auto-enabled for low-entropy rule"
-    );
-}
+    // (yaml, expected char_class as Option<(max_lower_pct, min_window_len)>, label)
+    #[allow(clippy::type_complexity)]
+    const CASES: &[(&str, Option<(u8, u16)>, &str)] = &[
+        (
+            "rules:\n  - name: high-entropy-no-cc\n    regex: 'tok_[a-zA-Z0-9]{40}'\n    anchors: [\"tok_\"]\n    radius: 64\n    entropy:\n      min_bits_per_byte: 3.5\n      min_len: 8\n      max_len: 64\n",
+            Some((95, 32)),
+            "high entropy without explicit char_class → auto-enabled with defaults",
+        ),
+        (
+            "rules:\n  - name: low-entropy-no-cc\n    regex: 'password=[a-z]{8}'\n    anchors: [\"password=\"]\n    radius: 64\n    entropy:\n      min_bits_per_byte: 1.0\n      min_len: 4\n      max_len: 32\n",
+            None,
+            "low entropy without explicit char_class → not auto-enabled",
+        ),
+        (
+            "rules:\n  - name: explicit-cc\n    regex: 'tok_[a-zA-Z0-9]{40}'\n    anchors: [\"tok_\"]\n    radius: 64\n    entropy:\n      min_bits_per_byte: 4.0\n      min_len: 8\n      max_len: 64\n    char_class:\n      max_lower_pct: 80\n      min_window_len: 16\n",
+            Some((80, 16)),
+            "high entropy with explicit char_class → explicit values preserved",
+        ),
+    ];
 
-#[test]
-fn explicit_char_class_not_overridden_by_auto_enable() {
-    let yaml = r#"
-rules:
-  - name: "explicit-cc"
-    regex: 'tok_[a-zA-Z0-9]{40}'
-    anchors: ["tok_"]
-    radius: 64
-    entropy:
-      min_bits_per_byte: 4.0
-      min_len: 8
-      max_len: 64
-    char_class:
-      max_lower_pct: 80
-      min_window_len: 16
-"#;
-    let rules = parse_yaml_rules(yaml).expect("parse");
-    let cc = rules[0]
-        .char_class
-        .as_ref()
-        .expect("explicit char_class should be present");
-    assert_eq!(
-        cc.max_lower_pct, 80,
-        "explicit value should be preserved, not overridden"
-    );
-    assert_eq!(
-        cc.min_window_len, 16,
-        "explicit value should be preserved, not overridden"
-    );
+    for &(yaml, expected, label) in CASES {
+        let rules = parse_yaml_rules(yaml).unwrap_or_else(|e| panic!("[{label}] parse: {e}"));
+        let cc = rules[0]
+            .char_class
+            .as_ref()
+            .map(|c| (c.max_lower_pct, c.min_window_len));
+        assert_eq!(cc, expected, "[{label}]");
+    }
 }
 
 #[test]
