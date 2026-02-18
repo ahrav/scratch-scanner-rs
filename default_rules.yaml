@@ -60,8 +60,9 @@
 # Threshold: 2.0 bits/byte
 #   Rejects strings where any single byte appears > n/4 times.
 #   For alphabets k >= 16 at token lengths n >= 32, the false-rejection
-#   probability for truly random tokens is negligible (< 10^-6).
-#   Caution: at n ~ 17 with k = 16, FN rate is ~ 3.7% -- too high to gate.
+#   probability for truly random tokens is negligible. At shorter lengths
+#   (n < 20) with small alphabets (k = 16), birthday collisions make
+#   the estimate unstable — such rules should not use this gate.
 #
 # Coverage tiers (97 rules total):
 #
