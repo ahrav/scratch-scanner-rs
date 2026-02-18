@@ -261,7 +261,6 @@ pub(super) fn run_odb_blob(
                 &config.tree_diff,
                 repo.object_format.oid_len(),
                 midx.object_count(),
-                config.path_policy_version,
                 mapping_cfg.max_loose_candidates,
             );
 
@@ -648,7 +647,6 @@ fn run_serial_spill_retry(
         &config.tree_diff,
         repo.object_format.oid_len(),
         midx.object_count(),
-        config.path_policy_version,
         mapping_cfg.max_loose_candidates,
     );
 

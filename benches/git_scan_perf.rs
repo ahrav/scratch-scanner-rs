@@ -309,13 +309,7 @@ fn main() {
         tuning.max_transform_depth = depth;
     }
     let base_config = GitScanConfig::default();
-    let policy = policy_hash(
-        &rules,
-        &transforms,
-        &tuning,
-        cfg.merge_mode,
-        base_config.path_policy_version,
-    );
+    let policy = policy_hash(&rules, &transforms, &tuning, cfg.merge_mode);
 
     let engine = Arc::new(match cfg.anchor_mode {
         AnchorMode::Manual => {

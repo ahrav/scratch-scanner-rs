@@ -4,7 +4,7 @@
 //! ## Benchmark groups
 //!
 //! - **Q1**: `tree_entry::parse_entry` — memchr-accelerated delimiter scan
-//! - **Q2**: `classify_path` + `is_excluded_path` — path policy hot path
+//! - **Q2**: `classify_path` + `is_nonscannable` — path policy hot path
 //! - **Q4 + Q5**: `hex_digit` and `parse_unix_timestamp` via `parse_commit`
 //!
 //! Usage:
@@ -16,7 +16,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 use scanner_rs::git_scan::commit_parse::{parse_commit, CommitParseLimits};
 use scanner_rs::git_scan::object_id::ObjectFormat;
-use scanner_rs::git_scan::path_policy::{classify_path, is_excluded_path};
+use scanner_rs::git_scan::path_policy::classify_path;
 use scanner_rs::git_scan::tree_entry::TreeEntryIter;
 
 // ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ fn bench_parse_entry(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Q2: classify_path + is_excluded_path
+// Q2: classify_path + is_nonscannable
 // ---------------------------------------------------------------------------
 
 fn bench_classify_path(c: &mut Criterion) {
@@ -96,11 +96,11 @@ fn bench_classify_path(c: &mut Criterion) {
             bits
         })
     });
-    group.bench_function("is_excluded_v2_batch", |b| {
+    group.bench_function("is_nonscannable_batch", |b| {
         b.iter(|| {
             let mut count = 0u32;
             for path in &paths {
-                if is_excluded_path(black_box(path), 2) {
+                if classify_path(black_box(path)).is_nonscannable() {
                     count += 1;
                 }
             }

@@ -195,6 +195,10 @@ name = "archive_detect"
 harness = false
 
 [[bench]]
+name = "path_policy"
+harness = false
+
+[[bench]]
 name = "event_encoding"
 harness = false
 required-features = ["bench"]

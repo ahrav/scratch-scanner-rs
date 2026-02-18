@@ -456,13 +456,7 @@ fn run_git(
         bytes as usize
     });
 
-    let policy = git_scan::policy_hash(
-        &rules,
-        &transforms,
-        &tuning,
-        cfg.merge_mode,
-        base_config.path_policy_version,
-    );
+    let policy = git_scan::policy_hash(&rules, &transforms, &tuning, cfg.merge_mode);
 
     let engine = Arc::new(match cfg.anchor_mode {
         AnchorMode::Manual => {

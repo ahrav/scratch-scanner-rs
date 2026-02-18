@@ -6,7 +6,6 @@
 //! - Transform configs (order-preserving)
 //! - Tuning parameters
 //! - Merge diff mode
-//! - Path policy version
 //!
 //! # Invariants
 //! - Identical inputs yield identical hashes across platforms.
@@ -48,25 +47,17 @@ const POLICY_HASH_VERSION: u8 = 1;
 /// # Semantics
 /// - `rules` are order-invariant (canonicalized and sorted).
 /// - `transforms` are order-preserving (pipeline order is significant).
-/// - `tuning`, `merge_diff_mode`, and `path_policy_version` are included
-///   verbatim; any change yields a different hash.
+/// - `tuning` and `merge_diff_mode` are included verbatim; any change
+///   yields a different hash.
 #[must_use]
 pub fn policy_hash(
     rules: &[RuleSpec],
     transforms: &[TransformConfig],
     tuning: &Tuning,
     merge_diff_mode: MergeDiffMode,
-    path_policy_version: u32,
 ) -> PolicyHash {
     let mut buf = Vec::with_capacity(4096);
-    encode_policy_hash(
-        &mut buf,
-        rules,
-        transforms,
-        tuning,
-        merge_diff_mode,
-        path_policy_version,
-    );
+    encode_policy_hash(&mut buf, rules, transforms, tuning, merge_diff_mode);
 
     *blake3::hash(&buf).as_bytes()
 }
@@ -77,7 +68,6 @@ fn encode_policy_hash(
     transforms: &[TransformConfig],
     tuning: &Tuning,
     merge_diff_mode: MergeDiffMode,
-    path_policy_version: u32,
 ) {
     // Canonical, versioned encoding with field tags to preserve order and
     // allow future extension without ambiguity. The output is not intended
@@ -91,10 +81,6 @@ fn encode_policy_hash(
     out.extend_from_slice(b"merge_diff");
     out.push(0);
     merge_diff_mode.encode(out);
-
-    out.extend_from_slice(b"path_policy");
-    out.push(0);
-    push_u32_le(out, path_policy_version);
 
     out.extend_from_slice(b"tuning");
     out.push(0);
@@ -187,8 +173,8 @@ mod tests {
     fn policy_hash_is_stable() {
         let rules = vec![rule("a", "a", &[b"a"]), rule("b", "b", &[b"b"])];
         let tuning = demo_tuning();
-        let h1 = policy_hash(&rules, &transforms(), &tuning, MergeDiffMode::AllParents, 1);
-        let h2 = policy_hash(&rules, &transforms(), &tuning, MergeDiffMode::AllParents, 1);
+        let h1 = policy_hash(&rules, &transforms(), &tuning, MergeDiffMode::AllParents);
+        let h2 = policy_hash(&rules, &transforms(), &tuning, MergeDiffMode::AllParents);
         assert_eq!(h1, h2);
     }
 
@@ -200,8 +186,8 @@ mod tests {
         r2.value_suppressors_any = Some(&[b"EXAMPLE"]);
         let tuning = demo_tuning();
 
-        let h1 = policy_hash(&[r1], &transforms(), &tuning, MergeDiffMode::AllParents, 1);
-        let h2 = policy_hash(&[r2], &transforms(), &tuning, MergeDiffMode::AllParents, 1);
+        let h1 = policy_hash(&[r1], &transforms(), &tuning, MergeDiffMode::AllParents);
+        let h2 = policy_hash(&[r2], &transforms(), &tuning, MergeDiffMode::AllParents);
         assert_ne!(
             h1, h2,
             "changing value_suppressors_any must change the policy hash"
@@ -219,15 +205,8 @@ mod tests {
             &transforms(),
             &tuning,
             MergeDiffMode::AllParents,
-            1,
         );
-        let h2 = policy_hash(
-            &[r2, r1],
-            &transforms(),
-            &tuning,
-            MergeDiffMode::AllParents,
-            1,
-        );
+        let h2 = policy_hash(&[r2, r1], &transforms(), &tuning, MergeDiffMode::AllParents);
         assert_eq!(h1, h2);
     }
 }

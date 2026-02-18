@@ -42,7 +42,7 @@ use super::object_id::OidBytes;
 use super::object_store::{ObjectStore, ObjectStoreLayout, TreeBytes};
 use super::oid_index::OidIndex;
 use super::pack_candidates::{LooseCandidate, PackCandidate, PackCandidateCollector};
-use super::path_policy::{classify_path, PathClass};
+use super::path_policy::classify_path;
 use super::repo_open::RepoJobState;
 use super::runner::GitScanConfig;
 use super::tree_candidate::{CandidateSink, ChangeKind};
@@ -525,7 +525,6 @@ pub struct BlobIntroducer {
     seen: SeenSets,
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
-    path_policy_version: u32,
 }
 
 impl BlobIntroducer {
@@ -534,7 +533,6 @@ impl BlobIntroducer {
         limits: &TreeDiffLimits,
         oid_len: u8,
         object_count: u32,
-        path_policy_version: u32,
         max_loose_oids: u32,
     ) -> Self {
         assert!(
@@ -554,7 +552,6 @@ impl BlobIntroducer {
             seen: SeenSets::new(object_count),
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
-            path_policy_version,
         }
     }
 
@@ -725,14 +722,7 @@ impl BlobIntroducer {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    // Inline the version-gate instead of calling `is_excluded_path()`:
-                    // `classify_path` was already called, so reusing `class` avoids
-                    // a redundant re-classification in the hot loop.
-                    let excluded = match self.path_policy_version {
-                        0 | 1 => false,
-                        2 => class.contains(PathClass::BINARY),
-                        _ => class.is_nonscannable(),
-                    };
+                    let excluded = class.is_nonscannable();
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -858,7 +848,6 @@ struct BlobIntroWorker<'a> {
     seen: &'a AtomicSeenSets,
     loose_seen: LooseOidSet,
     loose_excluded: LooseOidSet,
-    path_policy_version: u32,
     abort: &'a AtomicBool,
 }
 
@@ -866,7 +855,6 @@ impl<'a> BlobIntroWorker<'a> {
     fn new(
         limits: &TreeDiffLimits,
         oid_len: u8,
-        path_policy_version: u32,
         max_loose_oids: u32,
         seen: &'a AtomicSeenSets,
         abort: &'a AtomicBool,
@@ -884,7 +872,6 @@ impl<'a> BlobIntroWorker<'a> {
             seen,
             loose_seen: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
             loose_excluded: LooseOidSet::new(max_loose_oids, oid_len, MappingCandidateKind::Loose),
-            path_policy_version,
             abort,
         }
     }
@@ -1029,14 +1016,7 @@ impl<'a> BlobIntroWorker<'a> {
                     let leaf_start = self.path_builder.push_leaf(&self.name_scratch)?;
                     let path = self.path_builder.as_slice();
                     let class = classify_path(path);
-                    // Inline the version-gate instead of calling `is_excluded_path()`:
-                    // `classify_path` was already called, so reusing `class` avoids
-                    // a redundant re-classification in the hot loop.
-                    let excluded = match self.path_policy_version {
-                        0 | 1 => false,
-                        2 => class.contains(PathClass::BINARY),
-                        _ => class.is_nonscannable(),
-                    };
+                    let excluded = class.is_nonscannable();
                     let idx = oid_index.get(&oid);
 
                     if excluded {
@@ -1248,7 +1228,6 @@ pub(super) fn introduce_parallel<'a>(
                     let mut worker = BlobIntroWorker::new(
                         per_worker_limits,
                         repo.object_format.oid_len(),
-                        config.path_policy_version,
                         per_worker_loose,
                         seen,
                         abort,

@@ -74,12 +74,8 @@ impl PathClass {
     /// Returns true if this path is classified as non-scannable content.
     ///
     /// A path is non-scannable if it is a known binary format OR a known
-    /// lock/pin file. This is a classification helper, not a policy decision —
-    /// callers still gate on `path_policy_version` for exclusion semantics.
-    ///
-    /// Prefer this over [`is_excluded_path`] when `classify_path` has already
-    /// been called (e.g. in the blob-introducer hot loop) to avoid redundant
-    /// re-classification.
+    /// lock/pin file. Path-based skipping is always on — there is no version
+    /// gating.
     #[inline]
     #[must_use]
     pub const fn is_nonscannable(self) -> bool {
@@ -604,27 +600,13 @@ pub fn classify_path(path: &[u8]) -> PathClass {
     }
 }
 
-/// Returns true if the path should be excluded under the given policy version.
-///
-/// - Version 0–1: no exclusions (legacy default).
-/// - Version 2: exclude binary-classified paths only.
-/// - Version 3+: exclude binary-classified AND lock-file paths.
-#[must_use]
-pub fn is_excluded_path(path: &[u8], version: u32) -> bool {
-    match version {
-        0 | 1 => false,
-        2 => classify_path(path).contains(PathClass::BINARY),
-        _ => classify_path(path).is_nonscannable(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /// Returns true if any `/`-delimited segment of `path` matches a table
-/// entry (case-insensitive). Only the directory components are checked;
-/// the final filename segment is included in the scan.
+/// entry (case-insensitive). All segments are checked, including the
+/// final filename component.
 fn contains_segment(path: &[u8], table: &[&[u8]]) -> bool {
     let mut start = 0usize;
     while start <= path.len() {
@@ -904,38 +886,6 @@ mod tests {
     fn is_nonscannable_source() {
         let class = classify_path(b"main.rs");
         assert!(!class.is_nonscannable());
-    }
-
-    // ------------------------------------------------------------------
-    // is_excluded_path: version gating
-    // ------------------------------------------------------------------
-    #[test]
-    fn excluded_v0_v1_never() {
-        assert!(!is_excluded_path(b"logo.png", 0));
-        assert!(!is_excluded_path(b"logo.png", 1));
-        assert!(!is_excluded_path(b"Cargo.lock", 0));
-        assert!(!is_excluded_path(b"Cargo.lock", 1));
-    }
-
-    #[test]
-    fn excluded_v2_binary_only() {
-        assert!(is_excluded_path(b"logo.png", 2));
-        assert!(!is_excluded_path(b"Cargo.lock", 2));
-        assert!(!is_excluded_path(b"main.rs", 2));
-    }
-
-    #[test]
-    fn excluded_v3_binary_and_lock() {
-        assert!(is_excluded_path(b"logo.png", 3));
-        assert!(is_excluded_path(b"Cargo.lock", 3));
-        assert!(!is_excluded_path(b"main.rs", 3));
-    }
-
-    #[test]
-    fn excluded_future_version() {
-        assert!(is_excluded_path(b"logo.png", u32::MAX));
-        assert!(is_excluded_path(b"Cargo.lock", u32::MAX));
-        assert!(!is_excluded_path(b"main.rs", u32::MAX));
     }
 
     // ------------------------------------------------------------------
