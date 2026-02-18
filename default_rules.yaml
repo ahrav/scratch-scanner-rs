@@ -98,8 +98,6 @@
 #       Used for Random Bit Generation" (2018).
 #   [2] Rényi, A. "On Measures of Entropy and Information," Proc. 4th
 #       Berkeley Symposium on Math. Stat. and Prob. (1961), pp. 547-561.
-#   [3] scanner-rs internal deep-research synthesis
-#       (34 findings, 5 research agents).
 # --------------------------------------------------------------------------
 # ==========================================================================
 rules:
