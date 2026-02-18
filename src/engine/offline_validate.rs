@@ -1501,41 +1501,33 @@ mod tests {
     }
 
     #[test]
-    fn sentry_invalid_payload_char() {
-        let mut token = Vec::new();
-        token.extend_from_slice(b"sntrys_eyJpYXQiO@==_");
-        token.extend_from_slice(&[b'A'; 43]);
+    fn sentry_literal_cases() {
+        use OfflineVerdict::{Indeterminate, Invalid};
 
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, &token),
-            OfflineVerdict::Invalid,
-        );
-    }
+        let invalid_payload_char = {
+            let mut t = b"sntrys_eyJpYXQiO@==_".to_vec();
+            t.extend_from_slice(&[b'A'; 43]);
+            t
+        };
 
-    #[test]
-    fn sentry_too_short() {
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, b"sntrys_"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
+        let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
+            ("invalid_payload_char", invalid_payload_char, Invalid),
+            ("too_short", b"sntrys_".to_vec(), Indeterminate),
+            ("wrong_prefix", b"sntryu_abc".to_vec(), Indeterminate),
+            (
+                "no_separator",
+                b"sntrys_eyJpYXQiOjEyMzR9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec(),
+                Indeterminate,
+            ),
+        ];
 
-    #[test]
-    fn sentry_wrong_prefix() {
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, b"sntryu_abc"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
-
-    #[test]
-    fn sentry_no_separator() {
-        // No underscore after prefix — payload has no signature separator.
-        let token = b"sntrys_eyJpYXQiOjEyMzR9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert_eq!(
-            validate(OfflineValidationSpec::SentryOrgToken, token),
-            OfflineVerdict::Indeterminate,
-        );
+        for (label, token, expected) in &cases {
+            assert_eq!(
+                validate(OfflineValidationSpec::SentryOrgToken, token),
+                *expected,
+                "case: {label}",
+            );
+        }
     }
 
     // ---- Dispatcher ----
@@ -1645,201 +1637,84 @@ mod tests {
     }
 
     #[test]
-    fn pypi_wrong_header() {
-        // Valid base64url but decodes to wrong header bytes.
-        // "AAAAAAAAAAAAAAAA" decodes to all-zeros (12 bytes) ≠ PYPI_HEADER.
-        let mut token = Vec::new();
-        token.extend_from_slice(b"pypi-AAAAAAAAAAAAAAAA");
-        token.extend_from_slice(&[b'B'; 50]);
-        assert_eq!(
-            validate(OfflineValidationSpec::PyPiToken, &token),
-            OfflineVerdict::Invalid,
-        );
-    }
+    fn pypi_literal_cases() {
+        use OfflineVerdict::{Indeterminate, Invalid};
 
-    #[test]
-    fn pypi_too_short() {
-        // Only 5 + 4 = 9 bytes (< 21 minimum).
-        assert_eq!(
-            validate(OfflineValidationSpec::PyPiToken, b"pypi-AgEI"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
+        let wrong_header = {
+            let mut t = b"pypi-AAAAAAAAAAAAAAAA".to_vec();
+            t.extend_from_slice(&[b'B'; 50]);
+            t
+        };
 
-    #[test]
-    fn pypi_wrong_prefix() {
-        assert_eq!(
-            validate(
-                OfflineValidationSpec::PyPiToken,
-                b"not-pypi-AgEIcHlwaS5vcmcCxxxxxxxxxxxxxxxxxxxxxxxx"
+        let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
+            ("wrong_header", wrong_header, Invalid),
+            ("too_short", b"pypi-AgEI".to_vec(), Indeterminate),
+            (
+                "wrong_prefix",
+                b"not-pypi-AgEIcHlwaS5vcmcCxxxxxxxxxxxxxxxxxxxxxxxx".to_vec(),
+                Indeterminate,
             ),
-            OfflineVerdict::Indeterminate,
-        );
+            ("empty_body", b"pypi-".to_vec(), Indeterminate),
+        ];
+
+        for (label, token, expected) in &cases {
+            assert_eq!(
+                validate(OfflineValidationSpec::PyPiToken, token),
+                *expected,
+                "case: {label}",
+            );
+        }
     }
 
-    #[test]
-    fn pypi_empty_body() {
-        // Exactly 5 bytes: "pypi-".
-        assert_eq!(
-            validate(OfflineValidationSpec::PyPiToken, b"pypi-"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
-
-    // ---- Slack tokens ----
+    // ---- Slack tokens (table-driven) ----
 
     #[test]
-    fn slack_bot_current_valid() {
-        let token = b"xoxb-1234567890-1234567890-abcDEF12345678901234abcd";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
+    fn slack_token_cases() {
+        use OfflineVerdict::{Indeterminate, Invalid, Valid};
 
-    #[test]
-    fn slack_bot_legacy_valid() {
-        let token = b"xoxb-12345678-aBcDeFgHiJkLmNoPqRsT";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
+        // Dynamic tokens that require Vec construction.
+        let config_access = {
+            let mut t = b"xoxe.xoxb-1-".to_vec();
+            t.extend_from_slice(&[b'A'; 165]);
+            t
+        };
+        let config_refresh = {
+            let mut t = b"xoxe-1-".to_vec();
+            t.extend_from_slice(&[b'A'; 146]);
+            t
+        };
+        let config_access_xoxp = {
+            let mut t = b"xoxe.xoxp-1-".to_vec();
+            t.extend_from_slice(&[b'Z'; 163]);
+            t
+        };
 
-    #[test]
-    fn slack_bot_invalid_segments() {
-        // Only 3-char numeric segment (too short for both current and legacy).
-        let token = b"xoxb-123-abc";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Invalid,
-        );
-    }
+        let cases: Vec<(&str, Vec<u8>, OfflineVerdict)> = vec![
+            ("bot_current", b"xoxb-1234567890-1234567890-abcDEF12345678901234abcd".to_vec(), Valid),
+            ("bot_legacy", b"xoxb-12345678-aBcDeFgHiJkLmNoPqRsT".to_vec(), Valid),
+            ("bot_invalid_segments", b"xoxb-123-abc".to_vec(), Invalid),
+            ("user", b"xoxp-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(), Valid),
+            ("xapp", b"xapp-1-ABCD1234567-5678901234-abcdef1234567890".to_vec(), Valid),
+            ("config_access", config_access, Valid),
+            ("config_refresh", config_refresh, Valid),
+            ("legacy", b"xoxo-123-456-789-deadbeef".to_vec(), Valid),
+            ("legacy_workspace", b"xoxa-2-abcdefgh12345678".to_vec(), Valid),
+            ("unknown_prefix", b"xoxz-something".to_vec(), Indeterminate),
+            ("too_short", b"xox".to_vec(), Indeterminate),
+            ("case_insensitive_xapp", b"XAPP-1-ABCDEF123-456789-abcdef12".to_vec(), Valid),
+            ("xoxe_user_format", b"xoxe-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890".to_vec(), Valid),
+            ("config_access_xoxp", config_access_xoxp, Valid),
+            ("xoxr_workspace", b"xoxr-abcdefghij12345678".to_vec(), Valid),
+            ("xoxs_legacy", b"xoxs-123-456-789-0123456789abcdef".to_vec(), Valid),
+        ];
 
-    #[test]
-    fn slack_user_valid() {
-        // xoxp-{d10}-{d10}-{d10}-{an30}
-        let token = b"xoxp-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_xapp_valid() {
-        let token = b"xapp-1-ABCD1234567-5678901234-abcdef1234567890";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_config_access_valid() {
-        // xoxe.xoxb-1-{165 uppercase+digit chars}
-        let mut token = Vec::new();
-        token.extend_from_slice(b"xoxe.xoxb-1-");
-        token.extend_from_slice(&[b'A'; 165]);
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, &token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_config_refresh_valid() {
-        // xoxe-1-{146 uppercase+digit chars}
-        let mut token = Vec::new();
-        token.extend_from_slice(b"xoxe-1-");
-        token.extend_from_slice(&[b'A'; 146]);
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, &token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_legacy_valid() {
-        let token = b"xoxo-123-456-789-deadbeef";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_legacy_workspace_valid() {
-        let token = b"xoxa-2-abcdefgh12345678";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_unknown_prefix() {
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, b"xoxz-something"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
-
-    #[test]
-    fn slack_too_short() {
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, b"xox"),
-            OfflineVerdict::Indeterminate,
-        );
-    }
-
-    #[test]
-    fn slack_case_insensitive_xapp() {
-        let token = b"XAPP-1-ABCDEF123-456789-abcdef12";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_xoxe_user_format_valid() {
-        // xoxe- followed by user-token structure (d10, d10, d10, tail).
-        let token = b"xoxe-1234567890-1234567890-1234567890-abcdefghijABCDEFGHIJ1234567890";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_config_access_xoxp_variant() {
-        // xoxe.xoxp- compound prefix.
-        let mut token = Vec::new();
-        token.extend_from_slice(b"xoxe.xoxp-1-");
-        token.extend_from_slice(&[b'Z'; 163]);
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, &token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_xoxr_workspace_valid() {
-        let token = b"xoxr-abcdefghij12345678";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
-    }
-
-    #[test]
-    fn slack_xoxs_legacy_valid() {
-        let token = b"xoxs-123-456-789-0123456789abcdef";
-        assert_eq!(
-            validate(OfflineValidationSpec::SlackToken, token),
-            OfflineVerdict::Valid,
-        );
+        for (label, token, expected) in &cases {
+            assert_eq!(
+                validate(OfflineValidationSpec::SlackToken, token),
+                *expected,
+                "case: {label}",
+            );
+        }
     }
 
     // ---- Test-only helper ----
@@ -1872,6 +1747,89 @@ mod tests {
             output.push(ALPHABET[((n >> 12) & 63) as usize]);
             output.push(b'=');
             output.push(b'=');
+        }
+    }
+}
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod proptest_offline {
+    use super::*;
+    use proptest::prelude::*;
+
+    const PROPTEST_CASES: u32 = 256;
+
+    const BASE62_CHARS: &[u8; 62] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
+        for slot in buf.iter_mut().rev() {
+            *slot = BASE62_CHARS[(val % 62) as usize];
+            val /= 62;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
+        #[test]
+        fn crc32_base62_roundtrip_valid(payload in prop::collection::vec(any::<u8>(), 10..=10)) {
+            let crc = crc32fast::hash(&payload);
+            let mut checksum = [0u8; 6];
+            base62_encode_u32(crc, &mut checksum);
+
+            let mut token = b"pfx_".to_vec();
+            token.extend_from_slice(&payload);
+            token.extend_from_slice(&checksum);
+
+            let spec = OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 10,
+                checksum_len: 6,
+            };
+            prop_assert_eq!(validate(spec, &token), OfflineVerdict::Valid);
+        }
+
+        #[test]
+        fn github_pat_roundtrip_valid(
+            body in prop::collection::vec(b'A'..=b'z', 76..=76)
+        ) {
+            let mut token = b"github_pat_".to_vec();
+            token.extend_from_slice(&body);
+            let crc = crc32fast::hash(&token);
+            let mut checksum = [0u8; 6];
+            base62_encode_u32(crc, &mut checksum);
+            token.extend_from_slice(&checksum);
+
+            prop_assert_eq!(token.len(), 93);
+            prop_assert_eq!(
+                validate(OfflineValidationSpec::GithubFinegrainedPat, &token),
+                OfflineVerdict::Valid,
+            );
+        }
+
+        #[test]
+        fn grafana_roundtrip_valid(random in "[a-zA-Z0-9]{32}") {
+            let mut token = b"glsa_".to_vec();
+            token.extend_from_slice(random.as_bytes());
+            let crc = crc32fast::hash(&token);
+            token.push(b'_');
+            let hex = format!("{crc:08x}");
+            token.extend_from_slice(hex.as_bytes());
+
+            prop_assert_eq!(token.len(), 46);
+            prop_assert_eq!(
+                validate(OfflineValidationSpec::GrafanaServiceAccount, &token),
+                OfflineVerdict::Valid,
+            );
+        }
+
+        #[test]
+        fn base62_roundtrip(val in any::<u32>()) {
+            let mut buf = [0u8; 6];
+            base62_encode_u32(val, &mut buf);
+            prop_assert_eq!(base62_decode_u32(&buf), Some(val));
         }
     }
 }
