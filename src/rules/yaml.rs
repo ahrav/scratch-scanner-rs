@@ -443,6 +443,11 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
         // for secrets (API keys, tokens), not passwords or low-entropy strings.
         // Excludes ~6 low-entropy password rules (e.g. nuget-config-password
         // at 1.0).
+        //
+        // Note: `char_class: null` in YAML deserializes to `None` (same as
+        // absent), so auto-enable fires for both. This is standard serde/YAML
+        // behavior. To opt out, set `char_class: { max_lower_pct: 100, min_window_len: 0 }`
+        // which effectively disables the gate.
         let char_class = char_class.or_else(|| {
             entropy.as_ref().and_then(|ent| {
                 if ent.min_bits_per_byte >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD {
