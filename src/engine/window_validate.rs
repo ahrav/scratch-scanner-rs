@@ -252,16 +252,25 @@ fn has_assignment_value_shape(window: &[u8]) -> bool {
 /// Fails open for windows shorter than `spec.min_window_len` to avoid false
 /// negatives on short matches. Uses integer cross-multiply to avoid float
 /// division on the hot path.
+///
+/// # Design trade-off
+///
+/// This gate runs on the **full window**, not the extracted secret bytes.
+/// The entropy gate, by contrast, runs post-extraction on secret bytes only.
+/// Running char_class pre-regex avoids the regex cost entirely for prose
+/// windows, but surrounding context (e.g., `password=`) contributes to the
+/// classification. The generous default (`max_lower_pct: 95`) accommodates
+/// this dilution.
 #[inline]
 fn char_class_gate_passes(window: &[u8], spec: CharClassCompiled) -> bool {
     if window.len() < spec.min_window_len as usize {
         return true; // fail-open for short windows
     }
     let profile = super::simd_classify::classify_window(window);
-    let total = window.len() as u32;
     // Integer cross-multiply avoids f32 division:
     // lower / total <= max_lower_pct / 100  ⟺  lower * 100 <= total * max_lower_pct
-    (profile.lower as u64) * 100 <= (total as u64) * (spec.max_lower_pct as u64)
+    // Use u64 throughout to avoid u32 truncation on the (theoretical) >4 GiB path.
+    (profile.lower as u64) * 100 <= (window.len() as u64) * (spec.max_lower_pct as u64)
 }
 
 /// Returns the `(line_start, line_end)` byte offsets of the line containing

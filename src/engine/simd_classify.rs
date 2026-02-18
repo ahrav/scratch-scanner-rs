@@ -47,8 +47,19 @@ pub(crate) struct CharClassProfile {
 ///
 /// Dispatches to NEON (aarch64), SSE2 (x86_64), or scalar fallback.
 /// All paths produce identical results for the same input.
+///
+/// # Panics (debug only)
+///
+/// Debug-asserts that `window.len() <= u32::MAX`. All counts in
+/// [`CharClassProfile`] are `u32`, so inputs exceeding 4 GiB cannot be
+/// represented correctly. In practice, scanning windows are KB-sized.
 #[inline]
 pub(crate) fn classify_window(window: &[u8]) -> CharClassProfile {
+    debug_assert!(
+        window.len() <= u32::MAX as usize,
+        "CharClassProfile uses u32 counts; input length {} exceeds u32::MAX",
+        window.len(),
+    );
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     {
         // SAFETY: NEON is architecturally guaranteed on all AArch64 targets.
