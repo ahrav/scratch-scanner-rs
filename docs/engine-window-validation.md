@@ -57,6 +57,8 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 12] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
+[Step 13] Compute additive confidence score from gate signals that fired
+  ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
 

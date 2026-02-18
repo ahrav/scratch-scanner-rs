@@ -180,6 +180,7 @@ classDiagram
         +u64 root_hint_end
         +bool dedupe_with_span
         +StepId step_id
+        +i8 confidence_score
     }
 
     class FileId {
