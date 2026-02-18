@@ -637,6 +637,7 @@ mod kani_proofs {
             root_hint_end,
             dedupe_with_span: false,
             step_id,
+            confidence_score: 0,
         };
 
         let leaf_transform = if is_root {

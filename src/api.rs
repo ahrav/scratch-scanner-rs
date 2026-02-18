@@ -353,8 +353,8 @@ pub struct FindingRec {
     /// Phase 1 signals: entropy (+1), keyword (+2), assignment shape (+2),
     /// offline validation valid (+5). Score 0 means no confirming gates fired.
     ///
-    /// Accumulated via `+=`; Phase 1 range 0–10 is well within `i8` bounds.
-    /// Does **not**
+    /// Accumulated via `saturating_add`; no overflow panic.  Phase 1 range
+    /// 0–10 is well within `i8` bounds.  Does **not**
     /// participate in dedup keys — two findings at the same span with
     /// different scores still deduplicate normally.
     pub confidence_score: i8,

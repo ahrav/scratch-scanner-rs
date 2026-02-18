@@ -29,6 +29,7 @@ use super::vectorscan_prefilter::{
     build_stream_match_ctx, gate_match_callback, stream_match_callback, VsStreamMatchCtx,
     VsStreamWindow,
 };
+use crate::api::confidence;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::api::OfflineVerdict;
 #[cfg(feature = "stdx-proptest")]
@@ -7068,4 +7069,243 @@ fn base64_encode_bytes(input: &[u8]) -> Vec<u8> {
         out.push(b'=');
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Confidence-score integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn confidence_score_zero_when_no_gates() {
+    let rule = RuleSpec {
+        name: "test-secret",
+        anchors: &[b"SECRET"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"SECRET[A-Z]{8}").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let hay = b"prefix SECRETABCDEFGH suffix";
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "should find one match");
+    assert_eq!(recs[0].confidence_score, 0, "no gates → score 0");
+}
+
+#[test]
+fn confidence_score_entropy_gate() {
+    let rule = RuleSpec {
+        name: "entropy-test",
+        anchors: &[b"TOK_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 4,
+            max_len: 32,
+            min_entropy_bits_per_byte: None,
+        }),
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    // "xK9mQ2pR" has high entropy — mixed case + digits.
+    let hay = b"prefix TOK_xK9mQ2pR suffix";
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "high-entropy token should survive gate");
+    assert_eq!(
+        recs[0].confidence_score,
+        confidence::ENTROPY_PASS,
+        "entropy gate should add ENTROPY_PASS ({}) to score",
+        confidence::ENTROPY_PASS,
+    );
+}
+
+#[test]
+fn confidence_score_keyword_gate() {
+    let rule = RuleSpec {
+        name: "keyword-test",
+        anchors: &[b"TOK_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: Some(&[b"password"]),
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let hay = b"password TOK_ABCDEFGH suffix";
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "keyword-gated finding should be emitted");
+    assert_eq!(
+        recs[0].confidence_score,
+        confidence::KEYWORD_PRESENT,
+        "keyword gate should add KEYWORD_PRESENT ({}) to score",
+        confidence::KEYWORD_PRESENT,
+    );
+}
+
+#[test]
+fn confidence_score_offline_valid() {
+    let rule = offline_crc_rule();
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let valid_tok = build_valid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"prefix ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "valid CRC finding should be kept");
+    assert_eq!(
+        recs[0].confidence_score,
+        confidence::OFFLINE_VALID,
+        "offline-valid gate should add OFFLINE_VALID ({}) to score",
+        confidence::OFFLINE_VALID,
+    );
+}
+
+#[test]
+fn confidence_score_multiple_gates_accumulate() {
+    // Rule with entropy + keywords + offline CRC validation.
+    let rule = RuleSpec {
+        name: "multi-gate-test",
+        anchors: &[b"tok_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: Some(&[b"secret"]),
+        value_suppressors_any: None,
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 2.5,
+            min_len: 4,
+            max_len: 32,
+            min_entropy_bits_per_byte: None,
+        }),
+        char_class: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
+            prefix_skip: 4,
+            payload_len: 8,
+            checksum_len: 6,
+        }),
+        re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let valid_tok = build_valid_crc_token();
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"secret ");
+    hay.extend_from_slice(&valid_tok);
+    hay.extend_from_slice(b" end");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "multi-gate finding should be emitted");
+    let expected =
+        confidence::ENTROPY_PASS + confidence::KEYWORD_PRESENT + confidence::OFFLINE_VALID;
+    assert_eq!(
+        recs[0].confidence_score,
+        expected,
+        "all three gates should accumulate: ENTROPY({}) + KEYWORD({}) + OFFLINE({}) = {}",
+        confidence::ENTROPY_PASS,
+        confidence::KEYWORD_PRESENT,
+        confidence::OFFLINE_VALID,
+        expected,
+    );
+}
+
+#[test]
+fn confidence_score_assignment_shape_gate() {
+    // name = "generic-api-key" enables the assignment-shape check.
+    let rule = RuleSpec {
+        name: "generic-api-key",
+        anchors: &[b"gak_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: None,
+        offline_validation: None,
+        re: Regex::new(r"gak_[A-Z]{8}").unwrap(),
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    // Assignment pattern "api_key=" triggers the shape check.
+    let hay = b"api_key=gak_ABCDEFGH end";
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "assignment-shape finding should be emitted");
+    assert_eq!(
+        recs[0].confidence_score,
+        confidence::ASSIGNMENT_SHAPE,
+        "assignment-shape gate should add ASSIGNMENT_SHAPE ({}) to score",
+        confidence::ASSIGNMENT_SHAPE,
+    );
 }
