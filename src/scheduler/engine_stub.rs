@@ -375,6 +375,11 @@ impl FindingRecord for FindingRec {
     fn span_end(&self) -> u64 {
         self.span_end
     }
+
+    #[inline]
+    fn confidence_score(&self) -> i8 {
+        self.confidence_score
+    }
 }
 
 impl EngineScratch for ScanScratch {

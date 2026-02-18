@@ -215,6 +215,7 @@ fn make_fs_finding() -> FindingEvent<'static> {
         rule_name: "aws-access-key",
         commit_id: None,
         change_kind: None,
+        confidence_score: 0,
     }
 }
 
@@ -233,6 +234,7 @@ fn make_git_finding() -> FindingEvent<'static> {
         rule_name: "generic-secret",
         commit_id: Some(12345),
         change_kind: Some("add"),
+        confidence_score: 0,
     }
 }
 
@@ -626,6 +628,7 @@ fn bench_encode_batch(c: &mut Criterion) {
                         rule_name: f.rule_name,
                         commit_id: f.commit_id,
                         change_kind: f.change_kind,
+                        confidence_score: f.confidence_score,
                     }),
                     &mut buf,
                 );
@@ -670,6 +673,7 @@ fn bench_sink_emit(c: &mut Criterion) {
                     rule_name: f.rule_name,
                     commit_id: f.commit_id,
                     change_kind: f.change_kind,
+                    confidence_score: f.confidence_score,
                 }));
             }
         });
@@ -708,6 +712,7 @@ fn bench_json_sink_emit(c: &mut Criterion) {
                     rule_name: f.rule_name,
                     commit_id: f.commit_id,
                     change_kind: f.change_kind,
+                    confidence_score: f.confidence_score,
                 }));
             }
         });
@@ -754,6 +759,7 @@ fn bench_sink_contention(c: &mut Criterion) {
                                     rule_name: f.rule_name,
                                     commit_id: f.commit_id,
                                     change_kind: f.change_kind,
+                                    confidence_score: f.confidence_score,
                                 }));
                             }
                         });

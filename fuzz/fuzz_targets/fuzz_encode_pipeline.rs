@@ -88,6 +88,7 @@ fuzz_target!(|data: &[u8]| {
                 } else {
                     None
                 },
+                confidence_score: 0,
             };
             let mut buf = Vec::new();
             harness_api::encode_finding(&f, &mut buf);

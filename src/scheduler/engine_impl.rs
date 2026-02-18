@@ -68,6 +68,11 @@ impl FindingRecord for ApiFindingRec {
     fn span_end(&self) -> u64 {
         u64::from(self.span_end)
     }
+
+    #[inline]
+    fn confidence_score(&self) -> i8 {
+        self.confidence_score
+    }
 }
 
 // ============================================================================

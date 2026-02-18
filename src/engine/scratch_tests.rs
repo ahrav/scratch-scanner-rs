@@ -503,3 +503,60 @@ fn pack_rule_id_overflow_panics() {
 
     pack_rule_id_with_variant(DEDUP_RULE_ID_MAX + 1, 0);
 }
+
+#[test]
+fn higher_confidence_wins_dedup() {
+    // Two RAW findings at the same position (identical DedupKey) but with
+    // different confidence_score values.  The second push triggers
+    // `replace_same_scan_duplicate`; because root_hint_end is equal the
+    // tie-breaker is confidence_score — the higher value should win.
+    let engine = Engine::new(
+        vec![simple_rule()],
+        Vec::<TransformConfig>::new(),
+        test_tuning(),
+    );
+    let mut scratch = engine.new_scratch();
+    scratch.update_chunk_overlap(FileId(0), 0, 1024);
+
+    let low = FindingRec {
+        file_id: FileId(0),
+        rule_id: 0,
+        span_start: 10,
+        span_end: 20,
+        root_hint_start: 100,
+        root_hint_end: 120,
+        dedupe_with_span: true,
+        step_id: STEP_ROOT,
+        confidence_score: 3,
+    };
+    let high = FindingRec {
+        confidence_score: 7,
+        ..low
+    };
+
+    let hash_low = [0xAA; 32];
+    let hash_high = [0xBB; 32];
+
+    // Insert low-confidence first, then high-confidence.
+    scratch.push_finding_with_drop_hint(low, hash_low, low.root_hint_end, low.dedupe_with_span);
+    scratch.push_finding_with_drop_hint(high, hash_high, high.root_hint_end, high.dedupe_with_span);
+
+    assert_eq!(
+        scratch.pending_findings_len(),
+        1,
+        "duplicate should not create a second finding"
+    );
+
+    // The arena should contain the high-confidence finding.
+    let mut findings = Vec::with_capacity(1);
+    let mut hashes = Vec::with_capacity(1);
+    scratch.drain_findings_with_hashes(&mut findings, &mut hashes);
+    assert_eq!(
+        findings[0].confidence_score, 7,
+        "higher confidence should replace lower"
+    );
+    assert_eq!(
+        hashes[0], hash_high,
+        "norm_hash should be updated to the higher-confidence finding's hash"
+    );
+}

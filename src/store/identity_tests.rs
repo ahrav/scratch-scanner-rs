@@ -1218,3 +1218,56 @@ fn occurrence_id_propagates_object_key_too_large() {
         assert!(matches!(err, IdentityError::ObjectKeyTooLarge { len } if len > u32::MAX as usize));
     }
 }
+
+#[test]
+fn derive_occurrence_id_ignores_confidence() {
+    let keys = test_keys();
+    let rule_fp = rand_arr(&mut 99);
+    let secret = rand_arr(&mut 100);
+
+    let finding_low = FindingRec {
+        file_id: FileId(1),
+        rule_id: 5,
+        span_start: 100,
+        span_end: 120,
+        root_hint_start: 90,
+        root_hint_end: 130,
+        dedupe_with_span: false,
+        step_id: StepId(0),
+        confidence_score: 0,
+    };
+    let finding_high = FindingRec {
+        confidence_score: 7,
+        ..finding_low
+    };
+
+    let id_low = occurrence_id(
+        OccurrenceInput {
+            object_key: b"repo:src/creds.rs",
+            finding: &finding_low,
+            rule_fingerprint: &rule_fp,
+            secret_hash: &secret,
+            variant: VariantDiscriminant::None,
+            leaf_transform: None,
+        },
+        &keys,
+    )
+    .expect("valid occurrence");
+    let id_high = occurrence_id(
+        OccurrenceInput {
+            object_key: b"repo:src/creds.rs",
+            finding: &finding_high,
+            rule_fingerprint: &rule_fp,
+            secret_hash: &secret,
+            variant: VariantDiscriminant::None,
+            leaf_transform: None,
+        },
+        &keys,
+    )
+    .expect("valid occurrence");
+
+    assert_eq!(
+        id_low, id_high,
+        "confidence_score must not affect occurrence_id"
+    );
+}

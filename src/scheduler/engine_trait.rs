@@ -110,6 +110,12 @@ pub trait FindingRecord: Clone + Send + 'static {
 
     /// Full match span end offset (byte position in original buffer).
     fn span_end(&self) -> u64;
+
+    /// Additive confidence score from gate signals (Phase 1 range: 0–10).
+    ///
+    /// Does **not** participate in dedup keys — two findings at the same span
+    /// with different scores still deduplicate normally.
+    fn confidence_score(&self) -> i8;
 }
 
 /// A finding record that carries normalized secret hash bytes.
@@ -175,6 +181,11 @@ impl<F: FindingRecord> FindingRecord for FindingWithHash<F> {
     #[inline]
     fn span_end(&self) -> u64 {
         self.finding.span_end()
+    }
+
+    #[inline]
+    fn confidence_score(&self) -> i8 {
+        self.finding.confidence_score()
     }
 }
 
@@ -363,6 +374,10 @@ mod tests {
 
         fn span_end(&self) -> u64 {
             self.span_end
+        }
+
+        fn confidence_score(&self) -> i8 {
+            0
         }
     }
 

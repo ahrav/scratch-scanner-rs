@@ -101,6 +101,7 @@ fn sqlite_roundtrip_write_and_query() {
         span_start: 102,
         span_end: 118,
         norm_hash: [0x42; 32],
+        confidence_score: 0,
     };
     let batch = FsFindingBatch {
         object_path: b"src/main.rs",
@@ -148,6 +149,7 @@ fn idempotent_reinsert_same_finding() {
         span_start: 52,
         span_end: 68,
         norm_hash: [0xAA; 32],
+        confidence_score: 0,
     };
     let batch = FsFindingBatch {
         object_path: b"foo.txt",
@@ -307,6 +309,7 @@ fn emit_batch_persists_queryable_findings_rows() {
         span_start: 10,
         span_end: 20,
         norm_hash: [0x33; 32],
+        confidence_score: 0,
     };
     producer
         .emit_fs_batch(FsFindingBatch {
@@ -349,6 +352,7 @@ fn rules_do_not_collapse_when_norm_hash_matches() {
                 span_start: 0,
                 span_end: 5,
                 norm_hash: shared_norm_hash,
+                confidence_score: 0,
             },
             FsFindingRecord {
                 rule_id: 2,
@@ -357,6 +361,7 @@ fn rules_do_not_collapse_when_norm_hash_matches() {
                 span_start: 10,
                 span_end: 15,
                 norm_hash: shared_norm_hash,
+                confidence_score: 0,
             },
         ],
     };
@@ -573,6 +578,7 @@ fn db_reopen_across_lifetimes() {
             span_start: 0,
             span_end: 10,
             norm_hash: [0xEE; 32],
+            confidence_score: 0,
         };
         producer
             .emit_fs_batch(FsFindingBatch {
@@ -685,6 +691,7 @@ fn diff_runs_respects_limit() {
                 span_start: u64::from(i) * 100,
                 span_end: u64::from(i) * 100 + 50,
                 norm_hash: [i.wrapping_add(0x10); 32],
+                confidence_score: 0,
             };
             p.emit_fs_batch(FsFindingBatch {
                 object_path: format!("file_{i}.rs").as_bytes(),
@@ -778,6 +785,7 @@ fn secret_observation_counters_track_across_runs() {
                 span_start: 0,
                 span_end: 10,
                 norm_hash: shared_hash,
+                confidence_score: 0,
             }],
         })
         .unwrap();
@@ -797,6 +805,7 @@ fn secret_observation_counters_track_across_runs() {
                 span_start: 0,
                 span_end: 10,
                 norm_hash: shared_hash,
+                confidence_score: 0,
             }],
         })
         .unwrap();

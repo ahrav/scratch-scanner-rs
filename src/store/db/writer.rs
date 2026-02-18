@@ -249,11 +249,17 @@ impl StoreProducer for SqliteStoreProducer {
                 state
                     .conn
                     .prepare_cached(
+                        // On conflict keep the highest confidence score seen
+                        // across runs: a re-scan may fire more gates (e.g.,
+                        // updated rules) and we want the most informative
+                        // score to survive.
                         "INSERT INTO occurrences (
                          occurrence_id, root_pk, path_pk, rule_pk, secret_pk,
-                         start_byte, end_byte, identity_flags, object_path
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(occurrence_id) DO NOTHING",
+                         start_byte, end_byte, identity_flags, object_path,
+                         confidence_score
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                     ON CONFLICT(occurrence_id) DO UPDATE SET
+                         confidence_score = MAX(excluded.confidence_score, occurrences.confidence_score)",
                     )?
                     .execute(params![
                         occurrence_id.as_slice(),
@@ -265,6 +271,7 @@ impl StoreProducer for SqliteStoreProducer {
                         finding.root_hint_end as i64,
                         0i64,
                         object_path.as_str(),
+                        finding.confidence_score as i64,
                     ])?;
 
                 let occ_pk: i64 = state
@@ -588,6 +595,7 @@ mod tests {
             span_start: 12,
             span_end: 18,
             norm_hash: [0xBB; 32],
+            confidence_score: 0,
         };
         let batch = FsFindingBatch {
             object_path: b"src/main.rs",
@@ -763,6 +771,7 @@ mod tests {
             span_start: 0,
             span_end: 10,
             norm_hash: [0xDD; 32],
+            confidence_score: 0,
         };
         // Two batches with the same rule_id — fingerprint derived from rule_id
         // should be cached after the first batch.
@@ -801,6 +810,7 @@ mod tests {
                 span_start: 0,
                 span_end: 10,
                 norm_hash: [i; 32],
+                confidence_score: 0,
             })
             .collect();
         let batch = FsFindingBatch {
@@ -848,6 +858,7 @@ mod tests {
                     span_start: 0,
                     span_end: 10,
                     norm_hash: hash,
+                    confidence_score: 0,
                 }
             })
             .collect();
@@ -888,6 +899,7 @@ mod tests {
                         span_start: 0,
                         span_end: 10,
                         norm_hash: [t; 32],
+                        confidence_score: 0,
                     };
                     let path = format!("thread_{t}.rs");
                     let batch = FsFindingBatch {
@@ -949,6 +961,7 @@ mod tests {
             span_start: 0,
             span_end: 10,
             norm_hash: [0xFF; 32],
+            confidence_score: 0,
         };
         dyn_producer
             .emit_fs_batch(FsFindingBatch {
@@ -984,5 +997,125 @@ mod tests {
             let id = generate_run_id();
             assert_ne!(id, [0u8; 16], "run_id must never be all zeros");
         }
+    }
+
+    #[test]
+    fn confidence_score_persists_in_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        let rec = FsFindingRecord {
+            rule_id: 1,
+            root_hint_start: 10,
+            root_hint_end: 20,
+            span_start: 12,
+            span_end: 18,
+            norm_hash: [0xCC; 32],
+            confidence_score: 7,
+        };
+        let batch = FsFindingBatch {
+            object_path: b"src/secret.rs",
+            findings: &[rec],
+        };
+        producer.emit_fs_batch(batch).expect("emit");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let score: i64 = conn
+            .query_row(
+                "SELECT confidence_score FROM occurrences LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(score, 7);
+    }
+
+    #[test]
+    fn confidence_score_max_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        let rec_low = FsFindingRecord {
+            rule_id: 1,
+            root_hint_start: 10,
+            root_hint_end: 20,
+            span_start: 12,
+            span_end: 18,
+            norm_hash: [0xDD; 32],
+            confidence_score: 3,
+        };
+        producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"src/update.rs",
+                findings: &[rec_low],
+            })
+            .expect("emit low");
+
+        let rec_high = FsFindingRecord {
+            confidence_score: 7,
+            ..rec_low
+        };
+        producer
+            .emit_fs_batch(FsFindingBatch {
+                object_path: b"src/update.rs",
+                findings: &[rec_high],
+            })
+            .expect("emit high");
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let score: i64 = conn
+            .query_row(
+                "SELECT confidence_score FROM occurrences LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(score, 7, "MAX(3, 7) should yield 7");
+    }
+
+    #[test]
+    fn confidence_score_boundary_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config(tmp.path());
+        let producer = SqliteStoreProducer::open(config).expect("open");
+
+        for &score in &[i8::MIN, -1, 0, 1, 10, i8::MAX] {
+            let mut hash = [0u8; 32];
+            hash[0] = score as u8;
+            hash[1] = score.wrapping_add(42) as u8;
+            let rec = FsFindingRecord {
+                rule_id: 1,
+                root_hint_start: 0,
+                root_hint_end: 10,
+                span_start: 0,
+                span_end: 10,
+                norm_hash: hash,
+                confidence_score: score,
+            };
+            let path = format!("score_{}.rs", score);
+            producer
+                .emit_fs_batch(FsFindingBatch {
+                    object_path: path.as_bytes(),
+                    findings: &[rec],
+                })
+                .expect("emit");
+        }
+
+        let conn = Connection::open(tmp.path().join("findings.db")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT confidence_score FROM occurrences ORDER BY occ_pk")
+            .unwrap();
+        let scores: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            scores,
+            vec![i8::MIN as i64, -1, 0, 1, 10, i8::MAX as i64],
+            "all i8 boundary values must survive write→read",
+        );
     }
 }

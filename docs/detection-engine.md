@@ -51,7 +51,7 @@ flowchart TB
     end
 
     subgraph Output["Output"]
-        FindingRec["FindingRec<br/>{ file_id, rule_id, span, step_id }"]
+        FindingRec["FindingRec<br/>{ file_id, rule_id, span, step_id, confidence_score }"]
     end
 
     Chunk --> VS
@@ -89,7 +89,8 @@ flowchart TB
     Safelist --> SecretSafelist
     SecretSafelist --> OfflineVal
     OfflineVal --> Cap
-    Cap --> FindingRec
+    Cap --> ConfScore["compute_confidence_score()<br/>(additive 0–10 from gate signals)"]
+    ConfScore --> FindingRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0
@@ -554,6 +555,7 @@ FindingRec {
     root_hint_end: 140,
     dedupe_with_span: true,  // Whether span participates in dedupe key
     step_id: StepId(0),      // Decode provenance chain
+    confidence_score: 7,     // Additive 0–10 score from gate signals
 }
 ```
 

@@ -455,6 +455,9 @@ impl<'a> EngineAdapter<'a> {
                 rule_name: self.engine.rule_name(f.rule_id),
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
+                // Git adapter does not yet run gate evaluation — score is
+                // deferred to a future Phase 2 integration.
+                confidence_score: 0,
             }));
         }
     }
