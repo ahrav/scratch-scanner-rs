@@ -215,11 +215,11 @@ fn map_finding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FindingRow> {
         end_byte: row.get(4)?,
         secret_hash_hex: hex_encode(&secret),
         confidence_score: i8::try_from(raw_score).unwrap_or_else(|_| {
-            debug_assert!(
-                false,
-                "confidence_score {raw_score} out of i8 range in DB row; falling back to 0"
-            );
-            0
+            if raw_score > i64::from(i8::MAX) {
+                i8::MAX
+            } else {
+                i8::MIN
+            }
         }),
     })
 }

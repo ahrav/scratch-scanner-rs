@@ -44,6 +44,7 @@ impl FindingRecord for ApiFindingRec {
     fn root_hint_end(&self) -> u64 { self.root_hint_end }
     fn span_start(&self) -> u64 { u64::from(self.span_start) }
     fn span_end(&self) -> u64 { u64::from(self.span_end) }
+    fn confidence_score(&self) -> i8 { self.confidence_score }
 }
 ```
 
@@ -233,7 +234,7 @@ pub struct FindingRec {
     pub span_end: u32,
     pub file_id: FileId,
     pub step_id: StepId,
-    // ...
+    pub confidence_score: i8,
 }
 ```
 
