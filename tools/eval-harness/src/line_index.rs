@@ -1,9 +1,9 @@
 //! Byte-offset to line-number mapping for eval corpus files.
 //!
 //! [`LineIndex`] bridges scanner output (byte offsets) and ground-truth
-//! annotations (line numbers). Build once per file in O(n) using
-//! SIMD-accelerated newline scanning, then query in O(log n) via binary
-//! search.
+//! annotations (line numbers). Build once per file in O(b) time where
+//! b = file size in bytes, using [`memchr`]-based newline scanning. Query
+//! in O(log L) via binary search where L = number of lines.
 //!
 //! # Line-ending conventions
 //!
@@ -51,15 +51,16 @@ pub struct LineIndex {
     /// Byte offset of the first byte of each line. Immutable after
     /// construction — `Box<[u32]>` prevents accidental push/resize.
     line_starts: Box<[u32]>,
-    /// Length of the original data, retained for debug-mode bounds checking
-    /// without needing a reference to the source bytes.
+    /// Length of the original data, retained for bounds checking in
+    /// [`Self::line_of`] without needing a reference to the source bytes.
     data_len: u32,
 }
 
 impl LineIndex {
     /// Build a line index from raw file content.
     ///
-    /// Scans for `\n` bytes using [`memchr`] for SIMD-accelerated throughput.
+    /// Scans for `\n` bytes using [`memchr`] (SIMD-accelerated on supported
+    /// platforms).
     /// A trailing `\n` does not create an entry for the empty region after it.
     ///
     /// # Panics
@@ -75,7 +76,9 @@ impl LineIndex {
         );
         let data_len = data.len() as u32;
 
-        // Pre-allocate assuming ~32 bytes per line (conservative for source code).
+        // Pre-allocate assuming ~32 bytes per line. Typical source lines are
+        // longer, so this over-provisions capacity slightly, avoiding most
+        // reallocations.
         let mut line_starts = Vec::with_capacity(data.len() / 32 + 1);
         line_starts.push(0u32);
 
@@ -88,8 +91,9 @@ impl LineIndex {
             }
         }
 
-        debug_assert!(!line_starts.is_empty());
-        debug_assert!(line_starts[0] == 0);
+        assert!(!line_starts.is_empty());
+        assert!(line_starts[0] == 0);
+        // O(n) monotonicity check — debug-only due to cost on large files.
         debug_assert!(line_starts.windows(2).all(|w| w[0] < w[1]));
 
         Self {
@@ -102,13 +106,12 @@ impl LineIndex {
     ///
     /// Uses binary search over the line-start offsets. No heap allocation.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
-    /// Panics if `byte_offset` exceeds the indexed data length. In release
-    /// mode, offsets beyond the end map to the last line.
+    /// Panics if `byte_offset` exceeds the indexed data length.
     #[inline]
     pub fn line_of(&self, byte_offset: u64) -> u32 {
-        debug_assert!(
+        assert!(
             byte_offset <= self.data_len as u64,
             "byte offset {} out of range for {}-byte file",
             byte_offset,
@@ -137,12 +140,13 @@ impl LineIndex {
     /// containing `byte_start` for both bounds. This handles empty findings
     /// gracefully rather than underflowing on `byte_end - 1`.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
-    /// Panics if `byte_end < byte_start` (inverted range).
+    /// Panics if `byte_end < byte_start` (inverted range), or if either
+    /// bound exceeds the indexed data length.
     #[inline]
     pub fn line_range(&self, byte_start: u64, byte_end: u64) -> (u32, u32) {
-        debug_assert!(
+        assert!(
             byte_end >= byte_start,
             "inverted byte range: [{byte_start}, {byte_end})"
         );
@@ -159,9 +163,12 @@ impl LineIndex {
         (start_line, end_line)
     }
 
-    /// Total number of lines in the indexed data. Always >= 1.
+    /// Total number of lines in the indexed data. Always >= 1 (even an
+    /// empty file is treated as having one empty line, consistent with how
+    /// text editors display empty files).
     #[inline]
     pub fn line_count(&self) -> u32 {
+        // Safe: line_starts.len() <= data_len + 1, and data_len <= u32::MAX.
         self.line_starts.len() as u32
     }
 }
@@ -276,6 +283,28 @@ mod tests {
         assert_eq!(idx.line_range(0, 9), (1, 3));
         // [4, 7) — bytes 4-6 = "def", entirely line 2.
         assert_eq!(idx.line_range(4, 7), (2, 2));
+    }
+
+    #[test]
+    fn crlf_handling() {
+        // b"abc\r\ndef\r\n": \r at positions 3 and 8, \n at positions 4 and 9.
+        // \r is treated as line content, not a line separator.
+        let idx = LineIndex::new(b"abc\r\ndef\r\n");
+        assert_eq!(idx.line_count(), 2);
+        assert_eq!(idx.line_of(3), 1); // \r belongs to line 1
+        assert_eq!(idx.line_of(4), 1); // \n belongs to line 1
+        assert_eq!(idx.line_of(5), 2); // 'd' starts line 2
+        assert_eq!(idx.line_of(8), 2); // \r belongs to line 2
+    }
+
+    #[test]
+    fn line_of_at_eof() {
+        // Offset == data_len is one-past-the-end, allowed for half-open ranges.
+        let idx = LineIndex::new(b"abc\ndef\n");
+        assert_eq!(idx.line_of(8), 2); // data_len = 8, maps to last line
+
+        let idx = LineIndex::new(b"abc\ndef");
+        assert_eq!(idx.line_of(7), 2); // data_len = 7, no trailing newline
     }
 
     // ── Property tests ────────────────────────────────────────────
@@ -456,7 +485,8 @@ mod tests {
             }
 
             // ── P6: Cross-method consistency ──────────────────────
-            // line_range(s, e) == (line_of(s), line_of(e-1)) for non-empty ranges.
+            // For any half-open byte range [s, e_excl) with s < e_excl:
+            //   line_range(s, e_excl) == (line_of(s), line_of(e_excl - 1))
             // Ensures the convenience method and the primitive agree.
 
             #[test]
