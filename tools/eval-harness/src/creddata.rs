@@ -24,7 +24,7 @@
 //!
 //! Each CSV data row passes through these checks in order. The first
 //! failure stops processing for that row and increments the appropriate
-//! counter in [`ParseResult`]:
+//! counter in [`CsvParseResult`]:
 //!
 //! 1. **Deserialize** — serde maps the CSV columns to [`MetaRow`] fields.
 //!    Failures (missing columns, non-numeric line numbers) count as
@@ -51,11 +51,10 @@
 //! [`TruthItem::rule`], serving as the rule-name axis for per-rule
 //! precision/recall breakdowns.
 
-use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::types::{TruthItem, TruthLabel, normalize_path};
+use crate::types::{FileReadError, TruthItem, TruthLabel, normalize_path};
 
 // ── Wire format ──────────────────────────────────────────────────────────
 
@@ -87,40 +86,6 @@ struct MetaRow {
     category: String,
 }
 
-// ── Error type ───────────────────────────────────────────────────────────
-
-/// I/O error from reading a CredData CSV file or directory.
-///
-/// Carries the path that caused the failure so callers always know which
-/// input is responsible. Row-level issues (unknown labels, empty fields,
-/// sentinel line numbers) are not errors — they increment counters in
-/// [`ParseResult`] instead, following the principle that a single bad row
-/// should not abort the entire corpus load.
-#[derive(Debug)]
-pub struct ParseError {
-    path: PathBuf,
-    source: io::Error,
-}
-
-impl ParseError {
-    /// The file or directory path that caused the error.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to read {}: {}", self.path.display(), self.source)
-    }
-}
-
-impl std::error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
 // ── Result types ─────────────────────────────────────────────────────────
 
 /// Outcome of parsing one or more CredData CSV files.
@@ -137,7 +102,7 @@ impl std::error::Error for ParseError {
 /// This invariant is enforced by a property test
 /// (`counting_invariant_always_holds`) over arbitrary inputs.
 #[derive(Clone, Debug)]
-pub struct ParseResult {
+pub struct CsvParseResult {
     /// Successfully parsed and validated truth items.
     pub items: Vec<TruthItem>,
     /// Total CSV data rows processed (excludes header row).
@@ -148,9 +113,15 @@ pub struct ParseResult {
     /// Rows that failed serde deserialization (non-numeric fields, missing
     /// columns, UTF-8 errors).
     pub malformed_rows: u64,
+    /// First serde error message encountered, if any. Aids debugging when
+    /// `malformed_rows` is unexpectedly high.
+    pub first_malformed_error: Option<String>,
+    /// Reason the first row was skipped, if any. Aids debugging when
+    /// `skipped_rows` is unexpectedly high.
+    pub first_skip_reason: Option<String>,
 }
 
-impl ParseResult {
+impl CsvParseResult {
     /// A zero-valued result with no items and no rows processed.
     fn empty() -> Self {
         Self {
@@ -158,6 +129,8 @@ impl ParseResult {
             total_rows: 0,
             skipped_rows: 0,
             malformed_rows: 0,
+            first_malformed_error: None,
+            first_skip_reason: None,
         }
     }
 
@@ -168,6 +141,8 @@ impl ParseResult {
             total_rows: 0,
             skipped_rows: 0,
             malformed_rows: 0,
+            first_malformed_error: None,
+            first_skip_reason: None,
         }
     }
 
@@ -179,6 +154,12 @@ impl ParseResult {
         self.total_rows += other.total_rows;
         self.skipped_rows += other.skipped_rows;
         self.malformed_rows += other.malformed_rows;
+        if self.first_malformed_error.is_none() {
+            self.first_malformed_error = other.first_malformed_error;
+        }
+        if self.first_skip_reason.is_none() {
+            self.first_skip_reason = other.first_skip_reason;
+        }
         self.items.extend(other.items);
     }
 }
@@ -197,9 +178,9 @@ impl ParseResult {
 #[derive(Debug)]
 pub struct DirLoadResult {
     /// Merged parse results from all successfully parsed files.
-    pub parsed: ParseResult,
+    pub parsed: CsvParseResult,
     /// Per-file errors for files that could not be opened or read.
-    pub file_errors: Vec<ParseError>,
+    pub file_errors: Vec<FileReadError>,
     /// Number of `.csv` files discovered in the directory.
     pub files_found: u32,
     /// Number of `.csv` files successfully parsed (opened and fully read).
@@ -211,7 +192,7 @@ pub struct DirLoadResult {
 /// Parse a CredData CSV from an in-memory reader.
 ///
 /// Infallible: all errors (I/O, deserialization, validation) become
-/// counters in the returned [`ParseResult`]. Designed for testability
+/// counters in the returned [`CsvParseResult`]. Designed for testability
 /// and fuzzing — the disk wrapper [`parse_csv`] handles file-open errors
 /// and BOM stripping separately.
 ///
@@ -225,8 +206,16 @@ pub struct DirLoadResult {
 ///
 /// See the module-level [row validation pipeline](self#row-validation-pipeline)
 /// for the exact sequence of checks applied to each row.
-pub fn parse_csv_reader<R: io::Read>(reader: R, canonical_root: &str) -> ParseResult {
+pub fn parse_csv_reader<R: io::Read>(reader: R, canonical_root: &str) -> CsvParseResult {
     parse_csv_reader_inner(reader, canonical_root, 0)
+}
+
+/// Record a skipped row with a reason, updating counters.
+fn record_skip(result: &mut CsvParseResult, reason: &str) {
+    if result.first_skip_reason.is_none() {
+        result.first_skip_reason = Some(reason.to_owned());
+    }
+    result.skipped_rows += 1;
 }
 
 /// Core CSV parsing loop with an optional capacity hint for the items Vec.
@@ -238,13 +227,13 @@ fn parse_csv_reader_inner<R: io::Read>(
     reader: R,
     canonical_root: &str,
     capacity_hint: usize,
-) -> ParseResult {
+) -> CsvParseResult {
     let mut csv_reader = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
 
     let mut result = if capacity_hint > 0 {
-        ParseResult::with_capacity(capacity_hint)
+        CsvParseResult::with_capacity(capacity_hint)
     } else {
-        ParseResult::empty()
+        CsvParseResult::empty()
     };
 
     for row_result in csv_reader.deserialize::<MetaRow>() {
@@ -252,7 +241,10 @@ fn parse_csv_reader_inner<R: io::Read>(
 
         let row = match row_result {
             Ok(row) => row,
-            Err(_) => {
+            Err(e) => {
+                if result.first_malformed_error.is_none() {
+                    result.first_malformed_error = Some(e.to_string());
+                }
                 result.malformed_rows += 1;
                 continue;
             }
@@ -263,13 +255,13 @@ fn parse_csv_reader_inner<R: io::Read>(
             "F" => TruthLabel::Negative,
             "X" => TruthLabel::Placeholder,
             _ => {
-                result.skipped_rows += 1;
+                record_skip(&mut result, "unknown GroundTruth label");
                 continue;
             }
         };
 
         if row.file_path.is_empty() || row.category.is_empty() {
-            result.skipped_rows += 1;
+            record_skip(&mut result, "empty FilePath or Category");
             continue;
         }
 
@@ -277,27 +269,33 @@ fn parse_csv_reader_inner<R: io::Read>(
         // Clamping to 1 would fabricate concrete annotations at line 1,
         // corrupting precision/recall. Skip instead.
         if row.line_start <= 0 || row.line_end <= 0 {
-            result.skipped_rows += 1;
+            record_skip(&mut result, "non-positive line number");
             continue;
         }
 
-        // Saturating narrowing cast: i64 → u32. Values above u32::MAX are
-        // clamped rather than truncated to avoid silently wrapping a huge
-        // line number into a small one.
-        let line_start = row.line_start.min(u32::MAX as i64) as u32;
-        let line_end = row.line_end.min(u32::MAX as i64) as u32;
-
-        // Inverted range — skip rather than silently swap. Consistent
-        // with the JSONL finding parser which also rejects inverted spans.
-        if line_end < line_start {
-            result.skipped_rows += 1;
+        // Inverted range — check on original i64 values before narrowing,
+        // so clamping cannot mask the inversion.
+        if row.line_end < row.line_start {
+            record_skip(&mut result, "inverted line range");
             continue;
         }
+
+        // Line numbers exceeding u32::MAX indicate corrupt data (no real
+        // source file has 4+ billion lines). Skip rather than clamp, which
+        // would fabricate incorrect line numbers.
+        if row.line_start > u32::MAX as i64 || row.line_end > u32::MAX as i64 {
+            record_skip(&mut result, "line number exceeds u32::MAX");
+            continue;
+        }
+
+        // Safe narrowing cast: all values are in [1, u32::MAX] at this point.
+        let line_start = row.line_start as u32;
+        let line_end = row.line_end as u32;
 
         // normalize_path can return "" for degenerate inputs (e.g., "..")
         let norm_path = normalize_path(&row.file_path, canonical_root);
         if norm_path.is_empty() {
-            result.skipped_rows += 1;
+            record_skip(&mut result, "empty normalized path");
             continue;
         }
 
@@ -333,15 +331,12 @@ fn strip_bom(data: &[u8]) -> &[u8] {
 /// first bytes, and CredData meta CSVs are small (typically < 1 MB).
 ///
 /// Only file-open/read failures produce errors; row-level issues are
-/// counted in [`ParseResult`].
+/// counted in [`CsvParseResult`].
 ///
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
 /// the corpus-root prefix from file paths. Use `""` for no stripping.
-pub fn parse_csv(path: &Path, canonical_root: &str) -> Result<ParseResult, ParseError> {
-    let data = std::fs::read(path).map_err(|e| ParseError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+pub fn parse_csv(path: &Path, canonical_root: &str) -> Result<CsvParseResult, FileReadError> {
+    let data = std::fs::read(path).map_err(|e| FileReadError::new(path.to_path_buf(), e))?;
     let data = strip_bom(&data);
     // CredData CSV rows average ~100 bytes; pre-allocate to avoid repeated
     // Vec reallocations for large files.
@@ -366,21 +361,17 @@ pub fn parse_csv(path: &Path, canonical_root: &str) -> Result<ParseResult, Parse
 ///
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
 /// the corpus-root prefix from file paths. Use `""` for no stripping.
-pub fn load_meta_dir(dir: &Path, canonical_root: &str) -> Result<DirLoadResult, ParseError> {
+pub fn load_meta_dir(dir: &Path, canonical_root: &str) -> Result<DirLoadResult, FileReadError> {
     let mut csv_paths: Vec<PathBuf> = Vec::new();
-    let mut file_errors: Vec<ParseError> = Vec::new();
+    let mut file_errors: Vec<FileReadError> = Vec::new();
 
-    for entry_result in std::fs::read_dir(dir).map_err(|e| ParseError {
-        path: dir.to_path_buf(),
-        source: e,
-    })? {
+    for entry_result in
+        std::fs::read_dir(dir).map_err(|e| FileReadError::new(dir.to_path_buf(), e))?
+    {
         let entry = match entry_result {
             Ok(e) => e,
             Err(source) => {
-                file_errors.push(ParseError {
-                    path: dir.to_path_buf(),
-                    source,
-                });
+                file_errors.push(FileReadError::new(dir.to_path_buf(), source));
                 continue;
             }
         };
@@ -395,7 +386,7 @@ pub fn load_meta_dir(dir: &Path, canonical_root: &str) -> Result<DirLoadResult, 
     csv_paths.sort();
 
     let files_found = csv_paths.len() as u32;
-    let mut merged = ParseResult::empty();
+    let mut merged = CsvParseResult::empty();
     let mut files_parsed = 0u32;
 
     for csv_path in &csv_paths {
@@ -441,7 +432,7 @@ mod tests {
         )
     }
 
-    fn parse_str(csv: &str, canonical_root: &str) -> ParseResult {
+    fn parse_str(csv: &str, canonical_root: &str) -> CsvParseResult {
         parse_csv_reader(Cursor::new(csv.as_bytes()), canonical_root)
     }
 
@@ -489,6 +480,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_skips_degenerate_paths() {
+        for degenerate in ["..", ".", "../.."] {
+            let csv = format!("{HEADER}\n{}", make_row(degenerate, 1, 1, "T", "Key"));
+            let result = parse_str(&csv, "");
+            assert!(
+                result.items.is_empty(),
+                "degenerate path {degenerate:?} should produce no items"
+            );
+            assert_eq!(
+                result.skipped_rows, 1,
+                "degenerate path {degenerate:?} should count as skipped"
+            );
+            assert!(
+                result
+                    .first_skip_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("empty normalized path"),
+                "degenerate path {degenerate:?} skip reason should mention empty normalized path"
+            );
+        }
+    }
+
+    #[test]
     fn parse_line_number_clamping() {
         // Sentinel -1/-1 → skip.
         let csv = format!("{HEADER}\n{}", make_row("a.py", -1, -1, "T", "Key"));
@@ -515,15 +530,27 @@ mod tests {
         assert_eq!(r.items[0].line_start, 5);
         assert_eq!(r.items[0].line_end, 10);
 
-        // Overflow → clamped to u32::MAX.
+        // Overflow → skipped (no real file has 4+ billion lines).
         let csv = format!(
             "{HEADER}\n{}",
             make_row("a.py", 5_000_000_000, 5_000_000_000, "T", "Key")
         );
         let r = parse_str(&csv, "");
-        assert_eq!(r.items.len(), 1);
-        assert_eq!(r.items[0].line_start, u32::MAX);
-        assert_eq!(r.items[0].line_end, u32::MAX);
+        assert!(r.items.is_empty(), "overflow values should be skipped");
+        assert_eq!(r.skipped_rows, 1);
+
+        // Inverted range with both values > u32::MAX → skipped.
+        // Clamping must not mask the inversion.
+        let csv = format!(
+            "{HEADER}\n{}",
+            make_row("a.py", 5_000_000_001, 5_000_000_000, "T", "Key")
+        );
+        let r = parse_str(&csv, "");
+        assert!(
+            r.items.is_empty(),
+            "inverted overflow range should be skipped"
+        );
+        assert_eq!(r.skipped_rows, 1);
     }
 
     #[test]
@@ -604,6 +631,34 @@ mod tests {
         assert_eq!(result.items[0].path, "b.py");
     }
 
+    #[test]
+    fn first_malformed_error_captured() {
+        let csv = format!(
+            "{HEADER}\n1,f1,d,r,a.py,abc,1,T,-1,-1,N,N,Key\n{}",
+            make_row("b.py", 1, 1, "T", "Password"),
+        );
+        let result = parse_str(&csv, "");
+        assert_eq!(result.malformed_rows, 1);
+        assert!(
+            result.first_malformed_error.is_some(),
+            "first_malformed_error should be captured"
+        );
+    }
+
+    #[test]
+    fn first_skip_reason_captured() {
+        let csv = format!("{HEADER}\n{}", make_row("a.py", 1, 1, "Q", "Password"));
+        let result = parse_str(&csv, "");
+        assert_eq!(result.skipped_rows, 1);
+        assert!(
+            result
+                .first_skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("unknown"),
+        );
+    }
+
     // ── Directory loading test ──────────────────────────────────
 
     #[test]
@@ -641,6 +696,50 @@ mod tests {
         assert_eq!(result.parsed.items[3].path, "c.py");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_meta_dir_partial_failure() {
+        let dir = std::env::temp_dir().join("creddata_partial_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // One valid CSV file.
+        let csv_good = format!("{HEADER}\n{}", make_row("a.py", 1, 1, "T", "Key"));
+        std::fs::write(dir.join("good.csv"), &csv_good).unwrap();
+
+        // A directory masquerading as a .csv file — parse_csv will fail to
+        // read it because std::fs::read on a directory returns an error.
+        std::fs::create_dir_all(dir.join("bad.csv")).unwrap();
+
+        let result = load_meta_dir(&dir, "").unwrap();
+
+        assert_eq!(result.files_found, 2);
+        assert_eq!(result.files_parsed, 1);
+        assert_eq!(result.file_errors.len(), 1);
+        assert!(
+            result.file_errors[0]
+                .path()
+                .to_str()
+                .unwrap()
+                .contains("bad.csv"),
+            "error should reference the bad file"
+        );
+        // Valid file's items were still merged.
+        assert_eq!(result.parsed.items.len(), 1);
+        assert_eq!(result.parsed.items[0].path, "a.py");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_meta_dir_not_found() {
+        let err = load_meta_dir(Path::new("/nonexistent/creddata/dir"), "").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/nonexistent/creddata/dir"),
+            "error should contain path: {msg}"
+        );
     }
 
     // ── Property tests ──────────────────────────────────────────

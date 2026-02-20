@@ -26,6 +26,35 @@ const PATH_ID_DOMAIN: &[u8] = b"scanner.store.identity.v1.path_id";
 /// Default path scheme for filesystem paths.
 pub const PATH_SCHEME_FS_V1: &str = "fs_path_v1";
 
+/// Returns `true` when `raw` is already in canonical form and needs no
+/// normalization.
+///
+/// A path is considered canonical when it satisfies **all** of the
+/// following:
+///
+/// 1. Non-empty.
+/// 2. Contains no backslash (`\`) separators.
+/// 3. Does not start with `/` (canonical paths are relative).
+/// 4. Does not end with `/` (no trailing separator).
+/// 5. Contains no consecutive `//` sequences.
+/// 6. Contains no `/.<something>` sequences — this catches mid-path `.`
+///    and `..` components (e.g., `a/./b`, `a/../b`).
+/// 7. Does not start with `.` — this catches a leading `.` or `..`
+///    component that has no preceding `/` (e.g., `./a`, `../a`).
+///
+/// Conditions 6 and 7 together cover `.`/`..` segments in all positions:
+/// condition 6 handles any segment preceded by `/`, while condition 7
+/// handles the first segment which has no preceding `/`.
+fn is_already_canonical(raw: &str) -> bool {
+    !raw.is_empty()
+        && !raw.contains('\\')
+        && !raw.starts_with('/')
+        && !raw.ends_with('/')
+        && !raw.contains("//")
+        && !raw.contains("/.")
+        && !raw.starts_with('.')
+}
+
 /// Canonicalize a path string using purely lexical component-based
 /// normalization (no filesystem access).
 ///
@@ -39,19 +68,23 @@ pub const PATH_SCHEME_FS_V1: &str = "fs_path_v1";
 /// for hashing. Because this is lexical-only, symlinks are **not**
 /// resolved — two paths that resolve to the same inode through different
 /// symlink chains will produce different path IDs.
+///
+/// # Above-root traversal
+///
+/// A `..` component that would traverse above the root (i.e., there is no
+/// preceding component left to pop) is silently dropped. For example,
+/// `../../../etc/passwd` normalizes to `etc/passwd`. This is intentional:
+/// inputs to this function are expected to be root-relative paths within a
+/// scan root, so above-root segments carry no meaning.
+///
+/// **Callers processing untrusted paths** should validate that the input
+/// does not escape the intended root *before* calling this function.
+/// `canonicalize_path` normalizes structure but does not enforce
+/// containment — it is not a security boundary.
 #[must_use]
 pub fn canonicalize_path(raw: &str) -> String {
-    // Fast path: if the input has no backslashes, no `.`/`..` components,
-    // no leading/trailing `/`, and no consecutive `//`, it is already
-    // canonical — avoid the Vec + join overhead.
-    if !raw.is_empty()
-        && !raw.contains('\\')
-        && !raw.starts_with('/')
-        && !raw.ends_with('/')
-        && !raw.contains("//")
-        && !raw.contains("/.")
-        && !raw.starts_with('.')
-    {
+    // Fast path: already canonical — avoid the Vec + join overhead.
+    if is_already_canonical(raw) {
         return raw.to_string();
     }
 
@@ -168,6 +201,38 @@ mod tests {
     #[test]
     fn canonicalize_multiple_slashes() {
         assert_eq!(canonicalize_path("a///b//c"), "a/b/c");
+    }
+
+    #[test]
+    fn canonicalize_fast_path_is_identity() {
+        // Inputs that satisfy all fast-path conditions: no backslashes,
+        // no `.`/`..` components, no leading/trailing `/`, no `//`.
+        let cases = ["a/b/c", "src/main.rs", "a", "foo/bar/baz/qux.txt"];
+        for input in cases {
+            let result = canonicalize_path(input);
+            assert_eq!(
+                result, input,
+                "fast path should return input unchanged: {input:?}"
+            );
+            // Verify the slow path produces the same result.
+            let slow = {
+                let mut components: Vec<&str> = Vec::new();
+                for part in input.split(&['/', '\\']) {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            components.pop();
+                        }
+                        other => components.push(other),
+                    }
+                }
+                components.join("/")
+            };
+            assert_eq!(
+                result, slow,
+                "fast path and slow path diverge for: {input:?}"
+            );
+        }
     }
 
     // ── path_id ────────────────────────────────────────────────────
