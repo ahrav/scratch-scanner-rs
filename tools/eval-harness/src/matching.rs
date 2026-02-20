@@ -40,6 +40,22 @@ use crate::line_index::LineIndex;
 use crate::types::{ClassifiedFinding, FindingClass, NormalizedFinding, TruthItem, TruthLabel};
 use scanner_rs::stdx::bitset::DynamicBitSet;
 
+/// Per-file index combining truth items and byte-to-line mapping.
+///
+/// Merges what were previously two separate HashMaps (`truth_by_file` and
+/// `line_indices`) into a single lookup per finding path, halving per-finding
+/// hash computations.
+struct FileInfo<'a> {
+    /// Byte-to-line mapping for this file. `None` when truth items reference
+    /// the path but no file contents were provided — findings on such paths
+    /// are classified as Unlabeled.
+    line_index: Option<LineIndex>,
+    /// Truth items for this file, sorted by `line_start` for binary search.
+    /// The `usize` is the index into the original truth slice, used to mark
+    /// consumed Positive items in the global bitset.
+    truths: Vec<(usize, &'a TruthItem)>,
+}
+
 /// Configuration for the matching algorithm.
 ///
 /// All fields have sensible defaults for location-only matching. The
@@ -103,6 +119,13 @@ pub struct MatchResult {
     /// to recall.
     pub false_negatives: Vec<TruthItem>,
 
+    /// Pre-computed TP count, accumulated during the classification loop.
+    tp: u64,
+    /// Pre-computed FP count, accumulated during the classification loop.
+    fp: u64,
+    /// Pre-computed Unlabeled count, accumulated during the classification loop.
+    unlabeled: u64,
+
     /// Findings on paths with no corresponding truth entries at all.
     /// These findings are classified as Unlabeled because there is no
     /// annotation to compare against — they are neither penalized nor
@@ -125,20 +148,14 @@ impl MatchResult {
     /// Number of findings classified as True Positive (matched a Positive
     /// truth annotation). Bounded above by the total positive truth count.
     pub fn tp_count(&self) -> u64 {
-        self.classified
-            .iter()
-            .filter(|c| c.class == FindingClass::TruePositive)
-            .count() as u64
+        self.tp
     }
 
     /// Number of findings classified as False Positive (matched a Negative
     /// truth annotation). Non-zero only when Negative truth items exist in
     /// the corpus.
     pub fn fp_count(&self) -> u64 {
-        self.classified
-            .iter()
-            .filter(|c| c.class == FindingClass::FalsePositive)
-            .count() as u64
+        self.fp
     }
 
     /// Number of Positive truth items not matched by any finding (false
@@ -151,16 +168,13 @@ impl MatchResult {
     /// location, or matched a Placeholder. These do not affect precision
     /// or recall.
     pub fn unlabeled_count(&self) -> u64 {
-        self.classified
-            .iter()
-            .filter(|c| c.class == FindingClass::Unlabeled)
-            .count() as u64
+        self.unlabeled
     }
 
     /// Total ground-truth positive count: `tp_count() + fn_count()`.
     /// This is the denominator for recall computation.
     pub fn total_positives(&self) -> u64 {
-        self.tp_count() + self.fn_count()
+        self.tp + self.fn_count()
     }
 }
 
@@ -169,6 +183,10 @@ impl MatchResult {
 /// Pure function — no I/O. Caller provides file contents for [`LineIndex`]
 /// construction. Findings and truth items must have paths already
 /// normalized via [`crate::types::normalize_path`].
+///
+/// Takes ownership of `findings` and `truth` to avoid cloning when building
+/// the output — findings are moved into [`ClassifiedFinding`] and unmatched
+/// truth items are moved into [`MatchResult::false_negatives`].
 ///
 /// The output `classified` list is ordered by confidence descending (then by
 /// [`NormalizedFinding::Ord`] for ties). Pass it to
@@ -181,7 +199,6 @@ impl MatchResult {
 ///
 /// - `tp + fp + unlabeled != findings.len()`
 /// - `tp + fn != total positive truth items`
-/// - `consumed positive count != tp`
 ///
 /// These indicate a logic bug in the matching algorithm, not bad input.
 ///
@@ -193,8 +210,8 @@ impl MatchResult {
 /// count in file f). Adequate for F up to 100K and T up to 200K spread
 /// across thousands of files.
 pub fn match_findings(
-    findings: &[NormalizedFinding],
-    truth: &[TruthItem],
+    mut findings: Vec<NormalizedFinding>,
+    truth: Vec<TruthItem>,
     file_contents: &HashMap<String, Vec<u8>>,
     config: MatchConfig<'_>,
 ) -> MatchResult {
@@ -204,116 +221,101 @@ pub fn match_findings(
         "findings must be deduplicated before matching"
     );
 
-    // ── Sort findings by (-confidence, identity) ──────────────────
-    let mut sorted_indices: Vec<usize> = (0..findings.len()).collect();
-    sorted_indices.sort_by(|&a, &b| {
+    let findings_len = findings.len();
+
+    // ── Sort findings in-place by (-confidence, identity) ──────────
+    findings.sort_by(|a, b| {
         // Descending confidence via reverse comparison — never negate i8
         // (i8::MIN overflow wraps silently in release mode).
-        findings[b]
-            .confidence
-            .cmp(&findings[a].confidence)
-            .then_with(|| findings[a].cmp(&findings[b]))
+        b.confidence
+            .cmp(&a.confidence)
+            .then_with(|| a.cmp(b))
     });
 
     // Sort postcondition.
     debug_assert!(
-        sorted_indices
+        findings
             .windows(2)
-            .all(|w| findings[w[0]].confidence >= findings[w[1]].confidence),
+            .all(|w| w[0].confidence >= w[1].confidence),
         "sort must produce confidence-descending order"
     );
 
-    // ── Group truth by file path, sort by line_start ──────────────
-    let mut truth_by_file: HashMap<&str, Vec<(usize, &TruthItem)>> = HashMap::new();
+    // ── Build per-file index: group truth by path, attach LineIndex ─
+    // Counting total_positives inline avoids a separate scan of truth.
+    let mut file_info: HashMap<&str, FileInfo<'_>> = HashMap::new();
+    let mut unmatchable_truth_paths: u64 = 0;
+    let mut total_positives: u64 = 0;
+
     for (idx, item) in truth.iter().enumerate() {
-        truth_by_file
+        if item.label == TruthLabel::Positive {
+            total_positives += 1;
+        }
+        file_info
             .entry(item.path.as_str())
-            .or_default()
+            .or_insert_with(|| FileInfo {
+                line_index: None,
+                truths: Vec::new(),
+            })
+            .truths
             .push((idx, item));
     }
-    for group in truth_by_file.values_mut() {
-        group.sort_by_key(|(_, t)| t.line_start);
-    }
 
-    // ── Build LineIndex cache + diagnostics ────────────────────────
-    // Only truth-referenced paths need a LineIndex. Iterating truth_by_file
-    // keys (not file_contents keys) ensures line_indices is a subset of
-    // truth_by_file — classify_one_finding relies on this to distinguish
-    // "no truth for this path" from "truth exists but file is missing".
-    let mut line_indices: HashMap<&str, LineIndex> = HashMap::new();
-    let mut unmatchable_truth_paths: u64 = 0;
-    for path in truth_by_file.keys() {
+    for (path, info) in file_info.iter_mut() {
         if let Some(bytes) = file_contents.get(*path) {
-            line_indices.insert(path, LineIndex::new(bytes));
+            info.line_index = Some(LineIndex::new(bytes));
         } else {
             unmatchable_truth_paths += 1;
         }
+        info.truths.sort_by_key(|(_, t)| t.line_start);
     }
 
     // ── Global consumed-truth bitset (Positive truths only) ───────
     let mut consumed = DynamicBitSet::empty(truth.len());
 
-    // ── Per-finding classification ────────────────────────────────
-    let mut classified = Vec::with_capacity(findings.len());
+    // ── Per-finding classification with inline counting ──────────
+    let mut classified = Vec::with_capacity(findings_len);
+    let mut tp: u64 = 0;
+    let mut fp: u64 = 0;
+    let mut unlabeled: u64 = 0;
     let mut unmatched_finding_paths: u64 = 0;
     let mut out_of_bounds_findings: u64 = 0;
 
-    for &finding_idx in &sorted_indices {
-        let finding = &findings[finding_idx];
-
+    for finding in findings {
         let class = classify_one_finding(
-            finding,
-            &truth_by_file,
-            &line_indices,
+            &finding,
+            &file_info,
             &mut consumed,
             &config,
             &mut unmatched_finding_paths,
             &mut out_of_bounds_findings,
         );
 
-        classified.push(ClassifiedFinding {
-            finding: finding.clone(),
-            class,
-        });
+        match class {
+            FindingClass::TruePositive => tp += 1,
+            FindingClass::FalsePositive => fp += 1,
+            FindingClass::Unlabeled => unlabeled += 1,
+        }
+
+        classified.push(ClassifiedFinding { finding, class });
     }
 
+    // Drop file_info to release borrows on truth before consuming it.
+    drop(file_info);
+
     // ── Collect false negatives ───────────────────────────────────
+    // Move unmatched Positive truth items into the result without cloning.
     let false_negatives: Vec<TruthItem> = truth
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(idx, item)| item.label == TruthLabel::Positive && !consumed.is_set(*idx))
-        .map(|(_, item)| item.clone())
+        .map(|(_, item)| item)
         .collect();
 
     // ── Conservation assertions ───────────────────────────────────
-    // Three independent checks verify that the matching loop neither
-    // dropped nor duplicated any finding or truth item:
-    //   1. Finding partition: every finding lands in exactly one bucket.
-    //   2. Truth partition: every Positive truth is either matched (TP)
-    //      or unmatched (FN).
-    //   3. Bitset cross-check: consumed bits agree with TP count,
-    //      catching bugs where a Positive was consumed without producing
-    //      a TP classification or vice versa.
-    let tp = classified
-        .iter()
-        .filter(|c| c.class == FindingClass::TruePositive)
-        .count() as u64;
-    let fp = classified
-        .iter()
-        .filter(|c| c.class == FindingClass::FalsePositive)
-        .count() as u64;
-    let unlabeled = classified
-        .iter()
-        .filter(|c| c.class == FindingClass::Unlabeled)
-        .count() as u64;
-    let total_positives = truth
-        .iter()
-        .filter(|t| t.label == TruthLabel::Positive)
-        .count() as u64;
-
+    // Use pre-computed counts — zero extra iterations over classified or truth.
     assert_eq!(
         tp + fp + unlabeled,
-        findings.len() as u64,
+        findings_len as u64,
         "finding count conservation"
     );
     assert_eq!(
@@ -322,22 +324,20 @@ pub fn match_findings(
         "truth count conservation"
     );
 
-    // Cross-check: the number of Positive truths with their consumed bit set
-    // must equal the TP count. A mismatch means a Positive was consumed without
-    // incrementing TP, or vice versa — both indicate a bug in the matching loop.
-    let consumed_positives = truth
-        .iter()
-        .enumerate()
-        .filter(|(idx, t)| t.label == TruthLabel::Positive && consumed.is_set(*idx))
-        .count() as u64;
-    assert_eq!(
-        consumed_positives, tp,
+    // Cross-check: consumed bits must agree with TP count. Only Positive
+    // truths have their bits set, so `consumed.count()` == consumed Positives.
+    debug_assert_eq!(
+        consumed.count() as u64,
+        tp,
         "consumed positive count must equal TP"
     );
 
     MatchResult {
         classified,
         false_negatives,
+        tp,
+        fp,
+        unlabeled,
         unmatched_finding_paths,
         unmatchable_truth_paths,
         out_of_bounds_findings,
@@ -356,9 +356,7 @@ pub fn match_findings(
 /// - **`consumed`**: Sets the bit for any matched Positive truth item
 ///   (one-to-one consumption). Negative and Placeholder bits are never set.
 /// - **`unmatched_finding_paths`**: Incremented when the finding's path
-///   has no corresponding truth entries (distinct from "truth exists but
-///   file contents are missing", which is counted separately as
-///   `unmatchable_truth_paths` in the caller).
+///   has no corresponding truth entries.
 /// - **`out_of_bounds_findings`**: Incremented when `byte_end` exceeds
 ///   the file size, indicating stale scanner output.
 ///
@@ -367,35 +365,33 @@ pub fn match_findings(
 /// Returns [`FindingClass::Unlabeled`] early (without scanning truths) in
 /// three cases:
 ///
-/// 1. No [`LineIndex`] for this path — either no file contents were
-///    provided, or no truth items reference this file.
-/// 2. Byte offsets exceed file size (out-of-bounds).
-/// 3. No truth items exist for this file path.
+/// 1. No entry in `file_info` for this path — no truth items reference it.
+/// 2. Entry exists but no [`LineIndex`] — file contents were not provided.
+/// 3. Byte offsets exceed file size (out-of-bounds).
 ///
 /// In all early-return cases, the finding cannot affect TP or FP counts.
 fn classify_one_finding(
     finding: &NormalizedFinding,
-    truth_by_file: &HashMap<&str, Vec<(usize, &TruthItem)>>,
-    line_indices: &HashMap<&str, LineIndex>,
+    file_info: &HashMap<&str, FileInfo<'_>>,
     consumed: &mut DynamicBitSet,
     config: &MatchConfig<'_>,
     unmatched_finding_paths: &mut u64,
     out_of_bounds_findings: &mut u64,
 ) -> FindingClass {
-    // 1. Get LineIndex for this file. A missing LineIndex means either:
-    //    (a) no truth items reference this path → count as unmatched, or
-    //    (b) truth items exist but file_contents lacks the bytes → already
-    //        counted as unmatchable_truth_paths by the caller.
-    //    Only case (a) increments unmatched_finding_paths — case (b) is a
-    //    file-supply issue, not a coverage gap.
-    let Some(line_index) = line_indices.get(finding.path.as_str()) else {
-        if !truth_by_file.contains_key(finding.path.as_str()) {
-            *unmatched_finding_paths += 1;
-        }
+    // 1. Look up combined per-file info (truths + LineIndex).
+    let Some(info) = file_info.get(finding.path.as_str()) else {
+        *unmatched_finding_paths += 1;
         return FindingClass::Unlabeled;
     };
 
-    // 2. Validate byte offsets against file size. Out-of-bounds findings
+    // 2. Get LineIndex. None means truth items exist for this path but
+    //    file contents were not provided — already counted as
+    //    unmatchable_truth_paths by the caller.
+    let Some(line_index) = &info.line_index else {
+        return FindingClass::Unlabeled;
+    };
+
+    // 3. Validate byte offsets against file size. Out-of-bounds findings
     //    indicate stale scanner output or a truncated file read — diagnosable
     //    via the out_of_bounds_findings counter, but not a programming error.
     if finding.byte_end > line_index.data_len() as u64 {
@@ -403,20 +399,10 @@ fn classify_one_finding(
         return FindingClass::Unlabeled;
     }
 
-    // 3. Convert byte range to line range.
+    // 4. Convert byte range to line range.
     let (f_start, f_end) = line_index.line_range(finding.byte_start, finding.byte_end);
 
-    // 4. Look up this file's truth items. Because line_indices is built
-    //    only from truth_by_file keys (see caller), reaching here implies
-    //    truth_by_file has an entry for this path. The None branch is
-    //    retained defensively but should be unreachable in practice.
-    let file_truths = match truth_by_file.get(finding.path.as_str()) {
-        Some(truths) => truths.as_slice(),
-        None => {
-            *unmatched_finding_paths += 1;
-            return FindingClass::Unlabeled;
-        }
-    };
+    let file_truths = &info.truths;
 
     // Upper bound: first truth with line_start > f_end.
     // This predicate is SOUND on line_start-sorted data because line_start
@@ -575,11 +561,11 @@ mod tests {
             (TruthLabel::Placeholder, FindingClass::Unlabeled),
         ];
         for (label, expected_class) in cases {
-            let findings = [make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
-            let truth = [make_truth(SIMPLE_PATH, 1, 1, label, "r")];
+            let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
+            let truth = vec![make_truth(SIMPLE_PATH, 1, 1, label, "r")];
             let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-            let result = match_findings(&findings, &truth, &fc, default_config());
+            let result = match_findings(findings, truth, &fc, default_config());
             assert_eq!(result.classified.len(), 1);
             assert_eq!(
                 result.classified[0].class, expected_class,
@@ -590,99 +576,87 @@ mod tests {
 
     #[test]
     fn no_overlap() {
-        // Finding on line 1, truth on line 3 — no overlap.
-        let findings = [make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
-        let truth = [make_truth(SIMPLE_PATH, 3, 3, TruthLabel::Positive, "r")];
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
+        let truth = vec![make_truth(SIMPLE_PATH, 3, 3, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
         assert_eq!(result.false_negatives.len(), 1);
     }
 
     #[test]
     fn no_truth_file() {
-        // Finding on a path with no truth items at all.
-        let findings = [make_finding("other.txt", 0, 3, "r", 5)];
-        let truth = [make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let findings = vec![make_finding("other.txt", 0, 3, "r", 5)];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE), ("other.txt", b"abc")]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
         assert_eq!(result.unmatched_finding_paths, 1);
     }
 
     #[test]
     fn no_file_contents() {
-        // Finding on a path with no file contents.
-        let findings = [make_finding("missing.txt", 0, 3, "r", 5)];
-        let truth: [TruthItem; 0] = [];
+        let findings = vec![make_finding("missing.txt", 0, 3, "r", 5)];
+        let truth: Vec<TruthItem> = vec![];
         let fc: HashMap<String, Vec<u8>> = HashMap::new();
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
     }
 
     #[test]
     fn label_priority_positive_wins() {
-        // Finding overlaps both Positive (line 1) and Negative (line 1).
-        // Positive takes priority. Negative is NOT consumed.
-        let findings = [make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
-        let truth = [
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
+        let truth = vec![
             make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r"),
             make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Negative, "r"),
         ];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
         assert_eq!(result.false_negatives.len(), 0);
     }
 
     #[test]
     fn label_priority_placeholder_last() {
-        // Finding overlaps Positive and Placeholder — Positive wins.
-        let findings = [make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
-        let truth = [
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
+        let truth = vec![
             make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r"),
             make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Placeholder, "r"),
         ];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
     }
 
     #[test]
     fn one_to_one_consumption() {
-        // Two findings overlap the same Positive truth.
-        // Higher confidence (10) gets TP, lower (5) gets Unlabeled.
-        let findings = [
+        let findings = vec![
             make_finding(SIMPLE_PATH, 0, 4, "r", 10),
             make_finding(SIMPLE_PATH, 1, 4, "r", 5),
         ];
-        let truth = [make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
-        // First in output is the higher-confidence one.
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
         assert_eq!(result.classified[1].class, FindingClass::Unlabeled);
     }
 
     #[test]
     fn confidence_ordering() {
-        // Lower confidence (3) listed first in input, but higher (8) should
-        // get the TP because it's processed first in confidence order.
-        let findings = [
+        let findings = vec![
             make_finding(SIMPLE_PATH, 0, 4, "r1", 3),
             make_finding(SIMPLE_PATH, 0, 4, "r2", 8),
         ];
-        let truth = [make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
-        // The confidence-8 finding should be TP.
+        let result = match_findings(findings, truth, &fc, default_config());
         let tp_finding = result
             .classified
             .iter()
@@ -693,11 +667,11 @@ mod tests {
 
     #[test]
     fn byte_offset_out_of_bounds() {
-        let findings = [make_finding(SIMPLE_PATH, 0, 9999, "r", 5)];
-        let truth = [make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 9999, "r", 5)];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
         assert_eq!(result.out_of_bounds_findings, 1);
         assert_eq!(result.false_negatives.len(), 1);
@@ -705,24 +679,19 @@ mod tests {
 
     #[test]
     fn zero_width_finding() {
-        // byte_start == byte_end — zero-width finding at start of line 1.
-        let findings = [make_finding(SIMPLE_PATH, 0, 0, "r", 5)];
-        let truth = [make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 0, "r", 5)];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
     }
 
     #[test]
     fn rule_match_colon_split() {
-        let findings = [make_finding(SIMPLE_PATH, 0, 4, "Token", 5)];
-        let truth = [make_truth(
-            SIMPLE_PATH,
-            1,
-            1,
-            TruthLabel::Positive,
-            "Secret:Token",
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "Token", 5)];
+        let truth = vec![make_truth(
+            SIMPLE_PATH, 1, 1, TruthLabel::Positive, "Secret:Token",
         )];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
         let config = MatchConfig {
@@ -730,51 +699,40 @@ mod tests {
             require_rule_match: true,
         };
 
-        let result = match_findings(&findings, &truth, &fc, config);
+        let result = match_findings(findings, truth, &fc, config);
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
     }
 
     #[test]
     fn rule_match_disabled() {
-        // Different rules but require_rule_match=false — still matches.
-        let findings = [make_finding(SIMPLE_PATH, 0, 4, "scanner-rule", 5)];
-        let truth = [make_truth(
-            SIMPLE_PATH,
-            1,
-            1,
-            TruthLabel::Positive,
-            "CredDataCategory",
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "scanner-rule", 5)];
+        let truth = vec![make_truth(
+            SIMPLE_PATH, 1, 1, TruthLabel::Positive, "CredDataCategory",
         )];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
     }
 
     #[test]
     fn fn_collection() {
-        // No findings — all Positive truths become false negatives.
-        let findings: [NormalizedFinding; 0] = [];
-        let truth = [
+        let findings: Vec<NormalizedFinding> = vec![];
+        let truth = vec![
             make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r"),
             make_truth(SIMPLE_PATH, 2, 2, TruthLabel::Positive, "r"),
             make_truth(SIMPLE_PATH, 3, 3, TruthLabel::Negative, "r"),
         ];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.false_negatives.len(), 2);
-        assert!(
-            result
-                .false_negatives
-                .iter()
-                .all(|t| t.label == TruthLabel::Positive)
-        );
+        assert!(result.false_negatives.iter().all(|t| t.label == TruthLabel::Positive));
     }
 
     #[test]
     fn empty_inputs() {
-        let result = match_findings(&[], &[], &HashMap::new(), default_config());
+        let result = match_findings(vec![], vec![], &HashMap::new(), default_config());
         assert!(result.classified.is_empty());
         assert!(result.false_negatives.is_empty());
         assert_eq!(result.unmatched_finding_paths, 0);
@@ -782,63 +740,56 @@ mod tests {
         assert_eq!(result.out_of_bounds_findings, 0);
     }
 
-    // ── New tests from research ─────────────────────────────────────
-
     #[test]
     fn multi_line_partial_overlap() {
-        // Finding spans lines 1-2 (bytes 0-9), truth covers lines 2-3.
-        // Overlap at line 2 — should match.
-        let findings = [make_finding(SIMPLE_PATH, 0, 10, "r", 5)];
-        let truth = [make_truth(SIMPLE_PATH, 2, 3, TruthLabel::Positive, "r")];
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 10, "r", 5)];
+        let truth = vec![make_truth(SIMPLE_PATH, 2, 3, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
     }
 
     #[test]
-    fn non_consumed_truth_reusable() {
-        // Negative and Placeholder truths are not consumed — multiple
-        // findings at the same region all receive the same classification.
-        let cases = [
-            (TruthLabel::Negative, FindingClass::FalsePositive),
-            (TruthLabel::Placeholder, FindingClass::Unlabeled),
+    fn negative_truth_not_consumed() {
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "r1", 10),
+            make_finding(SIMPLE_PATH, 1, 4, "r2", 5),
         ];
-        for (label, expected_class) in cases {
-            let findings = [
-                make_finding(SIMPLE_PATH, 0, 4, "r1", 10),
-                make_finding(SIMPLE_PATH, 1, 4, "r2", 5),
-            ];
-            let truth = [make_truth(SIMPLE_PATH, 1, 1, label, "r")];
-            let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Negative, "r")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-            let result = match_findings(&findings, &truth, &fc, default_config());
-            assert_eq!(
-                result.classified[0].class, expected_class,
-                "label={label:?}"
-            );
-            assert_eq!(
-                result.classified[1].class, expected_class,
-                "label={label:?}"
-            );
-        }
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.classified[0].class, FindingClass::FalsePositive);
+        assert_eq!(result.classified[1].class, FindingClass::FalsePositive);
+    }
+
+    #[test]
+    fn placeholder_truth_not_consumed() {
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "r1", 10),
+            make_finding(SIMPLE_PATH, 1, 4, "r2", 5),
+        ];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Placeholder, "r")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
+        assert_eq!(result.classified[1].class, FindingClass::Unlabeled);
     }
 
     #[test]
     fn confidence_tie_determinism() {
-        // Two findings with identical confidence compete for the same truth.
-        // The one with lower identity (Ord) should win deterministically.
-        let findings = [
-            make_finding(SIMPLE_PATH, 0, 4, "r1", 5), // identity: ("f.txt", 0, 4, "r1")
-            make_finding(SIMPLE_PATH, 0, 4, "r2", 5), // identity: ("f.txt", 0, 4, "r2")
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "r1", 5),
+            make_finding(SIMPLE_PATH, 0, 4, "r2", 5),
         ];
-        let truth = [make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result1 = match_findings(&findings, &truth, &fc, default_config());
-        let result2 = match_findings(&findings, &truth, &fc, default_config());
+        let result1 = match_findings(findings.clone(), truth.clone(), &fc, default_config());
+        let result2 = match_findings(findings, truth, &fc, default_config());
 
-        // Deterministic: same output both times.
         assert_eq!(result1.classified[0].class, result2.classified[0].class);
         assert_eq!(result1.classified[1].class, result2.classified[1].class);
 
@@ -849,39 +800,33 @@ mod tests {
 
     #[test]
     fn finding_spans_entire_file() {
-        // Finding covers the entire file.
-        let findings = [make_finding(
-            SIMPLE_PATH,
-            0,
-            SIMPLE_FILE.len() as u64,
-            "r",
-            5,
+        let findings = vec![make_finding(
+            SIMPLE_PATH, 0, SIMPLE_FILE.len() as u64, "r", 5,
         )];
-        let truth = [make_truth(SIMPLE_PATH, 2, 2, TruthLabel::Positive, "r")];
+        let truth = vec![make_truth(SIMPLE_PATH, 2, 2, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-        let result = match_findings(&findings, &truth, &fc, default_config());
+        let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
     }
 
     // ── rule_matches helper tests ───────────────────────────────────
 
     #[test]
-    fn rule_matches_cases() {
-        let cases = [
-            ("Token", "Token", true),         // exact match
-            ("Token", "Secret:Token", true),  // colon-split match (suffix)
-            ("Secret", "Secret:Token", true), // colon-split match (prefix)
-            ("Other", "Secret:Token", false), // no segment match
-            ("Tok", "Secret:Token", false),   // partial segment (not substring)
-        ];
-        for (finding_rule, truth_rule, expected) in cases {
-            assert_eq!(
-                rule_matches(finding_rule, truth_rule),
-                expected,
-                "rule_matches({finding_rule:?}, {truth_rule:?})"
-            );
-        }
+    fn rule_matches_exact() {
+        assert!(rule_matches("Token", "Token"));
+    }
+
+    #[test]
+    fn rule_matches_colon_split() {
+        assert!(rule_matches("Token", "Secret:Token"));
+        assert!(rule_matches("Secret", "Secret:Token"));
+    }
+
+    #[test]
+    fn rule_matches_no_match() {
+        assert!(!rule_matches("Other", "Secret:Token"));
+        assert!(!rule_matches("Tok", "Secret:Token"));
     }
 
     // ── Property tests ──────────────────────────────────────────────
@@ -890,17 +835,13 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        /// Generate a small file with known content (1-200 bytes).
         fn file_bytes() -> impl Strategy<Value = Vec<u8>> {
             prop_oneof![
-                // Lines of varying length with newlines.
                 proptest::collection::vec(prop_oneof![Just(b'\n'), Just(b'x')], 1..200),
-                // Single long line.
                 proptest::collection::vec(Just(b'x'), 1..200),
             ]
         }
 
-        /// Generate a valid truth item for a file with the given line count.
         fn truth_item_for(path: String, line_count: u32) -> impl Strategy<Value = TruthItem> {
             (
                 1..=line_count,
@@ -919,7 +860,6 @@ mod tests {
                 })
         }
 
-        /// Generate a valid finding for a file with the given byte length.
         fn finding_for(path: String, data_len: u64) -> impl Strategy<Value = NormalizedFinding> {
             (
                 0..data_len.max(1),
@@ -934,7 +874,6 @@ mod tests {
                 })
         }
 
-        /// Full test scenario: files + truth + findings.
         #[derive(Debug, Clone)]
         struct Scenario {
             file_contents: HashMap<String, Vec<u8>>,
@@ -943,20 +882,17 @@ mod tests {
         }
 
         fn scenario() -> impl Strategy<Value = Scenario> {
-            // 1-3 files, each 1-200 bytes.
             proptest::collection::vec(file_bytes(), 1..=3).prop_flat_map(|files| {
                 let paths: Vec<String> = (0..files.len()).map(|i| format!("f{i}.txt")).collect();
                 let file_contents: HashMap<String, Vec<u8>> =
                     paths.iter().cloned().zip(files.iter().cloned()).collect();
 
-                // Build line indices to know valid ranges.
                 let line_counts: Vec<u32> = files
                     .iter()
                     .map(|f| LineIndex::new(f).line_count())
                     .collect();
                 let data_lens: Vec<u64> = files.iter().map(|f| f.len() as u64).collect();
 
-                // Generate truth items (0-10 per file).
                 let truth_strats: Vec<_> = paths
                     .iter()
                     .zip(line_counts.iter())
@@ -965,7 +901,6 @@ mod tests {
                     })
                     .collect();
 
-                // Generate findings (0-10 per file).
                 let finding_strats: Vec<_> = paths
                     .iter()
                     .zip(data_lens.iter())
@@ -977,7 +912,6 @@ mod tests {
                     let mut findings: Vec<NormalizedFinding> =
                         finding_groups.into_iter().flatten().collect();
 
-                    // Dedup findings (matching requires deduped input).
                     findings.sort();
                     findings.dedup_by(|a, b| {
                         if a == b {
@@ -988,7 +922,6 @@ mod tests {
                         }
                     });
 
-                    // Dedup truth (same location, same label = same item).
                     truth.sort_by(|a, b| {
                         a.path
                             .cmp(&b.path)
@@ -1016,28 +949,26 @@ mod tests {
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
-            /// P1: Finding count conservation.
             #[test]
             fn conservation_finding_count(s in scenario()) {
                 let result = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
+                    s.findings, s.truth, &s.file_contents, default_config(),
                 );
                 prop_assert_eq!(
                     result.tp_count() + result.fp_count() + result.unlabeled_count(),
-                    s.findings.len() as u64,
+                    result.classified.len() as u64,
                     "tp+fp+unlabeled != findings.len()"
                 );
             }
 
-            /// P2: Truth count conservation.
             #[test]
             fn conservation_truth_count(s in scenario()) {
-                let result = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
-                );
                 let total_positives = s.truth.iter()
                     .filter(|t| t.label == TruthLabel::Positive)
                     .count() as u64;
+                let result = match_findings(
+                    s.findings, s.truth, &s.file_contents, default_config(),
+                );
                 prop_assert_eq!(
                     result.tp_count() + result.fn_count(),
                     total_positives,
@@ -1045,14 +976,13 @@ mod tests {
                 );
             }
 
-            /// P3: Determinism.
             #[test]
             fn determinism(s in scenario()) {
                 let r1 = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
+                    s.findings.clone(), s.truth.clone(), &s.file_contents, default_config(),
                 );
                 let r2 = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
+                    s.findings, s.truth, &s.file_contents, default_config(),
                 );
                 prop_assert_eq!(r1.classified.len(), r2.classified.len());
                 for (a, b) in r1.classified.iter().zip(r2.classified.iter()) {
@@ -1062,16 +992,14 @@ mod tests {
                 prop_assert_eq!(r1.false_negatives.len(), r2.false_negatives.len());
             }
 
-            /// P4: One-to-one — no Positive truth consumed by two findings.
             #[test]
             fn one_to_one(s in scenario()) {
-                let result = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
-                );
-                // TP count must not exceed total positive truths.
                 let total_positives = s.truth.iter()
                     .filter(|t| t.label == TruthLabel::Positive)
                     .count() as u64;
+                let result = match_findings(
+                    s.findings, s.truth, &s.file_contents, default_config(),
+                );
                 prop_assert!(
                     result.tp_count() <= total_positives,
                     "more TPs ({}) than positive truths ({})",
@@ -1079,7 +1007,6 @@ mod tests {
                 );
             }
 
-            /// P5: Path isolation.
             #[test]
             fn path_isolation(
                 file_a in file_bytes(),
@@ -1089,11 +1016,10 @@ mod tests {
                 prop_assume!(!file_a.is_empty() && !file_b.is_empty());
                 let idx_b = LineIndex::new(&file_b);
 
-                // Finding on "a.txt", truth on "b.txt".
-                let findings = [NormalizedFinding::new(
+                let findings = vec![NormalizedFinding::new(
                     "a.txt".into(), 0, file_a.len() as u64, "r".into(), conf,
                 )];
-                let truth = [TruthItem::new(
+                let truth = vec![TruthItem::new(
                     "b.txt".into(), 1, idx_b.line_count(), TruthLabel::Positive, "r".into(),
                 )];
                 let fc = contents(&[
@@ -1101,18 +1027,16 @@ mod tests {
                     ("b.txt", &file_b),
                 ]);
 
-                let result = match_findings(&findings, &truth, &fc, default_config());
+                let result = match_findings(findings, truth, &fc, default_config());
                 prop_assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
                 prop_assert_eq!(result.false_negatives.len(), 1);
             }
 
-            /// P6: Label consistency — TP only from Positive truth, FP only from Negative.
             #[test]
             fn label_consistency_no_tp_from_negative(s in scenario()) {
-                // If there are no Positive truths, there should be no TP.
                 let has_positive = s.truth.iter().any(|t| t.label == TruthLabel::Positive);
                 let result = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
+                    s.findings, s.truth, &s.file_contents, default_config(),
                 );
                 if !has_positive {
                     prop_assert_eq!(
@@ -1122,31 +1046,28 @@ mod tests {
                 }
             }
 
-            /// P7: Negative truths never produce TP.
             #[test]
             fn negative_never_tp(s in scenario()) {
-                // If all truths are Negative, TP must be 0.
                 let all_negative = s.truth.iter().all(|t| t.label == TruthLabel::Negative);
+                let result = match_findings(
+                    s.findings, s.truth, &s.file_contents, default_config(),
+                );
                 if all_negative {
-                    let result = match_findings(
-                        &s.findings, &s.truth, &s.file_contents, default_config(),
-                    );
                     prop_assert_eq!(result.tp_count(), 0, "TP from Negative-only truths");
                 }
             }
 
-            /// P8: Placeholder neutrality — removing Placeholders doesn't change TP or FP.
             #[test]
             fn placeholder_neutrality(s in scenario()) {
-                let result_with = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
-                );
                 let truth_no_placeholder: Vec<TruthItem> = s.truth.iter()
                     .filter(|t| t.label != TruthLabel::Placeholder)
                     .cloned()
                     .collect();
+                let result_with = match_findings(
+                    s.findings.clone(), s.truth, &s.file_contents, default_config(),
+                );
                 let result_without = match_findings(
-                    &s.findings, &truth_no_placeholder, &s.file_contents, default_config(),
+                    s.findings, truth_no_placeholder, &s.file_contents, default_config(),
                 );
                 prop_assert_eq!(
                     result_with.tp_count(), result_without.tp_count(),
@@ -1158,17 +1079,12 @@ mod tests {
                 );
             }
 
-            /// P9: FP bounded by Negative truth count.
             #[test]
             fn fp_bounded_by_negatives(s in scenario()) {
-                // With require_rule_match=false, each finding can match any
-                // negative in its file. But FP count can exceed negative count
-                // when negatives are not consumed. So the property is:
-                // fp_count > 0 implies at least one negative truth exists.
-                let result = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
-                );
                 let has_negative = s.truth.iter().any(|t| t.label == TruthLabel::Negative);
+                let result = match_findings(
+                    s.findings, s.truth, &s.file_contents, default_config(),
+                );
                 if !has_negative {
                     prop_assert_eq!(
                         result.fp_count(), 0,
@@ -1177,26 +1093,19 @@ mod tests {
                 }
             }
 
-            /// P10: Recall monotonicity (nested TP sets for valid PRC-AUC).
-            ///
-            /// Walking the confidence-sorted classified list, cumulative recall
-            /// must never decrease. This is the defining property of greedy
-            /// matching with confidence ordering.
             #[test]
             fn recall_monotonicity(s in scenario()) {
-                let result = match_findings(
-                    &s.findings, &s.truth, &s.file_contents, default_config(),
-                );
                 let total_positives = s.truth.iter()
                     .filter(|t| t.label == TruthLabel::Positive)
                     .count() as u64;
+                let result = match_findings(
+                    s.findings, s.truth, &s.file_contents, default_config(),
+                );
 
                 if total_positives == 0 {
                     return Ok(());
                 }
 
-                // Classified list is in confidence-descending order.
-                // Walk it, accumulating TP count. Recall = cumulative_tp / total_positives.
                 let mut cumulative_tp: u64 = 0;
                 let mut prev_recall: f64 = 0.0;
 
