@@ -1510,7 +1510,7 @@ impl Engine {
         // bare UUID (8-4-4-4-12 hex) unless the originating rule captures
         // UUID-format secrets (e.g., Heroku, Snyk API keys).
         if !rule.uuid_format_secret() && super::safelist::is_uuid_format(secret_bytes) {
-            crate::perf_stats::sat_add_usize(&mut scratch.secret_bytes_safelist_suppressed, 1);
+            crate::perf_stats::sat_add_usize(&mut scratch.uuid_format_suppressed, 1);
             return None;
         }
 
