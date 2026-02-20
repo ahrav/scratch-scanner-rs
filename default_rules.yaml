@@ -32,8 +32,9 @@
 #     payload_len          — (crc32_base62 only) Payload length in base-62 digits.
 #     checksum_len         — (crc32_base62 only) Checksum length in base-62 digits.
 #   secret_group           — Capture group index when the secret is not the full match.
-#   uuid_format_secret     — When true, skip findings whose extracted secret
-#                            is a well-formed UUID (8-4-4-4-12 hex).
+#   uuid_format_secret     — When true, this rule captures UUID-format secrets;
+#                            the UUID quick-reject filter is bypassed so findings
+#                            with 8-4-4-4-12 hex values are kept.
 #
 # local_context sub-fields:
 #   lookbehind / lookahead           — Byte window before/after the match.

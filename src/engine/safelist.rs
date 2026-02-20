@@ -241,9 +241,9 @@ pub(crate) fn is_uuid_format(bytes: &[u8]) -> bool {
 /// - `regex_set`: the full 18-pattern set for context-window matching.
 /// - `secret_bytes_set`: a curated 9-pattern subset for bare secret-value matching.
 ///
-/// UUID-format quick-reject is handled by [`is_uuid_format`], a procedural
-/// byte check that replaces the previous regex approach. It is gated per-rule
-/// by `RuleCompiled::uuid_format_secret()` so rules that intentionally capture
+/// UUID-format quick-reject is handled by the module-level [`is_uuid_format`]
+/// function rather than a compiled regex. It is gated per-rule by
+/// `RuleCompiled::uuid_format_secret()` so rules that intentionally capture
 /// UUID-format secrets (e.g., Heroku, Snyk API keys) bypass suppression.
 ///
 /// Constructed once during [`Engine`] initialization and stored as `self.safelist`.

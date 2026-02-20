@@ -46,6 +46,7 @@ Suppression is split between rule-level secret filtering and engine-level safeli
 | `value_suppressors_any` | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes | Window validation post-match gate |
 | `offline_validation` | Per-rule YAML (`RuleSpec.offline_validation`) | Extracted secret bytes (root findings) | Inline emission-time gate (root-semantic findings) |
 | Global safelist | Engine policy (`SafelistFilter`) | Root-match context slice | Emit-time suppression on root emit paths |
+| UUID-format quick-reject | Per-rule YAML (`RuleSpec.uuid_format_secret`) | Extracted secret bytes | Emit-time suppression (structural UUID check, bypassed when flag is `true`) |
 
 Examples:
 

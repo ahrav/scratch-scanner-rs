@@ -150,6 +150,7 @@ classDiagram
         -DecodeSlab slab
         -usize offline_suppressed
         -usize secret_bytes_safelist_suppressed
+        -usize uuid_format_suppressed
         -FixedSet128 seen_findings_scan
         -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
