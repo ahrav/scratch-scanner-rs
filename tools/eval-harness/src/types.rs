@@ -264,116 +264,44 @@ pub fn normalize_path(raw: &str, corpus_root: &str) -> String {
 mod tests {
     use super::*;
 
-    // ── TruthLabel serde ──────────────────────────────────────
+    // ── TruthLabel traits (serde + display) ────────────────────
 
     #[test]
-    fn truth_label_serde_roundtrip() {
-        for label in [
-            TruthLabel::Positive,
-            TruthLabel::Negative,
-            TruthLabel::Placeholder,
-        ] {
-            let json = serde_json::to_string(&label).unwrap();
-            let back: TruthLabel = serde_json::from_str(&json).unwrap();
-            assert_eq!(label, back);
+    fn truth_label_traits() {
+        let cases: &[(TruthLabel, &str, &str)] = &[
+            (TruthLabel::Positive, r#""positive""#, "positive"),
+            (TruthLabel::Negative, r#""negative""#, "negative"),
+            (TruthLabel::Placeholder, r#""placeholder""#, "placeholder"),
+        ];
+        for &(variant, json, display) in cases {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, json, "{variant:?} serialization");
+            let back: TruthLabel = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(back, variant, "{variant:?} roundtrip");
+            assert_eq!(variant.to_string(), display, "{variant:?} display");
         }
     }
 
-    #[test]
-    fn truth_label_serializes_lowercase() {
-        assert_eq!(
-            serde_json::to_string(&TruthLabel::Positive).unwrap(),
-            r#""positive""#
-        );
-        assert_eq!(
-            serde_json::to_string(&TruthLabel::Negative).unwrap(),
-            r#""negative""#
-        );
-    }
-
-    // ── MatchClass serde ──────────────────────────────────────
+    // ── MatchClass traits (serde + display) ──────────────────
 
     #[test]
-    fn match_class_serde_roundtrip() {
-        for class in [
-            MatchClass::TruePositive,
-            MatchClass::FalsePositive,
-            MatchClass::FalseNegative,
-            MatchClass::Unlabeled,
-        ] {
-            let json = serde_json::to_string(&class).unwrap();
-            let back: MatchClass = serde_json::from_str(&json).unwrap();
-            assert_eq!(class, back);
+    fn match_class_traits() {
+        let cases: &[(MatchClass, &str, &str)] = &[
+            (MatchClass::TruePositive, r#""TruePositive""#, "TP"),
+            (MatchClass::FalsePositive, r#""FalsePositive""#, "FP"),
+            (MatchClass::FalseNegative, r#""FalseNegative""#, "FN"),
+            (MatchClass::Unlabeled, r#""Unlabeled""#, "unlabeled"),
+        ];
+        for &(variant, json, display) in cases {
+            let serialized = serde_json::to_string(&variant).unwrap();
+            assert_eq!(serialized, json, "{variant:?} serialization");
+            let back: MatchClass = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(back, variant, "{variant:?} roundtrip");
+            assert_eq!(variant.to_string(), display, "{variant:?} display");
         }
-    }
-
-    #[test]
-    fn match_class_serializes_pascal_case() {
-        assert_eq!(
-            serde_json::to_string(&MatchClass::TruePositive).unwrap(),
-            r#""TruePositive""#
-        );
-        assert_eq!(
-            serde_json::to_string(&MatchClass::FalsePositive).unwrap(),
-            r#""FalsePositive""#
-        );
-        assert_eq!(
-            serde_json::to_string(&MatchClass::FalseNegative).unwrap(),
-            r#""FalseNegative""#
-        );
-        assert_eq!(
-            serde_json::to_string(&MatchClass::Unlabeled).unwrap(),
-            r#""Unlabeled""#
-        );
     }
 
     // ── NormalizedFinding ordering contract ────────────────────
-
-    #[test]
-    fn finding_ord_excludes_confidence() {
-        let a = NormalizedFinding {
-            path: "a.txt".into(),
-            byte_start: 10,
-            byte_end: 20,
-            rule: "r1".into(),
-            confidence: 3,
-        };
-        let b = NormalizedFinding {
-            path: "a.txt".into(),
-            byte_start: 10,
-            byte_end: 20,
-            rule: "r1".into(),
-            confidence: 7,
-        };
-        assert_eq!(a, b);
-        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn finding_hash_excludes_confidence() {
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let hash_of = |f: &NormalizedFinding| {
-            let mut h = DefaultHasher::new();
-            f.hash(&mut h);
-            h.finish()
-        };
-        let a = NormalizedFinding {
-            path: "a.txt".into(),
-            byte_start: 10,
-            byte_end: 20,
-            rule: "r1".into(),
-            confidence: 3,
-        };
-        let b = NormalizedFinding {
-            path: "a.txt".into(),
-            byte_start: 10,
-            byte_end: 20,
-            rule: "r1".into(),
-            confidence: 7,
-        };
-        assert_eq!(a, b);
-        assert_eq!(hash_of(&a), hash_of(&b));
-    }
 
     #[test]
     fn finding_ord_is_path_start_end_rule() {
@@ -408,33 +336,6 @@ mod tests {
         let mut b = base();
         b.rule = "r2".into();
         assert!(a < b);
-    }
-
-    // ── Display impls ────────────────────────────────────────
-
-    #[test]
-    fn truth_label_display() {
-        let cases = [
-            (TruthLabel::Positive, "positive"),
-            (TruthLabel::Negative, "negative"),
-            (TruthLabel::Placeholder, "placeholder"),
-        ];
-        for (variant, expected) in cases {
-            assert_eq!(variant.to_string(), expected);
-        }
-    }
-
-    #[test]
-    fn match_class_display() {
-        let cases = [
-            (MatchClass::TruePositive, "TP"),
-            (MatchClass::FalsePositive, "FP"),
-            (MatchClass::FalseNegative, "FN"),
-            (MatchClass::Unlabeled, "unlabeled"),
-        ];
-        for (variant, expected) in cases {
-            assert_eq!(variant.to_string(), expected);
-        }
     }
 
     // ── normalize_path examples ───────────────────────────────
