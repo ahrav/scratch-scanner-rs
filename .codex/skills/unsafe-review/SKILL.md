@@ -1,7 +1,6 @@
 ---
 name: unsafe-review
 description: Comprehensive review of unsafe code — audits safety invariants, demands benchmark+ASM proof of performance benefit, and verifies Miri/Kani/fuzz/property test coverage for every unsafe block
-user-invocable: true
 ---
 
 # Unsafe Review — Evidence-Gated Unsafe Audit

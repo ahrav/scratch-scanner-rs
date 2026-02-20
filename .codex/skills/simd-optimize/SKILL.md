@@ -1,7 +1,6 @@
 ---
 name: simd-optimize
 description: SIMD vectorization for Rust — detects ISA features, identifies vectorizable patterns, generates platform-specific intrinsics (ARM NEON/SVE, x86 SSE/AVX/AVX-512), validates correctness and performance. Uses tiered research with baked-in references and /deep-research fallback.
-user-invocable: true
 ---
 
 # SIMD Optimize — Vectorization for Rust
