@@ -186,8 +186,9 @@ impl PartialOrd for NormalizedFinding {
 /// This type intentionally stays in the line-number domain to avoid lossy
 /// round-trips when ingesting corpus CSVs — converting line numbers to
 /// byte offsets at load time would require reading every source file
-/// upfront, and the reverse conversion at matching time is cheap (O(log L)
-/// binary search per finding).
+/// upfront, and converting byte offsets back to line numbers at matching
+/// time is cheap (O(log L) binary search per finding via
+/// [`crate::line_index::LineIndex`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthItem {
     /// Forward-slash normalized path relative to the corpus root.
@@ -201,10 +202,6 @@ pub struct TruthItem {
     /// Ground-truth label for this annotation.
     pub label: TruthLabel,
     /// Rule name this annotation applies to.
-    ///
-    /// Accepts `"category"` as an alias during deserialization for
-    /// interoperability with manifest formats that use that field name.
-    #[serde(alias = "category")]
     pub rule: String,
 }
 
