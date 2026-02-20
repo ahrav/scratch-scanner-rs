@@ -188,6 +188,7 @@ fn norm_hash_deterministic_for_raw_matches() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
     };
 
@@ -237,6 +238,7 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -290,6 +292,7 @@ fn local_context_gate_applies_in_base64_stream_decode() {
         }),
         secret_group: Some(0),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET_[A-Z]{4}").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -352,6 +355,7 @@ fn local_context_gate_filters_without_assignment_when_bounds_present() {
         }),
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
     };
 
@@ -399,6 +403,7 @@ fn local_context_key_names_required_and_fail_open_when_out_of_range() {
         }),
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
     };
 
@@ -670,6 +675,7 @@ fn zero_hit_url_plus_to_space_still_scans_transforms() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK [A-Z]{4}").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -734,6 +740,7 @@ fn base64_padding_in_root_hint() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SIM0_[A-Z0-9]{12}").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -831,6 +838,7 @@ fn keyword_gate_filters_without_keyword() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("secret").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -865,6 +873,7 @@ fn derived_confirm_all_is_compiled() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"foo\d+bar").unwrap(),
     };
 
@@ -937,6 +946,7 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
     };
 
@@ -986,6 +996,7 @@ fn value_suppressor_filters_matching_secret_in_raw_path() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1020,6 +1031,7 @@ fn value_suppressor_passes_non_matching_secret_in_raw_path() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1054,6 +1066,7 @@ fn value_suppressor_any_match_filters_with_multiple_patterns() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1092,6 +1105,7 @@ fn value_suppressor_absent_does_not_change_behavior() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -1126,6 +1140,7 @@ fn safelist_emit_time_filter_suppresses_root_finding() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1189,6 +1204,7 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
         secret_group: None,
         offline_validation: None,
         // Matches both the context placeholder and the decoded value.
+        uuid_format_secret: false,
         re: Regex::new(r"(?:placeholder_token|prod_token_A1B2C3)").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -1258,6 +1274,7 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"prod_token_A1B2C3").unwrap(),
     };
 
@@ -1304,6 +1321,7 @@ fn safelist_suppression_does_not_consume_findings_cap() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1348,6 +1366,7 @@ fn max_findings_cap_applies_after_safelist_suppression() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1408,6 +1427,7 @@ fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
     };
 
@@ -1465,6 +1485,7 @@ fn safelist_emit_time_filter_drops_tail_root_finding() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"(?:prod_token_[A-Z0-9]{6}|placeholder_token)").unwrap(),
     };
 
@@ -1514,6 +1535,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             local_context: None,
             secret_group: None,
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"placeholder_token").unwrap(),
         },
         RuleSpec {
@@ -1530,6 +1552,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             local_context: None,
             secret_group: None,
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"placeholder_token").unwrap(),
         },
         RuleSpec {
@@ -1546,6 +1569,7 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
             local_context: None,
             secret_group: None,
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
         },
     ];
@@ -1583,6 +1607,7 @@ fn safelist_emit_time_filter_all_findings_suppressed() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"placeholder_token").unwrap(),
     };
 
@@ -1629,6 +1654,7 @@ fn safelist_suppressed_counter_resets_between_scans() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
     };
 
@@ -1678,6 +1704,7 @@ fn secret_bytes_safelist_suppresses_placeholder_when_context_is_clean() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"header\s+(\S+)").unwrap(),
     };
 
@@ -1715,6 +1742,7 @@ fn secret_bytes_safelist_does_not_suppress_high_entropy_secret() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"token[:=]\s*(\S+)").unwrap(),
     };
 
@@ -1754,6 +1782,7 @@ fn secret_bytes_safelist_suppresses_decoded_placeholder() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"hunter2").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -1809,6 +1838,7 @@ fn secret_bytes_safelist_counter_resets_between_scans() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"header\s+(\S+)").unwrap(),
     };
 
@@ -1861,6 +1891,7 @@ fn secret_bytes_safelist_suppressed_findings_dont_consume_cap() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"header\s+(\S+)").unwrap(),
     };
 
@@ -1913,6 +1944,7 @@ fn secret_bytes_suppression_does_not_block_child_transforms() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET_([A-Za-z0-9]+)").unwrap(),
     };
     let transforms = vec![
@@ -1992,6 +2024,7 @@ fn secret_bytes_safelist_does_not_suppress_composite_secret_with_placeholder_seg
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET_([A-Za-z0-9._-]+)").unwrap(),
     };
 
@@ -2029,6 +2062,7 @@ fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
     };
     let transforms = vec![TransformConfig {
@@ -2085,6 +2119,7 @@ fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
         local_context: None,
         secret_group: Some(0),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK").unwrap(),
     };
     let without_suppressor = RuleSpec {
@@ -2155,6 +2190,7 @@ fn value_suppressor_filters_in_chunked_scan_path() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -2196,6 +2232,7 @@ fn value_suppressor_is_case_sensitive() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -2233,6 +2270,7 @@ fn value_suppressor_works_with_full_match_fallback() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
     };
 
@@ -2276,6 +2314,7 @@ fn value_suppressor_single_byte_pattern() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -2325,6 +2364,7 @@ fn value_suppressor_targets_secret_group_not_full_match() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -2370,6 +2410,7 @@ fn value_suppressor_is_substring_match_not_exact() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
     };
 
@@ -2438,6 +2479,7 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
         }),
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"KEY=([A-Za-z0-9]{8,16})").unwrap(),
     };
 
@@ -2495,6 +2537,7 @@ fn value_suppressor_direct_utf16_window() {
         local_context: None,
         secret_group: Some(0),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -2550,6 +2593,7 @@ fn multiple_rules_different_suppressors_are_independent() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"AA_([A-Za-z0-9]{8})").unwrap(),
     };
     let rule_b = RuleSpec {
@@ -2566,6 +2610,7 @@ fn multiple_rules_different_suppressors_are_independent() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"BB_([A-Za-z0-9]{8})").unwrap(),
     };
 
@@ -2621,6 +2666,7 @@ fn value_suppressor_with_explicit_secret_group_0() {
         local_context: None,
         secret_group: Some(0), // Explicit group 0 instead of None
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
     };
 
@@ -2670,6 +2716,7 @@ fn entropy_gate_filters_low_entropy_matches() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -2723,6 +2770,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"pfx_[a-z0-9]{8}:([X]{8})").unwrap(),
     };
 
@@ -2742,6 +2790,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"REP_[A]{20}_([a-z0-9]{8})").unwrap(),
     };
 
@@ -2790,6 +2839,7 @@ fn offline_validation_gate_pooled_round_trip() {
         local_context: None,
         secret_group: None,
         offline_validation: Some(OfflineValidationSpec::GithubFinegrainedPat),
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
     };
     let rule_without = RuleSpec {
@@ -2806,6 +2856,7 @@ fn offline_validation_gate_pooled_round_trip() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
     };
 
@@ -2884,6 +2935,7 @@ fn crc32_rule(name: &'static str, with_ov: bool) -> RuleSpec {
         } else {
             None
         },
+        uuid_format_secret: false,
         re: Regex::new(r"pfx_[A-Za-z0-9]{16}").unwrap(),
     }
 }
@@ -3034,6 +3086,7 @@ fn secret_extraction_prefers_group1_over_full_match() {
         secret_group: None,
         offline_validation: None,
         // Pattern: KEY_<secret> where <secret> is captured in group 1
+        uuid_format_secret: false,
         re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3078,6 +3131,7 @@ fn secret_extraction_uses_configured_secret_group() {
         secret_group: Some(2), // Use group 2 instead of group 1
         offline_validation: None,
         // Pattern: TOK<prefix>:<secret> where prefix is group 1, secret is group 2
+        uuid_format_secret: false,
         re: Regex::new(r"TOK([A-Z]+):([a-z0-9]{8,16})").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3124,6 +3178,7 @@ fn secret_extraction_falls_back_to_full_match_without_groups() {
         secret_group: None,
         offline_validation: None,
         // Pattern with no capture groups
+        uuid_format_secret: false,
         re: Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3171,6 +3226,7 @@ fn secret_extraction_skips_empty_group1() {
         secret_group: None,
         offline_validation: None,
         // Group 1 can be empty (optional prefix), group 0 is the full match
+        uuid_format_secret: false,
         re: Regex::new(r"OPT([A-Z]*)_[a-z0-9]{8}").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3218,6 +3274,7 @@ fn secret_extraction_hash_consistency() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SEC_([A-Za-z0-9]{12})").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3273,6 +3330,7 @@ fn secret_extraction_utf16le_path() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"UTF_([A-Za-z0-9]{8})").unwrap(),
     };
 
@@ -3342,6 +3400,7 @@ fn local_context_gate_applies_in_utf16_path() {
         }),
         secret_group: Some(0),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"UTF_[A-Za-z0-9]{8}").unwrap(),
     };
 
@@ -3490,6 +3549,7 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
         secret_group: None,
         offline_validation: None,
         // Pattern: PREFIX_<secret>_SUFFIX - group 1 is just the middle part.
+        uuid_format_secret: false,
         re: Regex::new(r"PREFIX_([A-Za-z0-9]{8})_SUFFIX").unwrap(),
     };
 
@@ -3548,6 +3608,7 @@ fn secret_extraction_explicit_group0_overrides_group1() {
         secret_group: Some(0), // Explicitly use full match
         offline_validation: None,
         // Pattern: TOK_<secret>_END where <secret> would normally be group 1
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})_END").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3593,6 +3654,7 @@ fn secret_extraction_empty_configured_group_falls_back() {
         secret_group: Some(2), // Points to group 2 which can be empty
         offline_validation: None,
         // Pattern: CFG_<prefix>_<optional> - group 1 is prefix, group 2 is optional suffix
+        uuid_format_secret: false,
         re: Regex::new(r"CFG_([a-z0-9]{8})([A-Z]*)").unwrap(),
     };
     let eng = Engine::new_with_anchor_policy(
@@ -3639,6 +3701,7 @@ fn anchor_policy_prefers_derived_over_manual() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("foo").unwrap(),
     };
 
@@ -3671,6 +3734,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("[A-Za-z]{1,}").unwrap(),
     };
 
@@ -4842,6 +4906,7 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("X").unwrap(),
     }];
     let engine = Arc::new(Engine::new(rules, Vec::new(), demo_tuning()));
@@ -4884,6 +4949,7 @@ fn utf16_overlap_accounts_for_scaled_radius() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -4947,6 +5013,7 @@ fn utf16le_anchor_odd_offset_near_start_is_detected() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -4996,6 +5063,7 @@ fn utf16be_mixed_parity_anchors_find_both() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
     };
     let mut tuning = demo_tuning();
@@ -5068,6 +5136,7 @@ fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"KEY_([A-Za-z0-9]{16})").unwrap(),
     };
 
@@ -5151,6 +5220,7 @@ fn test_chunked_scan_trailing_context_not_dropped() {
         local_context: None,
         secret_group: Some(1), // Capture group 1 is the secret
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"KEY_([A-Z0-9]{8})(?:;|$)").unwrap(),
     };
 
@@ -5522,6 +5592,7 @@ fn chunked_transform_root_hint_matches_reference() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -5654,6 +5725,7 @@ fn chunked_url_percent_prefix_trigger_kept() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -5712,6 +5784,7 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -5798,6 +5871,7 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -5880,6 +5954,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
     };
 
@@ -6004,6 +6079,7 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -6059,6 +6135,7 @@ fn stream_window_recovers_after_ring_eviction() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -6112,6 +6189,7 @@ fn stream_hit_cap_forces_full_fallback() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -6167,6 +6245,7 @@ fn stream_nested_span_fallback_recovers() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new("TOK").unwrap(),
     };
 
@@ -6613,6 +6692,7 @@ fn offline_crc_rule() -> RuleSpec {
             payload_len: 8,
             checksum_len: 6,
         }),
+        uuid_format_secret: false,
         re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
     }
 }
@@ -6705,6 +6785,7 @@ fn offline_validation_mixed_valid_invalid_and_no_gate() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"api_[A-Za-z0-9]{8}").unwrap(),
     };
 
@@ -6945,6 +7026,7 @@ fn char_class_gate_rejects_all_lowercase() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"tok_([a-z]{20})").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -6984,6 +7066,7 @@ fn char_class_gate_passes_mixed_case() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7022,6 +7105,7 @@ fn char_class_gate_fail_open_short_window() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"tok_([a-z]{8})").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7091,6 +7175,7 @@ fn confidence_score_zero_when_no_gates() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET[A-Z]{8}").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7128,6 +7213,7 @@ fn confidence_score_entropy_gate() {
         local_context: None,
         secret_group: Some(1),
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7166,6 +7252,7 @@ fn confidence_score_keyword_gate() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7240,6 +7327,7 @@ fn confidence_score_multiple_gates_accumulate() {
             payload_len: 8,
             checksum_len: 6,
         }),
+        uuid_format_secret: false,
         re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7288,6 +7376,7 @@ fn confidence_score_assignment_shape_gate() {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"gak_[A-Z]{8}").unwrap(),
     };
     let engine = Engine::new_with_anchor_policy(
@@ -7307,5 +7396,86 @@ fn confidence_score_assignment_shape_gate() {
         confidence::ASSIGNMENT_SHAPE,
         "assignment-shape gate should add ASSIGNMENT_SHAPE ({}) to score",
         confidence::ASSIGNMENT_SHAPE,
+    );
+}
+
+// ── UUID quick-reject integration tests ─────────────────────────────────
+
+#[test]
+fn uuid_quick_reject_suppresses_bare_uuid() {
+    // Rule with uuid_format_secret=false, regex captures UUID-shaped value.
+    // Extracted secret is a bare UUID → should be suppressed.
+    let rule = RuleSpec {
+        name: "uuid-suppress-test",
+        anchors: &[b"header"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"header\s+(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"header 67e55044-10b1-426f-9247-bb680e5fe0c8 trailer";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        0,
+        "UUID-format secret should be suppressed when uuid_format_secret=false"
+    );
+}
+
+#[test]
+fn uuid_quick_reject_bypassed_when_rule_captures_uuid_secrets() {
+    // Same setup but uuid_format_secret=true → finding should be preserved.
+    let rule = RuleSpec {
+        name: "uuid-bypass-test",
+        anchors: &[b"header"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        uuid_format_secret: true,
+        re: Regex::new(r"header\s+(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"header 67e55044-10b1-426f-9247-bb680e5fe0c8 trailer";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        1,
+        "UUID-format secret should be kept when uuid_format_secret=true"
     );
 }

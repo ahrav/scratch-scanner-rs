@@ -55,9 +55,11 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 11] Apply secret-bytes safelist suppression (all findings, including decoded)
   ↓
-[Gate 12] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+[Gate 12] Apply UUID-format quick-reject (all findings, gated per-rule by uuid_format_secret())
   ↓
-[Step 13] Compute additive confidence score from gate signals that fired
+[Gate 13] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+  ↓
+[Step 14] Compute additive confidence score from gate signals that fired
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -293,6 +295,19 @@ segments (e.g., `key-null-safety-9xK2mB`).
 - Suppressed findings increment `ScanScratch::secret_bytes_safelist_suppressed`.
 - Context-anchored patterns and short substrings (e.g., "mock") that risk
   false suppression of real secrets are excluded from this tier.
+
+**Tier 3 — UUID-format quick-reject** (all findings): After the secret-bytes
+check, the extracted value is tested against the canonical UUID shape
+(8-4-4-4-12 hyphenated hex, case-insensitive, structural-only — no
+version/variant validation per RFC 9562). Hyphenated format only — 32-char
+hex without hyphens is deliberately excluded because it collides with
+MD5/SHA/AES key representations. Full-value anchoring (`^...$`) prevents the
+TruffleHog #1953 false-negative pattern on composite secrets. The check is
+gated per-rule by `RuleCompiled::uuid_format_secret()` so that rules whose
+capture group is exactly UUID-format (e.g., Heroku, Snyk API keys) bypass
+suppression.
+
+- Suppressed findings increment `ScanScratch::uuid_format_suppressed`.
 
 ### 9. Offline Structural Validation
 
@@ -715,4 +730,4 @@ Findings are written to scratch buffers (not directly to materialized results) b
 6. All early returns occur before findings are recorded
 7. Findings are appended or replaced in-place for dedupe preference (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Root safelist suppression, secret-bytes safelist suppression, offline structural validation, and cap checks are applied before finding insertion
+9. Root safelist suppression, secret-bytes safelist suppression, UUID-format quick-reject, offline structural validation, and cap checks are applied before finding insertion

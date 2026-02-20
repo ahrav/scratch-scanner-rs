@@ -660,6 +660,18 @@ pub struct RuleSpec {
     /// after all other gates pass. See [`OfflineValidationSpec`] for variants.
     pub offline_validation: Option<OfflineValidationSpec>,
 
+    /// Indicates this rule intentionally captures UUID-format (8-4-4-4-12 hex)
+    /// values as real secrets.
+    ///
+    /// When `true`, the UUID-format quick-reject in the safelist is bypassed
+    /// for findings from this rule. Rules for providers like Heroku, Snyk, and
+    /// HubSpot issue API keys in UUID format and must set this flag to avoid
+    /// false-negative suppression.
+    ///
+    /// Default is `false` — findings whose extracted secret bytes match UUID
+    /// format are suppressed by the safelist.
+    pub uuid_format_secret: bool,
+
     /// Optional capture group index for secret extraction.
     ///
     /// When set, the engine extracts the secret value from the specified capture
@@ -1006,6 +1018,7 @@ mod tests {
             char_class: None,
             local_context,
             offline_validation: None,
+            uuid_format_secret: false,
             secret_group: None,
             re: Regex::new(r"tok_[a-z0-9]{8}").unwrap(),
         }

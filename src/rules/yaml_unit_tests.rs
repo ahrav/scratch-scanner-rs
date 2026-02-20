@@ -147,6 +147,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         local_context,
         offline_validation,
         secret_group: rule.secret_group,
+        uuid_format_secret: rule.uuid_format_secret,
     }
 }
 
@@ -858,6 +859,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
         "local_context",
         "offline_validation",
         "secret_group",
+        "uuid_format_secret",
     ];
     let offline_validation_fields: &[&str] =
         &["type", "prefix_skip", "payload_len", "checksum_len"];
@@ -2063,4 +2065,53 @@ rules:
         .expect("absent should auto-enable");
     assert_eq!(cc_null.max_lower_pct, cc_absent.max_lower_pct);
     assert_eq!(cc_null.min_window_len, cc_absent.min_window_len);
+}
+
+/// Verify that rules whose regex captures UUID-format secrets have the
+/// `uuid_format_secret` flag set, and rules whose regex captures non-UUID
+/// formats do NOT have the flag.
+#[test]
+fn uuid_format_secret_flag_matches_regex_structure() {
+    let rules = builtin_rules();
+    let find = |name: &str| -> &RuleSpec {
+        rules
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("missing rule: {name}"))
+    };
+
+    // Rules whose capture group is exactly UUID format (8-4-4-4-12 hex)
+    // MUST have uuid_format_secret=true to avoid false-negative suppression.
+    let uuid_format_rules = [
+        "heroku-api-key",
+        "hubspot-api-key",
+        "kucoin-secret-key",
+        "messagebird-client-id",
+        "sendbird-access-id",
+        "snyk-api-token",
+        "squarespace-access-token",
+    ];
+    for name in uuid_format_rules {
+        assert!(
+            find(name).uuid_format_secret,
+            "{name}: regex captures UUID format but uuid_format_secret is false"
+        );
+    }
+
+    // Rules whose capture group is NOT UUID format must NOT have the flag.
+    let non_uuid_rules = [
+        "heroku-api-key-v2",         // HRKU-AA prefix + 58 chars
+        "huggingface-access-token",  // hf_ prefix + 34 alpha
+        "launchdarkly-access-token", // 40-char alphanumeric
+        "microsoft-teams-webhook",   // full webhook URL
+        "sendbird-access-token",     // 40-char hex
+        "sonar-api-token",           // squ_/sqp_/sqa_ prefix + 40 chars
+        "stripe-access-token",       // sk_/rk_ prefix + 10-99 alphanum
+    ];
+    for name in non_uuid_rules {
+        assert!(
+            !find(name).uuid_format_secret,
+            "{name}: regex does NOT capture UUID format but uuid_format_secret is true"
+        );
+    }
 }

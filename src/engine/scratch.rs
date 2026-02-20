@@ -620,6 +620,10 @@ pub struct ScanScratch {
     /// Incremented only when both `perf-stats` and `debug_assertions` are
     /// enabled; accessor returns 0 otherwise.
     pub(super) secret_bytes_safelist_suppressed: usize,
+    /// Findings removed by the UUID-format quick-reject at emission time.
+    /// Incremented only when both `perf-stats` and `debug_assertions` are
+    /// enabled; accessor returns 0 otherwise.
+    pub(super) uuid_format_suppressed: usize,
     /// Findings removed by post-scan offline structural validation.
     /// Incremented only when both `perf-stats` and `debug_assertions` are
     /// enabled; accessor returns 0 otherwise.
@@ -863,6 +867,7 @@ impl ScanScratch {
             _cold_boundary: CachelineBoundary::new(),
             safelist_suppressed: 0,
             secret_bytes_safelist_suppressed: 0,
+            uuid_format_suppressed: 0,
             offline_suppressed: 0,
             last_chunk_start: 0,
             last_chunk_len: 0,
@@ -950,6 +955,7 @@ impl ScanScratch {
         self.findings_dropped = 0;
         self.safelist_suppressed = 0;
         self.secret_bytes_safelist_suppressed = 0;
+        self.uuid_format_suppressed = 0;
         self.offline_suppressed = 0;
         self.work_q.clear();
         self.work_head = 0;
@@ -1485,6 +1491,21 @@ impl ScanScratch {
         #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
         {
             let _ = &self.secret_bytes_safelist_suppressed;
+            0
+        }
+    }
+
+    /// Returns the number of findings removed by the UUID-format quick-reject.
+    ///
+    /// Always returns 0 when the `perf-stats` feature is disabled.
+    pub fn uuid_format_suppressed(&self) -> usize {
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            self.uuid_format_suppressed
+        }
+        #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+        {
+            let _ = &self.uuid_format_suppressed;
             0
         }
     }

@@ -80,6 +80,7 @@ fn real_simple_rule() -> RuleSpec {
         local_context: None,
         secret_group: None,
         offline_validation: None,
+        uuid_format_secret: false,
         re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
     }
 }

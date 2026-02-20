@@ -13,9 +13,9 @@
 //!   are acceptable because this filter is only a suppression hint after
 //!   detection, not a standalone detector.
 //!
-//! # Two-Tier Matching
+//! # Three-Component Matching
 //!
-//! The safelist operates in two tiers:
+//! The safelist uses three matching components:
 //!
 //! 1. **Context-window tier** (`regex_set`, 18 patterns): matches the full
 //!    context buffer around a finding. Patterns may use context anchors like
@@ -31,10 +31,17 @@
 //!    `key-null-safety-9xK2mB`). Structural markers (redaction runs,
 //!    template variables, base64 literals) remain as substring matches.
 //!
-//! Both tiers are checked during `apply_emit_time_policy`. The context tier
-//! runs first (root findings only); the secret-bytes tier runs on all findings
-//! (including decoded/transform-derived) when the context tier does not
-//! suppress.
+//! 3. **UUID-format quick-reject** ([`is_uuid_format`]): a procedural byte
+//!    check that recognizes the canonical 8-4-4-4-12 hyphenated hex UUID
+//!    format. Gated per-rule by `RuleCompiled::uuid_format_secret()` so that
+//!    rules intentionally capturing UUID-format secrets (e.g., Heroku, Snyk
+//!    API keys) bypass suppression. Structural-only — no version/variant
+//!    validation per RFC 9562.
+//!
+//! All three components are checked during `apply_emit_time_policy`. The
+//! context tier runs first (root findings only); then the secret-bytes tier
+//! and UUID quick-reject run on all findings (including decoded/
+//! transform-derived) when the context tier does not suppress.
 //!
 //! # Invariants
 //! - Pattern inventory is fixed at 18 context categories and 9 secret-bytes
@@ -61,8 +68,34 @@
 
 use regex::bytes::RegexSet;
 
+/// Number of patterns in the context-window safelist.
+///
+/// Tied to [`SAFELIST_PATTERNS`] by the `const _` assertion below. Any addition
+/// or removal of a pattern requires updating this constant.
 const SAFELIST_PATTERN_COUNT: usize = 18;
 
+/// Context-window safelist patterns for emit-time suppression.
+///
+/// Each entry targets a category of synthetic, demo, or placeholder context
+/// that signals a detected secret is not real. Categories span six themes:
+///
+/// - **Placeholder markers** (idx 0, 6, 7, 13): known fake values, sentinel
+///   words, sequential demo strings, and insert-your-X markers.
+/// - **Infrastructure references** (idx 3, 4, 9, 10): shell variables,
+///   random-generator commands, template variables, and localhost URIs.
+/// - **Metadata/schema noise** (idx 5, 8, 11, 12, 17): assignment-prefixed
+///   metadata values, XML namespace declarations, secret-manager markup,
+///   documentation prose, and hash output lines.
+/// - **Redaction and placeholder encodings** (idx 2, 14): asterisk redaction
+///   runs and base64 encodings of the words "example", "test", and "sample".
+/// - **Source control artifacts** (idx 1, 15): AWS example key IDs and git
+///   conflict markers.
+/// - **Test infrastructure** (idx 16): test fixture and mock path markers.
+///
+/// Patterns use `(?i)` for case-insensitivity where needed and
+/// `regex::bytes::RegexSet` ANY semantics (one hit suppresses). The full
+/// pattern set is only applied to context windows around root findings; for
+/// bare secret values, see [`SECRET_BYTES_PATTERNS`].
 const SAFELIST_PATTERNS: &[&str] = &[
     // Placeholder markers plus key/token/secret nouns.
     r"(?i)\b(?:placeholder|dummy|fake|sample|example|test)[-_ ]{0,3}(?:key|token|secret|password)\b|\b(?:key|token|secret|password)[-_ ]{0,3}(?:placeholder|dummy|fake|sample|example|test)\b",
@@ -179,16 +212,50 @@ const SECRET_BYTES_PATTERNS: &[&str] = &[
 
 const _: () = assert!(SECRET_BYTES_PATTERNS.len() == SECRET_BYTES_PATTERN_COUNT);
 
+/// Returns `true` if `bytes` is a canonical UUID: 8-4-4-4-12 hyphenated
+/// hex, case-insensitive. Structural-only — no version/variant validation
+/// per RFC 9562.
+///
+/// Hyphenated format only — 32-char hex without hyphens is deliberately
+/// excluded because it collides with MD5/SHA/AES key representations.
+/// Full-value check (not substring) prevents the TruffleHog #1953
+/// false-negative pattern on composite secrets.
+#[inline(always)]
+pub(crate) fn is_uuid_format(bytes: &[u8]) -> bool {
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
 /// Precompiled global safelist matcher used for emit-time suppression.
 ///
-/// Contains two `RegexSet` instances:
+/// Contains two matching components:
 /// - `regex_set`: the full 18-pattern set for context-window matching.
 /// - `secret_bytes_set`: a curated 9-pattern subset for bare secret-value matching.
 ///
-/// A `SafelistFilter` is immutable after construction and safe to share across scans.
+/// UUID-format quick-reject is handled by the module-level [`is_uuid_format`]
+/// function rather than a compiled regex. It is gated per-rule by
+/// `RuleCompiled::uuid_format_secret()` so rules that intentionally capture
+/// UUID-format secrets (e.g., Heroku, Snyk API keys) bypass suppression.
+///
+/// Constructed once during [`Engine`] initialization and stored as `self.safelist`.
+/// Immutable after construction and `Send + Sync`, so it can be shared across
+/// concurrent scan threads without additional synchronization.
+///
+/// [`Engine`]: super::Engine
 #[derive(Debug)]
 pub(crate) struct SafelistFilter {
+    /// Full 18-pattern set for context-window matching (root findings only).
     regex_set: RegexSet,
+    /// Curated 9-pattern subset for bare secret-value matching (all findings).
     secret_bytes_set: RegexSet,
 }
 
@@ -216,7 +283,13 @@ impl SafelistFilter {
         }
     }
 
-    /// Returns a reference to the context-window matcher for use in hot loops.
+    /// Returns the context-window `RegexSet` (the full 18-pattern set).
+    ///
+    /// Callers pass a byte slice of the surrounding context window — not the
+    /// bare secret value — and check `is_match(context_bytes)`. For matching
+    /// against the extracted secret alone, use [`secret_bytes_matcher`] instead.
+    ///
+    /// [`secret_bytes_matcher`]: Self::secret_bytes_matcher
     #[inline]
     pub(crate) fn matcher(&self) -> &RegexSet {
         &self.regex_set
@@ -242,9 +315,24 @@ impl SafelistFilter {
 
 #[cfg(test)]
 mod tests {
+    //! Test structure:
+    //!
+    //! - **Inventory counts**: verify `*_COUNT` constants match array lengths.
+    //! - **Positive/negative coverage**: each context-window and secret-bytes
+    //!   category has a positive example that must match and negative examples
+    //!   (realistic secrets) that must not.
+    //! - **Anchoring safety**: composite secrets containing placeholder words as
+    //!   hyphenated segments must not be falsely suppressed (the `^...$`
+    //!   anchoring regression tests).
+    //! - **Provenance enforcement**: the included/excluded index lists are
+    //!   checked for disjointness and full coverage of `SAFELIST_PATTERNS`.
+    //! - **UUID quick-reject**: RFC 9562 examples, non-UUID rejection, and
+    //!   anchoring tests that prevent substring matching inside composite
+    //!   secrets.
+
     use super::{
-        SafelistFilter, SAFELIST_PATTERNS, SAFELIST_PATTERN_COUNT, SECRET_BYTES_PATTERNS,
-        SECRET_BYTES_PATTERN_COUNT,
+        is_uuid_format, SafelistFilter, SAFELIST_PATTERNS, SAFELIST_PATTERN_COUNT,
+        SECRET_BYTES_PATTERNS, SECRET_BYTES_PATTERN_COUNT,
     };
 
     #[test]
@@ -518,5 +606,90 @@ mod tests {
             SECRET_BYTES_PATTERN_COUNT,
             "included indices length must equal SECRET_BYTES_PATTERN_COUNT"
         );
+    }
+
+    // -- UUID-format quick-reject tests --
+
+    #[test]
+    fn uuid_reject_matches_rfc_examples() {
+        let cases: &[(&str, &[u8])] = &[
+            // RFC 9562 §5.9 — Nil UUID.
+            ("nil", b"00000000-0000-0000-0000-000000000000"),
+            // RFC 9562 §5.10 — Max UUID.
+            ("max", b"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"),
+            // RFC 9562 / RFC 4122 running example — UUIDv1.
+            ("v1 rfc9562", b"f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            // RFC 4122 Appendix B — UUIDv1 output.
+            ("v1 rfc4122", b"7d444840-9dc0-11d1-b245-5ffdce74fad2"),
+            // RFC 4122 Appendix B — UUIDv3 from "www.widgets.com".
+            ("v3", b"e902893a-9d22-3c7e-a7b8-d6e313b71d9f"),
+            // uuid crate docs — UUIDv4.
+            ("v4", b"67e55044-10b1-426f-9247-bb680e5fe0c8"),
+            // RFC 4122 Appendix C — DNS namespace UUID.
+            ("dns namespace", b"6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+            // RFC 4122 Appendix C — URL namespace UUID.
+            ("url namespace", b"6ba7b811-9dad-11d1-80b4-00c04fd430c8"),
+            // Microsoft GUID — mixed case (uppercase).
+            ("ms guid", b"6B29FC40-CA47-1067-B31D-00DD010662DA"),
+        ];
+
+        for (label, value) in cases {
+            assert!(
+                is_uuid_format(value),
+                "expected is_uuid_format to match RFC example: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn uuid_reject_rejects_non_uuids() {
+        let cases: &[(&str, &[u8])] = &[
+            // 32-char hex without hyphens (MD5-like — must NOT match).
+            ("32-char hex", b"f81d4fae7dec11d0a76500a0c91e6bf6"),
+            // GitHub PAT.
+            ("github pat", b"ghp_2fK9sD6nL0pQ8rT1vW3xY5zA7bC9dE1fG3hI"),
+            // AWS key.
+            ("aws key", b"AKIA1234567890ABCD12"),
+            // Stripe key.
+            ("stripe key", b"sk_test_51Nn3t4ABcdEfGhIjKlMnOpQrStUvWxYz"),
+            // Wrong segment length (35 chars — one short).
+            ("35 chars", b"f81d4fae-7dec-11d0-a765-00a0c91e6bf"),
+            // Non-hex character in first segment.
+            ("non-hex char", b"g81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            // Missing a hyphen (fused second+third segments).
+            ("missing hyphen", b"f81d4fae-7dec11d0-a765-00a0c91e6bf6"),
+            // Empty string.
+            ("empty", b""),
+            // Short string.
+            ("short", b"abc"),
+        ];
+
+        for (label, value) in cases {
+            assert!(
+                !is_uuid_format(value),
+                "unexpected is_uuid_format match for non-UUID: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn uuid_reject_anchoring_prevents_substring_match() {
+        // Composite secrets containing a UUID substring must NOT match.
+        // Full-value length check (36 bytes) prevents the TruffleHog #1953 pattern.
+        let cases: &[(&str, &[u8])] = &[
+            ("prefix", b"prefix-f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
+            ("suffix", b"f81d4fae-7dec-11d0-a765-00a0c91e6bf6-suffix"),
+            (
+                "plaid-style",
+                b"access-sandbox-67e55044-10b1-426f-9247-bb680e5fe0c8",
+            ),
+        ];
+
+        for (label, value) in cases {
+            assert!(
+                !is_uuid_format(value),
+                "is_uuid_format must not match composite secret with UUID substring: {label}"
+            );
+        }
     }
 }

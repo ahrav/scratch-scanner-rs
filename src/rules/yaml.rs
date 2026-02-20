@@ -12,6 +12,28 @@
 //! `default_rules_yaml_has_no_unknown_fields` catches accidental typos in the
 //! canonical `default_rules.yaml`.
 //!
+//! # Conversion pipeline
+//!
+//! [`parse_yaml_rules`] transforms a YAML string into a `Vec<RuleSpec>` via
+//! a three-stage pipeline applied per rule:
+//!
+//! 1. **Deserialize** — serde maps the YAML text into [`YamlRule`] structs,
+//!    which mirror the on-disk schema using owned `String` / `Vec` types.
+//! 2. **Compile regex** — the pattern string is compiled into a
+//!    `regex::bytes::Regex` via [`super::build_regex`], which retries with
+//!    progressively larger DFA size limits on `CompiledTooBig` errors. This
+//!    step runs *outside* the interning lock to avoid holding the mutex
+//!    during potentially expensive compilation.
+//! 3. **Intern and assemble** — string/byte fields are interned into the
+//!    global [`RuleAtomPool`] (producing `&'static` references), numeric and
+//!    struct fields are converted directly, and a [`RuleSpec`] is emitted.
+//!
+//! During stage 3 the parser also applies *implicit defaults*: rules with
+//! an entropy threshold at or above [`AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`]
+//! that lack an explicit `char_class` gate automatically receive one. This
+//! eliminates per-rule boilerplate for the common case of high-entropy
+//! secret patterns (API keys, tokens) while preserving opt-out capability.
+//!
 //! # Interning
 //!
 //! Parsed rule data — names, anchors, keywords, etc. — are interned into a
@@ -46,15 +68,31 @@ use super::RulesError;
 // ---------------------------------------------------------------------------
 
 /// Minimum Shannon entropy threshold (bits/byte) for auto-enabling the
-/// character-class distribution gate. Rules at or above this threshold
-/// target high-entropy secrets (API keys, tokens); rules below it target
-/// passwords or low-entropy strings where the gate would cause false negatives.
+/// character-class distribution gate on rules that omit an explicit
+/// `char_class` setting.
+///
+/// Rules at or above this threshold target high-entropy secrets (API keys,
+/// tokens) where a predominantly-lowercase scan window is a reliable signal
+/// for prose rather than a real secret. Rules below it target passwords or
+/// low-entropy strings where the same gate would cause false negatives.
+///
+/// 3.0 bits/byte was chosen empirically: it separates the ~6 low-entropy
+/// rules (e.g. `nuget-config-password` at 1.0, `asana-client-id` at 2.5)
+/// from the bulk of token-oriented rules.
 pub(crate) const AUTO_CHAR_CLASS_ENTROPY_THRESHOLD: f32 = 3.0;
 
-/// Default max-lowercase-percentage for auto-enabled char_class gates.
+/// Default max-lowercase-percentage for auto-enabled `char_class` gates.
+///
+/// A window with more than 95% lowercase ASCII bytes is almost certainly
+/// natural-language prose rather than a secret. The 5% headroom accounts
+/// for mixed-case identifiers or punctuation at window boundaries.
 pub(crate) const AUTO_CHAR_CLASS_MAX_LOWER_PCT: u8 = 95;
 
-/// Default minimum window length for auto-enabled char_class gates.
+/// Default minimum window length for auto-enabled `char_class` gates.
+///
+/// Windows shorter than 32 bytes do not contain enough samples for the
+/// lowercase-percentage heuristic to be meaningful; applying it there
+/// would introduce noise without filtering useful signal.
 pub(crate) const AUTO_CHAR_CLASS_MIN_WINDOW_LEN: u16 = 32;
 
 // ---------------------------------------------------------------------------
@@ -114,17 +152,23 @@ pub(crate) struct YamlRule {
     pub offline_validation: Option<YamlOfflineValidation>,
     #[serde(default)]
     pub secret_group: Option<u16>,
+    #[serde(default)]
+    pub uuid_format_secret: bool,
 }
 
 /// Entropy gate parameters for a rule.
 ///
-/// When present, the secret value (captured group) must have at least
-/// `min_bits_per_byte` bits of Shannon entropy per byte. Secrets shorter
-/// than `min_len` bypass the entropy check (noisy on small samples);
-/// secrets longer than `max_len` are evaluated on only the first
-/// `max_len` bytes. An optional `min_entropy_bits_per_byte` adds a
-/// min-entropy (NIST SP 800-90B) gate that catches skewed distributions
-/// where one byte dominates even though Shannon entropy looks moderate.
+/// When present, the secret value (the captured group after regex matching)
+/// must have at least `min_bits_per_byte` bits of Shannon entropy per byte.
+/// Secrets shorter than `min_len` bypass the entropy check entirely because
+/// Shannon entropy is noisy on small samples; secrets longer than `max_len`
+/// are evaluated on only the first `max_len` bytes to bound compute cost.
+///
+/// An optional `min_entropy_bits_per_byte` adds a second, stricter gate
+/// based on min-entropy (NIST SP 800-90B). Min-entropy measures the
+/// probability of the single most frequent byte, catching skewed
+/// distributions where one byte value dominates even though the Shannon
+/// entropy across all byte values looks moderate.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
@@ -140,6 +184,12 @@ pub(crate) struct YamlEntropy {
 /// When present, scan windows whose byte composition exceeds `max_lower_pct`
 /// percent lowercase ASCII (`a`–`z`) **and** are at least `min_window_len`
 /// bytes long are rejected before the regex is applied.
+///
+/// If this section is absent (or explicitly `null`) in YAML **and** the rule
+/// has an entropy threshold at or above [`AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`],
+/// the parser auto-enables a gate with the `AUTO_CHAR_CLASS_*` defaults.
+/// To opt out of auto-enable, set `char_class` to a no-op configuration
+/// such as `{ max_lower_pct: 100, min_window_len: 16 }`.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlCharClass {
@@ -149,11 +199,15 @@ pub(crate) struct YamlCharClass {
 
 /// Two-phase scanning configuration.
 ///
-/// Phase 1 uses `seed_radius` to locate potential matches, then checks
-/// each seed window for at least one `confirm_any` literal — windows
-/// without a match are dropped immediately.
-/// Phase 2 expands surviving windows from `seed_radius` to `full_radius`
-/// and runs the regex on the wider view.
+/// Two-phase scanning trades a small literal-search pass for a large
+/// reduction in regex work on rules whose `full_radius` is wide but
+/// whose actual matches cluster around confirming literals.
+///
+/// - **Phase 1** — extract a narrow window (`seed_radius` bytes around
+///   the anchor hit) and scan it for at least one `confirm_any` literal.
+///   Windows without a confirming literal are dropped immediately.
+/// - **Phase 2** — expand surviving windows from `seed_radius` to
+///   `full_radius` and run the regex on the wider view.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlTwoPhase {
@@ -167,7 +221,9 @@ pub(crate) struct YamlTwoPhase {
 /// Examines the bytes immediately surrounding a regex match
 /// (`lookbehind` bytes before, `lookahead` bytes after) for structural
 /// cues such as assignment operators, quoting, or specific key names.
-/// Gates that fail suppress the finding.
+/// If none of the enabled checks pass, the finding is suppressed — the
+/// assumption being that a regex-matched value without surrounding
+/// assignment/quoting context is unlikely to be an actual secret in use.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlLocalContext {
@@ -183,9 +239,13 @@ pub(crate) struct YamlLocalContext {
 
 /// Offline structural validation configuration.
 ///
-/// The `type` field selects the validation algorithm. Parameterised variants
+/// The YAML `type` key (renamed to `kind` in Rust to avoid the keyword
+/// collision) selects the validation algorithm. Parameterised variants
 /// (currently only `crc32_base62`) require additional numeric fields; unit
 /// variants need only the type selector.
+///
+/// Conversion to [`OfflineValidationSpec`] is performed by
+/// [`yaml_offline_to_spec`], which rejects unknown type strings.
 ///
 /// # Supported types
 ///
@@ -227,6 +287,18 @@ pub(crate) struct YamlOfflineValidation {
 /// - `strings` — rule names (`&'static str`).
 /// - `bytes` — individual byte slices (anchors, keywords, etc.).
 /// - `bytes_slices` — slices-of-slices (e.g. the full anchors array).
+///
+/// # Memory characteristics
+///
+/// `Box::leak` makes each interned value permanently live. The
+/// `HashMap` keys duplicate the content for lookup, so total memory is
+/// roughly 2x the unique atom set. This is acceptable because the rule
+/// corpus is small (hundreds of rules, each with a few short literals)
+/// and parse calls with identical YAML hit the dedup path with zero
+/// additional allocation.
+///
+/// Growth is bounded by the number of *distinct* atom values across all
+/// `parse_yaml_rules` calls for the lifetime of the process.
 #[derive(Default)]
 struct RuleAtomPool {
     strings: HashMap<String, &'static str>,
@@ -235,8 +307,12 @@ struct RuleAtomPool {
 }
 
 impl RuleAtomPool {
-    /// Intern a string, returning a `&'static str` pointer-equal across calls
-    /// with the same content.
+    /// Intern a string, returning a `&'static str` that is pointer-equal
+    /// across calls with the same content.
+    ///
+    /// On the first call for a given string, the owned `String` is cloned
+    /// into a `Box<str>` and leaked. The clone is necessary because the
+    /// original `String` is consumed as the `HashMap` key for future lookups.
     fn intern_str(&mut self, s: String) -> &'static str {
         if let Some(existing) = self.strings.get(&s) {
             return existing;
@@ -246,7 +322,11 @@ impl RuleAtomPool {
         leaked
     }
 
-    /// Intern a string's UTF-8 bytes.
+    /// Intern a string's UTF-8 bytes, delegating to [`Self::intern_bytes_vec`].
+    ///
+    /// This is a convenience entry point for fields that arrive as `String`
+    /// from serde but are stored as `&'static [u8]` in [`RuleSpec`] (e.g.
+    /// `must_contain`, individual anchors).
     fn intern_bytes(&mut self, s: String) -> &'static [u8] {
         self.intern_bytes_vec(s.into_bytes())
     }
@@ -264,7 +344,9 @@ impl RuleAtomPool {
     /// Intern a list of strings as a `&'static [&'static [u8]]`.
     ///
     /// Both the outer slice and each inner byte slice are interned
-    /// independently, so element-level sharing works across rules.
+    /// independently via [`Self::intern_bytes_vec`], so element-level
+    /// sharing works across rules that happen to share individual
+    /// keywords or anchors.
     fn intern_bytes_slice(&mut self, values: Vec<String>) -> &'static [&'static [u8]] {
         let keys: Vec<Vec<u8>> = values.into_iter().map(String::into_bytes).collect();
         if let Some(existing) = self.bytes_slices.get(&keys) {
@@ -281,6 +363,12 @@ impl RuleAtomPool {
     }
 }
 
+/// Process-global interning pool for rule atom data.
+///
+/// `LazyLock` defers allocation until the first `parse_yaml_rules` call.
+/// The `Mutex` serializes concurrent access; the critical section is
+/// dominated by `HashMap` lookups (O(1) amortized) so contention is
+/// negligible in practice.
 static RULE_ATOMS: LazyLock<Mutex<RuleAtomPool>> =
     LazyLock::new(|| Mutex::new(RuleAtomPool::default()));
 
@@ -356,12 +444,30 @@ fn yaml_offline_to_spec(
 /// by compiling regexes and interning textual fields into reusable `'static`
 /// references via the global [`RuleAtomPool`].
 ///
+/// # Processing order per rule
+///
+/// 1. Compile the regex pattern (outside the interning lock).
+/// 2. Intern string/byte fields under the global atom pool lock.
+/// 3. Map numeric spec fields (`entropy`, `char_class`) directly.
+/// 4. Apply implicit defaults — auto-enable `char_class` when entropy
+///    threshold >= [`AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`] and no explicit
+///    gate is provided.
+/// 5. Convert `offline_validation` via [`yaml_offline_to_spec`].
+/// 6. Assemble the final [`RuleSpec`].
+///
+/// Note that this function performs *no* semantic validation beyond regex
+/// compilation and offline-validation type mapping. Higher-level checks
+/// (e.g. `assert_valid()`) are the caller's responsibility — see
+/// [`super::load_rules_from_content`].
+///
 /// # Errors
 ///
 /// - [`RulesError::Yaml`] — the input is not valid YAML or does not match
 ///   the expected schema (missing required fields).
 /// - [`RulesError::Regex`] — a rule's `regex` field fails to compile.
 ///   The error includes the rule name and pattern for diagnostics.
+/// - [`RulesError::OfflineValidation`] — an `offline_validation` block
+///   specifies an unknown type or is missing required parameters.
 pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
     let file: YamlRulesFile = serde_norway::from_str(content).map_err(RulesError::Yaml)?;
 
@@ -381,6 +487,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             local_context,
             offline_validation,
             secret_group,
+            uuid_format_secret,
         } = yr;
 
         let re = super::build_regex(&regex).map_err(|error| RulesError::Regex {
@@ -446,7 +553,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
         //
         // Note: `char_class: null` in YAML deserializes to `None` (same as
         // absent), so auto-enable fires for both. This is standard serde/YAML
-        // behavior. To opt out, set `char_class: { max_lower_pct: 100, min_window_len: 0 }`
+        // behavior. To opt out, set `char_class: { max_lower_pct: 100, min_window_len: 16 }`
         // which effectively disables the gate.
         let char_class = char_class.or_else(|| {
             entropy.as_ref().and_then(|ent| {
@@ -481,6 +588,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             char_class,
             local_context,
             offline_validation,
+            uuid_format_secret,
             secret_group,
             re,
         });
@@ -489,16 +597,13 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
     Ok(rules)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 #[path = "yaml_unit_tests.rs"]
 mod tests;
 
-// Property-based parser/interning invariants live in a sibling module to keep
-// this file's unit tests focused and to preserve fast default `cargo test`.
+/// Property-based parser/interning invariants live in a sibling module to
+/// keep this file's unit tests focused and to preserve fast default
+/// `cargo test` (proptest runs only with `--features stdx-proptest`).
 #[cfg(all(test, feature = "stdx-proptest"))]
 #[path = "yaml_tests.rs"]
 mod yaml_tests;

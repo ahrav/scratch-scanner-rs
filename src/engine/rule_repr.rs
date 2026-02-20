@@ -5,6 +5,33 @@
 //! [`RuleSpec`]. The emphasis is on cache-friendly layouts and variant-indexed
 //! tables so the hot path avoids allocation and encoding conversion.
 //!
+//! ## Data flow
+//!
+//! ```text
+//! RuleSpec (api.rs)
+//!   │
+//!   ├─ compile_rule() ──► (RuleCompiled, CompiledGates)
+//!   │                          │               │
+//!   │                          │   Engine::new() pools each gate object into
+//!   │                          │   a type-specific Vec on Engine and patches
+//!   │                          │   the u32 index back onto RuleCompiled.
+//!   │                          │
+//!   │                          ▼
+//!   │                     RuleCompiled   ── hot array iterated per buffer
+//!   │                     RuleCold       ── parallel cold array (name, etc.)
+//!   │
+//!   ├─ add_pat_raw/owned() ──► anchor map (AHashMap<Vec<u8>, Vec<Target>>)
+//!   │                              │
+//!   │                              ▼
+//!   │                         map_to_patterns() ──► (patterns, targets, offsets)
+//!   │                              │
+//!   │                              ▼
+//!   │                         Vectorscan prefilter DB
+//!   │                         (pattern ids are positional → deterministic sort)
+//!   │
+//!   └─ compile_confirm_all() ──► ConfirmAllCompiled (pooled in second pass)
+//! ```
+//!
 //! ## Two-tier compilation
 //!
 //! Compilation is split into two tiers to keep `RuleCompiled` compact:
@@ -21,6 +48,16 @@
 //! `confirm_all` is a special case: its literals are derived from regex analysis
 //! *after* `compile_rule` returns, so the caller must build it separately via
 //! [`compile_confirm_all`] and pool it in a second pass.
+//!
+//! ## Variant-indexed arrays
+//!
+//! Several compiled gate types (`TwoPhaseCompiled`, `KeywordsCompiled`,
+//! `ConfirmAllCompiled`) store pattern data in per-variant `[_; 3]` arrays
+//! indexed by [`Variant::idx()`]: slot 0 = Raw, 1 = Utf16Le, 2 = Utf16Be.
+//! Most use `[PackedPatterns; 3]`; `ConfirmAllCompiled::primary` uses
+//! `[Option<Box<[u8]>>; 3]` for the single longest literal.
+//! This avoids runtime dispatch and lets the scan loop select the correct
+//! encoding with a single array index.
 //!
 //! ## Notes
 //!
@@ -240,6 +277,10 @@ impl PackedPatternsBuilder {
 
 /// Two-phase rule data compiled per variant for fast confirm checks.
 ///
+/// Two-phase gating is applied in `buffer_scan` *before* windows are sent to
+/// `window_validate`, making it the earliest per-window filter after the
+/// Vectorscan prefilter.
+///
 /// The two-phase algorithm reduces regex work by narrowing candidate windows:
 ///
 /// 1. **Seed phase**: Vectorscan emits a seed window of
@@ -273,6 +314,12 @@ pub(super) struct TwoPhaseCompiled {
 
 /// Keyword gate compiled per variant for fast "any keyword" checks.
 ///
+/// Evaluated inside the validation window *before* the regex runs (after
+/// must-contain and confirm-all, but before assignment-shape and char-class
+/// gates). At least one keyword must appear in the window for the rule to
+/// proceed to regex evaluation. This is a cheap `memmem` scan that eliminates
+/// windows lacking the expected context words (e.g., `password`, `api_key`).
+///
 /// # Guarantees
 /// - `any` is encoded per variant and indexed by `Variant::idx()`.
 #[derive(Clone, Debug)]
@@ -284,16 +331,30 @@ pub(super) struct KeywordsCompiled {
     pub(super) any: [PackedPatterns; 3],
 }
 
-/// Derived "confirm all" gate from mandatory literal islands.
+/// Derived "confirm all" gate from mandatory literal islands extracted from
+/// regex analysis.
 ///
-/// Design intent:
-/// - The longest literal is checked first as a single memmem search.
-/// - The remaining literals are checked with AND semantics using PackedPatterns.
-/// - UTF-16 variants are encoded the same way as anchors/keywords so we can
-///   reject windows before decoding.
+/// Unlike `TwoPhaseCompiled` and `KeywordsCompiled` whose patterns come from
+/// the rule spec, confirm-all literals are derived automatically from the
+/// regex's mandatory literal islands by the anchor derivation pass. This is
+/// why the gate is compiled separately via [`compile_confirm_all`] rather
+/// than inside [`compile_rule`].
+///
+/// ## Check strategy
+///
+/// 1. **Primary literal** (longest): checked first via a single `memmem`
+///    search. Because it is the longest mandatory literal, it provides the
+///    highest rejection rate and makes the common negative case fast.
+/// 2. **Rest literals**: checked with AND semantics (all must match) using
+///    [`PackedPatterns`] iteration.
+///
+/// UTF-16 variants are encoded the same way as anchors/keywords so the gate
+/// can reject windows on raw bytes without decoding.
 ///
 /// # Guarantees
-/// - `primary` holds the longest literal (per `compile_confirm_all` sorting).
+/// - `primary[v]` is always `Some` when the gate exists (the longest literal
+///   is always promoted to primary). When only one literal is derived, it
+///   becomes the primary and `rest` contains zero patterns.
 /// - `rest` is encoded per variant and indexed by `Variant::idx()`.
 #[derive(Clone, Debug)]
 pub(super) struct ConfirmAllCompiled {
@@ -353,24 +414,50 @@ pub(super) struct CharClassCompiled {
 /// Sentinel value indicating no gate is assigned for a given slot.
 ///
 /// Using `u32::MAX` as a sentinel instead of `Option<u32>` saves 4 bytes per
-/// gate field (no discriminant padding), shrinking `RuleCompiled` by 32 bytes
-/// total. Valid pool indices never reach `u32::MAX` because pool sizes are
-/// bounded by the number of rules.
+/// gate field (no discriminant padding), shrinking `RuleCompiled` by ~32 bytes
+/// total across its eight gate fields. Valid pool indices never reach
+/// `u32::MAX` because each pool has at most one entry per rule, and the rule
+/// count is bounded well below `u32::MAX` by practical memory limits.
 pub(super) const NO_GATE: u32 = u32::MAX;
+
+// -- Packed rule metadata bit layout --
+//
+// `RuleCompiled::rule_meta` packs several per-rule flags into a single `u32`
+// to avoid padding and keep the hot struct compact. The layout is:
+//
+//   bits  0..=15  secret_group value (meaningful only when bit 17 is set)
+//   bit   16      needs_assignment_shape_check
+//   bit   17      has_secret_group_override (distinguishes None from Some(u16::MAX))
+//   bit   18      uuid_format_secret
+//   bits 19..=31  reserved (zero)
 
 const RULE_META_SECRET_GROUP_MASK: u32 = 0xFFFF;
 const RULE_META_NEEDS_ASSIGNMENT_SHAPE: u32 = 1 << 16;
-// Distinguishes `secret_group: None` from `secret_group: Some(u16::MAX)`.
 const RULE_META_HAS_SECRET_GROUP: u32 = 1 << 17;
+const RULE_META_UUID_FORMAT_SECRET: u32 = 1 << 18;
 
+/// Pack per-rule boolean flags and the optional secret-group index into a
+/// single `u32` for storage in [`RuleCompiled::rule_meta`].
+///
+/// A dedicated "has" bit (`RULE_META_HAS_SECRET_GROUP`) disambiguates
+/// `secret_group: None` from `secret_group: Some(u16::MAX)`, since the
+/// value `0xFFFF` would otherwise collide with the all-ones mask when the
+/// group is absent.
 #[inline(always)]
-fn pack_rule_meta(secret_group: Option<u16>, needs_assignment_shape_check: bool) -> u32 {
+fn pack_rule_meta(
+    secret_group: Option<u16>,
+    needs_assignment_shape_check: bool,
+    uuid_format_secret: bool,
+) -> u32 {
     let mut meta = 0;
     if let Some(secret_group) = secret_group {
         meta |= RULE_META_HAS_SECRET_GROUP | secret_group as u32;
     }
     if needs_assignment_shape_check {
         meta |= RULE_META_NEEDS_ASSIGNMENT_SHAPE;
+    }
+    if uuid_format_secret {
+        meta |= RULE_META_UUID_FORMAT_SECRET;
     }
     meta
 }
@@ -428,6 +515,7 @@ pub(super) struct RuleCompiled {
     // - bits 0..=15: secret_group (when bit 17 is set)
     // - bit 16: needs_assignment_shape_check
     // - bit 17: has_secret_group_override
+    // - bit 18: uuid_format_secret
     pub(super) rule_meta: u32,
     // Gate pool indices — dereference through Engine pool vectors.
     // NO_GATE (u32::MAX) means the gate is absent for this rule.
@@ -442,40 +530,68 @@ pub(super) struct RuleCompiled {
 }
 
 impl RuleCompiled {
+    /// Whether the window validator should run the assignment-shape precheck
+    /// (e.g., looking for `key = value` patterns) before executing the regex.
+    ///
+    /// Currently only enabled for `generic-api-key`, whose regex is expensive
+    /// and whose false-positive rate drops significantly with this gate.
     #[inline(always)]
     pub(super) fn needs_assignment_shape_check(&self) -> bool {
         (self.rule_meta & RULE_META_NEEDS_ASSIGNMENT_SHAPE) != 0
     }
 
+    /// Raw `u16` value of the secret-group capture index.
+    ///
+    /// Only meaningful when [`has_secret_group_override`](Self::has_secret_group_override)
+    /// is `true`; otherwise the low 16 bits are zero but carry no semantic meaning.
     #[inline(always)]
     pub(super) fn secret_group_raw(&self) -> u16 {
         (self.rule_meta & RULE_META_SECRET_GROUP_MASK) as u16
     }
 
+    /// Whether this rule specifies an explicit capture-group override for
+    /// secret extraction (i.e., `secret_group` was `Some(_)` in the spec).
     #[inline(always)]
     pub(super) fn has_secret_group_override(&self) -> bool {
         (self.rule_meta & RULE_META_HAS_SECRET_GROUP) != 0
     }
 
+    /// Reconstruct the `Option<u16>` secret-group value from the packed bits.
+    ///
+    /// Test-only because the hot path uses the decomposed accessors above
+    /// to avoid the branch.
     #[cfg(test)]
     #[inline(always)]
     pub(super) fn secret_group(&self) -> Option<u16> {
         self.has_secret_group_override()
             .then_some(self.secret_group_raw())
     }
+
+    /// Returns `true` if this rule intentionally captures UUID-format secrets.
+    ///
+    /// When set, the UUID-format quick-reject in the safelist is bypassed.
+    #[inline(always)]
+    pub(super) fn uuid_format_secret(&self) -> bool {
+        (self.rule_meta & RULE_META_UUID_FORMAT_SECRET) != 0
+    }
 }
 
 /// Cold rule metadata used outside the validation hot path.
 ///
-/// Kept in a parallel array with [`RuleCompiled`] (`rules_hot`) to keep
-/// scan-loop iteration focused on fields needed for gating and regex checks.
+/// Kept in a parallel array with [`RuleCompiled`] (`Engine::rules_hot`) so
+/// that scan-loop iteration touches only the compact hot fields needed for
+/// gating and regex evaluation. The cold array is indexed identically:
+/// `rules_hot[i]` and `rules_cold[i]` always describe the same rule.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RuleCold {
     pub(super) name: &'static str,
 }
 
-// Compile-time size guard: gate index is now a plain u32 (4 bytes) with
-// NO_GATE sentinel, down from 8-byte Option<u32> (no niche optimization).
+// Compile-time size guards: RuleCompiled is iterated for every merged window
+// in the scan loop, so its size directly affects cache pressure. The u32
+// sentinel approach (NO_GATE = u32::MAX) saves 4 bytes per gate field vs.
+// Option<u32> (which gets no niche optimization for u32::MAX), keeping the
+// struct within a single cache line pair.
 const _: () = assert!(std::mem::size_of::<u32>() == 4);
 const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 88);
 
@@ -484,6 +600,11 @@ const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 88);
 // --------------------------
 
 /// Compiled gates returned alongside `RuleCompiled` for pooling into `Engine`.
+///
+/// Each `Some` variant is a heavyweight gate object that the caller pools into
+/// a type-specific `Vec` on `Engine`, then patches the corresponding `u32`
+/// index on [`RuleCompiled`]. `None` fields result in the [`NO_GATE`] sentinel
+/// remaining in the rule (no pool entry allocated).
 ///
 /// `confirm_all` is intentionally absent here: its literals are derived from
 /// regex analysis *after* compilation, so the caller builds it separately via
@@ -506,6 +627,17 @@ pub(super) struct CompiledGates {
 ///
 /// `confirm_all` is intentionally left as `NO_GATE` and should be filled by
 /// the caller after confirm-all literals are derived.
+///
+/// # Gate encoding rules
+///
+/// - **Two-phase, keywords, confirm-all**: compiled into per-variant
+///   `[PackedPatterns; 3]` arrays (Raw + UTF-16LE + UTF-16BE) so the scan
+///   loop can gate on raw bytes without decoding.
+/// - **Value suppressors**: compiled as raw-only `PackedPatterns` because
+///   they run on decoded/extracted secret bytes, never on raw UTF-16 window
+///   bytes.
+/// - **Entropy, char-class, local-context, offline-validation**: copied
+///   verbatim from the spec (small `Copy` types or enums).
 pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     let two_phase = spec.two_phase.as_ref().map(|tp| {
         let count = tp.confirm_any.len();
@@ -568,14 +700,20 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
         min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
     });
 
-    // Enable assignment-shape precheck for rules with assignment-pattern regexes.
-    // Currently only `generic-api-key` benefits from this optimization.
+    // The assignment-shape precheck (looking for `key = value` structure) is a
+    // cheap textual gate that substantially reduces false positives for rules with
+    // broad regexes. Currently hard-coded to `generic-api-key` because that rule's
+    // regex is intentionally loose and benefits most from this structural filter.
     let needs_assignment_shape_check = spec.name == "generic-api-key";
 
     let rule = RuleCompiled {
         re: spec.re.clone(),
         must_contain: spec.must_contain,
-        rule_meta: pack_rule_meta(spec.secret_group, needs_assignment_shape_check),
+        rule_meta: pack_rule_meta(
+            spec.secret_group,
+            needs_assignment_shape_check,
+            spec.uuid_format_secret,
+        ),
         confirm_all: NO_GATE,
         keywords: NO_GATE,
         value_suppressors: NO_GATE,
@@ -608,9 +746,14 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
 ///
 /// Returns `None` if `confirm_all` is empty (no mandatory literals derived).
 ///
-/// The longest literal becomes the `primary` selector — checked first via a
+/// The longest literal becomes the `primary` selector -- checked first via a
 /// single memmem search for early rejection. The remaining literals are packed
 /// into AND-gated tables (all must match) for the fast memmem pass.
+///
+/// Sorting is longest-first with ties broken lexicographically. This makes
+/// the primary literal maximally selective (longer needles are less likely to
+/// appear by chance), and the tiebreaker ensures deterministic selection
+/// across compilations.
 pub(super) fn compile_confirm_all(mut confirm_all: Vec<Vec<u8>>) -> Option<ConfirmAllCompiled> {
     if confirm_all.is_empty() {
         return None;
@@ -642,7 +785,15 @@ pub(super) fn compile_confirm_all(mut confirm_all: Vec<Vec<u8>>) -> Option<Confi
     })
 }
 
-/// Add a target to the anchor map keyed by a borrowed pattern.
+/// Register a `(pattern, target)` pair in the anchor dedup map, borrowing the pattern.
+///
+/// Multiple rules (and variants) may share the same anchor byte pattern. This
+/// map deduplicates patterns so each unique byte sequence appears only once in
+/// the Vectorscan prefilter DB, with a fanout list of [`Target`] entries that
+/// records every (rule, variant) combination that needs to be notified on a hit.
+///
+/// Use [`add_pat_owned`] when the caller already has an owned `Vec<u8>` (e.g.,
+/// UTF-16-expanded patterns) to avoid an extra allocation.
 pub(super) fn add_pat_raw(map: &mut AHashMap<Vec<u8>, Vec<Target>>, pat: &[u8], target: Target) {
     if let Some(existing) = map.get_mut(pat) {
         existing.push(target);
@@ -651,7 +802,11 @@ pub(super) fn add_pat_raw(map: &mut AHashMap<Vec<u8>, Vec<Target>>, pat: &[u8], 
     }
 }
 
-/// Add a target to the anchor map keyed by an owned pattern.
+/// Register a `(pattern, target)` pair in the anchor dedup map, taking ownership.
+///
+/// Same semantics as [`add_pat_raw`] but avoids cloning when the pattern bytes
+/// are already owned (common for UTF-16-expanded anchors produced by
+/// [`utf16le_bytes`] / [`utf16be_bytes`]).
 pub(super) fn add_pat_owned(
     map: &mut AHashMap<Vec<u8>, Vec<Target>>,
     pat: Vec<u8>,
@@ -765,6 +920,7 @@ mod tests {
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
         }
     }
@@ -822,12 +978,73 @@ mod tests {
 
     #[test]
     fn pack_rule_meta_distinguishes_none_from_explicit_max_secret_group() {
-        let none_meta = pack_rule_meta(None, false);
-        let explicit_max_meta = pack_rule_meta(Some(u16::MAX), false);
+        let none_meta = pack_rule_meta(None, false, false);
+        let explicit_max_meta = pack_rule_meta(Some(u16::MAX), false, false);
 
         assert_ne!(
             none_meta, explicit_max_meta,
             "explicit secret_group=u16::MAX must not be conflated with None"
         );
+    }
+
+    #[test]
+    fn pack_rule_meta_uuid_format_secret_round_trips() {
+        let meta_without_uuid = pack_rule_meta(Some(42), true, false);
+        let meta_with_uuid = pack_rule_meta(Some(42), true, true);
+
+        let dummy_re = Regex::new(r"x").unwrap();
+
+        let rule_without = RuleCompiled {
+            re: dummy_re.clone(),
+            must_contain: None,
+            rule_meta: meta_without_uuid,
+            confirm_all: NO_GATE,
+            keywords: NO_GATE,
+            value_suppressors: NO_GATE,
+            entropy: NO_GATE,
+            char_class: NO_GATE,
+            local_context: NO_GATE,
+            two_phase: NO_GATE,
+            offline_validation: NO_GATE,
+        };
+
+        let rule_with = RuleCompiled {
+            re: dummy_re,
+            must_contain: None,
+            rule_meta: meta_with_uuid,
+            confirm_all: NO_GATE,
+            keywords: NO_GATE,
+            value_suppressors: NO_GATE,
+            entropy: NO_GATE,
+            char_class: NO_GATE,
+            local_context: NO_GATE,
+            two_phase: NO_GATE,
+            offline_validation: NO_GATE,
+        };
+
+        // Bit 18 round-trips correctly.
+        assert!(
+            !rule_without.uuid_format_secret(),
+            "uuid_format_secret should be false when packed as false"
+        );
+        assert!(
+            rule_with.uuid_format_secret(),
+            "uuid_format_secret should be true when packed as true"
+        );
+
+        // Other fields are unaffected by bit 18.
+        assert_eq!(
+            rule_without.secret_group(),
+            rule_with.secret_group(),
+            "secret_group must be identical regardless of uuid_format_secret"
+        );
+        assert_eq!(rule_without.secret_group(), Some(42));
+
+        assert_eq!(
+            rule_without.needs_assignment_shape_check(),
+            rule_with.needs_assignment_shape_check(),
+            "needs_assignment_shape_check must be identical regardless of uuid_format_secret"
+        );
+        assert!(rule_without.needs_assignment_shape_check());
     }
 }

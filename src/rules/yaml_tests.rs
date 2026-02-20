@@ -86,6 +86,7 @@ impl RuleCase {
             ),
             secret_group: self.secret_group,
             offline_validation: None,
+            uuid_format_secret: false,
         }
     }
 }

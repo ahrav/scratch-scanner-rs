@@ -53,6 +53,7 @@ classDiagram
         +Option~CharClassSpec~ char_class
         +Option~LocalContextSpec~ local_context
         +Option~OfflineValidationSpec~ offline_validation
+        +bool uuid_format_secret
         +Option~u16~ secret_group
         +Regex re
     }
@@ -149,6 +150,7 @@ classDiagram
         -DecodeSlab slab
         -usize offline_suppressed
         -usize secret_bytes_safelist_suppressed
+        -usize uuid_format_suppressed
         -FixedSet128 seen_findings_scan
         -HitAccPool hit_acc_pool
         -ScratchVec~u32~ touched_pairs
@@ -322,16 +324,17 @@ classDiagram
   suppressed finding is never inserted, so `findings`, `norm_hashes`, and
   `drop_hint_end` stay aligned 1:1 without a post-scan compaction pass.
 - Offline validation runs inline at finding emission time in `window_validate`
-  as Gate 12. Each root-semantic finding (parent `step_id == STEP_ROOT`) whose
+  as Gate 13. Each root-semantic finding (parent `step_id == STEP_ROOT`) whose
   rule has an `OfflineValidationSpec` gate is checked against the extracted
   secret bytes. `Valid` and `Indeterminate` verdicts keep the finding;
   `Invalid` suppresses it before the finding occupies a cap slot. Non-root
   (transform-derived) findings are always kept. Suppressed findings increment
   `ScanScratch.offline_suppressed`.
-- `RuleCompiled.rule_meta` packs three hot fields:
+- `RuleCompiled.rule_meta` packs four hot fields:
   - bits 0..=15: `secret_group` value (when override-present bit is set)
   - bit 16: `needs_assignment_shape_check`
   - bit 17: `has_secret_group_override`
+  - bit 18: `uuid_format_secret`
   This keeps `RuleCompiled` at ≤ 88 bytes on 64-bit targets while preserving
   full `u16` capture-group semantics.
 - `Engine.required_overlap()` is computed as:
