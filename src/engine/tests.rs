@@ -7398,3 +7398,84 @@ fn confidence_score_assignment_shape_gate() {
         confidence::ASSIGNMENT_SHAPE,
     );
 }
+
+// ── UUID quick-reject integration tests ─────────────────────────────────
+
+#[test]
+fn uuid_quick_reject_suppresses_bare_uuid() {
+    // Rule with uuid_format_secret=false, regex captures UUID-shaped value.
+    // Extracted secret is a bare UUID → should be suppressed.
+    let rule = RuleSpec {
+        name: "uuid-suppress-test",
+        anchors: &[b"header"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"header\s+(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"header 67e55044-10b1-426f-9247-bb680e5fe0c8 trailer";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        0,
+        "UUID-format secret should be suppressed when uuid_format_secret=false"
+    );
+}
+
+#[test]
+fn uuid_quick_reject_bypassed_when_rule_captures_uuid_secrets() {
+    // Same setup but uuid_format_secret=true → finding should be preserved.
+    let rule = RuleSpec {
+        name: "uuid-bypass-test",
+        anchors: &[b"header"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        offline_validation: None,
+        uuid_format_secret: true,
+        re: Regex::new(r"header\s+(\S+)").unwrap(),
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    let hay = b"header 67e55044-10b1-426f-9247-bb680e5fe0c8 trailer";
+    engine.scan_chunk_into(hay, FileId(0), 0, &mut scratch);
+
+    assert_eq!(
+        scratch.findings().len(),
+        1,
+        "UUID-format secret should be kept when uuid_format_secret=true"
+    );
+}

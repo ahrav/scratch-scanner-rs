@@ -986,4 +986,65 @@ mod tests {
             "explicit secret_group=u16::MAX must not be conflated with None"
         );
     }
+
+    #[test]
+    fn pack_rule_meta_uuid_format_secret_round_trips() {
+        let meta_without_uuid = pack_rule_meta(Some(42), true, false);
+        let meta_with_uuid = pack_rule_meta(Some(42), true, true);
+
+        let dummy_re = Regex::new(r"x").unwrap();
+
+        let rule_without = RuleCompiled {
+            re: dummy_re.clone(),
+            must_contain: None,
+            rule_meta: meta_without_uuid,
+            confirm_all: NO_GATE,
+            keywords: NO_GATE,
+            value_suppressors: NO_GATE,
+            entropy: NO_GATE,
+            char_class: NO_GATE,
+            local_context: NO_GATE,
+            two_phase: NO_GATE,
+            offline_validation: NO_GATE,
+        };
+
+        let rule_with = RuleCompiled {
+            re: dummy_re,
+            must_contain: None,
+            rule_meta: meta_with_uuid,
+            confirm_all: NO_GATE,
+            keywords: NO_GATE,
+            value_suppressors: NO_GATE,
+            entropy: NO_GATE,
+            char_class: NO_GATE,
+            local_context: NO_GATE,
+            two_phase: NO_GATE,
+            offline_validation: NO_GATE,
+        };
+
+        // Bit 18 round-trips correctly.
+        assert!(
+            !rule_without.uuid_format_secret(),
+            "uuid_format_secret should be false when packed as false"
+        );
+        assert!(
+            rule_with.uuid_format_secret(),
+            "uuid_format_secret should be true when packed as true"
+        );
+
+        // Other fields are unaffected by bit 18.
+        assert_eq!(
+            rule_without.secret_group(),
+            rule_with.secret_group(),
+            "secret_group must be identical regardless of uuid_format_secret"
+        );
+        assert_eq!(rule_without.secret_group(), Some(42));
+
+        assert_eq!(
+            rule_without.needs_assignment_shape_check(),
+            rule_with.needs_assignment_shape_check(),
+            "needs_assignment_shape_check must be identical regardless of uuid_format_secret"
+        );
+        assert!(rule_without.needs_assignment_shape_check());
+    }
 }
