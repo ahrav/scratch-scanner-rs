@@ -64,8 +64,8 @@ use crate::types::{TruthItem, TruthLabel, normalize_path};
 /// Only the 5 columns needed for [`TruthItem`] construction are declared.
 /// The csv crate's header-based serde matching silently skips the remaining
 /// 8 columns (Id, FileID, Domain, RepoName, ValueStart, ValueEnd,
-/// CryptographyKey, PredefinedPattern), avoiding 8 `String` allocations
-/// per row.
+/// CryptographyKey, PredefinedPattern), avoiding per-row deserialization
+/// and allocation overhead for 8 unused columns.
 ///
 /// Fields use `i64` for line numbers (not `u32`) because CredData encodes
 /// "unknown location" as `-1`. Accepting the sentinel at the serde layer
@@ -317,8 +317,9 @@ fn parse_csv_reader_inner<R: io::Read>(
 ///
 /// CredData CSVs exported from Excel or other Windows tools frequently
 /// carry a BOM. Left in place, it becomes part of the first header field
-/// name (`\u{FEFF}Id`), causing serde's header matcher to fail on every
-/// row. Stripping before handing bytes to the csv reader avoids this.
+/// name (`\u{FEFF}Id`), which would break header matching for any struct
+/// that declares that field. Stripping it defensively avoids subtle
+/// deserialization failures if the set of used columns ever changes.
 fn strip_bom(data: &[u8]) -> &[u8] {
     data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data)
 }
@@ -326,7 +327,8 @@ fn strip_bom(data: &[u8]) -> &[u8] {
 /// Parse a CredData CSV file from disk.
 ///
 /// Reads the entire file into memory, strips any UTF-8 BOM, then
-/// delegates to [`parse_csv_reader`]. The eager read (rather than
+/// delegates to the same core parsing loop used by [`parse_csv_reader`],
+/// with a capacity hint estimated from the file size. The eager read (rather than
 /// streaming) is intentional: BOM detection requires inspecting the
 /// first bytes, and CredData meta CSVs are small (typically < 1 MB).
 ///
