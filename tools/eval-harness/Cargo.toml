@@ -18,3 +18,4 @@ scanner-rs = { path = "../..", features = ["tiger-harness"] }
 
 [dev-dependencies]
 proptest = "1.5"
+tempfile = "3"

@@ -1,8 +1,8 @@
 //! Eval-harness binary — measures scanner-rs accuracy against labeled corpora.
 //!
 //! This tool will compare scanner findings (from a JSONL file or a live scan)
-//! against ground-truth annotations from labeled corpora (CredData, LeakyRepo,
-//! synthetic) and compute precision, recall, and PRC-AUC. It will optionally
+//! against ground-truth annotations from labeled corpora (CredData CSV,
+//! synthetic JSON manifests) and compute precision, recall, and PRC-AUC. It will optionally
 //! compare results against a baseline to detect regressions.
 //!
 //! # Exit codes
