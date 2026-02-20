@@ -330,12 +330,33 @@ fn strip_bom(data: &[u8]) -> &[u8] {
 /// streaming) is intentional: BOM detection requires inspecting the
 /// first bytes, and CredData meta CSVs are small (typically < 1 MB).
 ///
+/// Files larger than 256 MB are rejected as a sanity check — real
+/// CredData meta CSVs are well under 1 MB.
+///
 /// Only file-open/read failures produce errors; row-level issues are
 /// counted in [`CsvParseResult`].
 ///
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
 /// the corpus-root prefix from file paths. Use `""` for no stripping.
 pub fn parse_csv(path: &Path, canonical_root: &str) -> Result<CsvParseResult, FileReadError> {
+    // Sanity-check file size before reading into memory. Real CredData
+    // meta CSVs are well under 1 MB; anything above 256 MB is almost
+    // certainly the wrong file.
+    const MAX_CSV_SIZE: u64 = 256 * 1024 * 1024;
+    let meta = std::fs::metadata(path).map_err(|e| FileReadError::new(path.to_path_buf(), e))?;
+    if meta.len() > MAX_CSV_SIZE {
+        return Err(FileReadError::new(
+            path.to_path_buf(),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file size {} bytes exceeds {} byte limit for CredData CSV",
+                    meta.len(),
+                    MAX_CSV_SIZE,
+                ),
+            ),
+        ));
+    }
     let data = std::fs::read(path).map_err(|e| FileReadError::new(path.to_path_buf(), e))?;
     let data = strip_bom(&data);
     // CredData CSV rows average ~100 bytes; pre-allocate to avoid repeated
