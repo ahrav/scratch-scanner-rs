@@ -42,9 +42,12 @@ use scanner_rs::stdx::bitset::DynamicBitSet;
 
 /// Per-file index combining truth items and byte-to-line mapping.
 ///
-/// Merges what were previously two separate HashMaps (`truth_by_file` and
-/// `line_indices`) into a single lookup per finding path, halving per-finding
-/// hash computations.
+/// Collocates the two pieces of information needed per finding path — the
+/// truth items to match against and the [`LineIndex`] for byte-to-line
+/// conversion — behind a single `HashMap` key lookup. This halves per-finding
+/// hash computations compared to separate `truth_by_file` and `line_indices`
+/// maps, and improves cache locality when processing many findings against the
+/// same file.
 struct FileInfo<'a> {
     /// Byte-to-line mapping for this file. `None` when truth items reference
     /// the path but no file contents were provided — findings on such paths
@@ -423,10 +426,12 @@ fn classify_one_finding(
     );
 
     // 5. Scan candidates for the first overlapping truth of each label.
-    //    We track the first match per label rather than breaking early so
-    //    that label priority (Positive > Negative > Placeholder) is resolved
-    //    after scanning, not during. This avoids order-dependent bugs where
-    //    a Negative encountered before a Positive would shadow it.
+    //    Linear scan over `file_truths[..upper]` — bounded by T_f (truth
+    //    count in this file), which is small in practice. We track the first
+    //    match per label rather than breaking early so that label priority
+    //    (Positive > Negative > Placeholder) is resolved after scanning, not
+    //    during. This avoids order-dependent bugs where a Negative encountered
+    //    before a Positive would shadow it.
     let mut best_positive: Option<usize> = None;
     let mut best_negative: Option<usize> = None;
     let mut best_placeholder: Option<usize> = None;
@@ -501,6 +506,24 @@ fn rule_matches(finding_rule: &str, truth_rule: &str) -> bool {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+//
+// Two layers of coverage:
+//
+// 1. **Unit tests** — deterministic scenarios targeting one behavior each
+//    (single-label classification, consumption, priority, out-of-bounds,
+//    rule matching, confidence ordering, etc.). Use a fixed 3-line file
+//    (`SIMPLE_FILE`) to keep byte/line reasoning tractable.
+//
+// 2. **Property tests** (proptest) — randomized scenarios verifying global
+//    invariants that must hold for *all* inputs:
+//    - Conservation: tp + fp + unlabeled == findings count, tp + fn == positives.
+//    - Determinism: identical inputs always produce identical output.
+//    - One-to-one: TP count never exceeds positive truth count.
+//    - Path isolation: findings on path A never match truths on path B.
+//    - Label consistency: no TP without Positive truths, no FP without Negatives.
+//    - Placeholder neutrality: adding/removing Placeholders cannot change TP/FP.
+//    - Recall monotonicity: recall never decreases as the confidence threshold
+//      drops (required for valid PRC-AUC).
 
 #[cfg(test)]
 mod tests {

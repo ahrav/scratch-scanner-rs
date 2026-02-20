@@ -163,8 +163,12 @@ pub struct EvalMetrics {
 /// Per-rule precision breakdown.
 ///
 /// Contains TP/FP counts and precision for a single detection rule.
-/// Recall and F1 are omitted because per-rule false-negative counts
-/// are not available from the classified finding list alone.
+/// Recall and F1 are intentionally omitted: computing per-rule recall
+/// requires knowing how many ground-truth positives exist for each rule,
+/// but the classified finding list only contains scanner output — it has
+/// no record of truth items that went unmatched. Adding per-rule FN
+/// counts would require threading truth metadata through the matching
+/// layer, which is deferred until per-rule reporting is a priority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleMetrics {
     pub tp: u64,
@@ -431,8 +435,10 @@ pub fn bootstrap_ap_ci(
     });
 
     // Percentile extraction: floor for the lower bound, ceil for the upper
-    // bound, clamped to valid indices. With alpha=0.05 and 1000 samples
-    // this gives indices 25 and 975 (the 2.5th and 97.5th percentiles).
+    // bound produces a conservative (wider) CI — the interval never
+    // understates uncertainty. Clamped to valid indices for safety when
+    // n_iterations is very small. With alpha=0.05 and 1000 samples this
+    // gives indices 25 and 975 (the 2.5th and 97.5th percentiles).
     let lo_idx = ((config.alpha / 2.0) * ap_samples.len() as f64).floor() as usize;
     let hi_idx = ((1.0 - config.alpha / 2.0) * ap_samples.len() as f64).ceil() as usize;
     let lo_idx = lo_idx.min(ap_samples.len().saturating_sub(1));
@@ -498,6 +504,12 @@ fn build_pr_curve(classified: &[ClassifiedFinding], total_positives: u64) -> Vec
 /// confidence groups into single operating points. This is the shared
 /// core used by both [`build_pr_curve`] (which extracts from full findings)
 /// and [`bootstrap_ap_ci`] (which works on lightweight resampled pairs).
+///
+/// Takes `&mut` to sort in place, avoiding a clone on every bootstrap
+/// iteration. Uses `sort_unstable_by` because tie-breaking order within
+/// a confidence group is irrelevant — all items sharing a confidence
+/// value are collapsed into a single operating point regardless of their
+/// relative order.
 fn pr_curve_from_scored(scored: &mut [(i8, bool)], total_positives: u64) -> Vec<PrPoint> {
     if scored.is_empty() {
         return Vec::new();
@@ -550,8 +562,13 @@ fn pr_curve_from_scored(scored: &mut [(i8, bool)], total_positives: u64) -> Vec<
 /// Compute step-function Average Precision from a pre-built PR curve.
 ///
 /// `AP = sum of (recall_i - recall_{i-1}) * precision_i` over all
-/// operating points. Returns 0.0 for an empty curve. Result is clamped
-/// to `max(0.0, ap)` to guard against floating-point drift.
+/// operating points. Returns 0.0 for an empty curve.
+///
+/// The result is clamped to `max(0.0, ap)` as a defensive guard: AP is
+/// non-negative by construction (every `recall_i - recall_{i-1}` delta
+/// and every `precision_i` are non-negative), but floating-point
+/// subtraction can produce tiny negatives (e.g., `-1e-17`) when recall
+/// values are very close together.
 fn ap_from_curve(curve: &[PrPoint]) -> f64 {
     let mut prev_recall = 0.0;
     let mut ap = 0.0;
@@ -565,19 +582,33 @@ fn ap_from_curve(curve: &[PrPoint]) -> f64 {
 }
 
 /// Default recall targets for precision-at-recall queries.
-/// Also documented in the `EvalMetrics::precision_at_recall` field doc.
+///
+/// These are industry-standard recall operating points: 0.80 is a
+/// practical minimum for production secret scanning, 0.90 is a common
+/// quality bar for CI gates, and 0.95 is a stretch target for
+/// high-assurance environments. Also documented in the
+/// `EvalMetrics::precision_at_recall` field doc.
 const DEFAULT_PAR_TARGETS: &[f64] = &[0.80, 0.90, 0.95];
 
 /// Default precision targets for recall-at-precision queries.
-/// Also documented in the `EvalMetrics::recall_at_precision` field doc.
+///
+/// A single high-precision target (0.95) answers the practical question
+/// "how much recall can I get if I need <=5% false positive rate?" This
+/// is the operating point most relevant for automated remediation
+/// workflows where FP cost is high. Also documented in the
+/// `EvalMetrics::recall_at_precision` field doc.
 const DEFAULT_RAP_TARGETS: &[f64] = &[0.95];
 
 /// Find the best precision achievable at a given recall target.
 ///
-/// Returns the maximum precision among all operating points where
-/// `recall >= target`. This matters on recall plateaus where multiple
-/// points share the same recall but have different precision (e.g.,
-/// after adding FP items that lower precision without changing recall).
+/// Returns the **maximum** precision among all operating points where
+/// `recall >= target`, rather than the precision at the first qualifying
+/// point. This matters on recall plateaus where multiple points share
+/// the same recall but have decreasing precision (e.g., after adding FP
+/// items that lower precision without changing recall). Taking the max
+/// selects the operating point where the classifier is most precise
+/// while still meeting the recall floor.
+///
 /// Returns `None` if no point reaches the target recall.
 ///
 /// The comparison uses a small epsilon (`1e-12`) to absorb floating-point
@@ -598,9 +629,13 @@ fn precision_at_recall(curve: &[PrPoint], target: f64) -> Option<f64> {
 
 /// Find the highest recall achievable at a given precision target.
 ///
-/// Walks the curve from high recall to low recall and returns the recall
-/// at the first point where `precision >= target`. This is the maximum
-/// recall where the precision constraint is still satisfied.
+/// Walks the curve **backwards** (from the last point to the first),
+/// which means from high recall to low recall because the curve is
+/// ordered confidence-descending (i.e., recall-ascending). The first
+/// point encountered with `precision >= target` is therefore the
+/// highest-recall point meeting the constraint — no need to scan
+/// further.
+///
 /// Returns `None` if no operating point meets the precision threshold.
 ///
 /// Uses the same `1e-12` epsilon as [`precision_at_recall`] for
@@ -631,8 +666,16 @@ fn compute_average_precision(classified: &[ClassifiedFinding], total_positives: 
 /// Unlabeled items are skipped. Rules that produce only Unlabeled
 /// findings are absent from the output entirely.
 ///
-/// The result is collected into a `BTreeMap` for deterministic iteration
-/// order in serialized output (JSON reports, CLI tables).
+/// Accumulation uses a temporary `HashMap<&str, (u64, u64)>` for O(1)
+/// amortized insertion, then converts to `BTreeMap<String, RuleMetrics>`
+/// for deterministic iteration order in serialized output (JSON reports,
+/// CLI tables). The `&str` keys borrow from the input to avoid
+/// per-finding string allocation during counting.
+///
+/// # Complexity
+///
+/// O(n + r log r) where n is the number of classified findings and r is
+/// the number of distinct rules (r << n in practice).
 fn compute_per_rule(classified: &[ClassifiedFinding]) -> BTreeMap<String, RuleMetrics> {
     let mut counts: HashMap<&str, (u64, u64)> = HashMap::new();
 
