@@ -367,29 +367,35 @@ pub fn parse_csv(path: &Path, canonical_root: &str) -> Result<ParseResult, Parse
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
 /// the corpus-root prefix from file paths. Use `""` for no stripping.
 pub fn load_meta_dir(dir: &Path, canonical_root: &str) -> Result<DirLoadResult, ParseError> {
-    let mut csv_paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| ParseError {
-            path: dir.to_path_buf(),
-            source: e,
-        })?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
-            {
-                Some(path)
-            } else {
-                None
+    let mut csv_paths: Vec<PathBuf> = Vec::new();
+    let mut file_errors: Vec<ParseError> = Vec::new();
+
+    for entry_result in std::fs::read_dir(dir).map_err(|e| ParseError {
+        path: dir.to_path_buf(),
+        source: e,
+    })? {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(source) => {
+                file_errors.push(ParseError {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+                continue;
             }
-        })
-        .collect();
+        };
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+        {
+            csv_paths.push(path);
+        }
+    }
     csv_paths.sort();
 
     let files_found = csv_paths.len() as u32;
     let mut merged = ParseResult::empty();
-    let mut file_errors = Vec::new();
     let mut files_parsed = 0u32;
 
     for csv_path in &csv_paths {
