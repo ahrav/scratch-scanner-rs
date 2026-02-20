@@ -41,6 +41,20 @@ pub const PATH_SCHEME_FS_V1: &str = "fs_path_v1";
 /// symlink chains will produce different path IDs.
 #[must_use]
 pub fn canonicalize_path(raw: &str) -> String {
+    // Fast path: if the input has no backslashes, no `.`/`..` components,
+    // no leading/trailing `/`, and no consecutive `//`, it is already
+    // canonical — avoid the Vec + join overhead.
+    if !raw.is_empty()
+        && !raw.contains('\\')
+        && !raw.starts_with('/')
+        && !raw.ends_with('/')
+        && !raw.contains("//")
+        && !raw.contains("/.")
+        && !raw.starts_with('.')
+    {
+        return raw.to_string();
+    }
+
     let mut components: Vec<&str> = Vec::new();
     for part in raw.split(&['/', '\\']) {
         match part {
