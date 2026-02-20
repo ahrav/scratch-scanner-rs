@@ -5,8 +5,9 @@ edition = "2024"
 publish = false
 
 # Intentionally standalone — not a workspace member of the root crate.
-# If [workspace] is ever added to root Cargo.toml, explicitly exclude
-# this path or add it as a member.
+# Prevent cargo from walking up and claiming this as part of a parent workspace.
+[workspace]
+members = ["."]
 
 [dependencies]
 csv = "1.3"

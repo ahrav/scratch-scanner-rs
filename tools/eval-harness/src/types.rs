@@ -58,8 +58,9 @@ use serde::{Deserialize, Serialize};
 pub struct NormalizedFinding {
     /// Forward-slash normalized path relative to the corpus root.
     pub path: String,
-    /// Byte offset of the finding start (inclusive). Matches
-    /// `FindingEvent.start` (u64), not `FindingRec.span_start` (u32).
+    /// Byte offset of the finding start (inclusive). Uses the full 64-bit byte
+    /// offset from the scanner's streaming output, not the 32-bit truncated
+    /// offset stored in persistent records.
     pub byte_start: u64,
     /// Byte offset of the finding end (exclusive).
     pub byte_end: u64,
@@ -144,8 +145,9 @@ impl PartialOrd for NormalizedFinding {
 ///
 /// Uses **line numbers** because CSV corpora annotate by line, not byte
 /// offset. Scanner findings use byte offsets ([`NormalizedFinding::byte_start`]),
-/// so a separate `LineIndex` component handles the byte-to-line conversion
-/// during matching. This type intentionally stays in the line-number domain
+/// so a separate line-index layer (not yet implemented) handles the
+/// byte-to-line conversion during matching. This type intentionally stays
+/// in the line-number domain
 /// to avoid lossy round-trips when ingesting corpus CSVs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthItem {
