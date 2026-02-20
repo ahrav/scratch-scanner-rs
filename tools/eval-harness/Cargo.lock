@@ -321,6 +321,7 @@ dependencies = [
  "scanner-rs",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

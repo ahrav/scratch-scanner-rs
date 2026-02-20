@@ -9,8 +9,8 @@
 //!    findings at the same location are collapsed, retaining the highest
 //!    confidence score.
 //!
-//! 2. **Load ground truth** — Labeled corpora (CredData, LeakyRepo, synthetic
-//!    datasets) are loaded as [`TruthItem`] records using line-number
+//! 2. **Load ground truth** — Labeled corpora (CredData CSV, synthetic JSON
+//!    manifests) are loaded as [`TruthItem`] records using line-number
 //!    coordinates. A separate line-index layer converts between byte offsets
 //!    and line numbers so findings and truth items can be compared.
 //!
@@ -19,9 +19,26 @@
 //!    into precision/recall computation and PRC-AUC curves at varying
 //!    confidence thresholds.
 //!
+//! # Coordinate systems
+//!
+//! The two main types deliberately use different coordinate systems:
+//!
+//! - [`NormalizedFinding`] uses **byte offsets** (`byte_start`, `byte_end`)
+//!   because that is what the scanner emits natively.
+//! - [`TruthItem`] uses **1-indexed line numbers** (`line_start`, `line_end`)
+//!   because ground-truth corpora (CSV files, hand-written manifests) annotate
+//!   by line.
+//!
+//! [`crate::line_index::LineIndex`] handles the conversion at matching time.
+//! Keeping each type in its native coordinate system avoids lossy round-trips
+//! during ingestion and makes each loader simpler.
+//!
+//! # Path normalization
+//!
 //! All paths flowing through these types must be normalized via
 //! [`normalize_path`] to ensure cross-platform comparability (forward slashes,
-//! no `.`/`..`, corpus-root prefix stripped).
+//! no `.`/`..`, corpus-root prefix stripped). Matching between findings and
+//! truth items relies on exact string equality of normalized paths.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -39,12 +56,19 @@ use serde::{Deserialize, Serialize};
 /// Identity is `(path, byte_start, byte_end, rule)` — `confidence` is
 /// intentionally excluded from `Eq`, `Hash`, and `Ord` because the same
 /// detection at different confidence levels is still one finding. This
-/// prevents inflated PRC-AUC from counting duplicates.
+/// prevents inflated PRC-AUC from counting duplicates. See [`identity`]
+/// for the implementation of this guarantee.
+///
+/// Byte offsets use a half-open `[byte_start, byte_end)` convention
+/// matching the scanner's output. A zero-width finding (`byte_start ==
+/// byte_end`) is valid and represents a detection with no associated
+/// byte span (e.g., metadata-only rules).
 ///
 /// # Dedup pattern
 ///
 /// After collecting findings, sort and dedup while keeping the highest
-/// confidence score:
+/// confidence score. [`crate::finding_parser::dedup_findings`] provides
+/// this as a ready-made helper.
 ///
 /// ```rust,ignore
 /// findings.sort();
@@ -57,6 +81,8 @@ use serde::{Deserialize, Serialize};
 ///     }
 /// });
 /// ```
+///
+/// [`identity`]: NormalizedFinding::identity
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NormalizedFinding {
     /// Forward-slash normalized path relative to the corpus root.
@@ -102,9 +128,14 @@ impl NormalizedFinding {
         }
     }
 
-    /// The four fields that define finding identity for dedup.
-    /// All trait impls (`PartialEq`, `Hash`, `Ord`) delegate here so the
-    /// field set cannot diverge between impls.
+    /// The four fields that define finding identity for dedup and matching.
+    ///
+    /// All trait impls (`PartialEq`, `Hash`, `Ord`) delegate to this single
+    /// method rather than implementing field comparisons independently. This
+    /// "single source of truth" pattern guarantees the three impls agree on
+    /// which fields matter — a mismatch between `Eq` and `Hash` would
+    /// silently corrupt `HashSet`/`HashMap` lookups, and a mismatch between
+    /// `Eq` and `Ord` would violate `BTreeMap`'s ordering contract.
     fn identity(&self) -> (&str, u64, u64, &str) {
         (&self.path, self.byte_start, self.byte_end, &self.rule)
     }
@@ -143,14 +174,20 @@ impl PartialOrd for NormalizedFinding {
 
 // ── Ground truth ────────────────────────────────────────────────────────
 
-/// A single ground-truth annotation from a labeled corpus (CredData,
-/// LeakyRepo, synthetic).
+/// A single ground-truth annotation from a labeled corpus (CredData CSV,
+/// synthetic JSON manifest).
 ///
-/// Uses **line numbers** because CSV corpora annotate by line, not byte
-/// offset. Scanner findings use byte offsets ([`NormalizedFinding::byte_start`]),
-/// so [`crate::line_index::LineIndex`] handles the byte-to-line conversion
-/// during matching. This type intentionally stays in the line-number domain
-/// to avoid lossy round-trips when ingesting corpus CSVs.
+/// Uses **1-indexed, inclusive line numbers** because ground-truth corpora
+/// annotate by line, not byte offset. A single-line annotation has
+/// `line_start == line_end`. Scanner findings use byte offsets
+/// ([`NormalizedFinding::byte_start`]), so [`crate::line_index::LineIndex`]
+/// handles the byte-to-line conversion during matching.
+///
+/// This type intentionally stays in the line-number domain to avoid lossy
+/// round-trips when ingesting corpus CSVs — converting line numbers to
+/// byte offsets at load time would require reading every source file
+/// upfront, and the reverse conversion at matching time is cheap (O(log L)
+/// binary search per finding).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruthItem {
     /// Forward-slash normalized path relative to the corpus root.
@@ -164,6 +201,10 @@ pub struct TruthItem {
     /// Ground-truth label for this annotation.
     pub label: TruthLabel,
     /// Rule name this annotation applies to.
+    ///
+    /// Accepts `"category"` as an alias during deserialization for
+    /// interoperability with manifest formats that use that field name.
+    #[serde(alias = "category")]
     pub rule: String,
 }
 
@@ -238,15 +279,24 @@ impl std::fmt::Display for TruthLabel {
 /// Classification of a scanner finding after matching against ground truth.
 ///
 /// The metrics layer uses these classifications to compute precision, recall,
-/// and PRC-AUC. Each scanner finding is classified as exactly one of TP, FP,
-/// or Unlabeled. Separately, each ground-truth positive that no finding
-/// matches produces an FN. Together the four variants cover both domains
-/// without overlap.
+/// and PRC-AUC. The four variants arise from two independent domains:
+///
+/// - **Finding-derived** (one class per scanner finding):
+///   - [`TruePositive`](MatchClass::TruePositive) — matched a positive annotation.
+///   - [`FalsePositive`](MatchClass::FalsePositive) — matched a negative annotation.
+///   - [`Unlabeled`](MatchClass::Unlabeled) — no annotation at that location.
+///
+/// - **Truth-derived** (one class per unmatched ground-truth positive):
+///   - [`FalseNegative`](MatchClass::FalseNegative) — no finding matched this positive.
+///
+/// Together the four variants cover both domains without overlap.
 ///
 /// The distinction between [`FalsePositive`](MatchClass::FalsePositive) and
 /// [`Unlabeled`](MatchClass::Unlabeled) matters for corpus coverage analysis:
-/// a high unlabeled rate signals that the corpus has gaps, not necessarily
-/// that the scanner is noisy.
+/// a high unlabeled rate signals that the corpus has annotation gaps, not
+/// necessarily that the scanner is noisy. Only `FalsePositive` penalizes
+/// precision; `Unlabeled` findings are excluded from the precision
+/// denominator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchClass {
@@ -319,6 +369,13 @@ pub fn normalize_path(raw: &str, canonical_root: &str) -> String {
         return canonical;
     }
 
+    // Two-step strip: first remove the root prefix, then remove the
+    // joining `/`. The second strip_prefix('/') serves double duty:
+    // it removes the separator AND acts as a segment-boundary guard —
+    // if canonical_root is "corpus" and canonical is "corpus_data/f.txt",
+    // strip_prefix succeeds (yielding "_data/f.txt") but the second
+    // strip_prefix('/') fails, falling back to the full canonical path.
+    // This prevents partial-segment stripping.
     canonical
         .strip_prefix(canonical_root)
         .and_then(|s| s.strip_prefix('/'))
@@ -330,9 +387,14 @@ pub fn normalize_path(raw: &str, canonical_root: &str) -> String {
 
 /// I/O error from reading a file or directory during corpus loading.
 ///
-/// Shared by the CredData CSV parser and the JSONL finding parser so both
-/// surface file-level failures in the same way. Row/line-level issues are
-/// not errors — they are counted in the respective parse-result types
+/// Shared by [`crate::creddata`] and [`crate::finding_parser`] so both
+/// surface file-level failures in the same way. The synthetic manifest
+/// loader ([`crate::synthetic`]) uses its own [`crate::synthetic::SyntheticError`]
+/// instead because it needs richer error reporting (JSON parse errors,
+/// per-item validation).
+///
+/// Row/line-level issues are not represented here — they are counted in
+/// the respective parse-result types (`CsvParseResult`, `JsonlParseResult`)
 /// instead, following the principle that a single bad record should not
 /// abort the entire corpus load.
 #[derive(Debug)]
