@@ -1,4 +1,4 @@
-//! Precision, recall, F1, and PRC-AUC (Average Precision) computation.
+//! Evaluation metrics: precision, recall, F1/F2, Average Precision, P@R, R@P, bootstrap CI.
 //!
 //! This is the final stage of the eval pipeline: it takes classified findings
 //! from the matching layer and produces numeric accuracy metrics. The input is
@@ -10,8 +10,8 @@
 //! ## Pipeline context
 //!
 //! ```text
-//! Scanner output ──► NormalizedFinding ──► classify() ──► (finding, MatchClass) ──► this module
-//! Ground truth   ──► TruthItem         ──►              ──► fn_count            ──►
+//! Scanner output ──► NormalizedFinding ──► matching ──► (finding, MatchClass) ──► this module
+//! Ground truth   ──► TruthItem         ──►          ──► fn_count              ──►
 //! ```
 //!
 //! ## Metric families
@@ -60,10 +60,35 @@ use crate::types::{MatchClass, NormalizedFinding};
 
 // ── Public types ────────────────────────────────────────────────────────
 
+/// A threshold query result: "at the given target, what value was achieved?"
+///
+/// Used by [`EvalMetrics::precision_at_recall`] and
+/// [`EvalMetrics::recall_at_precision`] to report operating-point metrics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ThresholdResult {
+    /// The target threshold (e.g., target recall of 0.90).
+    pub target: f64,
+    /// The achieved metric value, or `None` if no operating point
+    /// meets the target.
+    pub value: Option<f64>,
+}
+
+/// A confidence interval with lower and upper bounds.
+///
+/// Used by [`EvalMetrics::ap_ci`] to report bootstrap confidence
+/// intervals for Average Precision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ConfidenceInterval {
+    /// Lower bound of the confidence interval.
+    pub lower: f64,
+    /// Upper bound of the confidence interval.
+    pub upper: f64,
+}
+
 /// Aggregate evaluation metrics for a classified finding set.
 ///
-/// Combines threshold-free counts (precision, recall, F1) with a
-/// confidence-aware ranking metric (Average Precision / PRC-AUC). The two
+/// Combines threshold-free counts (precision, recall, F1, F2) with a
+/// confidence-aware ranking metric (Average Precision). The two
 /// views are complementary: threshold-free metrics treat every finding
 /// equally regardless of confidence, while AP rewards classifiers that
 /// assign higher confidence to true positives.
@@ -73,15 +98,25 @@ use crate::types::{MatchClass, NormalizedFinding};
 /// - `tp + fp + unlabeled` equals the length of the input `classified` slice
 ///   (excluding any `FalseNegative` entries, which must not appear).
 /// - `total_positives = tp + false_neg` (invariant maintained by the caller).
-/// - `baseline_ap` is the AP a random confidence ranker would achieve over the
-///   scored population (TP + FP). When `precision_recall_auc` is close to
-///   `baseline_ap`, the classifier's confidence ranking adds little value
-///   beyond its raw detection rate. Can exceed `precision_recall_auc` when
-///   recall is low.
+/// - `f2 = 5 * P * R / (4*P + R)` when `4*P + R > 0`, else 0.0.
+/// - `f2 >= f1` when `recall >= precision`, `f2 <= f1` otherwise.
+/// - `baseline_ap` always equals `precision` (both are `tp / (tp + fp)`).
+///   This is the class prevalence among scored items, which also equals the
+///   expected AP of a random confidence ranker over the scored population.
+///   The field exists as a separate concept even though the formula is
+///   identical for the step-function AP definition used here.
+/// - `precision_at_recall` targets come from `DEFAULT_PAR_TARGETS`.
+/// - `recall_at_precision` targets come from `DEFAULT_RAP_TARGETS`.
+/// - `ap_ci` is always `None` from `compute_metrics`; populate via
+///   [`with_bootstrap_ci`](EvalMetrics::with_bootstrap_ci).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalMetrics {
-    /// Average Precision (step-function PRC-AUC with tie collapsing).
-    pub precision_recall_auc: f64,
+    /// Average Precision (step-function AP with tie collapsing).
+    ///
+    /// Computed as `sum of (recall_i - recall_{i-1}) * precision_i` over
+    /// collapsed operating points, matching sklearn's `average_precision_score`.
+    /// This is *not* the trapezoidal area under the PR curve (`auc(recall, precision)`).
+    pub average_precision: f64,
     /// Threshold-free precision: TP / (TP + FP). Equals 0.0 when
     /// there are no positive predictions (TP + FP = 0).
     pub precision: f64,
@@ -104,30 +139,24 @@ pub struct EvalMetrics {
     pub false_neg: u64,
     /// Findings with no ground-truth annotation (excluded from all metrics).
     pub unlabeled: u64,
-    /// Reference AP for a random confidence ranker over the scored population:
-    /// `tp / (tp + fp)`. Useful for gauging whether confidence ranking adds
-    /// value beyond the raw detection rate. Uses scored positives (TP) rather
+    /// Baseline AP: class prevalence among scored items (`tp / (tp + fp)`).
+    ///
+    /// Equals the expected AP of a random confidence ranker over the scored
+    /// population. Useful for gauging whether confidence ranking adds value
+    /// beyond the raw detection rate. Uses scored positives (TP) rather
     /// than `total_positives` so the baseline stays achievable when recall is
-    /// incomplete. Can exceed `precision_recall_auc` when recall is low.
+    /// incomplete. Can exceed `average_precision` when recall is low.
     pub baseline_ap: f64,
-    /// Precision at fixed recall targets. Each entry is
-    /// `(target_recall, Some(precision))` if achievable, or
-    /// `(target_recall, None)` if the target recall exceeds the maximum
-    /// achievable recall.
+    /// Precision at fixed recall targets.
     /// Default targets: 0.80, 0.90, 0.95.
-    pub precision_at_recall: Vec<(f64, Option<f64>)>,
-    /// Recall at fixed precision targets. Each entry is
-    /// `(target_precision, Some(recall))` — the highest recall where
-    /// precision is at least the target — or `(target_precision, None)` if
-    /// no operating point meets the precision threshold.
+    pub precision_at_recall: Vec<ThresholdResult>,
+    /// Recall at fixed precision targets — the highest recall where
+    /// precision is at least the target.
     /// Default target: 0.95.
-    pub recall_at_precision: Vec<(f64, Option<f64>)>,
-    /// Lower bound of bootstrap confidence interval for AP. `None` when
-    /// bootstrap has not been run (the default from `compute_metrics`).
-    pub ap_ci_lower: Option<f64>,
-    /// Upper bound of bootstrap confidence interval for AP. `None` when
-    /// bootstrap has not been run.
-    pub ap_ci_upper: Option<f64>,
+    pub recall_at_precision: Vec<ThresholdResult>,
+    /// Bootstrap confidence interval for AP. `None` when bootstrap has
+    /// not been run (the default from [`compute_metrics`]).
+    pub ap_ci: Option<ConfidenceInterval>,
     /// Per-rule breakdown keyed by rule name, sorted lexicographically.
     pub per_rule: BTreeMap<String, RuleMetrics>,
 }
@@ -149,7 +178,7 @@ pub struct RuleMetrics {
 ///
 /// Bootstrap resampling computes a confidence interval for the Average
 /// Precision metric by repeatedly resampling the classified findings
-/// (stratified by class to preserve the TP/FP ratio) and recomputing AP
+/// (stratified by class to preserve the TP and FP counts) and recomputing AP
 /// on each resample. The resulting distribution of AP values yields
 /// percentile-based confidence bounds.
 ///
@@ -194,8 +223,22 @@ impl EvalMetrics {
     /// ```
     #[must_use]
     pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Self {
-        self.ap_ci_lower = Some(ci.0);
-        self.ap_ci_upper = Some(ci.1);
+        debug_assert!(
+            ci.0 <= ci.1,
+            "CI lower ({}) must not exceed upper ({})",
+            ci.0,
+            ci.1,
+        );
+        debug_assert!(
+            ci.0 >= 0.0 && ci.1 <= 1.0,
+            "CI bounds must be in [0.0, 1.0], got ({}, {})",
+            ci.0,
+            ci.1,
+        );
+        self.ap_ci = Some(ConfidenceInterval {
+            lower: ci.0,
+            upper: ci.1,
+        });
         self
     }
 }
@@ -266,21 +309,27 @@ pub fn compute_metrics(
     let f2 = safe_div(5.0 * precision * recall, 4.0 * precision + recall);
 
     let curve = build_pr_curve(classified, total_positives);
-    let precision_recall_auc = ap_from_curve(&curve);
-    let baseline_ap = safe_div(tp as f64, (tp + fp) as f64);
+    let average_precision = ap_from_curve(&curve);
+    let baseline_ap = precision;
     let per_rule = compute_per_rule(classified);
 
     let par = DEFAULT_PAR_TARGETS
         .iter()
-        .map(|&t| (t, precision_at_recall(&curve, t)))
+        .map(|&t| ThresholdResult {
+            target: t,
+            value: precision_at_recall(&curve, t),
+        })
         .collect();
     let rap = DEFAULT_RAP_TARGETS
         .iter()
-        .map(|&t| (t, recall_at_precision(&curve, t)))
+        .map(|&t| ThresholdResult {
+            target: t,
+            value: recall_at_precision(&curve, t),
+        })
         .collect();
 
     EvalMetrics {
-        precision_recall_auc,
+        average_precision,
         precision,
         recall,
         f1,
@@ -292,8 +341,7 @@ pub fn compute_metrics(
         baseline_ap,
         precision_at_recall: par,
         recall_at_precision: rap,
-        ap_ci_lower: None,
-        ap_ci_upper: None,
+        ap_ci: None,
         per_rule,
     }
 }
@@ -301,7 +349,7 @@ pub fn compute_metrics(
 /// Compute a bootstrap confidence interval for Average Precision.
 ///
 /// Uses stratified resampling: TP and FP items are resampled independently
-/// (with replacement) to preserve the class ratio in every iteration.
+/// (with replacement) to preserve the TP and FP counts in every iteration.
 /// Each resampled set is run through `build_pr_curve` + `ap_from_curve` to
 /// produce an AP estimate. The resulting AP distribution is sorted and
 /// percentiles at `[alpha/2, 1 - alpha/2]` are returned.
@@ -315,51 +363,84 @@ pub fn compute_metrics(
 /// O(`n_iterations` * n * log n) where n is the number of TP + FP items.
 /// Each iteration sorts the resampled set to build a PR curve.
 ///
+/// # Panics
+///
+/// - If `config.n_iterations` is zero.
+/// - If `config.alpha` is not in the open interval `(0.0, 1.0)`.
+/// - If `total_positives` is less than the number of TP items in `classified`.
+///
 /// # Returns
 ///
 /// `(ci_lower, ci_upper)` as the `[alpha/2, 1 - alpha/2]` percentiles.
-/// Returns `(0.0, 0.0)` when there are no TP or FP items (Unlabeled items
-/// are excluded from bootstrap resampling).
+/// Returns `(0.0, 0.0)` when there are zero TP *and* zero FP items
+/// (Unlabeled items are excluded from bootstrap resampling).
 pub fn bootstrap_ap_ci(
     classified: &[(NormalizedFinding, MatchClass)],
     total_positives: u64,
     config: &BootstrapConfig,
 ) -> (f64, f64) {
-    let tp_items: Vec<_> = classified
+    // Extract lightweight (confidence, is_tp) pairs — avoids cloning full
+    // NormalizedFinding structs on every bootstrap iteration.
+    let tp_scores: Vec<i8> = classified
         .iter()
         .filter(|(_, c)| *c == MatchClass::TruePositive)
-        .cloned()
+        .map(|(f, _)| f.confidence)
         .collect();
-    let fp_items: Vec<_> = classified
+    let fp_scores: Vec<i8> = classified
         .iter()
         .filter(|(_, c)| *c == MatchClass::FalsePositive)
-        .cloned()
+        .map(|(f, _)| f.confidence)
         .collect();
 
-    if tp_items.is_empty() && fp_items.is_empty() {
+    assert!(
+        config.n_iterations > 0,
+        "BootstrapConfig::n_iterations must be > 0, got {}",
+        config.n_iterations,
+    );
+    assert!(
+        config.alpha > 0.0 && config.alpha < 1.0,
+        "BootstrapConfig::alpha must be in (0.0, 1.0), got {}",
+        config.alpha,
+    );
+    assert!(
+        total_positives >= tp_scores.len() as u64,
+        "total_positives ({total_positives}) must be >= TP count ({}); \
+         otherwise recall exceeds 1.0",
+        tp_scores.len(),
+    );
+
+    if tp_scores.is_empty() && fp_scores.is_empty() {
         return (0.0, 0.0);
     }
 
     let mut rng = StdRng::seed_from_u64(config.seed);
     let mut ap_samples = Vec::with_capacity(config.n_iterations as usize);
 
+    // Pre-allocate a single buffer for resampled scored pairs, reused
+    // across iterations to avoid per-iteration allocation.
+    let resample_len = tp_scores.len() + fp_scores.len();
+    let mut resampled = Vec::with_capacity(resample_len);
+
     for _ in 0..config.n_iterations {
-        let mut resampled = Vec::with_capacity(tp_items.len() + fp_items.len());
+        resampled.clear();
 
-        for _ in 0..tp_items.len() {
-            let idx = rng.gen_range(0..tp_items.len());
-            resampled.push(tp_items[idx].clone());
+        for _ in 0..tp_scores.len() {
+            let idx = rng.gen_range(0..tp_scores.len());
+            resampled.push((tp_scores[idx], true));
         }
-        for _ in 0..fp_items.len() {
-            let idx = rng.gen_range(0..fp_items.len());
-            resampled.push(fp_items[idx].clone());
+        for _ in 0..fp_scores.len() {
+            let idx = rng.gen_range(0..fp_scores.len());
+            resampled.push((fp_scores[idx], false));
         }
 
-        let curve = build_pr_curve(&resampled, total_positives);
+        let curve = pr_curve_from_scored(&mut resampled, total_positives);
         ap_samples.push(ap_from_curve(&curve));
     }
 
-    ap_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ap_samples.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("AP values must be finite for bootstrap CI")
+    });
 
     // Percentile extraction: floor for the lower bound, ceil for the upper
     // bound, clamped to valid indices. With alpha=0.05 and 1000 samples
@@ -378,8 +459,8 @@ pub fn bootstrap_ap_ci(
 /// collapsing. Each point represents the cumulative precision and recall
 /// achieved when the confidence threshold is set at (or below) a
 /// particular level. Points are produced in confidence-descending order,
-/// so precision generally decreases and recall generally increases as you
-/// walk the curve.
+/// so recall monotonically increases (non-decreasing) and precision
+/// generally decreases as you walk the curve.
 #[derive(Debug, Clone, Copy)]
 struct PrPoint {
     /// TP_so_far / (TP_so_far + FP_so_far) at this threshold.
@@ -414,9 +495,6 @@ fn build_pr_curve(
         return Vec::new();
     }
 
-    // Reduce to (confidence, is_tp) pairs. Only TP and FP participate
-    // in the ranked curve; Unlabeled items are excluded from all
-    // confidence-aware metrics.
     let mut scored: Vec<(i8, bool)> = classified
         .iter()
         .filter_map(|(f, c)| match c {
@@ -426,13 +504,23 @@ fn build_pr_curve(
         })
         .collect();
 
+    pr_curve_from_scored(&mut scored, total_positives)
+}
+
+/// Build a PR curve from pre-extracted `(confidence, is_tp)` pairs.
+///
+/// Sorts `scored` in place by confidence descending, then collapses tied
+/// confidence groups into single operating points. This is the shared
+/// core used by both [`build_pr_curve`] (which extracts from full findings)
+/// and [`bootstrap_ap_ci`] (which works on lightweight resampled pairs).
+fn pr_curve_from_scored(scored: &mut [(i8, bool)], total_positives: u64) -> Vec<PrPoint> {
     if scored.is_empty() {
         return Vec::new();
     }
 
     // Descending sort so the highest-confidence items come first,
     // producing a curve that sweeps from low recall to high recall.
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
     let total_pos_f64 = total_positives as f64;
     let mut cum_tp: u64 = 0;
@@ -492,31 +580,35 @@ fn ap_from_curve(curve: &[PrPoint]) -> f64 {
 }
 
 /// Default recall targets for precision-at-recall queries.
+/// Also documented in the `EvalMetrics::precision_at_recall` field doc.
 const DEFAULT_PAR_TARGETS: &[f64] = &[0.80, 0.90, 0.95];
 
 /// Default precision targets for recall-at-precision queries.
+/// Also documented in the `EvalMetrics::recall_at_precision` field doc.
 const DEFAULT_RAP_TARGETS: &[f64] = &[0.95];
 
-/// Find the precision achievable at a given recall target.
+/// Find the best precision achievable at a given recall target.
 ///
-/// Walks the curve from high recall to low recall (reverse order) and
-/// returns the precision at the first point where `recall >= target`.
-/// Returns `None` if no point reaches the target recall (e.g., the
-/// target exceeds the maximum achievable recall due to false negatives).
+/// Returns the maximum precision among all operating points where
+/// `recall >= target`. This matters on recall plateaus where multiple
+/// points share the same recall but have different precision (e.g.,
+/// after adding FP items that lower precision without changing recall).
+/// Returns `None` if no point reaches the target recall.
 ///
 /// The comparison uses a small epsilon (`1e-12`) to absorb floating-point
 /// rounding in cumulative recall values (e.g., 3/3 computing to
 /// 0.9999999999999998 instead of 1.0).
 fn precision_at_recall(curve: &[PrPoint], target: f64) -> Option<f64> {
-    // Curve is ordered low-recall -> high-recall. Walk backwards to find
-    // the highest-recall point that meets the target, which is the first
-    // point we encounter from the right with recall >= target.
-    for pt in curve.iter().rev() {
+    let mut best: Option<f64> = None;
+    for pt in curve {
         if pt.recall >= target - 1e-12 {
-            return Some(pt.precision);
+            best = Some(match best {
+                Some(prev) => f64::max(prev, pt.precision),
+                None => pt.precision,
+            });
         }
     }
-    None
+    best
 }
 
 /// Find the highest recall achievable at a given precision target.
@@ -627,13 +719,33 @@ mod tests {
 
         let cases: &[(&str, &[(i8, MatchClass)], u64, f64)] = &[
             ("single_tp", &[(5, TP)], 1, 1.0),
-            ("alternating", &[(5, TP), (4, FP), (3, TP), (2, FP), (1, TP)], 3, 34.0 / 45.0),
-            ("tp_heavy_front", &[(5, TP), (4, TP), (3, FP), (2, TP), (1, FP)], 3, 11.0 / 12.0),
+            (
+                "alternating",
+                &[(5, TP), (4, FP), (3, TP), (2, FP), (1, TP)],
+                3,
+                34.0 / 45.0,
+            ),
+            (
+                "tp_heavy_front",
+                &[(5, TP), (4, TP), (3, FP), (2, TP), (1, FP)],
+                3,
+                11.0 / 12.0,
+            ),
             ("all_fp", &[(5, FP), (4, FP), (3, FP)], 3, 0.0),
-            ("fp_heavy_front", &[(5, FP), (4, TP), (3, FP), (2, TP), (1, TP)], 3, 8.0 / 15.0),
+            (
+                "fp_heavy_front",
+                &[(5, FP), (4, TP), (3, FP), (2, TP), (1, TP)],
+                3,
+                8.0 / 15.0,
+            ),
             // Tied scores collapse into a single operating point.
             ("tied_collapse", &[(5, TP), (5, FP), (5, TP)], 2, 2.0 / 3.0),
-            ("constant_pred", &[(5, TP), (5, FP), (5, FP), (5, FP)], 1, 0.25),
+            (
+                "constant_pred",
+                &[(5, TP), (5, FP), (5, FP), (5, FP)],
+                1,
+                0.25,
+            ),
             // Recall capped at 0.5 because 2 of 4 positives are missed.
             ("with_fn", &[(5, TP), (4, TP)], 4, 0.5),
             ("empty", &[], 0, 0.0),
@@ -659,7 +771,7 @@ mod tests {
             item(3, MatchClass::TruePositive),
         ];
         let m = compute_metrics(&classified, 0, 3);
-        assert!((m.precision_recall_auc - 1.0).abs() < EPS);
+        assert!((m.average_precision - 1.0).abs() < EPS);
         assert!((m.precision - 1.0).abs() < EPS);
         assert!((m.recall - 1.0).abs() < EPS);
         assert!((m.f1 - 1.0).abs() < EPS);
@@ -668,11 +780,23 @@ mod tests {
         assert_eq!(m.fp, 0);
         assert_eq!(m.false_neg, 0);
         assert_eq!(m.unlabeled, 0);
-        for &(target, val) in &m.precision_at_recall {
-            assert_eq!(val, Some(1.0), "P@R={target} should be Some(1.0), got {val:?}");
+        for r in &m.precision_at_recall {
+            assert_eq!(
+                r.value,
+                Some(1.0),
+                "P@R={} should be Some(1.0), got {:?}",
+                r.target,
+                r.value,
+            );
         }
-        for &(target, val) in &m.recall_at_precision {
-            assert_eq!(val, Some(1.0), "R@P={target} should be Some(1.0), got {val:?}");
+        for r in &m.recall_at_precision {
+            assert_eq!(
+                r.value,
+                Some(1.0),
+                "R@P={} should be Some(1.0), got {:?}",
+                r.target,
+                r.value,
+            );
         }
     }
 
@@ -683,7 +807,7 @@ mod tests {
             item(4, MatchClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 3, 3);
-        assert!(m.precision_recall_auc.abs() < EPS);
+        assert!(m.average_precision.abs() < EPS);
         assert!(m.precision.abs() < EPS);
         assert!(m.recall.abs() < EPS);
         assert!(m.f1.abs() < EPS);
@@ -691,15 +815,19 @@ mod tests {
         assert_eq!(m.tp, 0);
         assert_eq!(m.fp, 2);
         assert_eq!(m.false_neg, 3);
-        for &(target, val) in &m.precision_at_recall {
-            assert_eq!(val, None, "P@R={target} should be None when all FP, got {val:?}");
+        for r in &m.precision_at_recall {
+            assert_eq!(
+                r.value, None,
+                "P@R={} should be None when all FP, got {:?}",
+                r.target, r.value
+            );
         }
     }
 
     #[test]
     fn metrics_empty_input() {
         let m = compute_metrics(&[], 0, 0);
-        assert!(m.precision_recall_auc.abs() < EPS);
+        assert!(m.average_precision.abs() < EPS);
         assert!(m.precision.abs() < EPS);
         assert!(m.recall.abs() < EPS);
         assert!(m.f1.abs() < EPS);
@@ -707,11 +835,11 @@ mod tests {
         assert_eq!(m.fp, 0);
         assert_eq!(m.false_neg, 0);
         assert_eq!(m.unlabeled, 0);
-        for &(_, val) in &m.precision_at_recall {
-            assert_eq!(val, None, "P@R should be None for empty input");
+        for r in &m.precision_at_recall {
+            assert_eq!(r.value, None, "P@R should be None for empty input");
         }
-        for &(_, val) in &m.recall_at_precision {
-            assert_eq!(val, None, "R@P should be None for empty input");
+        for r in &m.recall_at_precision {
+            assert_eq!(r.value, None, "R@P should be None for empty input");
         }
     }
 
@@ -817,14 +945,13 @@ mod tests {
         let m = compute_metrics(&classified, 0, 3);
 
         // P@R: all targets (0.80, 0.90, 0.95) met at conf=1 (R=1.0, P=0.6).
-        for &(_, val) in &m.precision_at_recall {
-            let p = val.unwrap();
+        for r in &m.precision_at_recall {
+            let p = r.value.unwrap();
             assert!((p - 0.6).abs() < EPS, "expected P=0.6, got {p}");
         }
 
         // R@P=0.95: only conf=5 has P >= 0.95, so R=1/3.
-        let (_, val) = m.recall_at_precision[0];
-        let r = val.unwrap();
+        let r = m.recall_at_precision[0].value.unwrap();
         assert!((r - 1.0 / 3.0).abs() < EPS, "expected R=1/3, got {r}");
     }
 
@@ -836,9 +963,62 @@ mod tests {
             item(4, MatchClass::TruePositive),
         ];
         let m = compute_metrics(&classified, 0, 1);
-        for &(_, val) in &m.recall_at_precision {
-            assert_eq!(val, None, "R@P should be None when no point meets threshold");
+        for r in &m.recall_at_precision {
+            assert_eq!(
+                r.value, None,
+                "R@P should be None when no point meets threshold"
+            );
         }
+    }
+
+    #[test]
+    fn rap_returns_highest_recall() {
+        // Curve where multiple points meet P >= 0.95.
+        // [TP(5), TP(4), TP(3), FP(2)] total_pos=3
+        // Operating points:
+        //   conf=5: P=1.0,  R=1/3
+        //   conf=4: P=1.0,  R=2/3
+        //   conf=3: P=1.0,  R=1.0
+        //   conf=2: P=0.75, R=1.0
+        // All of conf=5,4,3 have P >= 0.95. The highest recall among
+        // them is R=1.0 (at conf=3). A forward-walk bug would return
+        // R=1/3 instead.
+        let classified = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::TruePositive),
+            item(3, MatchClass::TruePositive),
+            item(2, MatchClass::FalsePositive),
+        ];
+        let m = compute_metrics(&classified, 0, 3);
+        let r = m.recall_at_precision[0].value.unwrap();
+        assert!(
+            (r - 1.0).abs() < EPS,
+            "R@P=0.95 should be 1.0 (highest recall), got {r}"
+        );
+    }
+
+    #[test]
+    fn f2_intermediate_value() {
+        // 1 TP, 1 FP, 0 FN → P=0.5, R=1.0.
+        // F1 = 2 * 0.5 * 1.0 / (0.5 + 1.0) = 2/3
+        // F2 = 5 * 0.5 * 1.0 / (4 * 0.5 + 1.0) = 2.5 / 3.0 = 5/6
+        let classified = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::FalsePositive),
+        ];
+        let m = compute_metrics(&classified, 0, 1);
+        let expected_f2 = 5.0 / 6.0;
+        assert!(
+            (m.f2 - expected_f2).abs() < EPS,
+            "F2 should be 5/6, got {}",
+            m.f2
+        );
+        assert!(
+            m.f2 > m.f1,
+            "F2 should exceed F1 when R > P: F2={}, F1={}",
+            m.f2,
+            m.f1
+        );
     }
 
     // ── Bootstrap CI tests ──────────────────────────────────────
@@ -923,13 +1103,13 @@ mod tests {
             item(4, MatchClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 0, 1);
-        assert!(m.ap_ci_lower.is_none());
-        assert!(m.ap_ci_upper.is_none());
+        assert!(m.ap_ci.is_none());
 
         let ci = bootstrap_ap_ci(&classified, 1, &BootstrapConfig::default());
         let m = m.with_bootstrap_ci(ci);
-        assert!(m.ap_ci_lower.is_some());
-        assert!(m.ap_ci_upper.is_some());
+        assert!(m.ap_ci.is_some());
+        let ci = m.ap_ci.unwrap();
+        assert!(ci.lower <= ci.upper);
     }
 
     // ── Proptest properties ─────────────────────────────────────
@@ -1182,8 +1362,8 @@ mod tests {
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
-                for &(_, val) in &m.precision_at_recall {
-                    if let Some(p) = val {
+                for r in &m.precision_at_recall {
+                    if let Some(p) = r.value {
                         prop_assert!(
                             (0.0..=1.0).contains(&p),
                             "P@R out of bounds: {p}"
@@ -1203,11 +1383,11 @@ mod tests {
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
-                for &(_, val) in &m.recall_at_precision {
-                    if let Some(r) = val {
+                for r in &m.recall_at_precision {
+                    if let Some(v) = r.value {
                         prop_assert!(
-                            (0.0..=1.0).contains(&r),
-                            "R@P out of bounds: {r}"
+                            (0.0..=1.0).contains(&v),
+                            "R@P out of bounds: {v}"
                         );
                     }
                 }
@@ -1228,6 +1408,34 @@ mod tests {
                     m.f2 >= 0.0 && m.f2 <= 1.0,
                     "F2 out of bounds: {}", m.f2
                 );
+            }
+
+            /// F2 >= F1 when recall > precision (recall-weighting),
+            /// F2 <= F1 when precision > recall.
+            #[test]
+            fn f2_relationship_to_f1(
+                classified in arb_classified_tp_fp(30),
+                fn_count in 0u64..20,
+            ) {
+                let tp_count = classified.iter()
+                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .count() as u64;
+                let total_pos = tp_count + fn_count;
+                let m = compute_metrics(&classified, fn_count, total_pos);
+                let eps = 1e-12;
+                if m.recall > m.precision + eps {
+                    prop_assert!(
+                        m.f2 >= m.f1 - eps,
+                        "F2 ({}) < F1 ({}) when R ({}) > P ({})",
+                        m.f2, m.f1, m.recall, m.precision,
+                    );
+                } else if m.precision > m.recall + eps {
+                    prop_assert!(
+                        m.f2 <= m.f1 + eps,
+                        "F2 ({}) > F1 ({}) when P ({}) > R ({})",
+                        m.f2, m.f1, m.precision, m.recall,
+                    );
+                }
             }
 
             /// Bootstrap CI is ordered: lower <= upper.
@@ -1255,5 +1463,170 @@ mod tests {
                 prop_assert!((0.0..=1.0).contains(&hi), "ci_upper out of bounds: {hi}");
             }
         }
+    }
+
+    // ── Input validation tests ──────────────────────────────────
+
+    #[test]
+    fn par_selects_best_precision_on_recall_plateau() {
+        // Curve: TP(conf=5), TP(conf=4), FP(conf=3), total_pos=2
+        // Operating points:
+        //   conf=5: P=1.0, R=0.5
+        //   conf=4: P=1.0, R=1.0
+        //   conf=3: P=2/3, R=1.0
+        // Points at R=1.0: (P=1.0) and (P=2/3).
+        // P@R=0.95 should return P=1.0 (the best precision where R >= 0.95).
+        let classified = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::TruePositive),
+            item(3, MatchClass::FalsePositive),
+        ];
+        let m = compute_metrics(&classified, 0, 2);
+        let par_095 = m
+            .precision_at_recall
+            .iter()
+            .find(|r| (r.target - 0.95).abs() < EPS);
+        let p = par_095
+            .expect("0.95 target missing")
+            .value
+            .expect("should be Some");
+        assert!(
+            (p - 1.0).abs() < EPS,
+            "P@R=0.95 should be 1.0 (best on plateau), got {p}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "n_iterations must be > 0")]
+    fn bootstrap_zero_iterations_panics() {
+        let classified = vec![item(5, MatchClass::TruePositive)];
+        let config = BootstrapConfig {
+            n_iterations: 0,
+            ..Default::default()
+        };
+        bootstrap_ap_ci(&classified, 1, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
+    fn bootstrap_alpha_zero_panics() {
+        let classified = vec![item(5, MatchClass::TruePositive)];
+        let config = BootstrapConfig {
+            alpha: 0.0,
+            ..Default::default()
+        };
+        bootstrap_ap_ci(&classified, 1, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
+    fn bootstrap_alpha_one_panics() {
+        let classified = vec![item(5, MatchClass::TruePositive)];
+        let config = BootstrapConfig {
+            alpha: 1.0,
+            ..Default::default()
+        };
+        bootstrap_ap_ci(&classified, 1, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
+    fn bootstrap_alpha_negative_panics() {
+        let classified = vec![item(5, MatchClass::TruePositive)];
+        let config = BootstrapConfig {
+            alpha: -0.5,
+            ..Default::default()
+        };
+        bootstrap_ap_ci(&classified, 1, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "total_positives (1) must be >= TP count (3)")]
+    fn bootstrap_total_positives_less_than_tp_panics() {
+        let classified = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::TruePositive),
+            item(3, MatchClass::TruePositive),
+        ];
+        let config = BootstrapConfig::default();
+        bootstrap_ap_ci(&classified, 1, &config);
+    }
+
+    #[test]
+    fn bootstrap_single_iteration() {
+        let classified = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::FalsePositive),
+        ];
+        let config = BootstrapConfig {
+            n_iterations: 1,
+            ..Default::default()
+        };
+        let (lo, hi) = bootstrap_ap_ci(&classified, 1, &config);
+        assert!(lo <= hi, "single iteration CI should have lo <= hi");
+        assert!((0.0..=1.0).contains(&lo), "ci_lower out of bounds: {lo}");
+        assert!((0.0..=1.0).contains(&hi), "ci_upper out of bounds: {hi}");
+    }
+
+    // ── Edge-case coverage ─────────────────────────────────────
+
+    #[test]
+    fn par_mixed_achievable_targets() {
+        // Max recall ~0.85: 17 TP out of 20 total positives.
+        // P@R=0.80 should be Some, P@R=0.90 and 0.95 should be None.
+        let mut classified: Vec<_> = (0..17)
+            .map(|i| item(100 - i as i8, MatchClass::TruePositive))
+            .collect();
+        classified.extend((0..3).map(|i| item(50 - i as i8, MatchClass::FalsePositive)));
+        let m = compute_metrics(&classified, 3, 20);
+
+        let par_80 = m
+            .precision_at_recall
+            .iter()
+            .find(|r| (r.target - 0.80).abs() < EPS);
+        assert!(
+            par_80.unwrap().value.is_some(),
+            "P@R=0.80 should be achievable"
+        );
+
+        let par_90 = m
+            .precision_at_recall
+            .iter()
+            .find(|r| (r.target - 0.90).abs() < EPS);
+        assert!(
+            par_90.unwrap().value.is_none(),
+            "P@R=0.90 should be None (max recall=0.85)"
+        );
+
+        let par_95 = m
+            .precision_at_recall
+            .iter()
+            .find(|r| (r.target - 0.95).abs() < EPS);
+        assert!(
+            par_95.unwrap().value.is_none(),
+            "P@R=0.95 should be None (max recall=0.85)"
+        );
+    }
+
+    #[test]
+    fn bootstrap_empty_scored_input() {
+        // Empty classified list → (0.0, 0.0).
+        let config = BootstrapConfig::default();
+        let (lo, hi) = bootstrap_ap_ci(&[], 3, &config);
+        assert!(lo.abs() < EPS, "expected 0.0, got {lo}");
+        assert!(hi.abs() < EPS, "expected 0.0, got {hi}");
+    }
+
+    #[test]
+    fn bootstrap_only_unlabeled() {
+        // Only Unlabeled items → no TP/FP → (0.0, 0.0).
+        let classified = vec![
+            item(5, MatchClass::Unlabeled),
+            item(4, MatchClass::Unlabeled),
+        ];
+        let config = BootstrapConfig::default();
+        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config);
+        assert!(lo.abs() < EPS, "expected 0.0, got {lo}");
+        assert!(hi.abs() < EPS, "expected 0.0, got {hi}");
     }
 }
