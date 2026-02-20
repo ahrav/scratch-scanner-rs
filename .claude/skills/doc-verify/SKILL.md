@@ -23,6 +23,7 @@ nothing, verify everything.
 
 - **Writing docs** — that's `/doc-rigor`
 - **Reviewing code logic** — that's `/review-dispatch`
+- **Verifying dist-sys claims** — that's `/dist-sys-auditor`
 - **Checking API ergonomics** — that's `/interface-design-review`
 
 ---
@@ -222,7 +223,7 @@ When the verification agent returns:
 
 ## Severity Classification
 
-Three-tier system:
+Three-tier system matching `/dist-sys-auditor`:
 
 ### BLOCK — Must Fix
 
@@ -356,6 +357,8 @@ and what the code does.
 ## Related Skills
 
 - `/doc-rigor` — writes documentation. Doc-verify checks what doc-rigor wrote.
+- `/dist-sys-auditor` — verifies distributed systems claims with citations.
+  Use dist-sys-auditor for coordination patterns; doc-verify for general doc accuracy.
 - `/review-dispatch` — multi-lens code review. Doc-verify focuses exclusively
   on documentation accuracy, going deeper than review-dispatch's docs lens.
 - `/interface-design-review` — checks API ergonomics. Doc-verify checks whether
