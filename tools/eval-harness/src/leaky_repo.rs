@@ -29,8 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::finding_parser::dedup_findings;
 use crate::types::{NormalizedFinding, normalize_path};
 
 // ── Types ─────────────────────────────────────────────────────────────────
@@ -40,36 +41,25 @@ use crate::types::{NormalizedFinding, normalize_path};
 /// Each row in the ground-truth CSV maps to one `FileExpectation`. The parser
 /// ([`parse_leaky_repo`]) guarantees uniqueness by path, so downstream code
 /// can safely index by `path` without worrying about collisions.
-///
-/// # Invariant
-///
-/// `expected_count == num_risk + num_informative` — enforced at construction
-/// by the parser. The two sub-counts are preserved so callers can weight
-/// risk-class findings differently if desired (e.g., only score `num_risk`
-/// for high-confidence evaluation).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileExpectation {
     /// Forward-slash normalized path relative to the corpus root, produced
     /// by [`normalize_path`](crate::types::normalize_path) with an empty root.
     pub path: String,
-    /// Total expected secrets: `num_risk + num_informative`.
+    /// Total expected secrets (`num_risk + num_informative` from the CSV).
     pub expected_count: u32,
-    /// Count of high-severity secrets (passwords, private keys, tokens).
-    pub num_risk: u32,
-    /// Count of lower-severity sensitive info (hostnames, usernames).
-    pub num_informative: u32,
 }
 
 /// Per-file comparison of expected vs actual secret counts.
 ///
 /// Produced by [`compare_counts`] for each file that appears in either the
 /// ground truth or the scanner output (or both). The three classification
-/// fields (`tp`, `fp`, `fn_count`) satisfy two algebraic invariants that
+/// fields (`tp`, `fp`, `false_neg`) satisfy two algebraic invariants that
 /// hold for every instance:
 ///
 /// - **`tp + fp == actual`** — every deduplicated scanner finding is either
 ///   a true positive or a false positive.
-/// - **`tp + fn_count == expected`** — every expected secret is either
+/// - **`tp + false_neg == expected`** — every expected secret is either
 ///   detected (TP) or missed (FN).
 ///
 /// These invariants follow directly from the `min`/`saturating_sub` formulas
@@ -87,7 +77,7 @@ pub struct FileCountComparison {
     /// False positives: `actual.saturating_sub(expected)`.
     pub fp: u32,
     /// False negatives: `expected.saturating_sub(actual)`.
-    pub fn_count: u32,
+    pub false_neg: u32,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────
@@ -100,7 +90,14 @@ pub struct FileCountComparison {
 #[derive(Debug)]
 pub enum LeakyRepoError {
     /// Underlying I/O failure.
-    Io(std::io::Error),
+    ///
+    /// `path` is `Some` when the error originates from a known file
+    /// (e.g., [`parse_leaky_repo_csv`]) and `None` when the source is a
+    /// generic [`BufRead`] reader.
+    Io {
+        path: Option<PathBuf>,
+        source: std::io::Error,
+    },
     /// A data row could not be parsed (missing fields, non-numeric counts).
     InvalidRow {
         /// 1-indexed line number.
@@ -120,7 +117,11 @@ pub enum LeakyRepoError {
 impl fmt::Display for LeakyRepoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Io {
+                path: Some(p),
+                source,
+            } => write!(f, "failed to read {}: {source}", p.display()),
+            Self::Io { path: None, source } => write!(f, "I/O error: {source}"),
             Self::InvalidRow { line, reason } => {
                 write!(f, "line {line}: {reason}")
             }
@@ -134,7 +135,7 @@ impl fmt::Display for LeakyRepoError {
 impl std::error::Error for LeakyRepoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Some(e),
+            Self::Io { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -142,16 +143,14 @@ impl std::error::Error for LeakyRepoError {
 
 impl From<std::io::Error> for LeakyRepoError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
+        Self::Io {
+            path: None,
+            source: e,
+        }
     }
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────
-
-/// Strip a UTF-8 BOM prefix if present.
-fn strip_bom(s: &str) -> &str {
-    s.strip_prefix('\u{feff}').unwrap_or(s)
-}
 
 /// Parse a LeakyRepo ground-truth CSV from any [`BufRead`] source.
 ///
@@ -181,8 +180,12 @@ pub fn parse_leaky_repo(reader: impl BufRead) -> Result<Vec<FileExpectation>, Le
         let line_num = idx + 1; // 1-indexed for error messages
         let raw = raw_line?;
 
-        // Strip BOM on the very first line.
-        let line = if line_num == 1 { strip_bom(&raw) } else { &raw };
+        // Strip UTF-8 BOM on the very first line (common in Windows-edited CSVs).
+        let line = if line_num == 1 {
+            raw.strip_prefix('\u{feff}').unwrap_or(&raw)
+        } else {
+            &raw
+        };
 
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -233,11 +236,19 @@ pub fn parse_leaky_repo(reader: impl BufRead) -> Result<Vec<FileExpectation>, Le
             });
         }
 
+        let expected_count =
+            num_risk
+                .checked_add(num_informative)
+                .ok_or_else(|| LeakyRepoError::InvalidRow {
+                    line: line_num,
+                    reason: format!(
+                        "num_risk ({num_risk}) + num_informative ({num_informative}) overflows u32"
+                    ),
+                })?;
+
         expectations.push(FileExpectation {
             path,
-            expected_count: num_risk + num_informative,
-            num_risk,
-            num_informative,
+            expected_count,
         });
     }
 
@@ -250,7 +261,10 @@ pub fn parse_leaky_repo(reader: impl BufRead) -> Result<Vec<FileExpectation>, Le
 /// [`parse_leaky_repo`]. I/O errors from [`File::open`] are wrapped in
 /// [`LeakyRepoError::Io`].
 pub fn parse_leaky_repo_csv(path: &Path) -> Result<Vec<FileExpectation>, LeakyRepoError> {
-    let file = File::open(path).map_err(LeakyRepoError::Io)?;
+    let file = File::open(path).map_err(|source| LeakyRepoError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    })?;
     parse_leaky_repo(BufReader::new(file))
 }
 
@@ -276,21 +290,7 @@ pub fn compare_counts(
     mut findings: Vec<NormalizedFinding>,
     expectations: &[FileExpectation],
 ) -> Vec<FileCountComparison> {
-    // Dedup findings: sort by identity, then collapse adjacent duplicates
-    // while retaining the highest confidence score. Takes ownership to
-    // avoid cloning the entire Vec.
-    // `dedup_by` removes `a` (the later element) when returning true,
-    // keeping `b` (the earlier element). We fold the max confidence into
-    // `b` so the surviving entry carries the strongest signal.
-    findings.sort();
-    findings.dedup_by(|a, b| {
-        if a == b {
-            b.confidence = b.confidence.max(a.confidence);
-            true
-        } else {
-            false
-        }
-    });
+    dedup_findings(&mut findings);
 
     // Group deduplicated findings by path.
     let mut actual_counts: HashMap<&str, u32> = HashMap::with_capacity(findings.len().min(4096));
@@ -298,14 +298,11 @@ pub fn compare_counts(
         *actual_counts.entry(f.path.as_str()).or_default() += 1;
     }
 
-    // Build the set of expected paths for the unlisted-file pass.
-    let expected_paths: HashSet<&str> = expectations.iter().map(|e| e.path.as_str()).collect();
-
     let mut results = Vec::with_capacity(expectations.len() + 64);
 
-    // Pass 1: expected files.
+    // Expected files — consume matching entries from actual_counts.
     for exp in expectations {
-        let actual = actual_counts.get(exp.path.as_str()).copied().unwrap_or(0);
+        let actual = actual_counts.remove(exp.path.as_str()).unwrap_or(0);
         let expected = exp.expected_count;
         results.push(FileCountComparison {
             path: exp.path.clone(),
@@ -313,22 +310,20 @@ pub fn compare_counts(
             actual,
             tp: expected.min(actual),
             fp: actual.saturating_sub(expected),
-            fn_count: expected.saturating_sub(actual),
+            false_neg: expected.saturating_sub(actual),
         });
     }
 
-    // Pass 2: unlisted files (scanner found secrets not in ground truth).
-    for (&path, &actual) in &actual_counts {
-        if !expected_paths.contains(path) {
-            results.push(FileCountComparison {
-                path: path.to_string(),
-                expected: 0,
-                actual,
-                tp: 0,
-                fp: actual,
-                fn_count: 0,
-            });
-        }
+    // Remaining entries: unlisted files (scanner found secrets not in ground truth).
+    for (path, actual) in actual_counts {
+        results.push(FileCountComparison {
+            path: path.to_string(),
+            expected: 0,
+            actual,
+            tp: 0,
+            fp: actual,
+            false_neg: 0,
+        });
     }
 
     results.sort_by(|a, b| a.path.cmp(&b.path));
@@ -362,8 +357,6 @@ mod tests {
         let result = parse(csv).unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].path, ".bash_profile");
-        assert_eq!(result[0].num_risk, 6);
-        assert_eq!(result[0].num_informative, 5);
         assert_eq!(result[0].expected_count, 11);
         assert_eq!(result[2].path, ".docker/.dockercfg");
         assert_eq!(result[2].expected_count, 4);
@@ -391,7 +384,7 @@ mod tests {
 
     #[test]
     fn parse_trailing_comment_no_newline() {
-        // Exercises the edge case that csv crate bug #363 would fail on.
+        // CSV ends with a comment line and no trailing newline.
         let csv = "file.txt,1,2\n# end";
         let result = parse(csv).unwrap();
         assert_eq!(result.len(), 1);
@@ -410,8 +403,7 @@ mod tests {
         let csv = "# header\r\nfile.txt,3,2\r\n";
         let result = parse(csv).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].num_risk, 3);
-        assert_eq!(result[0].num_informative, 2);
+        assert_eq!(result[0].expected_count, 5);
     }
 
     #[test]
@@ -421,16 +413,14 @@ mod tests {
         let result = parse(csv).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, "path/with,comma.txt");
-        assert_eq!(result[0].num_risk, 3);
-        assert_eq!(result[0].num_informative, 5);
+        assert_eq!(result[0].expected_count, 8);
     }
 
     #[test]
     fn parse_whitespace_around_numbers() {
         let csv = "file.txt, 3 , 5 \n";
         let result = parse(csv).unwrap();
-        assert_eq!(result[0].num_risk, 3);
-        assert_eq!(result[0].num_informative, 5);
+        assert_eq!(result[0].expected_count, 8);
     }
 
     #[test]
@@ -455,6 +445,7 @@ mod tests {
             ("non-numeric field", "file.txt,abc,2\n", 1),
             ("missing fields", "file.txt,1\n", 1),
             ("negative number", "file.txt,-1,2\n", 1),
+            ("overflow", "file.txt,4294967295,1\n", 1),
         ];
         for &(label, csv, expected_line) in cases {
             let err = parse(csv).unwrap_err();
@@ -480,8 +471,6 @@ mod tests {
             let expectations = vec![FileExpectation {
                 path: "a.txt".into(),
                 expected_count,
-                num_risk: expected_count,
-                num_informative: 0,
             }];
             let findings: Vec<NormalizedFinding> = (0..num_findings)
                 .map(|i| finding("a.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
@@ -490,7 +479,7 @@ mod tests {
             assert_eq!(result.len(), 1, "{label}: result count");
             assert_eq!(result[0].tp, exp_tp, "{label}: tp");
             assert_eq!(result[0].fp, exp_fp, "{label}: fp");
-            assert_eq!(result[0].fn_count, exp_fn, "{label}: fn_count");
+            assert_eq!(result[0].false_neg, exp_fn, "{label}: false_neg");
         }
     }
 
@@ -511,7 +500,7 @@ mod tests {
         assert_eq!(result[0].actual, 2);
         assert_eq!(result[0].tp, 0);
         assert_eq!(result[0].fp, 2);
-        assert_eq!(result[0].fn_count, 0);
+        assert_eq!(result[0].false_neg, 0);
     }
 
     #[test]
@@ -520,8 +509,6 @@ mod tests {
         let expectations = vec![FileExpectation {
             path: "a.txt".into(),
             expected_count: 2,
-            num_risk: 1,
-            num_informative: 1,
         }];
         let findings = vec![
             NormalizedFinding::new("a.txt".into(), 0, 5, "r1".into(), 30),
@@ -532,7 +519,39 @@ mod tests {
         assert_eq!(result[0].actual, 2); // deduped from 3 to 2
         assert_eq!(result[0].tp, 2);
         assert_eq!(result[0].fp, 0);
-        assert_eq!(result[0].fn_count, 0);
+        assert_eq!(result[0].false_neg, 0);
+    }
+
+    #[test]
+    fn compare_multi_file_with_unlisted() {
+        let expectations = vec![
+            FileExpectation {
+                path: "a.txt".into(),
+                expected_count: 3,
+            },
+            FileExpectation {
+                path: "b.txt".into(),
+                expected_count: 1,
+            },
+        ];
+        let findings = vec![
+            finding("a.txt", 0, 5),
+            finding("a.txt", 10, 15),
+            finding("b.txt", 0, 5),
+            finding("b.txt", 10, 15), // extra finding beyond expected
+            finding("c.txt", 0, 5),   // unlisted file
+        ];
+        let result = compare_counts(findings, &expectations);
+        assert_eq!(result.len(), 3);
+        // a.txt: expected=3, actual=2 => tp=2, fp=0, fn=1
+        let a = result.iter().find(|r| r.path == "a.txt").unwrap();
+        assert_eq!((a.tp, a.fp, a.false_neg), (2, 0, 1));
+        // b.txt: expected=1, actual=2 => tp=1, fp=1, fn=0
+        let b = result.iter().find(|r| r.path == "b.txt").unwrap();
+        assert_eq!((b.tp, b.fp, b.false_neg), (1, 1, 0));
+        // c.txt: expected=0, actual=1 => tp=0, fp=1, fn=0
+        let c = result.iter().find(|r| r.path == "c.txt").unwrap();
+        assert_eq!((c.tp, c.fp, c.false_neg), (0, 1, 0));
     }
 
     // ── Error display ─────────────────────────────────────────
@@ -550,6 +569,23 @@ mod tests {
             path: "foo.txt".into(),
         };
         assert_eq!(e.to_string(), "line 7: duplicate path \"foo.txt\"");
+
+        // Io with path context.
+        let e = LeakyRepoError::Io {
+            path: Some(PathBuf::from("/data/secrets.csv")),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "failed to read /data/secrets.csv: file not found"
+        );
+
+        // Io without path (generic reader).
+        let e = LeakyRepoError::Io {
+            path: None,
+            source: std::io::Error::other("broken pipe"),
+        };
+        assert_eq!(e.to_string(), "I/O error: broken pipe");
     }
 
     // ── Property-based tests ──────────────────────────────────
@@ -560,28 +596,6 @@ mod tests {
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
-
-            /// For every comparison entry: tp + fp == actual.
-            #[test]
-            fn tp_plus_fp_equals_actual(
-                expected in 0u32..100,
-                actual in 0u32..100,
-            ) {
-                let tp = expected.min(actual);
-                let fp = actual.saturating_sub(expected);
-                prop_assert_eq!(tp + fp, actual);
-            }
-
-            /// For every comparison entry: tp + fn == expected.
-            #[test]
-            fn tp_plus_fn_equals_expected(
-                expected in 0u32..100,
-                actual in 0u32..100,
-            ) {
-                let tp = expected.min(actual);
-                let fn_count = expected.saturating_sub(actual);
-                prop_assert_eq!(tp + fn_count, expected);
-            }
 
             /// Parsed paths never contain backslashes.
             #[test]
@@ -608,8 +622,6 @@ mod tests {
                 let csv = format!("# header\n{path},{risk},{info}\n");
                 let result = parse_leaky_repo(csv.as_bytes()).unwrap();
                 prop_assert_eq!(result.len(), 1);
-                prop_assert_eq!(result[0].num_risk, risk);
-                prop_assert_eq!(result[0].num_informative, info);
                 prop_assert_eq!(result[0].expected_count, risk + info);
             }
 
@@ -623,8 +635,6 @@ mod tests {
                 let expectations = vec![FileExpectation {
                     path: "f.txt".into(),
                     expected_count: expected,
-                    num_risk: expected,
-                    num_informative: 0,
                 }];
                 let findings: Vec<NormalizedFinding> = (0..actual)
                     .map(|i| finding("f.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
@@ -636,7 +646,7 @@ mod tests {
                         "tp+fp != actual for {}", entry.path
                     );
                     prop_assert_eq!(
-                        entry.tp + entry.fn_count, entry.expected,
+                        entry.tp + entry.false_neg, entry.expected,
                         "tp+fn != expected for {}", entry.path
                     );
                 }
@@ -652,8 +662,6 @@ mod tests {
                 let expectations = vec![FileExpectation {
                     path: "f.txt".into(),
                     expected_count: expected,
-                    num_risk: expected,
-                    num_informative: 0,
                 }];
                 let base_findings: Vec<NormalizedFinding> = (0..actual)
                     .map(|i| finding("f.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
@@ -677,8 +685,6 @@ mod tests {
                     FileExpectation {
                         path: p.clone(),
                         expected_count: 1,
-                        num_risk: 1,
-                        num_informative: 0,
                     }
                 }).collect();
                 let findings: Vec<NormalizedFinding> = unlisted_paths.iter().map(|p| {

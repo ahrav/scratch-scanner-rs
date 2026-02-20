@@ -24,7 +24,7 @@
 //! the optimistic bias of breaking ties TP-before-FP, which produces
 //! degenerate AP=1.0 for constant predictors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,18 +45,19 @@ use crate::types::{MatchClass, NormalizedFinding};
 /// - `tp + fp + unlabeled` equals the length of the input `classified` slice
 ///   (excluding any `FalseNegative` entries, which must not appear).
 /// - `total_positives = tp + false_neg` (invariant maintained by the caller).
-/// - `baseline_ap` is the AP a random confidence-assigner would achieve given
-///   the same TP/FP split. When `precision_recall_auc` is close to
+/// - `baseline_ap` is the AP a random confidence ranker would achieve over the
+///   scored population (TP + FP). When `precision_recall_auc` is close to
 ///   `baseline_ap`, the classifier's confidence ranking adds little value
-///   beyond its raw detection rate.
+///   beyond its raw detection rate. Can exceed `precision_recall_auc` when
+///   recall is low.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalMetrics {
     /// Average Precision (step-function PRC-AUC with tie collapsing).
     pub precision_recall_auc: f64,
-    /// Threshold-free precision: TP / (TP + FP). Returns 0.0 when
+    /// Threshold-free precision: TP / (TP + FP). Equals 0.0 when
     /// there are no positive predictions (TP + FP = 0).
     pub precision: f64,
-    /// Threshold-free recall: TP / total_positives. Returns 0.0 when
+    /// Threshold-free recall: TP / total_positives. Equals 0.0 when
     /// there are no ground-truth positives.
     pub recall: f64,
     /// Harmonic mean of precision and recall. Always less than or equal
@@ -70,8 +71,11 @@ pub struct EvalMetrics {
     pub false_neg: u64,
     /// Findings with no ground-truth annotation (excluded from all metrics).
     pub unlabeled: u64,
-    /// Expected AP of a random classifier: `total_positives / (total_positives + FP)`.
-    /// Serves as a lower-bound reference for interpreting `precision_recall_auc`.
+    /// Reference AP for a random confidence ranker over the scored population:
+    /// `tp / (tp + FP)`. Useful for gauging whether confidence ranking adds
+    /// value beyond the raw detection rate. Uses scored positives (TP) rather
+    /// than `total_positives` so the baseline stays achievable when recall is
+    /// incomplete. Can exceed `precision_recall_auc` when recall is low.
     pub baseline_ap: f64,
     /// Per-rule breakdown keyed by rule name, sorted lexicographically.
     pub per_rule: BTreeMap<String, RuleMetrics>,
@@ -79,22 +83,15 @@ pub struct EvalMetrics {
 
 /// Per-rule precision breakdown.
 ///
-/// `false_neg`, `recall`, and `f1` are always zero because per-rule FN
-/// counts are not available from the classified finding list alone. A
-/// future extension can accept per-rule total-positive counts to populate
-/// these fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Contains TP/FP counts and precision for a single detection rule.
+/// Recall and F1 are omitted because per-rule false-negative counts
+/// are not available from the classified finding list alone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleMetrics {
     pub tp: u64,
     pub fp: u64,
-    /// Always 0 until per-rule FN data is provided by the caller.
-    pub false_neg: u64,
     /// TP / (TP + FP).
     pub precision: f64,
-    /// Always 0.0 until per-rule total-positive counts are available.
-    pub recall: f64,
-    /// Always 0.0 until recall is available.
-    pub f1: f64,
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -104,8 +101,8 @@ pub struct RuleMetrics {
 /// # Parameters
 ///
 /// - `classified`: pairs of (finding, classification). Only `TruePositive`,
-///   `FalsePositive`, and `Unlabeled` should appear. A debug assertion fires
-///   if any `FalseNegative` is present.
+///   `FalsePositive`, and `Unlabeled` should appear. Panics if any
+///   `FalseNegative` is present.
 /// - `fn_count`: number of ground-truth positives not matched by any finding.
 /// - `total_positives`: total ground-truth positive count (TP + FN).
 pub fn compute_metrics(
@@ -113,7 +110,7 @@ pub fn compute_metrics(
     fn_count: u64,
     total_positives: u64,
 ) -> EvalMetrics {
-    debug_assert!(
+    assert!(
         !classified
             .iter()
             .any(|(_, c)| *c == MatchClass::FalseNegative),
@@ -129,16 +126,25 @@ pub fn compute_metrics(
             MatchClass::TruePositive => tp += 1,
             MatchClass::FalsePositive => fp += 1,
             MatchClass::Unlabeled => unlabeled += 1,
-            MatchClass::FalseNegative => {}
+            MatchClass::FalseNegative => unreachable!(
+                "FalseNegative must not appear in classified list; \
+                 pass FN count via fn_count"
+            ),
         }
     }
+
+    assert_eq!(
+        tp + fn_count,
+        total_positives,
+        "invariant violation: tp({tp}) + fn_count({fn_count}) != total_positives({total_positives})"
+    );
 
     let precision = safe_div(tp as f64, (tp + fp) as f64);
     let recall = safe_div(tp as f64, total_positives as f64);
     let f1 = safe_div(2.0 * precision * recall, precision + recall);
 
     let precision_recall_auc = compute_average_precision(classified, total_positives);
-    let baseline_ap = safe_div(total_positives as f64, (total_positives + fp) as f64);
+    let baseline_ap = safe_div(tp as f64, (tp + fp) as f64);
     let per_rule = compute_per_rule(classified);
 
     EvalMetrics {
@@ -176,7 +182,7 @@ fn compute_average_precision(
         .filter_map(|(f, c)| match c {
             MatchClass::TruePositive => Some((f.confidence, true)),
             MatchClass::FalsePositive => Some((f.confidence, false)),
-            _ => None,
+            MatchClass::Unlabeled | MatchClass::FalseNegative => None,
         })
         .collect();
 
@@ -234,17 +240,17 @@ fn compute_average_precision(
 fn compute_per_rule(
     classified: &[(NormalizedFinding, MatchClass)],
 ) -> BTreeMap<String, RuleMetrics> {
-    let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut counts: HashMap<&str, (u64, u64)> = HashMap::new();
 
     for (finding, class) in classified {
         match class {
             MatchClass::TruePositive => {
-                counts.entry(finding.rule.clone()).or_default().0 += 1;
+                counts.entry(finding.rule.as_str()).or_default().0 += 1;
             }
             MatchClass::FalsePositive => {
-                counts.entry(finding.rule.clone()).or_default().1 += 1;
+                counts.entry(finding.rule.as_str()).or_default().1 += 1;
             }
-            _ => {}
+            MatchClass::Unlabeled | MatchClass::FalseNegative => {}
         }
     }
 
@@ -252,15 +258,7 @@ fn compute_per_rule(
         .into_iter()
         .map(|(rule, (tp, fp))| {
             let precision = safe_div(tp as f64, (tp + fp) as f64);
-            (
-                rule,
-                RuleMetrics {
-                    tp,
-                    fp,
-                    precision,
-                    ..RuleMetrics::default()
-                },
-            )
+            (rule.to_string(), RuleMetrics { tp, fp, precision })
         })
         .collect()
 }
@@ -396,6 +394,20 @@ mod tests {
     }
 
     #[test]
+    fn ap_with_false_negatives() {
+        // [TP(5), TP(4)] total_pos=4 (2 FN not in list)
+        // conf=5: cum_tp=1, cum_fp=0, P=1.0, R=1/4. AP += 1/4
+        // conf=4: cum_tp=2, cum_fp=0, P=1.0, R=2/4. AP += 1/4
+        // AP = 0.5 (recall capped at 0.5 because 2 of 4 positives are missed)
+        let classified = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::TruePositive),
+        ];
+        let ap = compute_average_precision(&classified, 4);
+        assert!((ap - 0.5).abs() < EPS, "expected 0.5, got {ap}");
+    }
+
+    #[test]
     fn ap_empty() {
         let ap = compute_average_precision(&[], 0);
         assert!(ap.abs() < EPS, "expected 0.0, got {ap}");
@@ -490,7 +502,7 @@ mod tests {
 
     #[test]
     fn baseline_ap_value() {
-        // baseline_ap = total_positives / (total_positives + fp)
+        // baseline_ap = tp / (tp + fp), derived from the scored population.
         let classified = vec![
             item(5, MatchClass::TruePositive),
             item(4, MatchClass::FalsePositive),
@@ -498,8 +510,37 @@ mod tests {
             item(2, MatchClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 2, 3);
-        // baseline = 3 / (3 + 3) = 0.5
-        assert!((m.baseline_ap - 0.5).abs() < EPS);
+        // tp=1, fp=3 → baseline = 1 / (1 + 3) = 0.25
+        assert!((m.baseline_ap - 0.25).abs() < EPS);
+    }
+
+    #[test]
+    fn baseline_ap_derived_from_scored_positives() {
+        // baseline_ap uses scored positives (tp), not total_positives.
+        // With 1 TP, 99 FN, 0 FP: old formula gave 100/(100+0) = 1.0,
+        // new formula gives tp/(tp+fp) = 1/(1+0) = 1.0.
+        // The formulas only diverge when there are both FNs and FPs.
+        let classified = vec![item(5, MatchClass::TruePositive)];
+        let m = compute_metrics(&classified, 99, 100);
+        // tp=1, fp=0 → baseline = 1.0 (entire scored list is positive)
+        assert!((m.baseline_ap - 1.0).abs() < EPS);
+
+        // Divergent case: 1 TP, 2 FN, 3 FP.
+        // Old formula: total_positives/(total_positives+fp) = 3/(3+3) = 0.5
+        // New formula: tp/(tp+fp) = 1/(1+3) = 0.25
+        // The old baseline was inflated by counting FNs not in the ranked list.
+        let classified2 = vec![
+            item(5, MatchClass::TruePositive),
+            item(4, MatchClass::FalsePositive),
+            item(3, MatchClass::FalsePositive),
+            item(2, MatchClass::FalsePositive),
+        ];
+        let m2 = compute_metrics(&classified2, 2, 3);
+        assert!(
+            (m2.baseline_ap - 0.25).abs() < EPS,
+            "expected baseline 0.25 (tp/(tp+fp)), got {}",
+            m2.baseline_ap
+        );
     }
 
     // ── Proptest properties ─────────────────────────────────────
@@ -717,6 +758,27 @@ mod tests {
                 prop_assert!(
                     (ap_original - ap_transformed).abs() < 1e-9,
                     "AP changed under monotone transform: {ap_original} vs {ap_transformed}"
+                );
+            }
+
+            /// AP is monotonically non-increasing as total_positives grows
+            /// (more missed positives means lower recall ceiling).
+            #[test]
+            fn ap_decreases_with_more_positives(
+                classified in arb_classified_tp_fp(20),
+                total_pos_base in 1u64..50,
+                extra in 1u64..50,
+            ) {
+                let tp_count = classified.iter()
+                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .count() as u64;
+                let tp_low = total_pos_base.max(tp_count);
+                let tp_high = tp_low + extra;
+                let ap_low = compute_average_precision(&classified, tp_low);
+                let ap_high = compute_average_precision(&classified, tp_high);
+                prop_assert!(
+                    ap_low >= ap_high - 1e-12,
+                    "AP should decrease: AP({tp_low})={ap_low}, AP({tp_high})={ap_high}"
                 );
             }
         }
