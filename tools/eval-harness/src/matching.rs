@@ -227,9 +227,7 @@ pub fn match_findings(
     findings.sort_by(|a, b| {
         // Descending confidence via reverse comparison — never negate i8
         // (i8::MIN overflow wraps silently in release mode).
-        b.confidence
-            .cmp(&a.confidence)
-            .then_with(|| a.cmp(b))
+        b.confidence.cmp(&a.confidence).then_with(|| a.cmp(b))
     });
 
     // Sort postcondition.
@@ -691,7 +689,11 @@ mod tests {
     fn rule_match_colon_split() {
         let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "Token", 5)];
         let truth = vec![make_truth(
-            SIMPLE_PATH, 1, 1, TruthLabel::Positive, "Secret:Token",
+            SIMPLE_PATH,
+            1,
+            1,
+            TruthLabel::Positive,
+            "Secret:Token",
         )];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
         let config = MatchConfig {
@@ -707,7 +709,11 @@ mod tests {
     fn rule_match_disabled() {
         let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "scanner-rule", 5)];
         let truth = vec![make_truth(
-            SIMPLE_PATH, 1, 1, TruthLabel::Positive, "CredDataCategory",
+            SIMPLE_PATH,
+            1,
+            1,
+            TruthLabel::Positive,
+            "CredDataCategory",
         )];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
@@ -727,7 +733,12 @@ mod tests {
 
         let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.false_negatives.len(), 2);
-        assert!(result.false_negatives.iter().all(|t| t.label == TruthLabel::Positive));
+        assert!(
+            result
+                .false_negatives
+                .iter()
+                .all(|t| t.label == TruthLabel::Positive)
+        );
     }
 
     #[test]
@@ -801,7 +812,11 @@ mod tests {
     #[test]
     fn finding_spans_entire_file() {
         let findings = vec![make_finding(
-            SIMPLE_PATH, 0, SIMPLE_FILE.len() as u64, "r", 5,
+            SIMPLE_PATH,
+            0,
+            SIMPLE_FILE.len() as u64,
+            "r",
+            5,
         )];
         let truth = vec![make_truth(SIMPLE_PATH, 2, 2, TruthLabel::Positive, "r")];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
