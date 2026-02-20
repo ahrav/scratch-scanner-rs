@@ -18,6 +18,8 @@
 //! 3. Apply character-class distribution gate (when configured) — SIMD-accelerated
 //!    rejection of windows dominated by lowercase ASCII.
 //! 4. For UTF-16 variants, decode with per-window and total-output budgets.
+//!    Steps 2–3 run on the raw window for `Variant::Raw` but on the decoded
+//!    UTF-8 buffer for UTF-16 variants (i.e., after this step).
 //! 5. Run regex with reusable capture locations to access capture groups.
 //! 6. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
 //! 7. Apply entropy gates on the *extracted secret*.
@@ -25,9 +27,12 @@
 //! 9. Apply local context checks (when configured) on the secret span.
 //! 10. Apply root-context safelist suppression for root emit paths.
 //! 11. Apply secret-bytes safelist suppression (all findings, including decoded).
-//! 12. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 13. Compute additive confidence score from gate signals that fired.
-//! 14. Record the finding with the extracted secret span.
+//! 12. Apply UUID-format quick-reject: suppress findings whose extracted value is
+//!     a bare UUID (8-4-4-4-12 hex), unless the rule opts out via
+//!     `uuid_format_secret()`.
+//! 13. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 14. Compute additive confidence score from gate signals that fired.
+//! 15. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -175,10 +180,14 @@ struct EmitPolicyOutcome {
 /// `on_match(locs, start, end)` receives the full match span (`start..end`)
 /// relative to `hay[0]`. Capture groups are accessible through `locs`.
 ///
-/// # Performance
-/// O(hay.len() × regex_complexity) per call. The caller's `CaptureLocations`
-/// must be borrowed out of `scratch.capture_locs[rule_id]` and restored after
+/// # Preconditions
+/// `locs` must have been created by `Regex::capture_locations()` for the same
+/// `re`, ensuring it has enough slots for all capture groups. Callers borrow
+/// `locs` out of `scratch.capture_locs[rule_id]` and must restore it after
 /// the loop to keep the slot populated for the next invocation.
+///
+/// # Performance
+/// O(hay.len() x regex_complexity) per call.
 #[inline]
 fn for_each_capture_match(
     re: &regex::bytes::Regex,
@@ -421,7 +430,9 @@ fn local_context_passes(
 /// Evaluates all entropy-family gates on extracted secret bytes.
 ///
 /// Returns `true` if the candidate passes (entropy is high enough or no gate configured).
-/// Wraps the `if let Some / else true` pattern duplicated at each call site.
+/// Exists to DRY up the `if let Some / else true` unwrap-and-default pattern that
+/// would otherwise be duplicated in each match callback (raw, UTF-16 direct, and
+/// both `*_into` staging paths).
 #[inline]
 fn post_match_entropy_passes(
     entropy: Option<EntropyCompiled>,
@@ -480,7 +491,16 @@ fn compute_confidence_score(
 impl Engine {
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
-    /// Guarantees / invariants:
+    /// This is the engine hot-path entry point. It dispatches on `variant`:
+    /// - `Variant::Raw` — gates and regex run directly on the window bytes.
+    /// - `Variant::Utf16Le` / `Utf16Be` — tries both byte parities (hinted
+    ///   parity first), decoding each alignment to UTF-8 before regex matching.
+    ///
+    /// Findings are committed directly into `scratch` (dedup state, output
+    /// vectors, drop-hint bookkeeping). Use the `*_into` methods instead when
+    /// the caller needs staging semantics (commit/rollback).
+    ///
+    /// # Guarantees
     /// - `w` must be a valid range into `buf`.
     /// - For `Variant::Raw`, spans are expressed in raw `buf` byte space.
     /// - For UTF-16 variants, spans are in decoded UTF-8 byte space and the
@@ -491,11 +511,11 @@ impl Engine {
     ///   reported the match start. Regex search starts near this position with
     ///   a back-scan margin for correctness.
     ///
-    /// Errors / edge cases:
-    /// - Returns early when gates fail, decode budgets are exhausted, or decoding
-    ///   fails.
-    /// - Findings may be suppressed at emit-time by safelist policy or offline
-    ///   structural validation.
+    /// # Early returns
+    /// - Returns without findings when gates fail, decode budgets are exhausted,
+    ///   or decoding fails.
+    /// - Findings may be suppressed at emit-time by safelist policy, UUID-format
+    ///   quick-reject, or offline structural validation.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_window(
         &self,
@@ -708,25 +728,32 @@ impl Engine {
 
     /// Validates one UTF-16-aligned decode range and writes findings directly.
     ///
-    /// Guarantees / invariants:
-    /// - `decode_range` must start on a UTF-16 code-unit boundary.
+    /// Called by [`run_rule_on_window`] for each byte parity. The caller is
+    /// responsible for trying both even/odd alignments; this method assumes
+    /// `decode_range` already starts on a code-unit boundary.
+    ///
+    /// # Guarantees
+    /// - `decode_range` must start on a UTF-16 code-unit boundary (even byte
+    ///   offset for LE, the correct parity for BE).
     /// - Findings are emitted in decoded UTF-8 byte space and annotated with
     ///   `DecodeStep::Utf16Window` so callers can recover parent raw spans.
     /// - Root span hints are derived from full-match extents after mapping
-    ///   decoded offsets back into raw UTF-16 bytes.
+    ///   decoded offsets back into raw UTF-16 bytes via
+    ///   [`map_utf16_decoded_offset`].
     ///
-    /// # Behavior
-    /// Applies a gate sequence adapted for UTF-16: confirm-all and keywords run
-    /// on raw bytes (pre-decode), then must-contain, assignment-shape, and
-    /// char_class run on decoded bytes (post-decode), followed by regex, entropy,
-    /// value suppressor, local context, context-window safelist, secret-bytes
-    /// safelist, and offline validation. UTF-16 decode budgets are enforced.
-    /// Context-window safelist suppression uses the emitted finding step
-    /// (`utf16_step_id`, checked as `step_id == STEP_ROOT`); the secret-bytes
-    /// safelist runs on all findings. Offline validation uses the parent
-    /// `step_id` so root-level UTF-16 findings are correctly identified as
-    /// root-semantic.
+    /// # Gate ordering for UTF-16
+    /// Confirm-all and keyword gates run on **raw** UTF-16 bytes (pre-decode)
+    /// to avoid wasting decode budget. Must-contain, assignment-shape, and
+    /// char_class gates run on **decoded** UTF-8 bytes (post-decode). The
+    /// remaining gates (regex, entropy, value suppressor, local context,
+    /// safelist, UUID reject, offline validation) operate on the decoded
+    /// representation.
     ///
+    /// # Step ID distinction
+    /// Context-window safelist suppression uses the emitted `utf16_step_id`
+    /// (which is never `STEP_ROOT`, so root-only context checks are skipped).
+    /// Offline validation uses the **parent** `step_id` so root-level UTF-16
+    /// findings (`parent == STEP_ROOT`) are correctly validated.
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned(
         &self,
@@ -949,9 +976,15 @@ impl Engine {
         scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
-    /// Validates a raw decoded-space window and appends findings into `scratch.tmp_findings`.
+    /// Validates a raw decoded-space window and stages findings in `scratch.tmp_*`.
     ///
-    /// Guarantees / invariants:
+    /// Staging variant of the raw path in [`run_rule_on_window`]. Findings are
+    /// appended to `tmp_findings`, `tmp_drop_hint_end`, and `tmp_norm_hash`
+    /// instead of being committed directly into dedup state. The caller
+    /// (scheduler stream driver) decides whether to commit or roll back the
+    /// batch after all rules for the current buffer have run.
+    ///
+    /// # Guarantees
     /// - `window_start` is the decoded-stream offset for `window[0]`.
     /// - Span offsets in findings are expressed in decoded-stream byte space.
     /// - `root_hint`, when present, is in the same coordinate space as
@@ -965,10 +998,8 @@ impl Engine {
     ///   `IfNoFindingsInThisBuffer` transforms can still run.
     /// - Findings may be suppressed by the context-window safelist when emitted
     ///   `step_id == STEP_ROOT`, by the secret-bytes safelist (all findings),
-    ///   and by offline structural validation for root-semantic findings
-    ///   (`parent_step_id == STEP_ROOT`).
-    /// - Appends into staging buffers (`tmp_findings`, `tmp_drop_hint_end`,
-    ///   `tmp_norm_hash`) only; caller decides when to commit to output.
+    ///   UUID-format quick-reject, and by offline structural validation for
+    ///   root-semantic findings (`parent_step_id == STEP_ROOT`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_raw_window_into(
         &self,
@@ -1122,9 +1153,15 @@ impl Engine {
         scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
-    /// Validates a UTF-16 window by decoding to UTF-8 and appending findings.
+    /// Validates a UTF-16 window by decoding to UTF-8 and staging findings.
     ///
-    /// Guarantees / invariants:
+    /// Staging variant of [`run_rule_on_utf16_window_aligned`]. Applies the
+    /// same gate sequence (pre-decode raw gates, decode, post-decode gates,
+    /// regex, emit-time policy) but writes to `tmp_*` staging buffers instead
+    /// of committing directly. See that method for the full gate ordering and
+    /// safety justification for the `utf16_buf` raw-pointer reborrow.
+    ///
+    /// # Guarantees
     /// - `window_start` is the decoded-stream offset for `raw_win[0]`.
     /// - Spans recorded in findings are in decoded UTF-8 byte space.
     /// - An attached [`DecodeStep::Utf16Window`] records the raw UTF-16 parent
@@ -1134,18 +1171,20 @@ impl Engine {
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates AND emit-time policy.
-    ///   Suppressed findings do not set `found_any` (see raw-path comment).
+    ///   Suppressed findings do not set `found_any`, preserving
+    ///   `IfNoFindingsInThisBuffer` transform semantics.
     /// - Context-window safelist suppression checks the emitted step
     ///   (`utf16_step_id`), so UTF-16 emissions bypass root-only context checks.
-    ///   The secret-bytes safelist still applies to all findings regardless of
-    ///   step, catching placeholder values in decoded UTF-16 buffers.
+    ///   The secret-bytes safelist and UUID reject still apply to all findings
+    ///   regardless of step, catching placeholder values in decoded buffers.
     /// - Findings may be suppressed by offline structural validation using the
     ///   parent `step_id` (not `utf16_step_id`) for root-semantic detection.
     /// - Appends into staging buffers only; commit vs rollback is handled by
     ///   the stream driver.
     ///
-    /// # Edge cases
-    /// - Returns early when decode budgets are exhausted or decoding fails.
+    /// # Early returns
+    /// Returns without findings when decode budgets are exhausted or decoding
+    /// produces no output.
     #[allow(clippy::too_many_arguments)]
     fn run_rule_on_utf16_window_aligned_into(
         &self,
@@ -1358,11 +1397,15 @@ impl Engine {
         scratch.capture_locs[rule_id as usize] = Some(locs);
     }
 
-    /// UTF-16 scheduler adapter: scans both byte parities for the anchor-aligned
-    /// window and stages findings in `scratch.tmp_*`.
+    /// UTF-16 scheduler adapter: scans both byte parities and stages findings.
     ///
-    /// Ordering matters: hinted parity is attempted first, then the opposite
-    /// parity, so decode budget is spent on the most likely alignment first.
+    /// Staging counterpart of the UTF-16 branch in [`run_rule_on_window`].
+    /// Delegates to [`run_rule_on_utf16_window_aligned_into`] for each parity.
+    ///
+    /// Hinted parity is attempted first because the anchor hint byte offset
+    /// tells us which alignment most likely contains the match. The opposite
+    /// parity is tried second only if decode budget remains. This ordering
+    /// minimizes wasted decode work when the total-output budget is tight.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_utf16_window_into(
         &self,
@@ -1420,7 +1463,9 @@ impl Engine {
     /// 1. Context-window safelist (root findings only).
     /// 2. Secret-bytes safelist (all findings — placeholders in decoded buffers
     ///    are equally fake).
-    /// 3. Offline structural validation (root-semantic findings only).
+    /// 3. UUID-format quick-reject (skipped when the rule's `uuid_format_secret()`
+    ///    flag is set, e.g. Heroku/Snyk API keys that legitimately look like UUIDs).
+    /// 4. Offline structural validation (root-semantic findings only).
     ///
     /// Returns `None` when the finding is suppressed. In that case suppression
     /// counters are incremented here (when `perf-stats` + `debug_assertions`
@@ -1457,6 +1502,14 @@ impl Engine {
         // Secret-bytes safelist: checks all findings (not just root) because
         // placeholder values in decoded buffers are equally fake.
         if self.safelist.secret_bytes_matcher().is_match(secret_bytes) {
+            crate::perf_stats::sat_add_usize(&mut scratch.secret_bytes_safelist_suppressed, 1);
+            return None;
+        }
+
+        // UUID-format quick-reject: suppress findings whose extracted value is a
+        // bare UUID (8-4-4-4-12 hex) unless the originating rule captures
+        // UUID-format secrets (e.g., Heroku, Snyk API keys).
+        if !rule.uuid_format_secret() && self.safelist.uuid_reject().is_match(secret_bytes) {
             crate::perf_stats::sat_add_usize(&mut scratch.secret_bytes_safelist_suppressed, 1);
             return None;
         }

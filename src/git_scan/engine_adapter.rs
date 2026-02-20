@@ -4,7 +4,24 @@
 //! and a fixed-size ring buffer, then aggregates findings per blob with
 //! deterministic ordering.
 //!
-//! # Algorithm
+//! # Per-blob pipeline
+//!
+//! Each blob flows through four stages:
+//!
+//! 1. **Classify** (`scan_blob_into_buf`) — text blobs are scanned directly,
+//!    extractable binary formats (`.class`, `.pyc`, etc.) have their text
+//!    extracted first, and opaque binaries are skipped.
+//! 2. **Scan** — blob bytes are fed through overlap-safe chunk windows.
+//!    Blobs that fit in a single chunk skip the ring buffer entirely
+//!    (fast path); larger blobs stream through `RingChunker` (slow path).
+//! 3. **Stream** (`stream_findings`) — findings are emitted to the
+//!    structured `EventSink` for real-time consumption. A `CommitMeta`
+//!    event is emitted at most once per commit via `AtomicBitSet`.
+//! 4. **Record** (`record_findings`) — findings are appended to the shared
+//!    arena and the resulting `FindingSpan` is attached to the `ScannedBlob`.
+//!
+//! # Chunking algorithm
+//!
 //! 1. Stream blob bytes into fixed windows using `RingChunker`.
 //! 2. Scan each window with `Engine::scan_chunk_into` at the correct base offset.
 //! 3. Drop findings that fall entirely inside the overlap prefix so each match
@@ -12,19 +29,20 @@
 //! 4. Convert findings into `FindingKey` values (no raw secret bytes).
 //! 5. Sort + dedup per blob to guarantee deterministic ordering.
 //!
-//! Blobs that fit in a single chunk skip the ring buffer entirely (fast path).
-//!
 //! # Design
+//!
 //! - Chunk overlap uses `Engine::required_overlap()` and
 //!   `ScanScratch::drop_prefix_findings`.
 //! - A fixed-size ring buffer streams blob bytes into the scanner, avoiding
 //!   per-blob allocations beyond the chunk window.
-//! - Findings are stored in a shared arena with per-blob spans.
+//! - Findings are stored in a shared arena with per-blob spans, so individual
+//!   blobs reference contiguous slices rather than owning separate `Vec`s.
 //! - `CommitMeta` events are emitted at most once per commit using an
 //!   `AtomicBitSet` shared across all adapter instances. See
 //!   [`EngineAdapter::stream_findings`] for the exactly-once protocol.
 //!
 //! # Invariants
+//!
 //! - Results are returned in candidate order.
 //! - `ScannedBlob.findings` indexes into the adapter's findings arena.
 //! - Path refs in results point into the mapping arena supplied by the caller.
@@ -57,12 +75,15 @@ use super::tree_candidate::CandidateContext;
 /// Bundles the event sink and commit-graph state needed for exactly-once
 /// `CommitMeta` emission during scanning.
 ///
-/// Passed as a single argument to runner entry-points that forward these
-/// into [`EngineAdapter::new_with_event_sink`].
+/// This exists as a single argument bundle so that runner entry-points can
+/// thread all commit-attribution state into per-worker
+/// [`EngineAdapter::new_with_event_sink`] calls without growing the
+/// argument list every time a new shared resource is added.
 pub struct CommitMetaContext {
     /// Structured event sink for streaming scan progress and diagnostics.
     pub event_sink: Arc<dyn EventSink>,
-    /// Maps commit-graph positions to OIDs and timestamps.
+    /// Maps commit-graph positions to OIDs, timestamps, and (optionally)
+    /// identity data.
     pub commit_graph_index: Arc<CommitGraphIndex>,
     /// Emit-once bitset — one bit per commit-graph position.
     pub commit_meta_seen: Arc<AtomicBitSet>,
@@ -79,14 +100,20 @@ pub struct CommitMetaContext {
 pub const DEFAULT_CHUNK_BYTES: usize = 1 << 20;
 
 /// Engine adapter configuration.
+///
+/// Controls the chunking strategy and content-policy behavior for scanning.
+/// Larger `chunk_bytes` reduce per-blob overhead but increase peak memory;
+/// the default (1 MiB) balances throughput and resident memory.
 #[derive(Clone, Copy, Debug)]
 pub struct EngineAdapterConfig {
-    /// Total chunk window size (prefix + payload).
+    /// Total chunk window size in bytes (overlap prefix + new payload).
     ///
-    /// The adapter will clamp this to at least `required_overlap + 1`.
-    /// Use `0` to select the default (`DEFAULT_CHUNK_BYTES`).
+    /// The adapter clamps this to at least `required_overlap + 1` so every
+    /// chunk makes forward progress, and caps at `u32::MAX` so finding
+    /// offsets can safely downcast. Use `0` to select [`DEFAULT_CHUNK_BYTES`].
     pub chunk_bytes: usize,
-    /// When `true`, scan binary blobs instead of skipping them.
+    /// When `true`, skip the binary content check and scan every blob
+    /// regardless of content classification.
     pub scan_binary: bool,
 }
 
@@ -101,11 +128,19 @@ impl Default for EngineAdapterConfig {
 
 /// Normalized finding key for Git persistence.
 ///
-/// Order is total and stable: `(start, end, rule_id, norm_hash)`.
+/// Stores the minimal information needed to identify and deduplicate a
+/// finding without retaining the raw secret bytes — the secret is
+/// represented only by its `NormHash`, avoiding sensitive data in
+/// long-lived persistence structures.
 ///
-/// `start`/`end` are derived from `FindingRec.root_hint_*`, which use the
-/// *full match span* in blob coordinates. For transform-derived findings,
-/// these spans map back to the encoded bytes that produced the match.
+/// Order is total and stable: `(start, end, rule_id, norm_hash)`.
+/// This derived ordering means findings sort by position first, then
+/// by rule, then by secret identity — which makes sort+dedup deterministic
+/// regardless of scan-chunk ordering.
+///
+/// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
+/// a *best-effort root match span* in blob coordinates. For transform-derived
+/// findings, these spans map back to the encoded bytes that produced the match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FindingKey {
     /// Inclusive start offset within the blob.
@@ -114,7 +149,8 @@ pub struct FindingKey {
     pub end: u32,
     /// Stable rule identifier.
     pub rule_id: u32,
-    /// Normalized secret hash (no raw secret bytes stored).
+    /// Normalized secret hash — the sole representation of the matched
+    /// secret, so raw secret bytes never appear in scan output structures.
     pub norm_hash: NormHash,
 }
 
@@ -157,8 +193,12 @@ pub struct ScannedBlobs {
 
 /// Always-on Git scan counters for user-facing summaries.
 ///
-/// Unlike `git-perf` counters, these values are recorded in all builds and
-/// track the same core dimensions as FS summaries.
+/// Unlike `git-perf` counters (debug/profile only), these values are
+/// recorded in all builds and track the same core dimensions as the FS
+/// scan summary — enabling unified reporting across scan modes.
+///
+/// All counters use `saturating_add` so overflow silently caps at `u64::MAX`
+/// rather than panicking.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GitScanCommonMetrics {
     /// Number of blob payloads sent through the scanner.
@@ -180,6 +220,8 @@ pub struct GitScanCommonMetrics {
 }
 
 impl GitScanCommonMetrics {
+    /// Accumulates counters from `other` into `self` using saturating
+    /// arithmetic. Used to merge per-worker metrics into a global summary.
     #[inline(always)]
     pub fn merge_from(&mut self, other: &Self) {
         self.objects_scanned = self.objects_scanned.saturating_add(other.objects_scanned);
@@ -194,11 +236,22 @@ impl GitScanCommonMetrics {
 }
 
 /// Engine adapter error taxonomy.
+///
+/// These are non-recoverable errors from a single blob's scan.
+/// Both variants arise from `u32` bounds checking — a deliberate
+/// constraint that keeps `FindingKey` and `FindingSpan` compact
+/// (4 bytes per offset field vs 8 for `u64`).
 #[derive(Debug)]
 pub enum EngineAdapterError {
-    /// Finding offsets exceed `u32` bounds.
+    /// A finding's byte offsets within the blob exceeded `u32::MAX`.
+    ///
+    /// This can only happen for blobs larger than 4 GiB, which are
+    /// exotic in Git repositories.
     FindingOffsetOverflow { start: u64, end: u64 },
-    /// Findings arena index exceeds `u32` bounds.
+    /// The cumulative findings arena grew past `u32::MAX` entries.
+    ///
+    /// This would require billions of findings across all blobs in
+    /// a single adapter lifetime — practically unreachable.
     FindingArenaOverflow { end: usize, max: u32 },
 }
 
@@ -223,15 +276,23 @@ impl From<EngineAdapterError> for PackExecError {
     }
 }
 
-/// Git engine adapter that implements `PackObjectSink`.
+/// Git engine adapter that implements [`PackObjectSink`].
 ///
-/// The adapter reuses a ring chunker and scratch space across blobs to
-/// minimize allocations on hot paths. Results accumulate until
-/// `take_results` or `clear_results` is called.
+/// This is the primary entry point for scanning decoded Git blobs. It
+/// reuses a ring chunker and scratch space across blobs to minimize
+/// allocations on hot paths. Results accumulate until `take_results`
+/// or `clear_results` is called.
 ///
-/// When an `EventSink` is configured, findings are also streamed as
-/// structured [`ScanEvent::Finding`] events during scanning (in addition
-/// to being recorded in `ScannedBlobs` for persistence).
+/// Findings flow through two parallel channels:
+///
+/// - **Event stream** — structured [`ScanEvent::Finding`] events emitted
+///   to the configured `EventSink` for real-time consumption (dashboards,
+///   progress reporting, CI integrations).
+/// - **Arena accumulation** — `FindingKey` values appended to a shared
+///   arena for batch persistence after the scan completes.
+///
+/// The adapter is `Send` so it can be pooled across scoped-thread
+/// boundaries alongside `PackCache` and `PackExecScratch`.
 pub struct EngineAdapter<'a> {
     engine: &'a Engine,
     scratch: ScanScratch,
@@ -334,7 +395,8 @@ impl<'a> EngineAdapter<'a> {
         }
     }
 
-    /// Clears accumulated results while preserving allocated capacity.
+    /// Clears accumulated results and resets scan counters to zero while
+    /// preserving allocated capacity.
     ///
     /// This does not reset the file-id counter; file ids continue to
     /// monotonically wrap.
@@ -524,8 +586,10 @@ impl<'a> EngineAdapter<'a> {
         self.scan_blob_payload(file_id, bytes)
     }
 
-    /// Scans raw blob bytes (bypassing content classification) and updates
-    /// metrics. Called by `scan_blob_into_buf` for text blobs.
+    /// Scans raw blob bytes through the chunking pipeline and updates
+    /// metrics. Called by `scan_blob_into_buf` after content classification
+    /// has already determined the bytes are scannable (either the original
+    /// text bytes, or extracted text from a binary format).
     fn scan_blob_payload(
         &mut self,
         file_id: FileId,
@@ -642,6 +706,10 @@ impl<'a> EngineAdapter<'a> {
 
 /// Scan a blob with overlap-safe chunking and return sorted + deduped findings.
 ///
+/// This is the standalone entry point for callers that do not need a
+/// long-lived [`EngineAdapter`]. A fresh `ScanScratch` and `RingChunker`
+/// are allocated per call, so prefer the adapter API for batch scanning.
+///
 /// Findings are normalized into `FindingKey` values and ordered deterministically.
 ///
 /// # Errors
@@ -719,12 +787,23 @@ fn scan_blob_chunked_into(
 
 /// Scan a blob using a reusable chunker and optional allocation guard.
 ///
+/// This is the inner workhorse shared by both the standalone
+/// `scan_blob_chunked` API and the `EngineAdapter` per-blob pipeline.
+///
+/// Two code paths exist:
+///
+/// - **Fast path** — blob fits in a single chunk (`len <= chunk_bytes`).
+///   Constructs a `ChunkView` directly on the blob slice, skipping the
+///   ring buffer memcpy entirely.
+/// - **Slow path** — blob spans multiple chunks. Streams bytes through
+///   `RingChunker::feed` + `flush`, which emits overlapping windows.
+///
+/// Both paths sort+dedup findings after scanning and optionally assert
+/// zero allocations when the debug allocation guard is enabled.
+///
 /// The chunker is reset before use and must have the same overlap as the
 /// caller-provided `overlap`. `out` is cleared and populated with sorted,
 /// deduped findings.
-///
-/// When the debug allocation guard is enabled, `assert_no_alloc()` is called
-/// after the scan to verify no heap allocations occurred in the hot path.
 fn scan_blob_chunked_with_chunker(
     engine: &Engine,
     scratch: &mut ScanScratch,
@@ -890,16 +969,22 @@ fn scan_chunk(
 /// A single chunk window produced by the ring chunker.
 ///
 /// Each view represents a contiguous slice of a blob, potentially including
-/// an overlap prefix from the previous window. After scanning, findings
-/// whose `drop_hint_end` falls at or before the overlap boundary are dropped
-/// to prevent double-reporting — except for the first window (`is_first`),
-/// where no prior window exists to own those bytes.
+/// an overlap prefix from the previous window. The overlap region exists so
+/// the scan engine can detect secrets that straddle chunk boundaries.
+///
+/// After scanning, findings whose offsets fall entirely within the overlap
+/// prefix are dropped to prevent double-reporting — except for the first
+/// window (`is_first`), where no prior window exists to own those bytes.
 struct ChunkView<'a> {
-    /// Absolute start offset of `window` within the blob.
+    /// Absolute byte offset of `window[0]` within the original blob.
     base: u64,
-    /// Indicates the first window so the overlap prefix is not dropped.
+    /// `true` for the first window in a blob, which suppresses overlap
+    /// deduplication (there is no prior window whose "new bytes" region
+    /// could own findings in the prefix).
     is_first: bool,
-    /// Window bytes: overlap prefix followed by new bytes.
+    /// Window bytes: `[overlap prefix | new bytes]`.
+    /// Length is exactly `chunk_bytes` for full windows, or less for the
+    /// final partial window emitted by `flush`.
     window: &'a [u8],
 }
 
@@ -909,6 +994,10 @@ struct ChunkView<'a> {
 /// as they fill. The ring retains `overlap` trailing bytes between windows
 /// so the scan engine can detect secrets that straddle chunk boundaries.
 /// A final partial window is emitted by `flush`.
+///
+/// The buffer is allocated once at construction and reused across blobs
+/// (via `reset`), so per-blob overhead is bounded to overlap-prefix copies
+/// at chunk boundaries — no heap allocation on the hot path.
 ///
 /// # Usage protocol
 ///
@@ -924,7 +1013,8 @@ struct ChunkView<'a> {
 /// window whose "new bytes" region owns them).
 ///
 /// # Invariant
-/// `chunk_bytes > overlap`, enforced at construction.
+/// `chunk_bytes > overlap`, enforced at construction. This guarantees
+/// each window advances by at least one byte, preventing infinite loops.
 struct RingChunker {
     chunk_bytes: usize,
     overlap: usize,
@@ -935,6 +1025,10 @@ struct RingChunker {
 }
 
 impl RingChunker {
+    /// Creates a chunker with the given window size and overlap.
+    ///
+    /// # Panics
+    /// If `chunk_bytes == 0` or `chunk_bytes <= overlap`.
     fn new(chunk_bytes: usize, overlap: usize) -> Self {
         assert!(chunk_bytes > 0, "chunk_bytes must be > 0");
         assert!(chunk_bytes > overlap, "chunk_bytes must exceed overlap");
@@ -948,10 +1042,12 @@ impl RingChunker {
         }
     }
 
+    /// Returns the total window size (overlap + new bytes).
     fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }
 
+    /// Returns the overlap prefix size retained between consecutive windows.
     fn overlap(&self) -> usize {
         self.overlap
     }
@@ -968,7 +1064,10 @@ impl RingChunker {
 
     /// Stream data into fixed windows and invoke the callback per full chunk.
     ///
-    /// Each window is `chunk_bytes` long and includes the overlap prefix.
+    /// Each window is `chunk_bytes` long and includes the overlap prefix
+    /// from the tail of the previous window. Input data may be larger than
+    /// a single chunk; the loop consumes it in passes, emitting one
+    /// `ChunkView` each time the internal buffer fills.
     fn feed(&mut self, mut data: &[u8], mut on_chunk: impl FnMut(ChunkView<'_>)) {
         while !data.is_empty() {
             let space = self.chunk_bytes - self.filled;
@@ -1000,11 +1099,15 @@ impl RingChunker {
     }
 
     /// Emit the final partial chunk (if any), then reset internal state.
+    ///
+    /// A partial chunk that contains *only* the overlap prefix (no new bytes)
+    /// is suppressed — those bytes were already scanned as part of the
+    /// previous full window.
     fn flush(&mut self, mut on_chunk: impl FnMut(ChunkView<'_>)) {
         if self.filled == 0 {
             return;
         }
-        // Avoid emitting a final chunk that contains only the overlap prefix.
+        // Suppress a trailing window that has no new bytes beyond the overlap.
         if !self.is_first && self.filled <= self.overlap {
             self.reset();
             return;
@@ -1018,8 +1121,9 @@ impl RingChunker {
     }
 }
 
-// Compile-time assertion: EngineAdapter must be Send so it can be pooled
-// across scoped thread boundaries (same pattern as PackCache/PackExecScratch).
+// Compile-time assertion: `EngineAdapter` must be `Send` so it can live in
+// a per-worker pool and be moved across scoped-thread boundaries during
+// parallel pack execution (same pattern as `PackCache` / `PackExecScratch`).
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
@@ -1221,6 +1325,7 @@ mod tests {
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
         };
 

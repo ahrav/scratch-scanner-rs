@@ -147,6 +147,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         local_context,
         offline_validation,
         secret_group: rule.secret_group,
+        uuid_format_secret: rule.uuid_format_secret,
     }
 }
 
@@ -858,6 +859,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
         "local_context",
         "offline_validation",
         "secret_group",
+        "uuid_format_secret",
     ];
     let offline_validation_fields: &[&str] =
         &["type", "prefix_skip", "payload_len", "checksum_len"];

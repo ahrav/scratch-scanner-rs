@@ -26,6 +26,7 @@ fn test_engine() -> &'static Engine {
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"TOK_([A-Z0-9]{4,8})").unwrap(),
         };
         let rule_b = RuleSpec {
@@ -42,6 +43,7 @@ fn test_engine() -> &'static Engine {
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"KEY_([a-z0-9]{6})").unwrap(),
         };
         Engine::new_with_anchor_policy(

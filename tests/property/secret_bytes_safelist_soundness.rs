@@ -100,6 +100,7 @@ proptest! {
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(&re_pattern).unwrap(),
         };
 
@@ -155,6 +156,11 @@ proptest! {
 
         let secret_str = std::str::from_utf8(&secret).unwrap();
 
+        // Filter out secrets that match UUID format (8-4-4-4-12 hex with
+        // hyphens at positions 8, 13, 18, 23). These are now suppressed by
+        // the UUID quick-reject filter.
+        prop_assume!(secret.len() != 36 || secret[8] != b'-' || secret[13] != b'-');
+
         // Filter out secrets that are exact placeholder matches (the only
         // cases the anchored patterns should catch). With segment_count >= 2
         // and separators, this is practically impossible for length 10+.
@@ -181,6 +187,7 @@ proptest! {
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(&re_pattern).unwrap(),
         };
 
@@ -201,6 +208,94 @@ proptest! {
             total_len,
             segment_count,
             &secret_str[..secret_str.len().min(40)]
+        );
+    }
+
+    /// The `uuid_format_secret` flag prevents UUID-format values from being
+    /// suppressed. Rules that intentionally capture UUID-format secrets
+    /// (e.g., Heroku, Snyk API keys) set this flag.
+    #[test]
+    fn uuid_format_secret_flag_prevents_suppression(
+        seed in any::<u64>(),
+    ) {
+        // Generate a random valid UUID (8-4-4-4-12 hex).
+        let hex_chars = b"0123456789abcdef";
+        let mut rng = seed;
+        let mut uuid = Vec::with_capacity(36);
+        for i in 0..36 {
+            if i == 8 || i == 13 || i == 18 || i == 23 {
+                uuid.push(b'-');
+            } else {
+                let v = lcg(&mut rng);
+                uuid.push(hex_chars[(v >> 33) as usize % hex_chars.len()]);
+            }
+        }
+        let uuid_str = std::str::from_utf8(&uuid).unwrap();
+
+        // Rule WITHOUT the flag: UUID should be suppressed.
+        let re_pattern = r"SEC_([0-9a-f\-]{36})";
+        let rule_without = RuleSpec {
+            name: "proptest-uuid-no-flag",
+            anchors: &[b"SEC_"],
+            radius: 64,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            char_class: None,
+            local_context: None,
+            secret_group: Some(1),
+            offline_validation: None,
+            uuid_format_secret: false,
+            re: Regex::new(re_pattern).unwrap(),
+        };
+
+        let engine_without = Engine::new_with_anchor_policy(
+            vec![rule_without],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let hay = format!("prefix SEC_{uuid_str} suffix");
+        let hits_without = scan_findings(&engine_without, hay.as_bytes());
+        prop_assert!(
+            !hits_without.iter().any(|h| h.rule == "proptest-uuid-no-flag"),
+            "UUID-format value should be suppressed when uuid_format_secret=false: {uuid_str}"
+        );
+
+        // Rule WITH the flag: UUID should NOT be suppressed.
+        let rule_with = RuleSpec {
+            name: "proptest-uuid-with-flag",
+            anchors: &[b"SEC_"],
+            radius: 64,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: None,
+            value_suppressors_any: None,
+            entropy: None,
+            char_class: None,
+            local_context: None,
+            secret_group: Some(1),
+            offline_validation: None,
+            uuid_format_secret: true,
+            re: Regex::new(re_pattern).unwrap(),
+        };
+
+        let engine_with = Engine::new_with_anchor_policy(
+            vec![rule_with],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        );
+
+        let hits_with = scan_findings(&engine_with, hay.as_bytes());
+        prop_assert!(
+            hits_with.iter().any(|h| h.rule == "proptest-uuid-with-flag"),
+            "UUID-format value should NOT be suppressed when uuid_format_secret=true: {uuid_str}"
         );
     }
 }

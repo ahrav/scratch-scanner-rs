@@ -43,6 +43,10 @@ use crate::engine::{Engine, ScanScratch as RealScanScratch};
 // FindingRecord for api::FindingRec
 // ============================================================================
 
+/// Trivial delegation: the real engine's `FindingRec` already carries the
+/// exact fields the trait requires (`rule_id`, `root_hint_*`, `span_*`,
+/// `confidence_score`). Only trivial widening conversions are needed
+/// (`u32` → `u64` for `span_start`/`span_end`).
 impl FindingRecord for ApiFindingRec {
     #[inline]
     fn rule_id(&self) -> u32 {
@@ -130,7 +134,12 @@ pub struct RealEngineScratch {
 unsafe impl Send for RealEngineScratch {}
 
 impl RealEngineScratch {
-    /// Create a new wrapper around the real scratch.
+    /// Create a new wrapper, pre-allocating drain buffers to `max_findings`.
+    ///
+    /// `max_findings` must match `Tuning::max_findings_per_chunk` so that
+    /// `drain_findings_into` never allocates. The engine enforces this cap
+    /// internally; exceeding it is a logic error (caught by debug assertions
+    /// in `drain_findings_into`).
     pub fn new(scratch: RealScanScratch, max_findings: usize) -> Self {
         Self {
             scratch,
@@ -167,9 +176,10 @@ impl EngineScratch for RealEngineScratch {
     }
 
     fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
-        // The real `ScanScratch::drain_findings_with_hashes` clears its
-        // outputs, so we stage through local buffers to preserve append
-        // semantics for `out`.
+        // The real `ScanScratch::drain_findings_with_hashes` *clears* the
+        // destination vecs before writing, which would destroy any findings
+        // already in `out`. We stage through local buffers to preserve the
+        // trait's append semantics.
         self.findings_buf.clear();
         self.norm_hash_buf.clear();
         let pending = self.scratch.pending_findings_len();
@@ -232,6 +242,12 @@ impl EngineScratch for RealEngineScratch {
 // ScanEngine for engine::Engine
 // ============================================================================
 
+/// Bridges the real `Engine` to the scheduler's `ScanEngine` trait.
+///
+/// Most methods delegate directly to inherent methods of the same name.
+/// `scan_chunk_into` unwraps the `RealEngineScratch` wrapper to pass the
+/// inner `ScanScratch` to the engine, which calls `reset_for_scan`
+/// internally (the lazy reset pattern described on [`RealEngineScratch`]).
 impl ScanEngine for Engine {
     type Scratch = RealEngineScratch;
 
@@ -305,6 +321,7 @@ mod tests {
             local_context: None,
             secret_group: None,
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
         }
     }

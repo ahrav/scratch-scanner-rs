@@ -309,8 +309,12 @@ pub struct PackExecReport {
 
 /// Hot-path counters buffered outside `PackExecStats`.
 ///
-/// This keeps frequently bumped fields in a tiny struct during execution and
-/// applies them to `PackExecStats` once per report.
+/// Separated from [`PackExecStats`] for cache-line density: these six `u32`
+/// counters (24 bytes) are the only fields bumped on every offset iteration.
+/// Keeping them in a small, `Copy` struct avoids polluting the same cache
+/// line as the infrequently updated timing and histogram fields in
+/// `PackExecStats`. The counters are merged into the full stats struct
+/// exactly once, after the plan execution loop completes.
 #[derive(Clone, Copy, Debug, Default)]
 struct PackExecHotStats {
     decoded_offsets: u32,
@@ -418,6 +422,11 @@ impl CacheRejectHistogram {
 }
 
 impl PackExecStats {
+    /// Whether heavyweight stat recording (merge, histogram) is active.
+    ///
+    /// Gated on both `perf-stats` *and* `debug_assertions` so that release
+    /// builds skip the merge loop entirely, even when compiled with the
+    /// feature flag.
     #[inline(always)]
     fn recording_enabled() -> bool {
         cfg!(all(feature = "perf-stats", debug_assertions))
@@ -504,10 +513,22 @@ impl PackExecStats {
 
 /// Accumulate wall-clock nanoseconds into a timing field.
 ///
-/// Gated on `cfg(feature = "git-perf")` — compiles to a no-op in normal
-/// builds so that `perf::time()` call-sites are free.  Follows the same
-/// pattern as `perf_stats::sat_add_*` but uses a separate feature flag
-/// because timing probes have higher overhead than simple counter bumps.
+/// The executor uses two independent feature flags for instrumentation:
+///
+/// - **`perf-stats`** — gates cheap counter increments (`sat_add_u32` and
+///   friends). The cost is a single saturating add per offset; always safe
+///   to enable in production debug builds.
+/// - **`git-perf`** — gates wall-clock timing via `perf::time()`. Each
+///   timing probe requires a clock read (typically `clock_gettime`), which
+///   is measurably more expensive than a counter bump on high-throughput
+///   pack decoding. This flag is intended for targeted profiling runs,
+///   not routine builds.
+///
+/// `record_timing` bridges the two: it accepts the nanosecond value
+/// produced by `perf::time()` and accumulates it into a `PackExecStats`
+/// timing field, but only when `git-perf` is active. Without the flag
+/// the function compiles to nothing and the `perf::time()` wrapper
+/// returns `0` for the nanos component.
 #[inline(always)]
 fn record_timing(field: &mut u64, nanos: u64) {
     #[cfg(feature = "git-perf")]
@@ -590,10 +611,19 @@ pub fn merge_pack_exec_reports(mut reports: Vec<PackExecReport>) -> PackExecRepo
     merged
 }
 
-/// Packed candidate range indexed by `need_offsets`.
+/// Packed half-open candidate index range `[start, end)` into
+/// `PackPlan.candidate_offsets`, indexed by `need_offsets` position.
 ///
-/// `missing()` is encoded as `(NONE_U32, NONE_U32)` to avoid `Option` tagging
-/// overhead in hot-path range tables.
+/// The "no candidates" sentinel is encoded as `(NONE_U32, NONE_U32)`
+/// rather than wrapping in `Option<(u32, u32)>`. This avoids the 4-byte
+/// discriminant that `Option` would add to every slot in the dense
+/// `candidate_ranges` table (one entry per `need_offsets` element),
+/// keeping the table compact and avoiding branch-heavy enum matching
+/// on the hot path.
+///
+/// The sentinel is detected by checking `start == NONE_U32` alone;
+/// consistency of `end` is ensured by construction (`missing()` and
+/// `Default` both set both fields to `NONE_U32`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CandidateRange {
     start: u32,
@@ -687,10 +717,17 @@ fn next_candidate_range(
     }
 }
 
-/// Reusable scratch buffers for pack execution.
+/// Reusable scratch state for pack execution.
 ///
-/// The executor uses a three-buffer rotation scheme to avoid per-offset
-/// heap allocations on the hot path:
+/// Callers may allocate one `PackExecScratch` and pass it to multiple
+/// sequential `execute_pack_plan_with_scratch*` calls. Between calls,
+/// [`prepare`](Self::prepare) clears contents but retains heap capacity,
+/// amortizing allocation across plans.
+///
+/// # Buffer rotation
+///
+/// The executor uses a three-buffer rotation scheme (inside [`DecodeBufs`])
+/// to avoid per-offset heap allocations on the hot path:
 ///
 /// - `inflate_buf` — receives raw zlib-inflated delta payloads. Non-delta
 ///   objects are inflated directly into `result_buf`. Sized to
@@ -708,15 +745,18 @@ fn next_candidate_range(
 /// (base not in cache). The stack is unwound in reverse to apply deltas
 /// from the root base outward.
 ///
-/// `delta_deps_hot` is a compact view of delta dependencies rewritten for
-/// the hot decode path. External base OIDs are interned separately.
+/// # Plan-specific tables
 ///
-/// `external_base_oids` stores interned OIDs for REF deltas whose bases
-/// are outside the current pack. Indexed by `DeltaDepHot::external_oid_idx`.
+/// `delta_deps_hot` and `external_base_oids` are rebuilt on every
+/// [`prepare`](Self::prepare) call because `DeltaDepHot::external_oid_idx`
+/// values are positional indices that are valid only for the specific plan
+/// that produced them. The Vec capacity is retained so plans with similar
+/// delta counts avoid reallocation.
 ///
-/// `candidate_ranges` is populated once per plan for out-of-order
-/// execution; it maps each `need_offsets` index to its contiguous range
-/// in `candidate_offsets` via packed [`CandidateRange`] values.
+/// `candidate_ranges` is populated once per plan (by
+/// [`build_candidate_ranges`]) only when the plan uses out-of-order
+/// execution. Each entry maps a `need_offsets` index to its contiguous
+/// range in `candidate_offsets` via packed [`CandidateRange`] values.
 #[derive(Debug, Default)]
 pub struct PackExecScratch {
     bufs: DecodeBufs,
@@ -738,6 +778,9 @@ impl Default for DecodeBufs {
 }
 
 impl DecodeBufs {
+    /// Ensures each buffer has at least the capacity required by `limits`
+    /// and clears contents. Capacity only grows; existing allocations are
+    /// never shrunk.
     fn prepare(&mut self, limits: &PackDecodeLimits, max_delta_depth: u8) {
         let inflate_target = limits.max_delta_bytes.max(1024);
         if self.inflate_buf.capacity() < inflate_target {
@@ -789,38 +832,63 @@ impl PackExecScratch {
 
     /// Prepares scratch buffers for the given plan and decode limits.
     ///
-    /// This only reserves capacity; it does not prefill contents. Callers
-    /// rely on this to avoid per-offset allocations on the hot path.
+    /// Ensures that `inflate_buf`, `result_buf`, `base_buf`, and
+    /// `delta_stack` have enough capacity for the plan's size limits and
+    /// delta depth, without shrinking existing allocations. This is the
+    /// mechanism that amortizes allocation cost when a single
+    /// `PackExecScratch` is reused across multiple plan executions.
     ///
-    /// Also rebuilds `delta_deps_hot` and `external_base_oids` so that every
-    /// `DeltaDepHot::external_oid_idx` points at the matching interned OID for
-    /// this exact plan.
+    /// **Delta-dep rebuild:** `delta_deps_hot` and `external_base_oids`
+    /// are *always* cleared and rebuilt from the plan's `delta_deps` array,
+    /// because the `DeltaDepHot::external_oid_idx` values are positional
+    /// indices into `external_base_oids` — they are only valid for the
+    /// specific plan that produced them. Reusing stale tables from a
+    /// prior plan would silently mis-resolve external OIDs. The Vec
+    /// capacity is retained across calls so that plans with similar delta
+    /// counts avoid reallocation.
+    ///
+    /// `candidate_ranges` is cleared but not populated here; it is filled
+    /// lazily by [`build_candidate_ranges`] only when the plan uses
+    /// out-of-order execution (`exec_order.is_some()`).
     fn prepare(&mut self, plan: &PackPlan, limits: &PackDecodeLimits) {
         self.prepare_bufs(limits, plan.max_delta_depth);
         rebuild_delta_deps_hot(plan, &mut self.delta_deps_hot, &mut self.external_base_oids);
     }
 }
 
-/// Where the decoded bytes live after `decode_offset`.
+/// Where the decoded bytes live after [`decode_offset`].
 ///
-/// Each variant has different ownership semantics:
-/// - `Cache` — bytes are owned by the `PackCache`; valid until the cache
-///   evicts the entry or is dropped. A second `cache_get` call is needed
-///   to obtain a slice.
-/// - `Scratch` — bytes live in `result_buf`, which is overwritten on the
-///   next offset decode. The sink must consume them before returning from
-///   `emit`.
-/// - `Spill` — bytes live in an mmap-backed temp file. The `BlobSpill`
-///   handle must outlive any slice borrows.
+/// Each variant has different ownership and lifetime semantics:
+///
+/// - **`Cache`** — bytes were inserted into the `PackCache` and are owned
+///   by the cache's backing storage. They remain valid until the cache
+///   entry is evicted by a subsequent insert or the cache itself is
+///   dropped. Because `decode_offset` returns metadata only (no slice),
+///   callers must perform a second `cache_get()` to obtain a `&[u8]`.
+///   In the common case of [`execute_offset_range_with_scratch`], this
+///   second lookup is avoided on cache *hits* by reusing the bytes from
+///   the initial probe.
+///
+/// - **`Scratch`** — bytes reside in `DecodeBufs::result_buf`, which is
+///   cleared and overwritten on the next call to `decode_offset`. The
+///   sink **must** consume these bytes (or copy them) within the current
+///   `emit()` invocation; they are invalid afterward.
+///
+/// - **`Spill`** — bytes are backed by a temporary mmap file created
+///   through [`BlobSpill`]. The `BlobSpill` handle inside this variant
+///   owns the mapping; the bytes are valid for as long as this
+///   `DecodedStorage` value exists. Used for objects exceeding
+///   `limits.max_object_bytes` to keep resident memory bounded.
 #[derive(Debug)]
 enum DecodedStorage {
-    /// Bytes are stored in the `PackCache`.
+    /// Bytes are owned by the `PackCache`. Requires a `cache_get()` to
+    /// obtain a `&[u8]` slice.
     Cache,
-    /// Bytes are stored in the scratch buffer passed to the decoder.
+    /// Bytes live in `DecodeBufs::result_buf`. Valid only until the next
+    /// `decode_offset` call overwrites the buffer.
     Scratch,
-    /// Bytes are stored in a spill-backed mmap.
-    ///
-    /// The spill must outlive any use of the returned slice.
+    /// Bytes live in an mmap-backed temp file. The `BlobSpill` handle
+    /// owns the mapping and must outlive any slice borrows.
     Spill(BlobSpill),
 }
 
@@ -865,10 +933,14 @@ fn cache_get(cache: &mut PackCache, offset: u64) -> Option<CachedObject<'_>> {
 /// Bases that exceed `max_object_bytes` are backed by a spill mmap; the
 /// `BlobSpill` owns the mapping and must outlive any slice borrows.
 ///
-/// The lifetime `'a` ties `Slice` borrows to either the `PackCache`
-/// (when the base was a cache hit) or `base_buf` (after fallback
-/// decode). `Spill` is `'static`-equivalent because the mmap owns its
-/// backing file.
+/// The lifetime `'a` on `Slice` ties borrows to one of two sources:
+/// - **Cache hit** — the `PackCache`'s internal storage; valid until the
+///   entry is evicted or the cache is dropped.
+/// - **Fallback decode** — `base_buf` within `DecodeBufs`; valid until
+///   the next `decode_offset` call that may overwrite it.
+///
+/// `Spill` has no lifetime parameter because the `BlobSpill` owns its
+/// backing mmap file; the bytes live as long as the handle exists.
 enum BaseStorage<'a> {
     Slice(&'a [u8]),
     /// Spill-backed bytes; the spill must remain alive while referenced.
@@ -906,8 +978,16 @@ impl BaseBytes<'_> {
 
 /// Compact delta-dependency view used on the hot decode path.
 ///
-/// External base OIDs are interned into a separate table so the common
-/// pack-local case stays dense.
+/// This is a flattened, cache-friendly projection of [`DeltaDep`] that
+/// avoids the `BaseLoc` enum tag and moves external base OIDs into a
+/// separate interned table. The result is a dense struct optimized for
+/// sequential scan during offset iteration.
+///
+/// For pack-local (OFS) deltas, `base_offset` holds the base's pack
+/// offset and `external_oid_idx` is [`NONE_U32`]. For external (REF)
+/// deltas, `base_offset` is `0` (sentinel — the pack header occupies
+/// `0..12` so no valid base starts there) and `external_oid_idx` is an
+/// index into the companion `external_base_oids` table.
 #[derive(Clone, Copy, Debug)]
 struct DeltaDepHot {
     /// Pack offset of the base entry for OFS deltas.
@@ -916,8 +996,14 @@ struct DeltaDepHot {
     /// the pack header occupies bytes `0..12`, so no valid base starts at
     /// offset 0.
     base_offset: u64,
+    /// Index into the companion `external_base_oids` table, or
+    /// [`NONE_U32`] for pack-local bases.
     external_oid_idx: u32,
+    /// Byte offset where the delta entry's zlib payload starts.
+    /// `0` means plan-time metadata was not available (synthetic plan).
     data_start: u64,
+    /// Declared uncompressed delta payload size from the entry header.
+    /// `0` when plan-time metadata is unavailable.
     delta_size: u64,
 }
 
@@ -947,6 +1033,13 @@ impl DeltaDepHot {
     }
 }
 
+/// Rebuild the hot delta-dep and external-OID tables from a plan.
+///
+/// Clears both Vecs (retaining capacity) and repopulates them from
+/// `plan.delta_deps`. External OIDs are assigned sequential indices as
+/// they are encountered, so the resulting `external_oid_idx` values in
+/// `DeltaDepHot` are valid only when paired with the `external_base_oids`
+/// table produced by the same call.
 fn rebuild_delta_deps_hot(
     plan: &PackPlan,
     delta_deps_hot: &mut Vec<DeltaDepHot>,
@@ -978,10 +1071,17 @@ fn rebuild_delta_deps_hot(
     }
 }
 
-/// Read-only hot delta-dependency tables for one pack plan.
+/// Read-only, `Arc`-wrapped delta-dependency tables for one pack plan.
 ///
-/// Built once per plan and shared across shard workers to avoid rebuilding
-/// `delta_deps_hot` for each shard task.
+/// When a plan is executed in parallel shards, each shard needs access to
+/// the same `delta_deps_hot` and `external_base_oids` tables. Without
+/// this struct, every shard call to `PackExecScratch::prepare()` would
+/// rebuild these tables from the plan — redundant work proportional to
+/// the number of deltas. `PackPlanHotDeps` is built once per plan via
+/// [`from_plan`](Self::from_plan) and cheaply cloned (via `Arc`) into
+/// each shard's `execute_*_hot_deps` call. The `_hot_deps` entry points
+/// call `prepare_bufs` (buffers only) instead of the full `prepare`
+/// (which would overwrite the tables).
 #[derive(Clone, Debug)]
 pub(super) struct PackPlanHotDeps {
     delta_deps_hot: Arc<[DeltaDepHot]>,
@@ -1043,8 +1143,11 @@ struct DeltaFrame {
 ///
 /// Bundles plan data, decode limits, and precomputed delta-dependency views
 /// that are constant across all offsets in a single plan execution. Passed
-/// by shared reference to collapse 8 register-consuming parameters into one
-/// pointer, keeping hot decode functions within ARM's x0–x7 ABI window.
+/// by shared reference (`&DecodeEnv`) to collapse eight otherwise
+/// register-consuming parameters into a single pointer, keeping hot decode
+/// functions like [`decode_offset`] and [`resolve_and_apply_delta`] within
+/// ARM's x0-x7 calling convention window (and reducing register pressure on
+/// x86-64 as well).
 struct DecodeEnv<'a> {
     pack: &'a PackFile<'a>,
     limits: &'a PackDecodeLimits,
@@ -1058,10 +1161,16 @@ struct DecodeEnv<'a> {
 
 /// Mutable scratch buffers used during per-offset decoding.
 ///
-/// Split from [`PackExecScratch`] so that callers can hold an immutable
-/// reference to precomputed plan data (`delta_deps_hot`, `external_base_oids`)
-/// while mutating working buffers.  Functions that need split borrows across
-/// `base_buf` and `inflate_buf`/`result_buf` destructure through field access.
+/// Split from [`PackExecScratch`] as a separate struct so that callers can
+/// hold an immutable reference to precomputed plan data (`delta_deps_hot`,
+/// `external_base_oids`) while mutating working buffers — a pattern that
+/// Rust's borrow checker requires separate structs for. Functions that
+/// need split borrows across `base_buf` and `inflate_buf`/`result_buf`
+/// destructure through individual field access.
+///
+/// The `de` (Decompress) instance is owned here rather than in a
+/// `thread_local!` so that the executor can pass it by `&mut` through
+/// the decode call chain without TLS overhead or reentrancy concerns.
 struct DecodeBufs {
     de: flate2::Decompress,
     inflate_buf: Vec<u8>,
@@ -1069,6 +1178,34 @@ struct DecodeBufs {
     base_buf: Vec<u8>,
     delta_stack: Vec<DeltaFrame>,
 }
+
+// ---------------------------------------------------------------------------
+// Execution entry points
+//
+// The public surface has several variants to support different call-site
+// constraints (scratch reuse, pre-parsed headers, shard parallelism). They
+// compose as a layered hierarchy:
+//
+//   execute_pack_plan_with_reader   — top-level, reads pack via PackReader
+//     execute_pack_plan             — accepts raw pack bytes, allocates scratch
+//       execute_pack_plan_with_scratch — reuses caller-owned PackExecScratch
+//         execute_pack_plan_with_scratch_from_header — + pre-parsed header
+//
+//   Shard variants (split work across disjoint index sets):
+//     execute_pack_plan_with_scratch_indices       — explicit index list
+//       ..._indices_from_header                    — + pre-parsed header
+//       ..._indices_hot_deps                       — + shared PackPlanHotDeps
+//     execute_pack_plan_with_scratch_range          — contiguous [start, end)
+//       ..._range_from_header                      — + pre-parsed header
+//       ..._range_hot_deps                         — + shared PackPlanHotDeps
+//
+// All variants eventually funnel through the internal
+// `execute_pack_plan_with_selector_from_header`, which is parameterized by
+// an index iterator and a candidate-range lookup closure.
+//
+// When adding a new entry point, wire it through the selector core to
+// keep per-offset decode logic in one place.
+// ---------------------------------------------------------------------------
 
 /// Executes a pack plan against a `PackReader`.
 ///
@@ -1162,8 +1299,20 @@ pub fn parse_pack_header_for_plan(
     PackFile::parse_header(pack_bytes, plan.oid_len as usize).map_err(PackExecError::PackParse)
 }
 
-/// Shared execution core for pack plan entrypoints that differ only by index
-/// selection and candidate-range lookup.
+/// Shared execution core for all pack plan entry points.
+///
+/// Every public `execute_pack_plan_*` function ultimately calls this.
+/// The two generic parameters abstract over the two axes of variation:
+///
+/// - `I: IntoIterator<Item = usize>` — which `need_offsets` indices to
+///   decode (e.g., `0..n` for sequential, an explicit `&[usize]` for
+///   shard execution, or `exec_order` for out-of-order plans).
+/// - `R: FnMut(usize) -> CandidateRange` — how to resolve candidates
+///   for a given need index (forward merge cursor for monotone execution,
+///   precomputed table lookup for out-of-order or shard execution).
+///
+/// This design keeps the per-offset decode/emit logic in one place
+/// regardless of how the outer entry point selects work.
 #[allow(clippy::too_many_arguments)]
 fn execute_pack_plan_with_selector_from_header<
     S: PackObjectSink,
@@ -1237,11 +1386,28 @@ fn execute_pack_plan_with_selector_from_header<
 /// (when `alloc_guard_enabled` is true) to enforce the zero-allocation
 /// invariant on the hot path.
 ///
-/// Cache-hit fast path: when the offset is already in `cache`, the bytes
-/// from the initial probe are reused directly — no redundant re-probe.
-/// On a cache miss, `decode_offset` is invoked and may store bytes in
-/// `Cache`, `Scratch`, or `Spill`; a second `cache_get` is only needed
-/// when `decode_offset` returns `DecodedStorage::Cache`.
+/// # Bytes resolution strategy
+///
+/// After decoding, the function must produce a `&[u8]` slice for the
+/// sink. The strategy differs by how the offset was resolved:
+///
+/// - **Cache hit (initial probe)** — the `cache_get` at the top of the
+///   function returned `Some(hit)`. The returned `hit.bytes` slice is
+///   saved and reused directly for all candidates at this offset. No
+///   second cache lookup occurs. (Verified by the
+///   `*_cache_hit_probes_once` tests.)
+///
+/// - **Cache miss, decoded to `Cache`** — `decode_offset` inflated the
+///   object and inserted it into the cache. A second `cache_get` is
+///   required to borrow the bytes from the cache's backing storage.
+///   If the entry was evicted between insert and this lookup (possible
+///   in theory with a tiny cache), the fallback reads from `result_buf`.
+///
+/// - **Cache miss, decoded to `Scratch`** — bytes live in
+///   `bufs.result_buf` and are read directly.
+///
+/// - **Cache miss, decoded to `Spill`** — bytes live in the `BlobSpill`
+///   mmap and are read via `spill.as_slice()`.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn execute_offset_range_with_scratch<S: PackObjectSink, B: ExternalBaseProvider>(
@@ -1844,8 +2010,11 @@ fn read_pack_bytes<R: PackReader>(reader: &mut R, out: &mut Vec<u8>) -> Result<(
 
 /// Build candidate index ranges for each `need_offsets` entry.
 ///
-/// This is used only when `exec_order` reorders offsets; it avoids repeated
-/// scans of the candidate list by leveraging sorted candidate offsets.
+/// Within sequential (non-shard) execution, this is called only when
+/// `exec_order` reorders offsets. Shard-parallel entry points require
+/// callers to precompute ranges unconditionally because they access
+/// arbitrary index subsets. Avoids repeated scans of the candidate list
+/// by leveraging sorted candidate offsets.
 ///
 /// Assumes `candidate_offsets` is sorted ascending by offset.
 /// Runs in `O(need_offsets.len() + candidate_offsets.len())`.
@@ -1913,6 +2082,9 @@ fn data_start_to_usize(data_start: u64) -> Result<usize, PackDecodeError> {
 /// in resident memory. The choice is made once in
 /// [`inflate_delta_payload`] and is transparent to callers via
 /// `as_slice()`.
+///
+/// The lifetime `'a` on `Slice` borrows from `inflate_buf`; `Spill`
+/// owns its backing and has no lifetime dependency.
 enum DeltaPayload<'a> {
     Slice(&'a [u8]),
     Spill(BlobSpill),
@@ -1994,13 +2166,19 @@ fn skip_reason_from_delta_error(err: DeltaDecodeError) -> SkipReason {
 
 /// Offer decoded delta output to the cache and determine final storage.
 ///
-/// If the output is in `result_buf` (Scratch or Cache-tagged), attempts
-/// a cache insert. On success the object is promoted to `Cache` storage;
-/// on failure (oversize or cache disabled) it remains in `Scratch` and
-/// the reject is recorded in `stats`.
+/// Called after a successful delta application to decide where the
+/// reconstructed bytes should live for the remainder of this offset's
+/// processing:
 ///
-/// Spill-backed outputs skip the cache entirely — they are already
-/// too large to benefit from caching — and record a reject directly.
+/// - **`Scratch` or `Cache` input** — the output lives in `result_buf`.
+///   The function attempts `cache.insert()`. On success the storage is
+///   promoted to `Cache` (the sink will read from cache backing). On
+///   failure (oversize entry or cache at capacity) the output stays in
+///   `Scratch` and a cache-reject metric is recorded.
+///
+/// - **`Spill` input** — the output is already in a mmap-backed temp
+///   file, too large for cache benefit. The spill is returned as-is
+///   and a cache-reject metric is recorded directly.
 fn finalize_decoded_delta(
     offset: u64,
     kind: ObjectKind,
@@ -2249,22 +2427,34 @@ fn resolve_and_apply_delta<B: ExternalBaseProvider>(
 /// Successful decodes return metadata describing where the bytes reside
 /// (cache, scratch, or spill).
 ///
-/// Three dispatch paths, tried in order:
+/// # Dispatch paths
+///
+/// The function attempts three paths, falling through as needed:
 ///
 /// 1. **Planned-dep fast path** — when `delta_dep_index` maps this offset
 ///    to a [`DeltaDepHot`] with persisted header metadata (`has_header_meta`),
-///    the entry header parse is skipped entirely. External REF deltas go
-///    straight to the external base provider; in-pack OFS deltas go to
-///    [`resolve_and_apply_delta`].
+///    the entry header parse is skipped entirely. This path handles both
+///    external REF deltas (routed to the external base provider via
+///    [`resolve_external_and_apply_delta`]) and in-pack OFS deltas
+///    (routed to [`resolve_and_apply_delta`]). Returns immediately.
 ///
-/// 2. **Fallback header parse** — for synthetic plans or offsets without
-///    a delta-dep entry, the raw entry header is read from pack bytes.
-///    Non-delta entries are inflated directly (small → `result_buf`,
-///    large → spill). OFS deltas delegate to [`resolve_and_apply_delta`].
+/// 2. **Fallback header parse** — for offsets without a planned-dep entry
+///    (or where `has_header_meta` is false, as in synthetic plans), the
+///    raw entry header is parsed from pack bytes. The result branches by
+///    entry kind:
+///    - **Non-delta** — inflated directly into `result_buf` when the
+///      object fits within `max_object_bytes`, or streamed to a spill
+///      mmap for oversized objects. Offered to the cache on success.
+///    - **OFS delta** — delegates to [`resolve_and_apply_delta`] using
+///      the base offset from the header.
+///    - **REF delta** — proceeds to path 3.
 ///
-/// 3. **REF delta header parse** — REF deltas check the planned-dep for
-///    an in-pack base offset first; otherwise the external provider is
-///    queried using the OID from either the plan or the entry header.
+/// 3. **REF delta from header** — checks whether a planned-dep exists
+///    with an in-pack base offset (i.e., the planner resolved the REF to
+///    an OFS equivalent). If so, delegates to [`resolve_and_apply_delta`].
+///    Otherwise, resolves the OID (preferring the interned OID from
+///    `external_base_oids` over the raw header OID) and routes to the
+///    external base provider via [`resolve_external_and_apply_delta`].
 #[allow(clippy::too_many_arguments)]
 fn decode_offset<B: ExternalBaseProvider>(
     env: &DecodeEnv<'_>,
@@ -2735,6 +2925,11 @@ fn unwind_and_build_base<'b>(
 }
 
 /// Root base discovered while walking a fallback delta chain.
+///
+/// Returned by [`walk_delta_chain_to_root`] to tell the caller how to
+/// materialize the root object. `Pack` carries enough metadata to
+/// inflate directly from pack bytes; `External` requires a call to the
+/// [`ExternalBaseProvider`].
 #[derive(Clone, Copy, Debug)]
 enum ChainRoot {
     /// Root is a non-delta entry in the current pack.
@@ -2748,11 +2943,22 @@ enum ChainRoot {
     External { oid: OidBytes },
 }
 
-/// Walk delta links from `offset` to the root base, collecting frames.
+/// Walk delta links from `offset` toward the root base, collecting frames.
 ///
-/// The walk follows persisted delta metadata when available, falling back to
-/// header parsing for synthetic/manual plans. It returns the resolved root
-/// descriptor while `delta_stack` accumulates intermediate deltas in walk order.
+/// Starting at `offset`, each iteration either follows persisted plan
+/// metadata (`DeltaDepHot` via `delta_dep_index`) or falls back to parsing
+/// the raw entry header from pack bytes. For each delta encountered, a
+/// [`DeltaFrame`] is pushed onto `delta_stack` (in forward/walk order,
+/// i.e., shallowest first). The walk terminates when:
+///
+/// - A **non-delta** pack entry is found → returns `ChainRoot::Pack`.
+/// - An **external REF base** is identified → returns `ChainRoot::External`.
+/// - **`max_delta_depth`** is exceeded → returns `Err(BaseMissing)`.
+/// - A **self-referential** base offset is detected → returns
+///   `Err(BaseMissing)` to prevent infinite loops.
+///
+/// The returned [`ChainRoot`] tells the caller how to materialize the root
+/// base bytes before unwinding the stack.
 fn walk_delta_chain_to_root(
     env: &DecodeEnv<'_>,
     offset: u64,
@@ -2983,21 +3189,35 @@ fn materialize_root_base<B: ExternalBaseProvider>(
 /// Called when a delta's base is not in the cache (fallback path). The
 /// algorithm has two phases:
 ///
-/// 1. **Walk forward** — starting at `offset`, read each entry header. If
-///    the entry is itself a delta, push a [`DeltaFrame`] onto the stack
-///    and follow the base pointer. Stop when a non-delta entry or an
+/// 1. **Walk forward** ([`walk_delta_chain_to_root`]) — starting at
+///    `offset`, follow delta base pointers, pushing a [`DeltaFrame`] for
+///    each intermediate delta. The walk prefers persisted plan metadata
+///    (`DeltaDepHot`) when available and falls back to parsing entry
+///    headers from pack bytes. Terminates when a non-delta entry or an
 ///    external REF base is reached, or `max_delta_depth` is exceeded.
 ///
-/// 2. **Unwind backward** — inflate the root base into `base_buf`, then
-///    iterate the delta stack in reverse. For each frame, inflate the
-///    delta payload and apply it against the current base bytes, writing
-///    the output into `result_buf`. After each application, swap
-///    `base_buf` and `result_buf` so the latest output becomes the base
-///    for the next frame. Results are also offered to the cache at each
-///    step.
+/// 2. **Unwind backward** ([`unwind_and_build_base`]) — materializes the
+///    root base (via [`materialize_root_base`]), then iterates the delta
+///    stack in reverse. For each frame, the delta payload is inflated and
+///    applied against the current base, writing output into `result_buf`.
+///    After each application, `base_buf` and `result_buf` are swapped so
+///    the latest output becomes the input base for the next frame.
+///    Intermediate results are offered to the cache at each step.
 ///
-/// Oversized bases or delta outputs are spilled to mmap-backed files
-/// under `spill_dir` rather than held in RAM.
+/// # Oversized object handling
+///
+/// Both the root base and each intermediate delta output may exceed
+/// `limits.max_object_bytes`. When this happens:
+///
+/// - **Root base** — `materialize_pack_root_base` or
+///   `load_external_root_base` streams the object into a `BlobSpill`
+///   mmap rather than `base_buf`. The spill handle is threaded through
+///   `unwind_delta_stack` as `base_spill`.
+///
+/// - **Intermediate delta output** — `decode_delta_output` returns
+///   `DecodedStorage::Spill(spill)` when the result exceeds the size
+///   cap. During the unwind, the spill replaces `base_spill` and the
+///   next frame reads from it instead of `base_buf`.
 ///
 /// Returns the fully resolved base bytes (in `base_buf` or a spill) on
 /// success, or a `SkipReason` for non-fatal failures. Callers record the
@@ -3059,14 +3279,28 @@ fn decode_base_from_pack<'b, B: ExternalBaseProvider>(
     )
 }
 
-/// Non-fatal delta decode failure.
+/// Non-fatal delta decode failure used as an internal error type within
+/// the delta resolution pipeline.
 ///
-/// Callers convert this into the appropriate [`SkipReason`] variant and
-/// record it in the execution report. This is separate from
-/// [`PackExecError`] because delta failures do not abort the plan.
+/// This enum exists to distinguish between two failure modes that arise
+/// during delta processing so that they map cleanly onto the external
+/// skip taxonomy:
+///
+/// - `Decode` — the zlib inflate or entry header parse failed *before*
+///   delta application could begin. Maps to [`SkipReason::Decode`].
+/// - `Delta` — inflate succeeded but the delta instruction stream itself
+///   was malformed, or the output exceeded size limits. Maps to
+///   [`SkipReason::Delta`].
+///
+/// Both variants are non-fatal: the affected offset is skipped and
+/// execution continues with the next offset. This type is deliberately
+/// separate from [`PackExecError`] (which signals fatal, plan-aborting
+/// failures like pack parse or sink errors) to enforce the distinction
+/// at the type level. Conversion to [`SkipReason`] happens in
+/// [`skip_reason_from_delta_error`].
 #[derive(Debug)]
 enum DeltaDecodeError {
-    /// Inflation or header parsing failed.
+    /// Inflation or header parsing failed before delta application.
     Decode(PackDecodeError),
     /// Delta application itself failed (e.g., output overrun, bad opcodes).
     Delta(DeltaError),
@@ -5051,6 +5285,7 @@ run with --test-threads=1 to enable"
             local_context: None,
             secret_group: Some(1),
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
         };
 

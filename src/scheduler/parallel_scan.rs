@@ -440,6 +440,11 @@ struct IterWalker {
 }
 
 impl IterWalker {
+    /// Build a single-threaded directory walker rooted at `root`.
+    ///
+    /// Configures the `ignore` crate's `WalkBuilder` with gitignore,
+    /// symlink, and hidden-file settings from `config`. The resulting
+    /// iterator is consumed lazily by `next_file()`.
     fn new(root: &Path, config: &ParallelScanConfig) -> Self {
         let mut builder = ignore::WalkBuilder::new(root);
         builder
@@ -508,7 +513,6 @@ impl FileSource for SingleFileSource {
 /// - `root`: Root directory or file to scan (must exist)
 /// - `engine`: The detection engine (determines overlap, provides scan logic)
 /// - `config`: Scan configuration (workers, chunk size, filtering options)
-/// - `output`: Sink for findings (stdout, file, or custom)
 ///
 /// # Returns
 ///
@@ -667,6 +671,7 @@ mod tests {
             local_context: None,
             secret_group: None,
             offline_validation: None,
+            uuid_format_secret: false,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
         }
     }
