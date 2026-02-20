@@ -316,6 +316,7 @@ name = "eval-harness"
 version = "0.1.0"
 dependencies = [
  "csv",
+ "memchr",
  "proptest",
  "scanner-rs",
  "serde",
