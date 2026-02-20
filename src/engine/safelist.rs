@@ -31,11 +31,11 @@
 //!    `key-null-safety-9xK2mB`). Structural markers (redaction runs,
 //!    template variables, base64 literals) remain as substring matches.
 //!
-//! 3. **UUID-format quick-reject** (`uuid_reject`): a standalone regex that
-//!    matches the canonical 8-4-4-4-12 hyphenated hex UUID format. Gated
-//!    per-rule by `RuleCompiled::uuid_format_secret()` so that rules
-//!    intentionally capturing UUID-format secrets (e.g., Heroku, Snyk API
-//!    keys) bypass suppression. Structural-only — no version/variant
+//! 3. **UUID-format quick-reject** ([`is_uuid_format`]): a procedural byte
+//!    check that recognizes the canonical 8-4-4-4-12 hyphenated hex UUID
+//!    format. Gated per-rule by `RuleCompiled::uuid_format_secret()` so that
+//!    rules intentionally capturing UUID-format secrets (e.g., Heroku, Snyk
+//!    API keys) bypass suppression. Structural-only — no version/variant
 //!    validation per RFC 9562.
 //!
 //! All three components are checked during `apply_emit_time_policy`. The
@@ -66,7 +66,7 @@
 //! - Construction panics if any pattern is invalid; this is treated as a build-time
 //!   configuration bug, not a recoverable runtime condition.
 
-use regex::bytes::{Regex, RegexSet};
+use regex::bytes::RegexSet;
 
 /// Number of patterns in the context-window safelist.
 ///
@@ -212,14 +212,39 @@ const SECRET_BYTES_PATTERNS: &[&str] = &[
 
 const _: () = assert!(SECRET_BYTES_PATTERNS.len() == SECRET_BYTES_PATTERN_COUNT);
 
+/// Returns `true` if `bytes` is a canonical UUID: 8-4-4-4-12 hyphenated
+/// hex, case-insensitive. Structural-only — no version/variant validation
+/// per RFC 9562.
+///
+/// Hyphenated format only — 32-char hex without hyphens is deliberately
+/// excluded because it collides with MD5/SHA/AES key representations.
+/// Full-value check (not substring) prevents the TruffleHog #1953
+/// false-negative pattern on composite secrets.
+#[inline(always)]
+pub(crate) fn is_uuid_format(bytes: &[u8]) -> bool {
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
 /// Precompiled global safelist matcher used for emit-time suppression.
 ///
-/// Contains three matching components:
+/// Contains two matching components:
 /// - `regex_set`: the full 18-pattern set for context-window matching.
 /// - `secret_bytes_set`: a curated 9-pattern subset for bare secret-value matching.
-/// - `uuid_reject`: a standalone regex for UUID-format quick-reject, gated per-rule
-///   by `RuleCompiled::uuid_format_secret()` so rules that intentionally capture
-///   UUID-format secrets (e.g., Heroku, Snyk API keys) bypass suppression.
+///
+/// UUID-format quick-reject is handled by [`is_uuid_format`], a procedural
+/// byte check that replaces the previous regex approach. It is gated per-rule
+/// by `RuleCompiled::uuid_format_secret()` so rules that intentionally capture
+/// UUID-format secrets (e.g., Heroku, Snyk API keys) bypass suppression.
 ///
 /// Constructed once during [`Engine`] initialization and stored as `self.safelist`.
 /// Immutable after construction and `Send + Sync`, so it can be shared across
@@ -232,8 +257,6 @@ pub(crate) struct SafelistFilter {
     regex_set: RegexSet,
     /// Curated 9-pattern subset for bare secret-value matching (all findings).
     secret_bytes_set: RegexSet,
-    /// Structural UUID matcher (8-4-4-4-12 hex), gated per-rule.
-    uuid_reject: Regex,
 }
 
 impl SafelistFilter {
@@ -254,20 +277,9 @@ impl SafelistFilter {
                 SECRET_BYTES_PATTERNS.len()
             )
         });
-        // UUID-format quick-reject: structural-only matching (no version/variant
-        // validation) per RFC 9562. Hyphenated 8-4-4-4-12 only — 32-char hex
-        // without hyphens collides with MD5/SHA/AES key representations.
-        // Case-insensitive: RFC 9562 is case-insensitive and Microsoft GUIDs
-        // use uppercase. Full-value anchored to prevent substring matching
-        // inside composite secrets (TruffleHog #1953).
-        let uuid_reject =
-            Regex::new(r"(?i-u)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-                .expect("uuid_reject pattern must compile");
-
         Self {
             regex_set,
             secret_bytes_set,
-            uuid_reject,
         }
     }
 
@@ -281,18 +293,6 @@ impl SafelistFilter {
     #[inline]
     pub(crate) fn matcher(&self) -> &RegexSet {
         &self.regex_set
-    }
-
-    /// Returns a reference to the UUID-format quick-reject regex.
-    ///
-    /// Matches the canonical 8-4-4-4-12 hyphenated hex UUID format
-    /// (case-insensitive, structural-only — no version/variant validation).
-    ///
-    /// Callers must gate this check on `!rule.uuid_format_secret()` so that
-    /// rules intentionally capturing UUID-format secrets are not suppressed.
-    #[inline]
-    pub(crate) fn uuid_reject(&self) -> &Regex {
-        &self.uuid_reject
     }
 
     /// Returns a reference to the secret-bytes matcher.
@@ -331,8 +331,8 @@ mod tests {
     //!   secrets.
 
     use super::{
-        SafelistFilter, SAFELIST_PATTERNS, SAFELIST_PATTERN_COUNT, SECRET_BYTES_PATTERNS,
-        SECRET_BYTES_PATTERN_COUNT,
+        is_uuid_format, SafelistFilter, SAFELIST_PATTERNS, SAFELIST_PATTERN_COUNT,
+        SECRET_BYTES_PATTERNS, SECRET_BYTES_PATTERN_COUNT,
     };
 
     #[test]
@@ -612,7 +612,6 @@ mod tests {
 
     #[test]
     fn uuid_reject_matches_rfc_examples() {
-        let filter = SafelistFilter::new();
         let cases: &[(&str, &[u8])] = &[
             // RFC 9562 §5.9 — Nil UUID.
             ("nil", b"00000000-0000-0000-0000-000000000000"),
@@ -636,15 +635,14 @@ mod tests {
 
         for (label, value) in cases {
             assert!(
-                filter.uuid_reject().is_match(value),
-                "expected uuid_reject to match RFC example: {label}"
+                is_uuid_format(value),
+                "expected is_uuid_format to match RFC example: {label}"
             );
         }
     }
 
     #[test]
     fn uuid_reject_rejects_non_uuids() {
-        let filter = SafelistFilter::new();
         let cases: &[(&str, &[u8])] = &[
             // 32-char hex without hyphens (MD5-like — must NOT match).
             ("32-char hex", b"f81d4fae7dec11d0a76500a0c91e6bf6"),
@@ -668,17 +666,16 @@ mod tests {
 
         for (label, value) in cases {
             assert!(
-                !filter.uuid_reject().is_match(value),
-                "unexpected uuid_reject match for non-UUID: {label}"
+                !is_uuid_format(value),
+                "unexpected is_uuid_format match for non-UUID: {label}"
             );
         }
     }
 
     #[test]
     fn uuid_reject_anchoring_prevents_substring_match() {
-        let filter = SafelistFilter::new();
         // Composite secrets containing a UUID substring must NOT match.
-        // This verifies ^...$ anchoring prevents the TruffleHog #1953 pattern.
+        // Full-value length check (36 bytes) prevents the TruffleHog #1953 pattern.
         let cases: &[(&str, &[u8])] = &[
             ("prefix", b"prefix-f81d4fae-7dec-11d0-a765-00a0c91e6bf6"),
             ("suffix", b"f81d4fae-7dec-11d0-a765-00a0c91e6bf6-suffix"),
@@ -690,8 +687,8 @@ mod tests {
 
         for (label, value) in cases {
             assert!(
-                !filter.uuid_reject().is_match(value),
-                "uuid_reject must not match composite secret with UUID substring: {label}"
+                !is_uuid_format(value),
+                "is_uuid_format must not match composite secret with UUID substring: {label}"
             );
         }
     }

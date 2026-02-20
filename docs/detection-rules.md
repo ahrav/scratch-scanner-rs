@@ -23,6 +23,7 @@ The values below are from the current repository snapshot:
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
 - `char_class` enabled: `212` rules (auto-enabled for all rules with `entropy.min_bits_per_byte >= 3.0`)
 - `offline_validation` enabled: `18` rules (`aws-access-token`, `github-app-token`, `github-fine-grained-pat`, `github-oauth`, `github-pat`, `github-refresh-token`, `grafana-service-account-token`, `npm-access-token`, `pypi-upload-token`, `sentry-org-token`, `slack-app-token`, `slack-bot-token`, `slack-config-access-token`, `slack-config-refresh-token`, `slack-legacy-bot-token`, `slack-legacy-token`, `slack-legacy-workspace-token`, `slack-user-token`)
+- `uuid_format_secret` enabled: `7` rules (`heroku-api-key`, `hubspot-api-key`, `kucoin-secret-key`, `messagebird-client-id`, `sendbird-access-id`, `snyk-api-token`, `squarespace-access-token`)
 - `must_contain` enabled: `0` rules
 - `keywords_any` enabled: `223` rules
 
@@ -147,6 +148,7 @@ graph TB
         CharClass["char_class: Option<CharClassSpec>"]
         LocalContext["local_context: Option<LocalContextSpec>"]
         OfflineValidation["offline_validation: Option<OfflineValidationSpec>"]
+        UuidFormatSecret["uuid_format_secret: bool"]
         SecretGroup["secret_group: Option<u16>"]
         Regex["re: Regex"]
     end
@@ -298,6 +300,7 @@ rules:
   two_phase: null
   local_context: null
   offline_validation: null
+  uuid_format_secret: false  # set true when the capture group is exactly UUID (8-4-4-4-12 hex)
   secret_group: null
 ```
 
