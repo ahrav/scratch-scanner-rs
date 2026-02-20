@@ -14,7 +14,7 @@ csv = "1.3"
 memchr = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-scanner-rs = { path = "../.." }
+scanner-rs = { path = "../..", features = ["tiger-harness"] }
 
 [dev-dependencies]
 proptest = "1.5"

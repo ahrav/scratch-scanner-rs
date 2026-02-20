@@ -31,6 +31,7 @@
 //!
 //! [`JsonlEncoder`]: scanner_rs::unified::events::JsonlEncoder
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -46,21 +47,19 @@ use crate::types::{NormalizedFinding, normalize_path};
 /// producing a serde error. This makes the parser robust to new
 /// event types and future wire-format additions.
 ///
-/// Uses `&'a str` borrows rather than owned `String`s because most
-/// lines are non-finding events that are counted and discarded. Paying
-/// for allocation only on the ~5-10% of lines that produce
-/// [`NormalizedFinding`] values keeps throughput high on large JSONL
-/// streams.
+/// Uses `Cow<'a, str>` fields: borrows when possible (no JSON escape
+/// sequences), allocates only when serde must decode escapes like `\\`,
+/// `\"`, or `\uXXXX`.
 #[derive(Deserialize)]
 struct WireLine<'a> {
     /// The `"type"` discriminator from the wire format. Renamed because
     /// `type` is a Rust keyword.
     #[serde(rename = "type")]
-    event_type: &'a str,
-    path: Option<&'a str>,
+    event_type: Cow<'a, str>,
+    path: Option<Cow<'a, str>>,
     start: Option<u64>,
     end: Option<u64>,
-    rule: Option<&'a str>,
+    rule: Option<Cow<'a, str>>,
     confidence_score: Option<i8>,
 }
 
@@ -83,6 +82,11 @@ struct WireLine<'a> {
 ///
 /// This invariant is enforced by a property test (`line_count_invariant_always_holds`)
 /// over arbitrary inputs.
+///
+/// **Note:** This invariant holds immediately after parsing. Calling
+/// [`dedup_findings`] on `findings` reduces its length without adjusting
+/// the counters — the counters describe parse-time classification, not
+/// post-dedup state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParseResult {
     /// Successfully parsed and validated findings.
@@ -100,39 +104,34 @@ pub struct ParseResult {
     /// validation (inverted span, empty normalized path, missing required
     /// fields on a finding-typed line).
     pub skipped_findings: u64,
+    /// First serde error message encountered, if any. Aids debugging when
+    /// `malformed_lines` is unexpectedly high.
+    pub first_malformed_error: Option<String>,
+    /// Reason the first finding was skipped, if any. Aids debugging when
+    /// `skipped_findings` is unexpectedly high.
+    pub first_skip_reason: Option<String>,
 }
 
-/// Errors that can occur when reading a JSONL file from disk.
+/// I/O error from reading a JSONL file from disk.
 ///
-/// Only I/O failures are represented here. Parse-level errors (malformed
-/// JSON, invalid fields) are deliberately non-fatal — they are counted in
-/// [`ParseResult`] instead. This two-tier design means callers only need
-/// to handle `Result` for true I/O problems; parse corruption is surfaced
-/// through counters that can be aggregated across many files.
+/// Parse-level errors (malformed JSON, invalid fields) are deliberately
+/// non-fatal — they are counted in [`ParseResult`] instead. This means
+/// callers only handle `Result` for true I/O problems.
 #[derive(Debug)]
-pub enum FindingParseError {
-    /// Failed to read the file at `path`.
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+pub struct FindingParseError {
+    pub path: PathBuf,
+    source: std::io::Error,
 }
 
 impl std::fmt::Display for FindingParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io { path, source } => {
-                write!(f, "failed to read {}: {source}", path.display())
-            }
-        }
+        write!(f, "failed to read {}: {}", self.path.display(), self.source)
     }
 }
 
 impl std::error::Error for FindingParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-        }
+        Some(&self.source)
     }
 }
 
@@ -145,7 +144,8 @@ impl std::error::Error for FindingParseError {
 /// may contain duplicates; call [`dedup_findings`] afterward if needed.
 ///
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
-/// the corpus-root prefix from finding paths. Use `""` for no stripping.
+/// the corpus-root prefix from finding paths. Must be pre-canonicalized
+/// (forward slashes, no `.`/`..` components); use `""` for no stripping.
 pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> ParseResult {
     let mut result = ParseResult {
         findings: Vec::new(),
@@ -153,6 +153,8 @@ pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> ParseResult {
         non_finding_lines: 0,
         malformed_lines: 0,
         skipped_findings: 0,
+        first_malformed_error: None,
+        first_skip_reason: None,
     };
 
     // split('\n') rather than lines(): str::lines() strips trailing
@@ -171,11 +173,15 @@ pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> ParseResult {
 /// Reads the entire file into memory, then delegates to
 /// [`parse_findings_jsonl`]. Only I/O failures produce errors; parse
 /// failures are captured as counters in the returned [`ParseResult`].
+///
+/// `canonical_root` is passed through to [`normalize_path`] for stripping
+/// the corpus-root prefix from finding paths. Must be pre-canonicalized
+/// (forward slashes, no `.`/`..` components); use `""` for no stripping.
 pub fn parse_findings_file(
     path: &Path,
     canonical_root: &str,
 ) -> Result<ParseResult, FindingParseError> {
-    let contents = std::fs::read_to_string(path).map_err(|e| FindingParseError::Io {
+    let contents = std::fs::read_to_string(path).map_err(|e| FindingParseError {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -187,29 +193,9 @@ pub fn parse_findings_file(
 ///
 /// Identity is `(path, byte_start, byte_end, rule)` — confidence is
 /// excluded from comparison (see [`NormalizedFinding`]'s `Eq` impl).
-/// After dedup, findings are in sorted order (lexicographic over the
-/// identity tuple).
-///
-/// # Algorithm
-///
-/// Uses sort-then-linear-dedup (O(n log n) time, O(n) auxiliary space from
-/// the stable sort) rather than a `HashSet`-based approach. This is
-/// preferable because:
-///
-/// 1. The sorted output is useful downstream for deterministic diffing
-///    and binary-search lookups against truth items.
-/// 2. Avoids heap allocation for a hash table that would be discarded
-///    immediately.
-/// 3. `dedup_by` gives access to both the retained and removed element,
-///    letting us merge the max confidence in the same pass.
-///
-/// # Post-conditions
-///
-/// - No two elements share the same identity.
-/// - `findings` is sorted by identity.
-/// - Each surviving element carries the maximum confidence seen across
-///   all duplicates at that identity.
-/// - Idempotent: calling twice produces the same result as calling once.
+/// After dedup, findings are sorted by identity and each surviving
+/// element carries the maximum confidence seen across all duplicates.
+/// Idempotent: calling twice produces the same result as calling once.
 pub fn dedup_findings(findings: &mut Vec<NormalizedFinding>) {
     findings.sort();
     findings.dedup_by(|a, b| {
@@ -225,6 +211,14 @@ pub fn dedup_findings(findings: &mut Vec<NormalizedFinding>) {
 
 // ── Internal ─────────────────────────────────────────────────────────────
 
+/// Record a skipped finding with a reason, updating counters.
+fn record_skip(result: &mut ParseResult, reason: &str) {
+    if result.first_skip_reason.is_none() {
+        result.first_skip_reason = Some(reason.to_owned());
+    }
+    result.skipped_findings += 1;
+}
+
 /// Process a single JSONL line into `result`.
 ///
 /// Categorizes the line into exactly one of four buckets, maintaining
@@ -235,7 +229,7 @@ pub fn dedup_findings(findings: &mut Vec<NormalizedFinding>) {
 /// | Valid finding with all identity fields | `findings` | Push `NormalizedFinding` |
 /// | Non-finding event type, or empty line (after `\r` trimming) | `non_finding_lines` | Count only |
 /// | Unparseable JSON | `malformed_lines` | Count only |
-/// | Finding-typed but invalid (inverted span, empty path, missing fields) | `skipped_findings` | Count only |
+/// | Finding-typed but invalid (missing fields, empty rule, inverted span, empty path) | `skipped_findings` | [`record_skip`] |
 ///
 /// Handles Windows-style CRLF line endings by stripping trailing `\r`
 /// before attempting JSON parse, so the caller can split on `\n` alone.
@@ -252,7 +246,10 @@ fn parse_line(line: &str, canonical_root: &str, result: &mut ParseResult) {
 
     let wire: WireLine<'_> = match serde_json::from_str(line) {
         Ok(w) => w,
-        Err(_) => {
+        Err(e) => {
+            if result.first_malformed_error.is_none() {
+                result.first_malformed_error = Some(e.to_string());
+            }
             result.malformed_lines += 1;
             return;
         }
@@ -267,24 +264,29 @@ fn parse_line(line: &str, canonical_root: &str, result: &mut ParseResult) {
     let (Some(path), Some(start), Some(end), Some(rule)) =
         (wire.path, wire.start, wire.end, wire.rule)
     else {
-        result.skipped_findings += 1;
+        record_skip(result, "missing required field(s)");
         return;
     };
+
+    if rule.is_empty() {
+        record_skip(result, "empty rule");
+        return;
+    }
 
     // Reject inverted spans here rather than relying on
     // NormalizedFinding::new's debug_assert (which is compiled away in
     // release builds). An inverted span that slipped through would panic
     // downstream in LineIndex::line_range during truth-matching.
     if end < start {
-        result.skipped_findings += 1;
+        record_skip(result, "inverted span");
         return;
     }
 
     // normalize_path can return "" for degenerate inputs (e.g., "..", ".")
     // where all path components are consumed by lexical resolution.
-    let normalized = normalize_path(path, canonical_root);
+    let normalized = normalize_path(&path, canonical_root);
     if normalized.is_empty() {
-        result.skipped_findings += 1;
+        record_skip(result, "empty normalized path");
         return;
     }
 
@@ -297,7 +299,7 @@ fn parse_line(line: &str, canonical_root: &str, result: &mut ParseResult) {
         normalized,
         start,
         end,
-        rule.to_owned(),
+        rule.into_owned(),
         confidence,
     ));
 }
@@ -383,6 +385,20 @@ mod tests {
         let result = parse_findings_jsonl(jsonl, "");
 
         assert!(result.findings.is_empty());
+        assert_eq!(result.skipped_findings, 1);
+    }
+
+    #[test]
+    fn empty_rule_string_skipped() {
+        let jsonl =
+            r#"{"type":"finding","path":"a.rs","start":0,"end":10,"rule":"","confidence_score":0}"#;
+
+        let result = parse_findings_jsonl(jsonl, "");
+
+        assert!(
+            result.findings.is_empty(),
+            "empty rule should be rejected, not produce a finding"
+        );
         assert_eq!(result.skipped_findings, 1);
     }
 
@@ -491,6 +507,14 @@ mod tests {
     }
 
     #[test]
+    fn escaped_path_parsed_correctly() {
+        let jsonl = r#"{"type":"finding","path":"src\/a.rs","start":0,"end":10,"rule":"r","confidence_score":0}"#;
+        let result = parse_findings_jsonl(jsonl, "");
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].path, "src/a.rs");
+    }
+
+    #[test]
     fn file_not_found_error() {
         let err = parse_findings_file(Path::new("/nonexistent/path.jsonl"), "").unwrap_err();
 
@@ -518,6 +542,99 @@ mod tests {
         let mut findings: Vec<NormalizedFinding> = Vec::new();
         dedup_findings(&mut findings);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn first_malformed_error_captured() {
+        let jsonl =
+            "not json\n{\"type\":\"finding\",\"path\":\"a\",\"start\":0,\"end\":1,\"rule\":\"r\"}";
+        let result = parse_findings_jsonl(jsonl, "");
+        assert_eq!(result.malformed_lines, 1);
+        assert!(result.first_malformed_error.is_some());
+    }
+
+    #[test]
+    fn first_skip_reason_captured() {
+        let jsonl = r#"{"type":"finding","path":"a.rs","start":50,"end":10,"rule":"r"}"#;
+        let result = parse_findings_jsonl(jsonl, "");
+        assert_eq!(result.skipped_findings, 1);
+        assert!(
+            result
+                .first_skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("inverted"),
+        );
+    }
+
+    #[test]
+    fn encoder_parser_roundtrip() {
+        use scanner_rs::unified::SourceKind;
+        use scanner_rs::unified::events::FindingEvent;
+        use scanner_rs::unified::harness_api::encode_finding;
+
+        let event = FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 42,
+            end: 80,
+            rule_id: 7,
+            rule_name: "aws-access-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 5,
+        };
+        let mut buf = Vec::new();
+        encode_finding(&event, &mut buf);
+        let line = std::str::from_utf8(&buf).unwrap();
+
+        let result = parse_findings_jsonl(line.trim(), "");
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].path, "src/main.rs");
+        assert_eq!(result.findings[0].byte_start, 42);
+        assert_eq!(result.findings[0].byte_end, 80);
+        assert_eq!(result.findings[0].rule, "aws-access-key");
+        assert_eq!(result.findings[0].confidence, 5);
+        assert_eq!(result.malformed_lines, 0);
+        assert_eq!(result.skipped_findings, 0);
+    }
+
+    #[test]
+    fn empty_path_string_skipped() {
+        let jsonl =
+            r#"{"type":"finding","path":"","start":0,"end":10,"rule":"r","confidence_score":0}"#;
+        let result = parse_findings_jsonl(jsonl, "");
+        assert!(result.findings.is_empty());
+        assert_eq!(result.skipped_findings, 1);
+    }
+
+    #[test]
+    fn degenerate_path_components_skipped() {
+        for jsonl in [
+            r#"{"type":"finding","path":".","start":0,"end":10,"rule":"r","confidence_score":0}"#,
+            r#"{"type":"finding","path":"..","start":0,"end":10,"rule":"r","confidence_score":0}"#,
+        ] {
+            let result = parse_findings_jsonl(jsonl, "");
+            assert!(result.findings.is_empty(), "should skip: {jsonl}");
+            assert_eq!(
+                result.skipped_findings, 1,
+                "should count as skipped: {jsonl}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_mixed_distinct_and_duplicate() {
+        let mut findings = vec![
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r1".into(), 3),
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r1".into(), 7),
+            NormalizedFinding::new("b.rs".into(), 0, 10, "r1".into(), 5),
+            NormalizedFinding::new("b.rs".into(), 0, 10, "r1".into(), 2),
+        ];
+        dedup_findings(&mut findings);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].confidence, 7);
+        assert_eq!(findings[1].confidence, 5);
     }
 
     // ── Property tests ──────────────────────────────────────────
