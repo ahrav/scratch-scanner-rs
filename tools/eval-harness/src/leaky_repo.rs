@@ -174,8 +174,8 @@ fn strip_bom(s: &str) -> &str {
 /// - [`LeakyRepoError::DuplicatePath`] — if two data rows resolve to the
 ///   same normalized path.
 pub fn parse_leaky_repo(reader: impl BufRead) -> Result<Vec<FileExpectation>, LeakyRepoError> {
-    let mut expectations = Vec::new();
-    let mut seen = HashSet::new();
+    let mut expectations = Vec::with_capacity(256);
+    let mut seen = HashSet::with_capacity(256);
 
     for (idx, raw_line) in reader.lines().enumerate() {
         let line_num = idx + 1; // 1-indexed for error messages
@@ -273,17 +273,17 @@ pub fn parse_leaky_repo_csv(path: &Path) -> Result<Vec<FileExpectation>, LeakyRe
 ///
 /// Output is sorted by path for deterministic, diff-friendly ordering.
 pub fn compare_counts(
-    findings: &[NormalizedFinding],
+    mut findings: Vec<NormalizedFinding>,
     expectations: &[FileExpectation],
 ) -> Vec<FileCountComparison> {
-    // Dedup findings: clone, sort by identity, then collapse adjacent
-    // duplicates while retaining the highest confidence score.
+    // Dedup findings: sort by identity, then collapse adjacent duplicates
+    // while retaining the highest confidence score. Takes ownership to
+    // avoid cloning the entire Vec.
     // `dedup_by` removes `a` (the later element) when returning true,
     // keeping `b` (the earlier element). We fold the max confidence into
     // `b` so the surviving entry carries the strongest signal.
-    let mut deduped = findings.to_vec();
-    deduped.sort();
-    deduped.dedup_by(|a, b| {
+    findings.sort();
+    findings.dedup_by(|a, b| {
         if a == b {
             b.confidence = b.confidence.max(a.confidence);
             true
@@ -293,15 +293,15 @@ pub fn compare_counts(
     });
 
     // Group deduplicated findings by path.
-    let mut actual_counts: HashMap<&str, u32> = HashMap::new();
-    for f in &deduped {
+    let mut actual_counts: HashMap<&str, u32> = HashMap::with_capacity(findings.len().min(4096));
+    for f in &findings {
         *actual_counts.entry(f.path.as_str()).or_default() += 1;
     }
 
     // Build the set of expected paths for the unlisted-file pass.
     let expected_paths: HashSet<&str> = expectations.iter().map(|e| e.path.as_str()).collect();
 
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(expectations.len() + 64);
 
     // Pass 1: expected files.
     for exp in expectations {
@@ -486,7 +486,7 @@ mod tests {
             let findings: Vec<NormalizedFinding> = (0..num_findings)
                 .map(|i| finding("a.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
                 .collect();
-            let result = compare_counts(&findings, &expectations);
+            let result = compare_counts(findings, &expectations);
             assert_eq!(result.len(), 1, "{label}: result count");
             assert_eq!(result[0].tp, exp_tp, "{label}: tp");
             assert_eq!(result[0].fp, exp_fp, "{label}: fp");
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn compare_empty() {
-        let result = compare_counts(&[], &[]);
+        let result = compare_counts(vec![], &[]);
         assert!(result.is_empty());
     }
 
@@ -504,7 +504,7 @@ mod tests {
     fn compare_unlisted_file() {
         // Scanner found secrets in a file not in expectations.
         let findings = vec![finding("unknown.txt", 0, 5), finding("unknown.txt", 10, 15)];
-        let result = compare_counts(&findings, &[]);
+        let result = compare_counts(findings, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].path, "unknown.txt");
         assert_eq!(result[0].expected, 0);
@@ -528,7 +528,7 @@ mod tests {
             NormalizedFinding::new("a.txt".into(), 0, 5, "r1".into(), 80), // dup
             NormalizedFinding::new("a.txt".into(), 10, 15, "r1".into(), 50),
         ];
-        let result = compare_counts(&findings, &expectations);
+        let result = compare_counts(findings, &expectations);
         assert_eq!(result[0].actual, 2); // deduped from 3 to 2
         assert_eq!(result[0].tp, 2);
         assert_eq!(result[0].fp, 0);
@@ -629,7 +629,7 @@ mod tests {
                 let findings: Vec<NormalizedFinding> = (0..actual)
                     .map(|i| finding("f.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
                     .collect();
-                let result = compare_counts(&findings, &expectations);
+                let result = compare_counts(findings, &expectations);
                 for entry in &result {
                     prop_assert_eq!(
                         entry.tp + entry.fp, entry.actual,
@@ -662,8 +662,8 @@ mod tests {
                 for _ in 0..extra_dupes {
                     with_dupes.push(base_findings[0].clone());
                 }
-                let result_base = compare_counts(&base_findings, &expectations);
-                let result_dupes = compare_counts(&with_dupes, &expectations);
+                let result_base = compare_counts(base_findings, &expectations);
+                let result_dupes = compare_counts(with_dupes, &expectations);
                 prop_assert_eq!(result_base, result_dupes, "duplicates changed result");
             }
 
@@ -684,7 +684,7 @@ mod tests {
                 let findings: Vec<NormalizedFinding> = unlisted_paths.iter().map(|p| {
                     NormalizedFinding::new(p.clone(), 0, 5, "r".into(), 50)
                 }).collect();
-                let result = compare_counts(&findings, &expectations);
+                let result = compare_counts(findings, &expectations);
                 for w in result.windows(2) {
                     prop_assert!(
                         w[0].path <= w[1].path,
