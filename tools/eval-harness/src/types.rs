@@ -24,7 +24,10 @@
 //! no `.`/`..`, corpus-root prefix stripped).
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::io;
+use std::path::{Path, PathBuf};
 
 use scanner_rs::store::canonicalize_path;
 use serde::{Deserialize, Serialize};
@@ -321,6 +324,45 @@ pub fn normalize_path(raw: &str, canonical_root: &str) -> String {
         .and_then(|s| s.strip_prefix('/'))
         .unwrap_or(&canonical)
         .to_string()
+}
+
+// ── File-read error ──────────────────────────────────────────────────
+
+/// I/O error from reading a file or directory during corpus loading.
+///
+/// Shared by the CredData CSV parser and the JSONL finding parser so both
+/// surface file-level failures in the same way. Row/line-level issues are
+/// not errors — they are counted in the respective parse-result types
+/// instead, following the principle that a single bad record should not
+/// abort the entire corpus load.
+#[derive(Debug)]
+pub struct FileReadError {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl FileReadError {
+    /// Create a new error for a failed file/directory read.
+    pub fn new(path: PathBuf, source: io::Error) -> Self {
+        Self { path, source }
+    }
+
+    /// The file or directory path that caused the error.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl fmt::Display for FileReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to read {}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for FileReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[cfg(test)]

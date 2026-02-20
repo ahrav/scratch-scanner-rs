@@ -21,22 +21,21 @@
 //! and skipped. A typical finding line:
 //!
 //! ```json
-//! {"type":"finding","source":"fs","path":"src/main.rs","start":42,"end":80,"rule":"aws-access-key","rule_id":1,"confidence_score":5}
+//! {"type":"finding","source":"fs","path":"src/main.rs","start":42,"end":80,"rule_id":7,"rule":"aws-access-key","confidence_score":5}
 //! ```
 //!
-//! (Actual wire lines include additional fields such as `source`,
-//! `commit_id`, `change_kind`, and `rule_id` — all intentionally
-//! discarded here because the eval corpora are file-level, not
-//! commit-level.)
+//! (Actual wire lines may include additional fields such as `commit_id`
+//! and `change_kind` — both intentionally discarded here because the
+//! eval corpora are file-level, not commit-level.)
 //!
 //! [`JsonlEncoder`]: scanner_rs::unified::events::JsonlEncoder
 
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{NormalizedFinding, normalize_path};
+use crate::types::{FileReadError, NormalizedFinding, normalize_path};
 
 // ── Wire format ──────────────────────────────────────────────────────────
 
@@ -88,7 +87,7 @@ struct WireLine<'a> {
 /// the counters — the counters describe parse-time classification, not
 /// post-dedup state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ParseResult {
+pub struct JsonlParseResult {
     /// Successfully parsed and validated findings.
     pub findings: Vec<NormalizedFinding>,
     /// Total lines processed (including empty, non-finding, malformed, and
@@ -112,43 +111,39 @@ pub struct ParseResult {
     pub first_skip_reason: Option<String>,
 }
 
-/// I/O error from reading a JSONL file from disk.
-///
-/// Parse-level errors (malformed JSON, invalid fields) are deliberately
-/// non-fatal — they are counted in [`ParseResult`] instead. This means
-/// callers only handle `Result` for true I/O problems.
-#[derive(Debug)]
-pub struct FindingParseError {
-    pub path: PathBuf,
-    source: std::io::Error,
-}
-
-impl std::fmt::Display for FindingParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "failed to read {}: {}", self.path.display(), self.source)
-    }
-}
-
-impl std::error::Error for FindingParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
 // ── Public API ───────────────────────────────────────────────────────────
 
 /// Parse JSONL text in memory.
 ///
 /// Every line is processed independently — malformed lines increment
-/// counters but never halt parsing. The returned [`ParseResult::findings`]
+/// counters but never halt parsing. The returned [`JsonlParseResult::findings`]
 /// may contain duplicates; call [`dedup_findings`] afterward if needed.
 ///
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
 /// the corpus-root prefix from finding paths. Must be pre-canonicalized
 /// (forward slashes, no `.`/`..` components); use `""` for no stripping.
-pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> ParseResult {
-    let mut result = ParseResult {
-        findings: Vec::new(),
+pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> JsonlParseResult {
+    parse_findings_jsonl_inner(jsonl, canonical_root, 0)
+}
+
+/// Core JSONL parsing loop with an optional capacity hint for the findings Vec.
+///
+/// `capacity_hint` of 0 falls back to the default (no pre-allocation).
+/// [`parse_findings_file`] estimates capacity from the file size to avoid
+/// repeated Vec reallocations for large files.
+fn parse_findings_jsonl_inner(
+    jsonl: &str,
+    canonical_root: &str,
+    capacity_hint: usize,
+) -> JsonlParseResult {
+    let findings = if capacity_hint > 0 {
+        Vec::with_capacity(capacity_hint)
+    } else {
+        Vec::new()
+    };
+
+    let mut result = JsonlParseResult {
+        findings,
         total_lines: 0,
         non_finding_lines: 0,
         malformed_lines: 0,
@@ -170,9 +165,10 @@ pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> ParseResult {
 
 /// Parse JSONL from a file on disk.
 ///
-/// Reads the entire file into memory, then delegates to
-/// [`parse_findings_jsonl`]. Only I/O failures produce errors; parse
-/// failures are captured as counters in the returned [`ParseResult`].
+/// Reads the entire file into memory, then delegates to the same core
+/// parsing loop used by [`parse_findings_jsonl`], with a capacity hint
+/// estimated from the file size. Only I/O failures produce errors; parse
+/// failures are captured as counters in the returned [`JsonlParseResult`].
 ///
 /// `canonical_root` is passed through to [`normalize_path`] for stripping
 /// the corpus-root prefix from finding paths. Must be pre-canonicalized
@@ -180,12 +176,17 @@ pub fn parse_findings_jsonl(jsonl: &str, canonical_root: &str) -> ParseResult {
 pub fn parse_findings_file(
     path: &Path,
     canonical_root: &str,
-) -> Result<ParseResult, FindingParseError> {
-    let contents = std::fs::read_to_string(path).map_err(|e| FindingParseError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(parse_findings_jsonl(&contents, canonical_root))
+) -> Result<JsonlParseResult, FileReadError> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| FileReadError::new(path.to_path_buf(), e))?;
+    // JSONL finding lines average ~140 bytes; pre-allocate to avoid repeated
+    // Vec reallocations for large files. Mirrors the CSV parser's approach.
+    let capacity_hint = contents.len() / 140;
+    Ok(parse_findings_jsonl_inner(
+        &contents,
+        canonical_root,
+        capacity_hint,
+    ))
 }
 
 /// Sort and deduplicate findings in place, retaining the highest
@@ -212,7 +213,7 @@ pub fn dedup_findings(findings: &mut Vec<NormalizedFinding>) {
 // ── Internal ─────────────────────────────────────────────────────────────
 
 /// Record a skipped finding with a reason, updating counters.
-fn record_skip(result: &mut ParseResult, reason: &str) {
+fn record_skip(result: &mut JsonlParseResult, reason: &str) {
     if result.first_skip_reason.is_none() {
         result.first_skip_reason = Some(reason.to_owned());
     }
@@ -222,7 +223,7 @@ fn record_skip(result: &mut ParseResult, reason: &str) {
 /// Process a single JSONL line into `result`.
 ///
 /// Categorizes the line into exactly one of four buckets, maintaining
-/// the [`ParseResult`] counting invariant:
+/// the [`JsonlParseResult`] counting invariant:
 ///
 /// | Condition | Bucket | Action |
 /// |---|---|---|
@@ -233,7 +234,7 @@ fn record_skip(result: &mut ParseResult, reason: &str) {
 ///
 /// Handles Windows-style CRLF line endings by stripping trailing `\r`
 /// before attempting JSON parse, so the caller can split on `\n` alone.
-fn parse_line(line: &str, canonical_root: &str, result: &mut ParseResult) {
+fn parse_line(line: &str, canonical_root: &str, result: &mut JsonlParseResult) {
     result.total_lines += 1;
 
     // Trim trailing \r for Windows-style line endings.
