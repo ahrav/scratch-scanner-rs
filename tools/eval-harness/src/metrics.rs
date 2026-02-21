@@ -355,6 +355,8 @@ pub fn compute_metrics(
 ///
 /// O(`n_iterations` * n) where n is the number of TP + FP items.
 /// Each iteration fills a 256-bin histogram and sweeps it (O(n + 256)).
+/// The final percentile sort adds O(`n_iterations` log `n_iterations`),
+/// dominated by the main loop in practice.
 ///
 /// # Panics
 ///
@@ -373,7 +375,7 @@ pub fn compute_metrics(
 /// Bootstrap CI quality degrades when the scored set (TP + FP) is small.
 /// With fewer than ~30 scored items, resampling draws from a tiny pool and
 /// the resulting interval collapses toward a point estimate. In the extreme
-/// case (e.g., 1 TP + 0 FP), every resample produces the same AP, yielding
+/// case (e.g., 1 TP + 0 FP with `total_positives == 1`), every resample produces the same AP, yielding
 /// a degenerate zero-width CI of `(1.0, 1.0)` regardless of `n_iterations`.
 /// Interpret narrow CIs on small scored sets as reflecting insufficient data
 /// rather than high certainty.
@@ -512,12 +514,13 @@ fn build_pr_curve(classified: &[ClassifiedFinding], total_positives: u64) -> Vec
 /// Build a PR curve from pre-extracted `(confidence, is_tp)` pairs.
 ///
 /// Sorts `scored` in place by confidence descending, then collapses tied
-/// confidence groups into single operating points. This is the shared
-/// core used by both [`build_pr_curve`] (which extracts from full findings)
-/// and [`bootstrap_ap_ci`] (which works on lightweight resampled pairs).
+/// confidence groups into single operating points. Used by
+/// [`build_pr_curve`], which extracts scored pairs from full findings.
+/// The histogram-based [`pr_curve_from_histogram`] provides an equivalent
+/// O(n) alternative used by the bootstrap inner loop.
 ///
-/// Takes `&mut` to sort in place, avoiding a clone on every bootstrap
-/// iteration. Uses `sort_unstable_by` because tie-breaking order within
+/// Takes `&mut` to sort in place, avoiding allocation of a separate
+/// sorted copy. Uses `sort_unstable_by` because tie-breaking order within
 /// a confidence group is irrelevant — all items sharing a confidence
 /// value are collapsed into a single operating point regardless of their
 /// relative order.
