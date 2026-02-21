@@ -343,7 +343,7 @@ pub fn compute_metrics(
 ///
 /// Uses stratified resampling: TP and FP items are resampled independently
 /// (with replacement) to preserve the TP and FP counts in every iteration.
-/// Each resampled set is run through `pr_curve_from_scored` + `ap_from_curve` to
+/// Each resampled set is run through `pr_curve_from_histogram` + `ap_from_curve` to
 /// produce an AP estimate. The resulting AP distribution is sorted and
 /// percentiles at `[alpha/2, 1 - alpha/2]` are returned.
 ///
@@ -353,8 +353,8 @@ pub fn compute_metrics(
 ///
 /// # Complexity
 ///
-/// O(`n_iterations` * n * log n) where n is the number of TP + FP items.
-/// Each iteration sorts the resampled set to build a PR curve.
+/// O(`n_iterations` * n) where n is the number of TP + FP items.
+/// Each iteration fills a 256-bin histogram and sweeps it (O(n + 256)).
 ///
 /// # Panics
 ///
@@ -436,7 +436,7 @@ pub fn bootstrap_ap_ci(
             resampled.push((fp_scores[idx], false));
         }
 
-        let curve = pr_curve_from_scored(&mut resampled, total_positives);
+        let curve = pr_curve_from_histogram(&resampled, total_positives);
         ap_samples.push(ap_from_curve(&curve));
     }
 
@@ -565,6 +565,68 @@ fn pr_curve_from_scored(scored: &mut [(i8, bool)], total_positives: u64) -> Vec<
         });
 
         i = j;
+    }
+
+    curve
+}
+
+/// Build a PR curve from `(confidence, is_tp)` pairs using histogram counting.
+///
+/// Instead of sorting the input O(n log n), this exploits the fact that
+/// confidence is `i8` (256 distinct values) to bin TP and FP counts in
+/// O(n), then sweeps the 256 bins in descending order to produce the same
+/// curve as [`pr_curve_from_scored`].
+///
+/// Takes an immutable slice — no sorting required. Used by the bootstrap
+/// inner loop where sorting dominated per-iteration cost.
+///
+/// # Complexity
+///
+/// O(n + 256) — one pass to populate histograms, one 256-step sweep.
+fn pr_curve_from_histogram(scored: &[(i8, bool)], total_positives: u64) -> Vec<PrPoint> {
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    // Histogram bins indexed by order-preserving unsigned encoding of i8:
+    // XOR the sign bit so that i8 -128 → 0 and i8 127 → 255, preserving
+    // the natural ordering. Sweeping indices 255→0 then visits confidence
+    // values 127→−128 (descending), matching the sort-based approach.
+    let mut tp_hist = [0u32; 256];
+    let mut fp_hist = [0u32; 256];
+
+    for &(conf, is_tp) in scored {
+        let idx = (conf as u8 ^ 0x80) as usize;
+        if is_tp {
+            tp_hist[idx] += 1;
+        } else {
+            fp_hist[idx] += 1;
+        }
+    }
+
+    let total_pos_f64 = total_positives as f64;
+    let mut cum_tp: u64 = 0;
+    let mut cum_fp: u64 = 0;
+    let mut curve = Vec::new();
+
+    // Sweep from highest confidence (i8::MAX = 127, index 255) down to
+    // lowest (i8::MIN = -128, index 0). This produces the same
+    // confidence-descending traversal as the sort-based approach.
+    for idx in (0..256).rev() {
+        let group_tp = tp_hist[idx] as u64;
+        let group_fp = fp_hist[idx] as u64;
+
+        if group_tp == 0 && group_fp == 0 {
+            continue;
+        }
+
+        cum_tp += group_tp;
+        cum_fp += group_fp;
+
+        curve.push(PrPoint {
+            precision: safe_div(cum_tp as f64, (cum_tp + cum_fp) as f64),
+            recall: safe_div(cum_tp as f64, total_pos_f64),
+        });
     }
 
     curve
@@ -1502,6 +1564,47 @@ mod tests {
                 let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config);
                 prop_assert!((0.0..=1.0).contains(&lo), "ci_lower out of bounds: {lo}");
                 prop_assert!((0.0..=1.0).contains(&hi), "ci_upper out of bounds: {hi}");
+            }
+
+            /// Histogram-based and sort-based PR curve builders produce
+            /// identical curves and AP values for all inputs.
+            #[test]
+            fn histogram_curve_matches_sort_curve(
+                items in proptest::collection::vec((any::<i8>(), any::<bool>()), 0..=60),
+                total_pos in 1u64..100,
+            ) {
+                let scored: Vec<(i8, bool)> = items;
+
+                let curve_hist = pr_curve_from_histogram(&scored, total_pos);
+
+                let mut scored_mut = scored.clone();
+                let curve_sort = pr_curve_from_scored(&mut scored_mut, total_pos);
+
+                prop_assert_eq!(
+                    curve_hist.len(), curve_sort.len(),
+                    "curve lengths differ: histogram={}, sort={}",
+                    curve_hist.len(), curve_sort.len()
+                );
+
+                for (i, (h, s)) in curve_hist.iter().zip(curve_sort.iter()).enumerate() {
+                    prop_assert!(
+                        (h.precision - s.precision).abs() < 1e-15,
+                        "precision mismatch at point {i}: hist={}, sort={}",
+                        h.precision, s.precision
+                    );
+                    prop_assert!(
+                        (h.recall - s.recall).abs() < 1e-15,
+                        "recall mismatch at point {i}: hist={}, sort={}",
+                        h.recall, s.recall
+                    );
+                }
+
+                let ap_hist = ap_from_curve(&curve_hist);
+                let ap_sort = ap_from_curve(&curve_sort);
+                prop_assert!(
+                    (ap_hist - ap_sort).abs() < 1e-15,
+                    "AP mismatch: hist={ap_hist}, sort={ap_sort}"
+                );
             }
         }
     }
