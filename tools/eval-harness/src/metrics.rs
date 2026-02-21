@@ -30,8 +30,9 @@
 //! Uses the step-function (rectangular) formula with **tie collapsing**:
 //!
 //! 1. Filter to TP and FP only (skip Unlabeled).
-//! 2. Sort by confidence descending (stable sort preserves input order within
-//!    ties, though ordering within ties is irrelevant after collapsing).
+//! 2. Sort by confidence descending (unstable sort; tie-breaking order is
+//!    irrelevant because all items at the same confidence are collapsed
+//!    into a single operating point).
 //! 3. Collapse consecutive items sharing the same confidence into a single
 //!    precision/recall operating point, accumulating TP and FP counts per
 //!    group.
@@ -342,7 +343,7 @@ pub fn compute_metrics(
 ///
 /// Uses stratified resampling: TP and FP items are resampled independently
 /// (with replacement) to preserve the TP and FP counts in every iteration.
-/// Each resampled set is run through `build_pr_curve` + `ap_from_curve` to
+/// Each resampled set is run through `pr_curve_from_scored` + `ap_from_curve` to
 /// produce an AP estimate. The resulting AP distribution is sorted and
 /// percentiles at `[alpha/2, 1 - alpha/2]` are returned.
 ///

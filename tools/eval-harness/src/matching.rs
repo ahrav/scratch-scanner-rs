@@ -74,9 +74,9 @@ pub struct MatchConfig<'a> {
 
     /// When true, a finding only matches truth items where the finding's
     /// rule name exactly equals one colon-delimited segment of the truth
-    /// item's `rule` field (see [`rule_matches`]). When false (default),
-    /// matching is purely location-based — any finding overlapping a truth
-    /// item's line range is considered a match regardless of rule name.
+    /// item's `rule` field (see [`rule_matches`]). When false, matching
+    /// is purely location-based — any finding overlapping a truth item's
+    /// line range is considered a match regardless of rule name.
     pub require_rule_match: bool,
 }
 
@@ -219,6 +219,9 @@ pub fn match_findings(
     config: MatchConfig<'_>,
 ) -> MatchResult {
     // ── Precondition: findings are deduplicated ────────────────────
+    // Debug-only by design: duplicates inflate TP counts but don't
+    // corrupt memory. The hard conservation assertions at the end of
+    // this function serve as a release-mode backstop.
     debug_assert!(
         findings.windows(2).all(|w| w[0] != w[1]),
         "findings must be deduplicated before matching"
