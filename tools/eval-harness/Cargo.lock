@@ -315,6 +315,7 @@ dependencies = [
 name = "eval-harness"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "csv",
  "memchr",
  "proptest",
