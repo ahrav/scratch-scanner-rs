@@ -440,7 +440,7 @@ pub fn bootstrap_ap_ci(
         ap_samples.push(ap_from_curve(&curve));
     }
 
-    ap_samples.sort_by(|a, b| {
+    ap_samples.sort_unstable_by(|a, b| {
         a.partial_cmp(b)
             .expect("AP values must be finite for bootstrap CI")
     });

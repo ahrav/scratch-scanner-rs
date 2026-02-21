@@ -228,7 +228,7 @@ pub fn match_findings(
     let findings_len = findings.len();
 
     // ── Sort findings in-place by (-confidence, identity) ──────────
-    findings.sort_by(|a, b| {
+    findings.sort_unstable_by(|a, b| {
         // Descending confidence via reverse comparison — never negate i8
         // (i8::MIN overflow wraps silently in release mode).
         b.confidence.cmp(&a.confidence).then_with(|| a.cmp(b))
@@ -268,7 +268,7 @@ pub fn match_findings(
         } else {
             unmatchable_truth_paths += 1;
         }
-        info.truths.sort_by_key(|(_, t)| t.line_start);
+        info.truths.sort_unstable_by_key(|(_, t)| t.line_start);
     }
 
     // ── Global consumed-truth bitset (Positive truths only) ───────
