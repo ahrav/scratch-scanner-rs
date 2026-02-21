@@ -274,10 +274,9 @@ fn parse_line(line: &str, canonical_root: &str, result: &mut JsonlParseResult) {
         return;
     }
 
-    // Reject inverted spans here rather than relying on
-    // NormalizedFinding::new's debug_assert (which is compiled away in
-    // release builds). An inverted span that slipped through would panic
-    // downstream in LineIndex::line_range during truth-matching.
+    // Reject inverted spans here for an actionable error message
+    // (with skip counting) rather than letting NormalizedFinding::new's
+    // assert! panic with a generic message.
     if end < start {
         record_skip(result, "inverted span");
         return;

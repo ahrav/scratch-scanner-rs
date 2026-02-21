@@ -1,9 +1,17 @@
 //! Byte-offset to line-number mapping for eval corpus files.
 //!
 //! [`LineIndex`] bridges scanner output (byte offsets) and ground-truth
-//! annotations (line numbers). Build once per file in O(b) time where
-//! b = file size in bytes, using [`memchr`]-based newline scanning. Query
-//! in O(log L) via binary search where L = number of lines.
+//! annotations (line numbers). The matching layer ([`crate::matching`])
+//! builds one index per file, validates finding byte offsets against
+//! [`LineIndex::data_len`], and calls [`LineIndex::line_range`] to convert
+//! finding byte spans into inclusive line ranges for overlap comparison
+//! with [`crate::types::TruthItem`] annotations.
+//!
+//! # Complexity
+//!
+//! Build once per file in O(b) time where b = file size in bytes, using
+//! [`memchr`]-based newline scanning. Query in O(log L) via binary search
+//! where L = number of lines.
 //!
 //! # Line-ending conventions
 //!
@@ -28,9 +36,10 @@
 /// ```rust,ignore
 /// let data = b"hello\nworld\n";
 /// let idx = LineIndex::new(data);
-/// assert_eq!(idx.line_count(), 2);       // two lines (trailing \n is a terminator)
-/// assert_eq!(idx.line_of(0), 1);         // 'h' is on line 1
-/// assert_eq!(idx.line_of(6), 2);         // 'w' is on line 2
+/// assert_eq!(idx.data_len(), 12);           // 12 bytes total
+/// assert_eq!(idx.line_count(), 2);          // two lines (trailing \n is a terminator)
+/// assert_eq!(idx.line_of(0), 1);            // 'h' is on line 1
+/// assert_eq!(idx.line_of(6), 2);            // 'w' is on line 2
 /// assert_eq!(idx.line_range(0, 7), (1, 2)); // [0,7) spans lines 1–2
 /// ```
 ///
@@ -45,7 +54,9 @@
 /// # Limits
 ///
 /// Supports files up to [`u32::MAX`] bytes (~4 GiB). The constructor panics
-/// on larger inputs.
+/// on larger inputs. Query methods accept `u64` offsets because the scanner
+/// emits 64-bit streaming byte offsets; the assert in [`Self::line_of`]
+/// catches any mismatch at the call site rather than silently truncating.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineIndex {
     /// Byte offset of the first byte of each line. Immutable after
@@ -60,8 +71,13 @@ impl LineIndex {
     /// Build a line index from raw file content.
     ///
     /// Scans for `\n` bytes using [`memchr`] (SIMD-accelerated on supported
-    /// platforms).
-    /// A trailing `\n` does not create an entry for the empty region after it.
+    /// platforms). Each `\n` that is *not* the final byte registers the
+    /// following byte as a new line start. A trailing `\n` does not create
+    /// an entry for the empty region after it (POSIX terminator semantics).
+    ///
+    /// Pre-allocates assuming ~32 bytes per line to avoid repeated
+    /// reallocation. Typical source files have longer lines, so this
+    /// slightly over-provisions capacity.
     ///
     /// # Panics
     ///
@@ -104,7 +120,23 @@ impl LineIndex {
 
     /// Returns the 1-indexed line number containing `byte_offset`.
     ///
-    /// Uses binary search over the line-start offsets. No heap allocation.
+    /// Uses [`partition_point`] (binary search) over the line-start offsets.
+    /// No heap allocation.
+    ///
+    /// Accepts `byte_offset == data_len` (one-past-the-end) to support
+    /// two edge cases: a zero-width range at EOF where `byte_start == data_len`,
+    /// and a range ending one past the file where `byte_end == data_len + 1`
+    /// (so `line_of(byte_end - 1)` receives `data_len`). Callers passing raw
+    /// scanner offsets should validate against [`data_len`] first, as
+    /// [`crate::matching`] does.
+    ///
+    /// The parameter is `u64` rather than `u32` because the scanner emits
+    /// 64-bit streaming byte offsets. The assert catches overflow at the
+    /// call site rather than silently truncating to `u32`.
+    ///
+    /// [`partition_point`]: slice::partition_point
+    /// [`line_range`]: Self::line_range
+    /// [`data_len`]: Self::data_len
     ///
     /// # Panics
     ///
@@ -129,21 +161,24 @@ impl LineIndex {
     }
 
     /// Convert a half-open byte range `[byte_start, byte_end)` to an inclusive
-    /// line range `(start_line, end_line)` where both bounds are 1-indexed.
+    /// 1-indexed line range `(start_line, end_line)`.
     ///
     /// This is the primary bridge between scanner output (which uses half-open
-    /// byte ranges) and ground-truth annotations (which use inclusive line
-    /// ranges per [`crate::types::TruthItem`]). A finding on a single line
-    /// returns `(n, n)`.
+    /// byte ranges via [`crate::types::NormalizedFinding`]) and ground-truth
+    /// annotations (which use inclusive line ranges per
+    /// [`crate::types::TruthItem`]). The matching layer calls this once per
+    /// finding to project byte spans into line-number space for overlap tests.
     ///
-    /// A zero-width range (`byte_start == byte_end`) returns the line
-    /// containing `byte_start` for both bounds. This handles empty findings
-    /// gracefully rather than underflowing on `byte_end - 1`.
+    /// A finding on a single line returns `(n, n)`. A zero-width range
+    /// (`byte_start == byte_end`) returns the line containing `byte_start`
+    /// for both bounds — this handles metadata-only findings gracefully
+    /// rather than underflowing on `byte_end - 1`.
     ///
     /// # Panics
     ///
-    /// Panics if `byte_end < byte_start` (inverted range), or if either
-    /// bound exceeds the indexed data length.
+    /// Panics if `byte_end < byte_start` (inverted range), if
+    /// `byte_start > data_len`, or if `byte_end > data_len + 1` (for
+    /// non-zero-width ranges, the last checked offset is `byte_end - 1`).
     #[inline]
     pub fn line_range(&self, byte_start: u64, byte_end: u64) -> (u32, u32) {
         assert!(
@@ -163,9 +198,25 @@ impl LineIndex {
         (start_line, end_line)
     }
 
-    /// Total number of lines in the indexed data. Always >= 1 (even an
-    /// empty file is treated as having one empty line, consistent with how
-    /// text editors display empty files).
+    /// Length of the original data in bytes.
+    ///
+    /// The matching layer checks `finding.byte_end <= data_len()` before
+    /// calling [`line_of`] or [`line_range`], which panic on out-of-bounds
+    /// offsets. This gate turns stale scanner output or truncated file reads
+    /// into a diagnostic counter rather than a panic.
+    ///
+    /// [`line_of`]: Self::line_of
+    /// [`line_range`]: Self::line_range
+    #[inline]
+    pub fn data_len(&self) -> u32 {
+        self.data_len
+    }
+
+    /// Total number of lines in the indexed data.
+    ///
+    /// Always >= 1: even an empty file is treated as having one empty line,
+    /// matching the convention used by most text editors (vim, VS Code). Equal to
+    /// `line_starts.len()` — the length of the internal offset array.
     #[inline]
     pub fn line_count(&self) -> u32 {
         // Safe: line_starts.len() <= data_len + 1, and data_len <= u32::MAX.

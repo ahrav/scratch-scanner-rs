@@ -15,9 +15,22 @@
 //!    and line numbers so findings and truth items can be compared.
 //!
 //! 3. **Classify** — Each finding is matched against truth items to produce a
-//!    [`MatchClass`] (TP, FP, FN, or unlabeled). These classifications feed
-//!    into precision/recall computation and PRC-AUC curves at varying
+//!    [`ClassifiedFinding`] pairing the original finding with a
+//!    [`FindingClass`] (TP, FP, or Unlabeled). Unmatched positive truth
+//!    items are tracked separately as false negatives. These classifications
+//!    feed into precision/recall computation and PRC-AUC curves at varying
 //!    confidence thresholds.
+//!
+//! # Type hierarchy
+//!
+//! The classification types form a deliberate hierarchy:
+//!
+//! - [`FindingClass`] — finding-only outcomes (TP, FP, Unlabeled), excluding
+//!   FN because false negatives are truth-derived, not finding-derived.
+//!   This makes invalid states unrepresentable: a [`ClassifiedFinding`] can
+//!   never carry a `FalseNegative` label.
+//! - [`ClassifiedFinding`] — a finding paired with its [`FindingClass`],
+//!   carrying the confidence score needed for PRC-AUC threshold sweeping.
 //!
 //! # Coordinate systems
 //!
@@ -93,29 +106,34 @@ pub struct NormalizedFinding {
     pub byte_start: u64,
     /// Byte offset of the finding end (exclusive).
     pub byte_end: u64,
-    /// Rule name that produced this finding.
+    /// Scanner rule name that produced this finding (e.g., `"aws-access-key"`).
     pub rule: String,
-    /// Additive confidence score from gate signals. Excluded from identity
-    /// comparisons — two findings at the same span with different scores
-    /// represent the same detection.
+    /// Additive confidence score from the engine's gate signals (range:
+    /// -128..=127). Excluded from identity comparisons — two findings at the
+    /// same span with different scores represent the same detection.
+    ///
+    /// Higher values indicate stronger confidence that the finding is a true
+    /// secret. The metrics layer uses this score as the ranking axis for
+    /// PRC-AUC: at each confidence threshold, only findings at or above the
+    /// threshold contribute to precision/recall.
     pub confidence: i8,
 }
 
 impl NormalizedFinding {
-    /// Create a new finding with debug-mode validity checks.
+    /// Create a new finding with validity checks.
     ///
     /// Fields remain `pub` for test construction, but production code should
     /// prefer this constructor to catch malformed data early.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
     /// - `path` is empty
     /// - `rule` is empty
     /// - `byte_end < byte_start` (inverted span)
     pub fn new(path: String, byte_start: u64, byte_end: u64, rule: String, confidence: i8) -> Self {
-        debug_assert!(!path.is_empty(), "finding path must not be empty");
-        debug_assert!(!rule.is_empty(), "finding rule must not be empty");
-        debug_assert!(
+        assert!(!path.is_empty(), "finding path must not be empty");
+        assert!(!rule.is_empty(), "finding rule must not be empty");
+        assert!(
             byte_end >= byte_start,
             "inverted span: byte_end ({byte_end}) < byte_start ({byte_start})"
         );
@@ -199,19 +217,24 @@ pub struct TruthItem {
     /// 1-indexed, inclusive end line. A single-line annotation has
     /// `line_start == line_end`.
     pub line_end: u32,
-    /// Ground-truth label for this annotation.
+    /// Ground-truth label for this annotation. Determines how findings
+    /// overlapping this region are classified during matching.
     pub label: TruthLabel,
-    /// Rule name this annotation applies to.
+    /// Rule or category name this annotation applies to. Format varies by
+    /// corpus: CredData uses colon-separated category names (e.g.,
+    /// `"Secret:Token"`), while synthetic manifests use scanner-style
+    /// kebab-case names (e.g., `"aws-access-key"`). When rule matching
+    /// is enabled, the matching layer splits on `:` and compares segments.
     pub rule: String,
 }
 
 impl TruthItem {
-    /// Create a new truth item with debug-mode validity checks.
+    /// Create a new truth item with validity checks.
     ///
     /// Fields remain `pub` for test construction, but production code should
     /// prefer this constructor to catch malformed corpus data early.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
     /// - `path` is empty
     /// - `rule` is empty
@@ -224,10 +247,10 @@ impl TruthItem {
         label: TruthLabel,
         rule: String,
     ) -> Self {
-        debug_assert!(!path.is_empty(), "truth item path must not be empty");
-        debug_assert!(!rule.is_empty(), "truth item rule must not be empty");
-        debug_assert!(line_start > 0, "line_start must be 1-indexed, got 0");
-        debug_assert!(
+        assert!(!path.is_empty(), "truth item path must not be empty");
+        assert!(!rule.is_empty(), "truth item rule must not be empty");
+        assert!(line_start > 0, "line_start must be 1-indexed, got 0");
+        assert!(
             line_end >= line_start,
             "inverted line range: line_end ({line_end}) < line_start ({line_start})"
         );
@@ -247,17 +270,26 @@ impl TruthItem {
 /// because in secret scanning the set of true negatives (all file regions
 /// that are not secrets and are not flagged) is enormous and unenumerable.
 /// PRC-AUC only needs TP, FP, and total positives.
+///
+/// During matching, label priority is Positive > Negative > Placeholder:
+/// when a finding overlaps multiple truth items, the highest-priority label
+/// determines the classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TruthLabel {
-    /// Should be detected — ground truth says a secret is here.
+    /// Should be detected — ground truth says a secret is here. A finding
+    /// overlapping this annotation is classified as TP. Consumed on match
+    /// (one-to-one) to prevent a single truth item from inflating TP counts.
     Positive,
     /// Should NOT be detected — ground truth explicitly marks this as benign.
+    /// A finding overlapping this annotation is classified as FP. Not consumed
+    /// on match — multiple findings at the same negative region all count as FP.
     Negative,
     /// Exclude from scoring entirely. Used for test scaffolding, ambiguous
     /// annotations that cannot be confidently labeled either way, or
     /// regions under active relabeling. Findings matching a placeholder
-    /// annotation are neither penalized nor rewarded.
+    /// annotation are classified as Unlabeled (neither penalized nor
+    /// rewarded). Not consumed on match.
     Placeholder,
 }
 
@@ -273,52 +305,58 @@ impl std::fmt::Display for TruthLabel {
 
 // ── Match classification ────────────────────────────────────────────────
 
-/// Classification of a scanner finding after matching against ground truth.
+/// Classification of a scanner finding (finding-derived only).
 ///
-/// The metrics layer uses these classifications to compute precision, recall,
-/// and PRC-AUC. The four variants arise from two independent domains:
-///
-/// - **Finding-derived** (one class per scanner finding):
-///   - [`TruePositive`](MatchClass::TruePositive) — matched a positive annotation.
-///   - [`FalsePositive`](MatchClass::FalsePositive) — matched a negative annotation.
-///   - [`Unlabeled`](MatchClass::Unlabeled) — no annotation at that location.
-///
-/// - **Truth-derived** (one class per unmatched ground-truth positive):
-///   - [`FalseNegative`](MatchClass::FalseNegative) — no finding matched this positive.
-///
-/// Together the four variants cover both domains without overlap.
-///
-/// The distinction between [`FalsePositive`](MatchClass::FalsePositive) and
-/// [`Unlabeled`](MatchClass::Unlabeled) matters for corpus coverage analysis:
-/// a high unlabeled rate signals that the corpus has annotation gaps, not
-/// necessarily that the scanner is noisy. Only `FalsePositive` penalizes
-/// precision; `Unlabeled` findings are excluded from the precision
-/// denominator.
+/// Intentionally excludes `FalseNegative` because false negatives are
+/// truth-derived (unmatched positive ground truth), not finding-derived.
+/// This is the "make invalid states unrepresentable" pattern: a
+/// [`ClassifiedFinding`] can never carry a `FalseNegative` label because
+/// the type system prevents it at compile time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MatchClass {
-    /// Scanner found a secret where ground truth says one exists.
+pub enum FindingClass {
+    /// Matched a Positive annotation.
     TruePositive,
-    /// Scanner found a secret where ground truth explicitly says none exists
-    /// (i.e., the location has a `TruthLabel::Negative` annotation).
+    /// Matched a Negative annotation.
     FalsePositive,
-    /// Ground truth says a secret exists but scanner did not find it.
-    FalseNegative,
-    /// Scanner produced a finding at a location with no ground-truth
-    /// annotation. Distinct from `FalsePositive`, which requires an
-    /// explicit `TruthLabel::Negative` annotation.
+    /// No annotation at location, or matched a Placeholder.
     Unlabeled,
 }
 
-impl std::fmt::Display for MatchClass {
+impl std::fmt::Display for FindingClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::TruePositive => "TP",
             Self::FalsePositive => "FP",
-            Self::FalseNegative => "FN",
             Self::Unlabeled => "unlabeled",
         })
     }
+}
+
+/// A scanner finding paired with its ground-truth classification.
+///
+/// Bridges the matching and metrics layers. The `finding` field carries
+/// the confidence score needed for PRC-AUC threshold sweeping; `class`
+/// carries the TP/FP/Unlabeled verdict from matching.
+///
+/// When produced by [`crate::matching::match_findings`], the output
+/// `Vec<ClassifiedFinding>` is ordered by confidence descending (with
+/// ties broken by [`NormalizedFinding::Ord`]). This matches the
+/// confidence-descending order used by PRC-AUC computation in
+/// [`crate::metrics`].
+///
+/// # Counting invariant
+///
+/// Every input finding is classified into exactly one [`FindingClass`]:
+/// ```text
+/// classified.len() == input_findings.len()
+/// ```
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClassifiedFinding {
+    /// The original finding with its identity fields and confidence score.
+    pub finding: NormalizedFinding,
+    /// The ground-truth verdict from the matching algorithm.
+    pub class: FindingClass,
 }
 
 // ── Path normalization ──────────────────────────────────────────────────
@@ -406,7 +444,9 @@ impl FileReadError {
         Self { path, source }
     }
 
-    /// The file or directory path that caused the error.
+    /// The file or directory path that caused the error. Returns the
+    /// original path as provided to [`FileReadError::new`], without any
+    /// normalization or canonicalization.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -441,25 +481,6 @@ mod tests {
             let serialized = serde_json::to_string(&variant).unwrap();
             assert_eq!(serialized, json, "{variant:?} serialization");
             let back: TruthLabel = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(back, variant, "{variant:?} roundtrip");
-            assert_eq!(variant.to_string(), display, "{variant:?} display");
-        }
-    }
-
-    // ── MatchClass traits (serde + display) ──────────────────
-
-    #[test]
-    fn match_class_traits() {
-        let cases: &[(MatchClass, &str, &str)] = &[
-            (MatchClass::TruePositive, r#""true_positive""#, "TP"),
-            (MatchClass::FalsePositive, r#""false_positive""#, "FP"),
-            (MatchClass::FalseNegative, r#""false_negative""#, "FN"),
-            (MatchClass::Unlabeled, r#""unlabeled""#, "unlabeled"),
-        ];
-        for &(variant, json, display) in cases {
-            let serialized = serde_json::to_string(&variant).unwrap();
-            assert_eq!(serialized, json, "{variant:?} serialization");
-            let back: MatchClass = serde_json::from_str(&serialized).unwrap();
             assert_eq!(back, variant, "{variant:?} roundtrip");
             assert_eq!(variant.to_string(), display, "{variant:?} display");
         }

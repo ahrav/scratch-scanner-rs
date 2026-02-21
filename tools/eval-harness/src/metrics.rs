@@ -2,16 +2,16 @@
 //!
 //! This is the final stage of the eval pipeline: it takes classified findings
 //! from the matching layer and produces numeric accuracy metrics. The input is
-//! a list of `(NormalizedFinding, MatchClass)` pairs where each finding has
-//! been classified as TP, FP, or Unlabeled; false negatives (unmatched truth
+//! a slice of [`ClassifiedFinding`] items where each finding has been
+//! classified as TP, FP, or Unlabeled; false negatives (unmatched truth
 //! positives) are counted separately via the `fn_count` parameter because they
 //! have no corresponding [`NormalizedFinding`].
 //!
 //! ## Pipeline context
 //!
 //! ```text
-//! Scanner output ──► NormalizedFinding ──► matching ──► (finding, MatchClass) ──► this module
-//! Ground truth   ──► TruthItem         ──►          ──► fn_count              ──►
+//! Scanner output ──► NormalizedFinding ──► matching ──► ClassifiedFinding ──► this module
+//! Ground truth   ──► TruthItem         ──►          ──► fn_count          ──►
 //! ```
 //!
 //! ## Metric families
@@ -30,8 +30,9 @@
 //! Uses the step-function (rectangular) formula with **tie collapsing**:
 //!
 //! 1. Filter to TP and FP only (skip Unlabeled).
-//! 2. Sort by confidence descending (stable sort preserves input order within
-//!    ties, though ordering within ties is irrelevant after collapsing).
+//! 2. Sort by confidence descending (unstable sort; tie-breaking order is
+//!    irrelevant because all items at the same confidence are collapsed
+//!    into a single operating point).
 //! 3. Collapse consecutive items sharing the same confidence into a single
 //!    precision/recall operating point, accumulating TP and FP counts per
 //!    group.
@@ -56,7 +57,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{MatchClass, NormalizedFinding};
+use crate::types::{ClassifiedFinding, FindingClass};
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -95,8 +96,7 @@ pub struct ConfidenceInterval {
 ///
 /// # Field relationships
 ///
-/// - `tp + fp + unlabeled` equals the length of the input `classified` slice
-///   (excluding any `FalseNegative` entries, which must not appear).
+/// - `tp + fp + unlabeled` equals the length of the input `classified` slice.
 /// - `total_positives = tp + false_neg` (invariant maintained by the caller).
 /// - `f2 = 5 * P * R / (4*P + R)` when `4*P + R > 0`, else 0.0.
 /// - `f2 >= f1` when `recall >= precision`, `f2 <= f1` otherwise.
@@ -164,8 +164,12 @@ pub struct EvalMetrics {
 /// Per-rule precision breakdown.
 ///
 /// Contains TP/FP counts and precision for a single detection rule.
-/// Recall and F1 are omitted because per-rule false-negative counts
-/// are not available from the classified finding list alone.
+/// Recall and F1 are intentionally omitted: computing per-rule recall
+/// requires knowing how many ground-truth positives exist for each rule,
+/// but the classified finding list only contains scanner output — it has
+/// no record of truth items that went unmatched. Adding per-rule FN
+/// counts would require threading truth metadata through the matching
+/// layer, which is deferred until per-rule reporting is a priority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleMetrics {
     pub tp: u64,
@@ -223,13 +227,13 @@ impl EvalMetrics {
     /// ```
     #[must_use]
     pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Self {
-        debug_assert!(
+        assert!(
             ci.0 <= ci.1,
             "CI lower ({}) must not exceed upper ({})",
             ci.0,
             ci.1,
         );
-        debug_assert!(
+        assert!(
             ci.0 >= 0.0 && ci.1 <= 1.0,
             "CI bounds must be in [0.0, 1.0], got ({}, {})",
             ci.0,
@@ -257,43 +261,32 @@ impl EvalMetrics {
 ///
 /// # Parameters
 ///
-/// - `classified`: pairs of (finding, classification). Only `TruePositive`,
-///   `FalsePositive`, and `Unlabeled` should appear.
+/// - `classified`: classified findings from the matching layer. Only
+///   [`FindingClass::TruePositive`], [`FindingClass::FalsePositive`], and
+///   [`FindingClass::Unlabeled`] can appear (enforced at compile time by
+///   the [`FindingClass`] type, which has no `FalseNegative` variant).
 /// - `fn_count`: number of ground-truth positives not matched by any finding.
 /// - `total_positives`: total ground-truth positive count (`tp + fn_count`).
 ///
 /// # Panics
 ///
-/// - If any entry in `classified` has class [`MatchClass::FalseNegative`].
-///   FN items have no corresponding finding and must be passed as `fn_count`.
 /// - If `tp + fn_count != total_positives` (invariant check).
 ///
 /// [`with_bootstrap_ci`]: EvalMetrics::with_bootstrap_ci
 pub fn compute_metrics(
-    classified: &[(NormalizedFinding, MatchClass)],
+    classified: &[ClassifiedFinding],
     fn_count: u64,
     total_positives: u64,
 ) -> EvalMetrics {
-    assert!(
-        !classified
-            .iter()
-            .any(|(_, c)| *c == MatchClass::FalseNegative),
-        "FalseNegative must not appear in classified list; pass FN count via fn_count",
-    );
-
     let mut tp: u64 = 0;
     let mut fp: u64 = 0;
     let mut unlabeled: u64 = 0;
 
-    for (_, class) in classified {
-        match class {
-            MatchClass::TruePositive => tp += 1,
-            MatchClass::FalsePositive => fp += 1,
-            MatchClass::Unlabeled => unlabeled += 1,
-            MatchClass::FalseNegative => unreachable!(
-                "FalseNegative must not appear in classified list; \
-                 pass FN count via fn_count"
-            ),
+    for cf in classified {
+        match cf.class {
+            FindingClass::TruePositive => tp += 1,
+            FindingClass::FalsePositive => fp += 1,
+            FindingClass::Unlabeled => unlabeled += 1,
         }
     }
 
@@ -350,7 +343,7 @@ pub fn compute_metrics(
 ///
 /// Uses stratified resampling: TP and FP items are resampled independently
 /// (with replacement) to preserve the TP and FP counts in every iteration.
-/// Each resampled set is run through `build_pr_curve` + `ap_from_curve` to
+/// Each resampled set is run through `pr_curve_from_histogram` + `ap_from_curve` to
 /// produce an AP estimate. The resulting AP distribution is sorted and
 /// percentiles at `[alpha/2, 1 - alpha/2]` are returned.
 ///
@@ -360,8 +353,10 @@ pub fn compute_metrics(
 ///
 /// # Complexity
 ///
-/// O(`n_iterations` * n * log n) where n is the number of TP + FP items.
-/// Each iteration sorts the resampled set to build a PR curve.
+/// O(`n_iterations` * n) where n is the number of TP + FP items.
+/// Each iteration fills a 256-bin histogram and sweeps it (O(n + 256)).
+/// The final percentile sort adds O(`n_iterations` log `n_iterations`),
+/// dominated by the main loop in practice.
 ///
 /// # Panics
 ///
@@ -374,8 +369,18 @@ pub fn compute_metrics(
 /// `(ci_lower, ci_upper)` as the `[alpha/2, 1 - alpha/2]` percentiles.
 /// Returns `(0.0, 0.0)` when there are zero TP *and* zero FP items
 /// (Unlabeled items are excluded from bootstrap resampling).
+///
+/// # Limitations
+///
+/// Bootstrap CI quality degrades when the scored set (TP + FP) is small.
+/// With fewer than ~30 scored items, resampling draws from a tiny pool and
+/// the resulting interval collapses toward a point estimate. In the extreme
+/// case (e.g., 1 TP + 0 FP with `total_positives == 1`), every resample produces the same AP, yielding
+/// a degenerate zero-width CI of `(1.0, 1.0)` regardless of `n_iterations`.
+/// Interpret narrow CIs on small scored sets as reflecting insufficient data
+/// rather than high certainty.
 pub fn bootstrap_ap_ci(
-    classified: &[(NormalizedFinding, MatchClass)],
+    classified: &[ClassifiedFinding],
     total_positives: u64,
     config: &BootstrapConfig,
 ) -> (f64, f64) {
@@ -383,13 +388,13 @@ pub fn bootstrap_ap_ci(
     // NormalizedFinding structs on every bootstrap iteration.
     let tp_scores: Vec<i8> = classified
         .iter()
-        .filter(|(_, c)| *c == MatchClass::TruePositive)
-        .map(|(f, _)| f.confidence)
+        .filter(|cf| cf.class == FindingClass::TruePositive)
+        .map(|cf| cf.finding.confidence)
         .collect();
     let fp_scores: Vec<i8> = classified
         .iter()
-        .filter(|(_, c)| *c == MatchClass::FalsePositive)
-        .map(|(f, _)| f.confidence)
+        .filter(|cf| cf.class == FindingClass::FalsePositive)
+        .map(|cf| cf.finding.confidence)
         .collect();
 
     assert!(
@@ -433,18 +438,20 @@ pub fn bootstrap_ap_ci(
             resampled.push((fp_scores[idx], false));
         }
 
-        let curve = pr_curve_from_scored(&mut resampled, total_positives);
+        let curve = pr_curve_from_histogram(&resampled, total_positives);
         ap_samples.push(ap_from_curve(&curve));
     }
 
-    ap_samples.sort_by(|a, b| {
+    ap_samples.sort_unstable_by(|a, b| {
         a.partial_cmp(b)
             .expect("AP values must be finite for bootstrap CI")
     });
 
     // Percentile extraction: floor for the lower bound, ceil for the upper
-    // bound, clamped to valid indices. With alpha=0.05 and 1000 samples
-    // this gives indices 25 and 975 (the 2.5th and 97.5th percentiles).
+    // bound produces a conservative (wider) CI — the interval never
+    // understates uncertainty. Clamped to valid indices for safety when
+    // n_iterations is very small. With alpha=0.05 and 1000 samples this
+    // gives indices 25 and 975 (the 2.5th and 97.5th percentiles).
     let lo_idx = ((config.alpha / 2.0) * ap_samples.len() as f64).floor() as usize;
     let hi_idx = ((1.0 - config.alpha / 2.0) * ap_samples.len() as f64).ceil() as usize;
     let lo_idx = lo_idx.min(ap_samples.len().saturating_sub(1));
@@ -487,20 +494,17 @@ struct PrPoint {
 ///
 /// Returns an empty vec when `total_positives` is zero or no TP/FP items
 /// are present.
-fn build_pr_curve(
-    classified: &[(NormalizedFinding, MatchClass)],
-    total_positives: u64,
-) -> Vec<PrPoint> {
+fn build_pr_curve(classified: &[ClassifiedFinding], total_positives: u64) -> Vec<PrPoint> {
     if total_positives == 0 {
         return Vec::new();
     }
 
     let mut scored: Vec<(i8, bool)> = classified
         .iter()
-        .filter_map(|(f, c)| match c {
-            MatchClass::TruePositive => Some((f.confidence, true)),
-            MatchClass::FalsePositive => Some((f.confidence, false)),
-            MatchClass::Unlabeled | MatchClass::FalseNegative => None,
+        .filter_map(|cf| match cf.class {
+            FindingClass::TruePositive => Some((cf.finding.confidence, true)),
+            FindingClass::FalsePositive => Some((cf.finding.confidence, false)),
+            FindingClass::Unlabeled => None,
         })
         .collect();
 
@@ -510,9 +514,16 @@ fn build_pr_curve(
 /// Build a PR curve from pre-extracted `(confidence, is_tp)` pairs.
 ///
 /// Sorts `scored` in place by confidence descending, then collapses tied
-/// confidence groups into single operating points. This is the shared
-/// core used by both [`build_pr_curve`] (which extracts from full findings)
-/// and [`bootstrap_ap_ci`] (which works on lightweight resampled pairs).
+/// confidence groups into single operating points. Used by
+/// [`build_pr_curve`], which extracts scored pairs from full findings.
+/// The histogram-based [`pr_curve_from_histogram`] provides an equivalent
+/// O(n) alternative used by the bootstrap inner loop.
+///
+/// Takes `&mut` to sort in place, avoiding allocation of a separate
+/// sorted copy. Uses `sort_unstable_by` because tie-breaking order within
+/// a confidence group is irrelevant — all items sharing a confidence
+/// value are collapsed into a single operating point regardless of their
+/// relative order.
 fn pr_curve_from_scored(scored: &mut [(i8, bool)], total_positives: u64) -> Vec<PrPoint> {
     if scored.is_empty() {
         return Vec::new();
@@ -562,11 +573,78 @@ fn pr_curve_from_scored(scored: &mut [(i8, bool)], total_positives: u64) -> Vec<
     curve
 }
 
+/// Build a PR curve from `(confidence, is_tp)` pairs using histogram counting.
+///
+/// Instead of sorting the input O(n log n), this exploits the fact that
+/// confidence is `i8` (256 distinct values) to bin TP and FP counts in
+/// O(n), then sweeps the 256 bins in descending order to produce the same
+/// curve as [`pr_curve_from_scored`].
+///
+/// Takes an immutable slice — no sorting required. Used by the bootstrap
+/// inner loop where sorting dominated per-iteration cost.
+///
+/// # Complexity
+///
+/// O(n + 256) — one pass to populate histograms, one 256-step sweep.
+fn pr_curve_from_histogram(scored: &[(i8, bool)], total_positives: u64) -> Vec<PrPoint> {
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    // Histogram bins indexed by order-preserving unsigned encoding of i8:
+    // XOR the sign bit so that i8 -128 → 0 and i8 127 → 255, preserving
+    // the natural ordering. Sweeping indices 255→0 then visits confidence
+    // values 127→−128 (descending), matching the sort-based approach.
+    let mut tp_hist = [0u32; 256];
+    let mut fp_hist = [0u32; 256];
+
+    for &(conf, is_tp) in scored {
+        let idx = (conf as u8 ^ 0x80) as usize;
+        if is_tp {
+            tp_hist[idx] += 1;
+        } else {
+            fp_hist[idx] += 1;
+        }
+    }
+
+    let total_pos_f64 = total_positives as f64;
+    let mut cum_tp: u64 = 0;
+    let mut cum_fp: u64 = 0;
+    let mut curve = Vec::new();
+
+    // Sweep from highest confidence (i8::MAX = 127, index 255) down to
+    // lowest (i8::MIN = -128, index 0). This produces the same
+    // confidence-descending traversal as the sort-based approach.
+    for idx in (0..256).rev() {
+        let group_tp = tp_hist[idx] as u64;
+        let group_fp = fp_hist[idx] as u64;
+
+        if group_tp == 0 && group_fp == 0 {
+            continue;
+        }
+
+        cum_tp += group_tp;
+        cum_fp += group_fp;
+
+        curve.push(PrPoint {
+            precision: safe_div(cum_tp as f64, (cum_tp + cum_fp) as f64),
+            recall: safe_div(cum_tp as f64, total_pos_f64),
+        });
+    }
+
+    curve
+}
+
 /// Compute step-function Average Precision from a pre-built PR curve.
 ///
 /// `AP = sum of (recall_i - recall_{i-1}) * precision_i` over all
-/// operating points. Returns 0.0 for an empty curve. Result is clamped
-/// to `max(0.0, ap)` to guard against floating-point drift.
+/// operating points. Returns 0.0 for an empty curve.
+///
+/// The result is clamped to `max(0.0, ap)` as a defensive guard: AP is
+/// non-negative by construction (every `recall_i - recall_{i-1}` delta
+/// and every `precision_i` are non-negative), but floating-point
+/// subtraction can produce tiny negatives (e.g., `-1e-17`) when recall
+/// values are very close together.
 fn ap_from_curve(curve: &[PrPoint]) -> f64 {
     let mut prev_recall = 0.0;
     let mut ap = 0.0;
@@ -580,19 +658,33 @@ fn ap_from_curve(curve: &[PrPoint]) -> f64 {
 }
 
 /// Default recall targets for precision-at-recall queries.
-/// Also documented in the `EvalMetrics::precision_at_recall` field doc.
+///
+/// These are industry-standard recall operating points: 0.80 is a
+/// practical minimum for production secret scanning, 0.90 is a common
+/// quality bar for CI gates, and 0.95 is a stretch target for
+/// high-assurance environments. Also documented in the
+/// `EvalMetrics::precision_at_recall` field doc.
 const DEFAULT_PAR_TARGETS: &[f64] = &[0.80, 0.90, 0.95];
 
 /// Default precision targets for recall-at-precision queries.
-/// Also documented in the `EvalMetrics::recall_at_precision` field doc.
+///
+/// A single high-precision target (0.95) answers the practical question
+/// "how much recall can I get if I need <=5% false positive rate?" This
+/// is the operating point most relevant for automated remediation
+/// workflows where FP cost is high. Also documented in the
+/// `EvalMetrics::recall_at_precision` field doc.
 const DEFAULT_RAP_TARGETS: &[f64] = &[0.95];
 
 /// Find the best precision achievable at a given recall target.
 ///
-/// Returns the maximum precision among all operating points where
-/// `recall >= target`. This matters on recall plateaus where multiple
-/// points share the same recall but have different precision (e.g.,
-/// after adding FP items that lower precision without changing recall).
+/// Returns the **maximum** precision among all operating points where
+/// `recall >= target`, rather than the precision at the first qualifying
+/// point. This matters on recall plateaus where multiple points share
+/// the same recall but have decreasing precision (e.g., after adding FP
+/// items that lower precision without changing recall). Taking the max
+/// selects the operating point where the classifier is most precise
+/// while still meeting the recall floor.
+///
 /// Returns `None` if no point reaches the target recall.
 ///
 /// The comparison uses a small epsilon (`1e-12`) to absorb floating-point
@@ -613,9 +705,13 @@ fn precision_at_recall(curve: &[PrPoint], target: f64) -> Option<f64> {
 
 /// Find the highest recall achievable at a given precision target.
 ///
-/// Walks the curve from high recall to low recall and returns the recall
-/// at the first point where `precision >= target`. This is the maximum
-/// recall where the precision constraint is still satisfied.
+/// Walks the curve **backwards** (from the last point to the first),
+/// which means from high recall to low recall because the curve is
+/// ordered confidence-descending (i.e., recall-ascending). The first
+/// point encountered with `precision >= target` is therefore the
+/// highest-recall point meeting the constraint — no need to scan
+/// further.
+///
 /// Returns `None` if no operating point meets the precision threshold.
 ///
 /// Uses the same `1e-12` epsilon as [`precision_at_recall`] for
@@ -636,35 +732,38 @@ fn recall_at_precision(curve: &[PrPoint], target: f64) -> Option<f64> {
 /// Thin wrapper around `build_pr_curve` + `ap_from_curve` retained as a
 /// convenience for tests that only need the scalar AP value.
 #[cfg(test)]
-fn compute_average_precision(
-    classified: &[(NormalizedFinding, MatchClass)],
-    total_positives: u64,
-) -> f64 {
+fn compute_average_precision(classified: &[ClassifiedFinding], total_positives: u64) -> f64 {
     ap_from_curve(&build_pr_curve(classified, total_positives))
 }
 
 /// Per-rule precision breakdown from classified findings.
 ///
 /// Groups TP and FP findings by rule name, computes precision per rule.
-/// Unlabeled and FalseNegative items are skipped. Rules that produce
-/// only Unlabeled findings are absent from the output entirely.
+/// Unlabeled items are skipped. Rules that produce only Unlabeled
+/// findings are absent from the output entirely.
 ///
-/// The result is collected into a `BTreeMap` for deterministic iteration
-/// order in serialized output (JSON reports, CLI tables).
-fn compute_per_rule(
-    classified: &[(NormalizedFinding, MatchClass)],
-) -> BTreeMap<String, RuleMetrics> {
+/// Accumulation uses a temporary `HashMap<&str, (u64, u64)>` for O(1)
+/// amortized insertion, then converts to `BTreeMap<String, RuleMetrics>`
+/// for deterministic iteration order in serialized output (JSON reports,
+/// CLI tables). The `&str` keys borrow from the input to avoid
+/// per-finding string allocation during counting.
+///
+/// # Complexity
+///
+/// O(n + r log r) where n is the number of classified findings and r is
+/// the number of distinct rules (r << n in practice).
+fn compute_per_rule(classified: &[ClassifiedFinding]) -> BTreeMap<String, RuleMetrics> {
     let mut counts: HashMap<&str, (u64, u64)> = HashMap::new();
 
-    for (finding, class) in classified {
-        match class {
-            MatchClass::TruePositive => {
-                counts.entry(finding.rule.as_str()).or_default().0 += 1;
+    for cf in classified {
+        match cf.class {
+            FindingClass::TruePositive => {
+                counts.entry(cf.finding.rule.as_str()).or_default().0 += 1;
             }
-            MatchClass::FalsePositive => {
-                counts.entry(finding.rule.as_str()).or_default().1 += 1;
+            FindingClass::FalsePositive => {
+                counts.entry(cf.finding.rule.as_str()).or_default().1 += 1;
             }
-            MatchClass::Unlabeled | MatchClass::FalseNegative => {}
+            FindingClass::Unlabeled => {}
         }
     }
 
@@ -695,19 +794,25 @@ mod tests {
     const EPS: f64 = 1e-9;
 
     /// Build a classified finding with minimal boilerplate.
-    fn item(confidence: i8, class: MatchClass) -> (NormalizedFinding, MatchClass) {
-        (
-            NormalizedFinding::new("test.txt".into(), 0, 1, "test_rule".into(), confidence),
+    fn item(confidence: i8, class: FindingClass) -> ClassifiedFinding {
+        ClassifiedFinding {
+            finding: NormalizedFinding::new(
+                "test.txt".into(),
+                0,
+                1,
+                "test_rule".into(),
+                confidence,
+            ),
             class,
-        )
+        }
     }
 
     /// Build a classified finding for a specific rule.
-    fn item_rule(confidence: i8, class: MatchClass, rule: &str) -> (NormalizedFinding, MatchClass) {
-        (
-            NormalizedFinding::new("test.txt".into(), 0, 1, rule.into(), confidence),
+    fn item_rule(confidence: i8, class: FindingClass, rule: &str) -> ClassifiedFinding {
+        ClassifiedFinding {
+            finding: NormalizedFinding::new("test.txt".into(), 0, 1, rule.into(), confidence),
             class,
-        )
+        }
     }
 
     // ── AP oracle tests ─────────────────────────────────────────
@@ -715,9 +820,9 @@ mod tests {
     #[test]
     #[allow(clippy::type_complexity)]
     fn ap_oracle_cases() {
-        use MatchClass::{FalsePositive as FP, TruePositive as TP};
+        use FindingClass::{FalsePositive as FP, TruePositive as TP};
 
-        let cases: &[(&str, &[(i8, MatchClass)], u64, f64)] = &[
+        let cases: &[(&str, &[(i8, FindingClass)], u64, f64)] = &[
             ("single_tp", &[(5, TP)], 1, 1.0),
             (
                 "alternating",
@@ -766,9 +871,9 @@ mod tests {
     #[test]
     fn metrics_perfect_classifier() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::TruePositive),
-            item(3, MatchClass::TruePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::TruePositive),
+            item(3, FindingClass::TruePositive),
         ];
         let m = compute_metrics(&classified, 0, 3);
         assert!((m.average_precision - 1.0).abs() < EPS);
@@ -803,8 +908,8 @@ mod tests {
     #[test]
     fn metrics_all_fp() {
         let classified = vec![
-            item(5, MatchClass::FalsePositive),
-            item(4, MatchClass::FalsePositive),
+            item(5, FindingClass::FalsePositive),
+            item(4, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 3, 3);
         assert!(m.average_precision.abs() < EPS);
@@ -847,10 +952,10 @@ mod tests {
     fn metrics_unlabeled_excluded() {
         // Unlabeled findings should not affect P/R/F1/AP.
         let classified = vec![
-            item(10, MatchClass::TruePositive),
-            item(8, MatchClass::Unlabeled),
-            item(6, MatchClass::Unlabeled),
-            item(4, MatchClass::FalsePositive),
+            item(10, FindingClass::TruePositive),
+            item(8, FindingClass::Unlabeled),
+            item(6, FindingClass::Unlabeled),
+            item(4, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 0, 1);
         assert!((m.precision - 0.5).abs() < EPS); // 1/(1+1)
@@ -863,11 +968,11 @@ mod tests {
     #[test]
     fn per_rule_grouping() {
         let classified = vec![
-            item_rule(5, MatchClass::TruePositive, "rule_a"),
-            item_rule(4, MatchClass::FalsePositive, "rule_a"),
-            item_rule(3, MatchClass::TruePositive, "rule_b"),
-            item_rule(2, MatchClass::TruePositive, "rule_b"),
-            item_rule(1, MatchClass::Unlabeled, "rule_c"),
+            item_rule(5, FindingClass::TruePositive, "rule_a"),
+            item_rule(4, FindingClass::FalsePositive, "rule_a"),
+            item_rule(3, FindingClass::TruePositive, "rule_b"),
+            item_rule(2, FindingClass::TruePositive, "rule_b"),
+            item_rule(1, FindingClass::Unlabeled, "rule_c"),
         ];
         let per = compute_per_rule(&classified);
         assert_eq!(per.len(), 2); // rule_c excluded (only Unlabeled)
@@ -885,10 +990,10 @@ mod tests {
     fn baseline_ap_value() {
         // baseline_ap = tp / (tp + fp), derived from the scored population.
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
-            item(3, MatchClass::FalsePositive),
-            item(2, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
+            item(3, FindingClass::FalsePositive),
+            item(2, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 2, 3);
         // tp=1, fp=3 → baseline = 1 / (1 + 3) = 0.25
@@ -901,7 +1006,7 @@ mod tests {
         // With 1 TP, 99 FN, 0 FP: old formula gave 100/(100+0) = 1.0,
         // new formula gives tp/(tp+fp) = 1/(1+0) = 1.0.
         // The formulas only diverge when there are both FNs and FPs.
-        let classified = vec![item(5, MatchClass::TruePositive)];
+        let classified = vec![item(5, FindingClass::TruePositive)];
         let m = compute_metrics(&classified, 99, 100);
         // tp=1, fp=0 → baseline = 1.0 (entire scored list is positive)
         assert!((m.baseline_ap - 1.0).abs() < EPS);
@@ -911,10 +1016,10 @@ mod tests {
         // New formula: tp/(tp+fp) = 1/(1+3) = 0.25
         // The old baseline was inflated by counting FNs not in the ranked list.
         let classified2 = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
-            item(3, MatchClass::FalsePositive),
-            item(2, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
+            item(3, FindingClass::FalsePositive),
+            item(2, FindingClass::FalsePositive),
         ];
         let m2 = compute_metrics(&classified2, 2, 3);
         assert!(
@@ -936,11 +1041,11 @@ mod tests {
         //   conf=2: P=0.5,   R=2/3
         //   conf=1: P=0.6,   R=1.0
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
-            item(3, MatchClass::TruePositive),
-            item(2, MatchClass::FalsePositive),
-            item(1, MatchClass::TruePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
+            item(3, FindingClass::TruePositive),
+            item(2, FindingClass::FalsePositive),
+            item(1, FindingClass::TruePositive),
         ];
         let m = compute_metrics(&classified, 0, 3);
 
@@ -959,8 +1064,8 @@ mod tests {
     fn rap_no_point_meets_threshold() {
         // All points have precision < 0.95 → None.
         let classified = vec![
-            item(5, MatchClass::FalsePositive),
-            item(4, MatchClass::TruePositive),
+            item(5, FindingClass::FalsePositive),
+            item(4, FindingClass::TruePositive),
         ];
         let m = compute_metrics(&classified, 0, 1);
         for r in &m.recall_at_precision {
@@ -984,10 +1089,10 @@ mod tests {
         // them is R=1.0 (at conf=3). A forward-walk bug would return
         // R=1/3 instead.
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::TruePositive),
-            item(3, MatchClass::TruePositive),
-            item(2, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::TruePositive),
+            item(3, FindingClass::TruePositive),
+            item(2, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 0, 3);
         let r = m.recall_at_precision[0].value.unwrap();
@@ -1003,8 +1108,8 @@ mod tests {
         // F1 = 2 * 0.5 * 1.0 / (0.5 + 1.0) = 2/3
         // F2 = 5 * 0.5 * 1.0 / (4 * 0.5 + 1.0) = 2.5 / 3.0 = 5/6
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 0, 1);
         let expected_f2 = 5.0 / 6.0;
@@ -1026,9 +1131,9 @@ mod tests {
     #[test]
     fn bootstrap_perfect_classifier() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::TruePositive),
-            item(3, MatchClass::TruePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::TruePositive),
+            item(3, FindingClass::TruePositive),
         ];
         let config = BootstrapConfig {
             n_iterations: 100,
@@ -1048,11 +1153,11 @@ mod tests {
     #[test]
     fn bootstrap_deterministic() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
-            item(3, MatchClass::TruePositive),
-            item(2, MatchClass::FalsePositive),
-            item(1, MatchClass::TruePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
+            item(3, FindingClass::TruePositive),
+            item(2, FindingClass::FalsePositive),
+            item(1, FindingClass::TruePositive),
         ];
         let config = BootstrapConfig::default();
         let (lo1, hi1) = bootstrap_ap_ci(&classified, 3, &config);
@@ -1064,11 +1169,11 @@ mod tests {
     #[test]
     fn bootstrap_ci_contains_ap() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
-            item(3, MatchClass::TruePositive),
-            item(2, MatchClass::FalsePositive),
-            item(1, MatchClass::TruePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
+            item(3, FindingClass::TruePositive),
+            item(2, FindingClass::FalsePositive),
+            item(1, FindingClass::TruePositive),
         ];
         let total_pos = 3;
         let ap = compute_average_precision(&classified, total_pos);
@@ -1084,8 +1189,8 @@ mod tests {
     #[test]
     fn bootstrap_all_fp() {
         let classified = vec![
-            item(5, MatchClass::FalsePositive),
-            item(4, MatchClass::FalsePositive),
+            item(5, FindingClass::FalsePositive),
+            item(4, FindingClass::FalsePositive),
         ];
         let config = BootstrapConfig {
             n_iterations: 100,
@@ -1099,8 +1204,8 @@ mod tests {
     #[test]
     fn bootstrap_with_metrics_convenience() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 0, 1);
         assert!(m.ap_ci.is_none());
@@ -1119,21 +1224,19 @@ mod tests {
         use proptest::prelude::*;
 
         /// Generate a random classified list of TP/FP items.
-        fn arb_classified_tp_fp(
-            max_len: usize,
-        ) -> impl Strategy<Value = Vec<(NormalizedFinding, MatchClass)>> {
+        fn arb_classified_tp_fp(max_len: usize) -> impl Strategy<Value = Vec<ClassifiedFinding>> {
             proptest::collection::vec((any::<i8>(), any::<bool>()), 0..=max_len).prop_map(|items| {
                 items
                     .into_iter()
                     .enumerate()
                     .map(|(i, (conf, is_tp))| {
                         let class = if is_tp {
-                            MatchClass::TruePositive
+                            FindingClass::TruePositive
                         } else {
-                            MatchClass::FalsePositive
+                            FindingClass::FalsePositive
                         };
-                        (
-                            NormalizedFinding::new(
+                        ClassifiedFinding {
+                            finding: NormalizedFinding::new(
                                 "f.txt".into(),
                                 i as u64 * 10,
                                 i as u64 * 10 + 5,
@@ -1141,7 +1244,7 @@ mod tests {
                                 conf,
                             ),
                             class,
-                        )
+                        }
                     })
                     .collect()
             })
@@ -1150,19 +1253,19 @@ mod tests {
         /// Generate a classified list that includes Unlabeled items.
         fn arb_classified_with_unlabeled(
             max_len: usize,
-        ) -> impl Strategy<Value = Vec<(NormalizedFinding, MatchClass)>> {
+        ) -> impl Strategy<Value = Vec<ClassifiedFinding>> {
             proptest::collection::vec((any::<i8>(), 0u8..3), 0..=max_len).prop_map(|items| {
                 items
                     .into_iter()
                     .enumerate()
                     .map(|(i, (conf, class_idx))| {
                         let class = match class_idx {
-                            0 => MatchClass::TruePositive,
-                            1 => MatchClass::FalsePositive,
-                            _ => MatchClass::Unlabeled,
+                            0 => FindingClass::TruePositive,
+                            1 => FindingClass::FalsePositive,
+                            _ => FindingClass::Unlabeled,
                         };
-                        (
-                            NormalizedFinding::new(
+                        ClassifiedFinding {
+                            finding: NormalizedFinding::new(
                                 "f.txt".into(),
                                 i as u64 * 10,
                                 i as u64 * 10 + 5,
@@ -1170,7 +1273,7 @@ mod tests {
                                 conf,
                             ),
                             class,
-                        )
+                        }
                     })
                     .collect()
             })
@@ -1183,7 +1286,7 @@ mod tests {
             #[test]
             fn ap_bounded(classified in arb_classified_tp_fp(50)) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count.max(1);
                 let ap = compute_average_precision(&classified, total_pos);
@@ -1205,10 +1308,10 @@ mod tests {
             fn perfect_ranking_ap_one(n in 1u64..20) {
                 let mut classified: Vec<_> = (0..n).map(|i| {
                     let conf = (n as i8 + 10).saturating_sub(i as i8);
-                    item(conf, MatchClass::TruePositive)
+                    item(conf, FindingClass::TruePositive)
                 }).collect();
                 for i in 0..n {
-                    classified.push(item(-(i as i8) - 1, MatchClass::FalsePositive));
+                    classified.push(item(-(i as i8) - 1, FindingClass::FalsePositive));
                 }
                 let ap = compute_average_precision(&classified, n);
                 prop_assert!(
@@ -1224,7 +1327,7 @@ mod tests {
                 fn_count in 0u64..20,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
@@ -1241,7 +1344,7 @@ mod tests {
                 fn_count in 0u64..20,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
@@ -1259,12 +1362,12 @@ mod tests {
             ) {
                 let classified: Vec<_> = is_tp.iter().enumerate().map(|(i, &tp)| {
                     let class = if tp {
-                        MatchClass::TruePositive
+                        FindingClass::TruePositive
                     } else {
-                        MatchClass::FalsePositive
+                        FindingClass::FalsePositive
                     };
-                    (
-                        NormalizedFinding::new(
+                    ClassifiedFinding {
+                        finding: NormalizedFinding::new(
                             "f.txt".into(),
                             i as u64 * 10,
                             i as u64 * 10 + 5,
@@ -1272,7 +1375,7 @@ mod tests {
                             42,
                         ),
                         class,
-                    )
+                    }
                 }).collect();
                 let tp_count = is_tp.iter().filter(|&&t| t).count() as u64;
                 let total_pos = tp_count.max(1);
@@ -1284,7 +1387,7 @@ mod tests {
             #[test]
             fn count_invariant(classified in arb_classified_with_unlabeled(30)) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let m = compute_metrics(&classified, 0, tp_count);
                 prop_assert_eq!(
@@ -1302,7 +1405,7 @@ mod tests {
                 classified in arb_classified_tp_fp(20),
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count.max(1);
                 let ap_original = compute_average_precision(&classified, total_pos);
@@ -1310,17 +1413,20 @@ mod tests {
                 // Apply a strictly monotone transform that preserves ties:
                 // map each distinct confidence to its rank among distinct
                 // values (not per-item rank). Equal values stay equal.
-                let mut distinct: Vec<i8> = classified.iter().map(|(f, _)| f.confidence).collect();
+                let mut distinct: Vec<i8> = classified.iter().map(|cf| cf.finding.confidence).collect();
                 distinct.sort();
                 distinct.dedup();
                 let rank_of = |c: i8| -> i8 {
                     distinct.binary_search(&c).unwrap() as i8
                 };
 
-                let transformed: Vec<_> = classified.iter().map(|(f, c)| {
-                    let mut f2 = f.clone();
-                    f2.confidence = rank_of(f.confidence);
-                    (f2, *c)
+                let transformed: Vec<_> = classified.iter().map(|cf| {
+                    let mut f2 = cf.finding.clone();
+                    f2.confidence = rank_of(cf.finding.confidence);
+                    ClassifiedFinding {
+                        finding: f2,
+                        class: cf.class,
+                    }
                 }).collect();
                 let ap_transformed = compute_average_precision(&transformed, total_pos);
 
@@ -1339,7 +1445,7 @@ mod tests {
                 extra in 1u64..50,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let tp_low = total_pos_base.max(tp_count);
                 let tp_high = tp_low + extra;
@@ -1358,7 +1464,7 @@ mod tests {
                 fn_count in 0u64..20,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
@@ -1379,7 +1485,7 @@ mod tests {
                 fn_count in 0u64..20,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
@@ -1400,7 +1506,7 @@ mod tests {
                 fn_count in 0u64..20,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
@@ -1418,7 +1524,7 @@ mod tests {
                 fn_count in 0u64..20,
             ) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
                 let m = compute_metrics(&classified, fn_count, total_pos);
@@ -1442,7 +1548,7 @@ mod tests {
             #[test]
             fn bootstrap_ci_ordered(classified in arb_classified_tp_fp(15)) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count.max(1);
                 let config = BootstrapConfig { n_iterations: 50, ..Default::default() };
@@ -1454,13 +1560,54 @@ mod tests {
             #[test]
             fn bootstrap_ci_bounded(classified in arb_classified_tp_fp(15)) {
                 let tp_count = classified.iter()
-                    .filter(|(_, c)| *c == MatchClass::TruePositive)
+                    .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count.max(1);
                 let config = BootstrapConfig { n_iterations: 50, ..Default::default() };
                 let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config);
                 prop_assert!((0.0..=1.0).contains(&lo), "ci_lower out of bounds: {lo}");
                 prop_assert!((0.0..=1.0).contains(&hi), "ci_upper out of bounds: {hi}");
+            }
+
+            /// Histogram-based and sort-based PR curve builders produce
+            /// identical curves and AP values for all inputs.
+            #[test]
+            fn histogram_curve_matches_sort_curve(
+                items in proptest::collection::vec((any::<i8>(), any::<bool>()), 0..=60),
+                total_pos in 1u64..100,
+            ) {
+                let scored: Vec<(i8, bool)> = items;
+
+                let curve_hist = pr_curve_from_histogram(&scored, total_pos);
+
+                let mut scored_mut = scored.clone();
+                let curve_sort = pr_curve_from_scored(&mut scored_mut, total_pos);
+
+                prop_assert_eq!(
+                    curve_hist.len(), curve_sort.len(),
+                    "curve lengths differ: histogram={}, sort={}",
+                    curve_hist.len(), curve_sort.len()
+                );
+
+                for (i, (h, s)) in curve_hist.iter().zip(curve_sort.iter()).enumerate() {
+                    prop_assert!(
+                        (h.precision - s.precision).abs() < 1e-15,
+                        "precision mismatch at point {i}: hist={}, sort={}",
+                        h.precision, s.precision
+                    );
+                    prop_assert!(
+                        (h.recall - s.recall).abs() < 1e-15,
+                        "recall mismatch at point {i}: hist={}, sort={}",
+                        h.recall, s.recall
+                    );
+                }
+
+                let ap_hist = ap_from_curve(&curve_hist);
+                let ap_sort = ap_from_curve(&curve_sort);
+                prop_assert!(
+                    (ap_hist - ap_sort).abs() < 1e-15,
+                    "AP mismatch: hist={ap_hist}, sort={ap_sort}"
+                );
             }
         }
     }
@@ -1477,9 +1624,9 @@ mod tests {
         // Points at R=1.0: (P=1.0) and (P=2/3).
         // P@R=0.95 should return P=1.0 (the best precision where R >= 0.95).
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::TruePositive),
-            item(3, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::TruePositive),
+            item(3, FindingClass::FalsePositive),
         ];
         let m = compute_metrics(&classified, 0, 2);
         let par_095 = m
@@ -1499,7 +1646,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "n_iterations must be > 0")]
     fn bootstrap_zero_iterations_panics() {
-        let classified = vec![item(5, MatchClass::TruePositive)];
+        let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             n_iterations: 0,
             ..Default::default()
@@ -1510,7 +1657,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
     fn bootstrap_alpha_zero_panics() {
-        let classified = vec![item(5, MatchClass::TruePositive)];
+        let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             alpha: 0.0,
             ..Default::default()
@@ -1521,7 +1668,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
     fn bootstrap_alpha_one_panics() {
-        let classified = vec![item(5, MatchClass::TruePositive)];
+        let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             alpha: 1.0,
             ..Default::default()
@@ -1532,7 +1679,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
     fn bootstrap_alpha_negative_panics() {
-        let classified = vec![item(5, MatchClass::TruePositive)];
+        let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             alpha: -0.5,
             ..Default::default()
@@ -1544,9 +1691,9 @@ mod tests {
     #[should_panic(expected = "total_positives (1) must be >= TP count (3)")]
     fn bootstrap_total_positives_less_than_tp_panics() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::TruePositive),
-            item(3, MatchClass::TruePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::TruePositive),
+            item(3, FindingClass::TruePositive),
         ];
         let config = BootstrapConfig::default();
         bootstrap_ap_ci(&classified, 1, &config);
@@ -1555,8 +1702,8 @@ mod tests {
     #[test]
     fn bootstrap_single_iteration() {
         let classified = vec![
-            item(5, MatchClass::TruePositive),
-            item(4, MatchClass::FalsePositive),
+            item(5, FindingClass::TruePositive),
+            item(4, FindingClass::FalsePositive),
         ];
         let config = BootstrapConfig {
             n_iterations: 1,
@@ -1575,9 +1722,9 @@ mod tests {
         // Max recall ~0.85: 17 TP out of 20 total positives.
         // P@R=0.80 should be Some, P@R=0.90 and 0.95 should be None.
         let mut classified: Vec<_> = (0..17)
-            .map(|i| item(100 - i as i8, MatchClass::TruePositive))
+            .map(|i| item(100 - i as i8, FindingClass::TruePositive))
             .collect();
-        classified.extend((0..3).map(|i| item(50 - i as i8, MatchClass::FalsePositive)));
+        classified.extend((0..3).map(|i| item(50 - i as i8, FindingClass::FalsePositive)));
         let m = compute_metrics(&classified, 3, 20);
 
         let par_80 = m
@@ -1621,8 +1768,8 @@ mod tests {
     fn bootstrap_only_unlabeled() {
         // Only Unlabeled items → no TP/FP → (0.0, 0.0).
         let classified = vec![
-            item(5, MatchClass::Unlabeled),
-            item(4, MatchClass::Unlabeled),
+            item(5, FindingClass::Unlabeled),
+            item(4, FindingClass::Unlabeled),
         ];
         let config = BootstrapConfig::default();
         let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config);
