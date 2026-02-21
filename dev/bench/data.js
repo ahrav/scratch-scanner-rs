@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1771561505664,
+  "lastUpdate": 1771647426230,
   "repoUrl": "https://github.com/ahrav/scratch-scanner-rs",
   "entries": {
     "Benchmark": [
@@ -1399,6 +1399,334 @@ window.BENCHMARK_DATA = {
             "name": "offline_validate_slack_token/config_access",
             "value": 82,
             "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/invalid_segments",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/unknown_prefix",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ahrav",
+            "username": "ahrav",
+            "email": "ahravdutta02@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "091e1377490f32de0be5c55e154382df43cd6f60",
+          "message": "Merge pull request #131 from ahrav/feature/finding-to-truth-match\n\nAdd finding-to-truth matching pipeline with PRC-AUC, P@R, R@P, and bootstrap CI",
+          "timestamp": "2026-02-21T02:31:11Z",
+          "url": "https://github.com/ahrav/scratch-scanner-rs/commit/091e1377490f32de0be5c55e154382df43cd6f60"
+        },
+        "date": 1771647425372,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "write_u64/value/small_42",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_u64/value/medium_1_7B",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_u64/value/large_u64_max",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_oid_hex/sha1_20B",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_oid_hex/sha256_32B",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/scalar_short/4",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/scalar_short/8",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/scalar_short/14",
+            "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/clean_ascii/32",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/clean_ascii/128",
+            "value": 19,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/clean_ascii/512",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/with_escapes/32",
+            "value": 44,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/with_escapes/128",
+            "value": 118,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/with_escapes/512",
+            "value": 422,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/sparse_escapes/512",
+            "value": 76,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_bytes/clean_ascii_128B",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_bytes/with_0xff_128B",
+            "value": 340,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_f64/81.23",
+            "value": 21,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_finding/fs_finding",
+            "value": 53,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_finding/git_finding",
+            "value": 75,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_commit_meta/no_identity",
+            "value": 26,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_commit_meta/with_identity",
+            "value": 54,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_batch/1000_findings",
+            "value": 69791,
+            "range": "± 659",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_emit/1000_findings_dev_null",
+            "value": 81960,
+            "range": "± 750",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "json_sink_emit/1000_findings_dev_null",
+            "value": 84687,
+            "range": "± 423",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_contention/threads/2",
+            "value": 140306,
+            "range": "± 1200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_contention/threads/4",
+            "value": 184101,
+            "range": "± 1519",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_contention/threads/8",
+            "value": 292669,
+            "range": "± 4970",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "u64_vs_itoa/custom_write_u64",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "u64_vs_itoa/itoa_write",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "f64_vs_ryu/custom_write_f64",
+            "value": 22,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "f64_vs_ryu/ryu_write",
+            "value": 46,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/valid_akia",
+            "value": 32,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/valid_a3t",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/invalid_charset",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/invalid_prefix",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/valid_small",
+            "value": 62,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/valid_large",
+            "value": 295,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/invalid_prefix",
+            "value": 285,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/invalid_char",
+            "value": 277,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/oversized_payload",
+            "value": 39,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/valid",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/wrong_header",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/invalid_char",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/too_short",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/bot_current",
+            "value": 52,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/bot_legacy",
+            "value": 33,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/user_token",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/config_access",
+            "value": 82,
+            "range": "± 1",
             "unit": "ns/iter"
           },
           {
