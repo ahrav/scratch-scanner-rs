@@ -870,6 +870,31 @@ mod tests {
         assert!(!rule_matches("Tok", "Secret:Token"));
     }
 
+    // ── Duplicate-on-consumed-positive verification ───────────────
+    //
+    // Reviewer claims: a finding that overlaps only a consumed Positive
+    // (no Negative) should be FP per COCO/VOC, but current code produces
+    // Unlabeled. This test verifies the current documented behavior.
+
+    #[test]
+    fn duplicate_on_consumed_positive_is_unlabeled() {
+        // Two findings overlap the same Positive truth. The higher-confidence
+        // finding consumes it (TP). The duplicate has no other truth to match
+        // and becomes Unlabeled — not FP.
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "r", 10), // F1: conf=10
+            make_finding(SIMPLE_PATH, 0, 4, "r", 5),  // F2: conf=5, same span
+        ];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.classified[0].class, FindingClass::TruePositive);
+        // Current behavior: Unlabeled (excluded from scoring).
+        // COCO/VOC would classify this as FalsePositive.
+        assert_eq!(result.classified[1].class, FindingClass::Unlabeled);
+    }
+
     // ── Property tests ──────────────────────────────────────────────
 
     mod prop {
