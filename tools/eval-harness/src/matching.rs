@@ -65,13 +65,7 @@ struct FileInfo<'a> {
 /// `require_rule_match` toggle adds an additional constraint when ground
 /// truth uses rule-specific annotations (e.g., CredData categories).
 #[derive(Clone, Copy, Debug)]
-pub struct MatchConfig<'a> {
-    /// Corpus root path used for human-readable diagnostics in error
-    /// messages. Not consulted during matching logic — all finding and
-    /// truth paths must already be normalized via
-    /// [`crate::types::normalize_path`] before calling [`match_findings`].
-    pub canonical_root: &'a str,
-
+pub struct MatchConfig {
     /// When true, a finding only matches truth items where the finding's
     /// rule name exactly equals one colon-delimited segment of the truth
     /// item's `rule` field (see [`rule_matches`]). When false, matching
@@ -104,8 +98,8 @@ pub struct MatchConfig<'a> {
 ///
 /// # Diagnostic counters
 ///
-/// The three `u64` counters (`unmatched_finding_paths`, `unmatchable_truth_paths`,
-/// `out_of_bounds_findings`) are diagnostic signals, not error codes. Non-zero
+/// The four `u64` counters (`unmatched_finding_paths`, `unmatchable_truth_paths`,
+/// `out_of_bounds_findings`, `unmatchable_findings`) are diagnostic signals, not error codes. Non-zero
 /// values indicate data quality issues (stale scanner output, missing corpus
 /// files, incomplete annotations) rather than matching bugs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +139,11 @@ pub struct MatchResult {
     /// [`LineIndex`]. Typically caused by stale scanner output run against
     /// a file that was subsequently truncated. Classified as Unlabeled.
     pub out_of_bounds_findings: u64,
+
+    /// Findings on paths where truth items exist but file contents were
+    /// not provided. Without a [`LineIndex`], byte-to-line conversion is
+    /// impossible, so these findings are classified as Unlabeled.
+    pub unmatchable_findings: u64,
 }
 
 impl MatchResult {
@@ -216,13 +215,12 @@ pub fn match_findings(
     mut findings: Vec<NormalizedFinding>,
     truth: Vec<TruthItem>,
     file_contents: &HashMap<String, Vec<u8>>,
-    config: MatchConfig<'_>,
+    config: MatchConfig,
 ) -> MatchResult {
     // ── Precondition: findings are deduplicated ────────────────────
-    // Debug-only by design: duplicates inflate TP counts but don't
-    // corrupt memory. The hard conservation assertions at the end of
-    // this function serve as a release-mode backstop.
-    debug_assert!(
+    // Precondition: duplicates inflate TP counts. The hard conservation
+    // assertions at the end of this function serve as an additional backstop.
+    assert!(
         findings.windows(2).all(|w| w[0] != w[1]),
         "findings must be deduplicated before matching"
     );
@@ -283,6 +281,7 @@ pub fn match_findings(
     let mut unlabeled: u64 = 0;
     let mut unmatched_finding_paths: u64 = 0;
     let mut out_of_bounds_findings: u64 = 0;
+    let mut unmatchable_findings: u64 = 0;
 
     for finding in findings {
         let class = classify_one_finding(
@@ -292,6 +291,7 @@ pub fn match_findings(
             &config,
             &mut unmatched_finding_paths,
             &mut out_of_bounds_findings,
+            &mut unmatchable_findings,
         );
 
         match class {
@@ -345,6 +345,7 @@ pub fn match_findings(
         unmatched_finding_paths,
         unmatchable_truth_paths,
         out_of_bounds_findings,
+        unmatchable_findings,
     }
 }
 
@@ -363,6 +364,8 @@ pub fn match_findings(
 ///   has no corresponding truth entries.
 /// - **`out_of_bounds_findings`**: Incremented when `byte_end` exceeds
 ///   the file size, indicating stale scanner output.
+/// - **`unmatchable_findings`**: Incremented when the finding's path has
+///   truth entries but no [`LineIndex`] (file contents not provided).
 ///
 /// # Early-return paths
 ///
@@ -378,9 +381,10 @@ fn classify_one_finding(
     finding: &NormalizedFinding,
     file_info: &HashMap<&str, FileInfo<'_>>,
     consumed: &mut DynamicBitSet,
-    config: &MatchConfig<'_>,
+    config: &MatchConfig,
     unmatched_finding_paths: &mut u64,
     out_of_bounds_findings: &mut u64,
+    unmatchable_findings: &mut u64,
 ) -> FindingClass {
     // 1. Look up combined per-file info (truths + LineIndex).
     let Some(info) = file_info.get(finding.path.as_str()) else {
@@ -392,6 +396,7 @@ fn classify_one_finding(
     //    file contents were not provided — already counted as
     //    unmatchable_truth_paths by the caller.
     let Some(line_index) = &info.line_index else {
+        *unmatchable_findings += 1;
         return FindingClass::Unlabeled;
     };
 
@@ -554,9 +559,8 @@ mod tests {
         TruthItem::new(path.into(), line_start, line_end, label, rule.into())
     }
 
-    fn default_config() -> MatchConfig<'static> {
+    fn default_config() -> MatchConfig {
         MatchConfig {
-            canonical_root: "",
             require_rule_match: false,
         }
     }
@@ -658,6 +662,43 @@ mod tests {
     }
 
     #[test]
+    fn label_priority_negative_over_placeholder() {
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
+        let truth = vec![
+            make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Negative, "r"),
+            make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Placeholder, "r"),
+        ];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.classified[0].class, FindingClass::FalsePositive);
+        assert!(result.false_negatives.is_empty());
+    }
+
+    #[test]
+    fn greedy_consumption_respects_confidence_order() {
+        // Each finding needs a distinct rule so dedup does not collapse them.
+        // require_rule_match is false, so rule names do not affect matching.
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 9, "r1", 10),
+            make_finding(SIMPLE_PATH, 0, 9, "r2", 5),
+            make_finding(SIMPLE_PATH, 0, 9, "r3", 1),
+        ];
+        let truth = vec![
+            make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r"),
+            make_truth(SIMPLE_PATH, 2, 2, TruthLabel::Positive, "r"),
+        ];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.tp_count(), 2);
+        assert_eq!(result.fp_count(), 0);
+        assert_eq!(result.classified[0].class, FindingClass::TruePositive);
+        assert_eq!(result.classified[1].class, FindingClass::TruePositive);
+        assert_eq!(result.classified[2].class, FindingClass::Unlabeled);
+    }
+
+    #[test]
     fn one_to_one_consumption() {
         let findings = vec![
             make_finding(SIMPLE_PATH, 0, 4, "r", 10),
@@ -723,7 +764,6 @@ mod tests {
         )];
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
         let config = MatchConfig {
-            canonical_root: "",
             require_rule_match: true,
         };
 
@@ -745,6 +785,39 @@ mod tests {
 
         let result = match_findings(findings, truth, &fc, default_config());
         assert_eq!(result.classified[0].class, FindingClass::TruePositive);
+    }
+
+    #[test]
+    fn rule_match_required_but_no_match() {
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "slack-bot-token", 5)];
+        let truth = vec![make_truth(
+            SIMPLE_PATH,
+            1,
+            1,
+            TruthLabel::Positive,
+            "Secret:Token",
+        )];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+        let config = MatchConfig {
+            require_rule_match: true,
+        };
+
+        let result = match_findings(findings, truth, &fc, config);
+        assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
+        assert_eq!(result.false_negatives.len(), 1);
+    }
+
+    #[test]
+    fn unmatchable_truth_path_missing_file_contents() {
+        let findings = vec![make_finding("missing.txt", 0, 4, "r", 5)];
+        let truth = vec![make_truth("missing.txt", 1, 1, TruthLabel::Positive, "r")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.unmatchable_truth_paths, 1);
+        assert_eq!(result.unmatchable_findings, 1);
+        assert_eq!(result.classified[0].class, FindingClass::Unlabeled);
+        assert_eq!(result.false_negatives.len(), 1);
     }
 
     #[test]
@@ -775,6 +848,7 @@ mod tests {
         assert_eq!(result.unmatched_finding_paths, 0);
         assert_eq!(result.unmatchable_truth_paths, 0);
         assert_eq!(result.out_of_bounds_findings, 0);
+        assert_eq!(result.unmatchable_findings, 0);
     }
 
     #[test]
@@ -868,31 +942,6 @@ mod tests {
     fn rule_matches_no_match() {
         assert!(!rule_matches("Other", "Secret:Token"));
         assert!(!rule_matches("Tok", "Secret:Token"));
-    }
-
-    // ── Duplicate-on-consumed-positive verification ───────────────
-    //
-    // Reviewer claims: a finding that overlaps only a consumed Positive
-    // (no Negative) should be FP per COCO/VOC, but current code produces
-    // Unlabeled. This test verifies the current documented behavior.
-
-    #[test]
-    fn duplicate_on_consumed_positive_is_unlabeled() {
-        // Two findings overlap the same Positive truth. The higher-confidence
-        // finding consumes it (TP). The duplicate has no other truth to match
-        // and becomes Unlabeled — not FP.
-        let findings = vec![
-            make_finding(SIMPLE_PATH, 0, 4, "r", 10), // F1: conf=10
-            make_finding(SIMPLE_PATH, 0, 4, "r", 5),  // F2: conf=5, same span
-        ];
-        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r")];
-        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
-
-        let result = match_findings(findings, truth, &fc, default_config());
-        assert_eq!(result.classified[0].class, FindingClass::TruePositive);
-        // Current behavior: Unlabeled (excluded from scoring).
-        // COCO/VOC would classify this as FalsePositive.
-        assert_eq!(result.classified[1].class, FindingClass::Unlabeled);
     }
 
     // ── Property tests ──────────────────────────────────────────────

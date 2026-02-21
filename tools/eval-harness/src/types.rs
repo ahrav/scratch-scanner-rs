@@ -17,22 +17,18 @@
 //! 3. **Classify** — Each finding is matched against truth items to produce a
 //!    [`ClassifiedFinding`] pairing the original finding with a
 //!    [`FindingClass`] (TP, FP, or Unlabeled). Unmatched positive truth
-//!    items are tracked separately as false negatives. The broader
-//!    [`MatchClass`] enum unifies both finding-derived and truth-derived
-//!    classifications for downstream reporting. These classifications feed
-//!    into precision/recall computation and PRC-AUC curves at varying
+//!    items are tracked separately as false negatives. These classifications
+//!    feed into precision/recall computation and PRC-AUC curves at varying
 //!    confidence thresholds.
 //!
 //! # Type hierarchy
 //!
 //! The classification types form a deliberate hierarchy:
 //!
-//! - [`MatchClass`] — all four outcomes (TP, FP, FN, Unlabeled), used for
-//!   aggregate reporting and metrics display.
-//! - [`FindingClass`] — the finding-only subset (TP, FP, Unlabeled),
-//!   excluding FN because false negatives are truth-derived, not
-//!   finding-derived. This makes invalid states unrepresentable: a
-//!   [`ClassifiedFinding`] can never carry a `FalseNegative` label.
+//! - [`FindingClass`] — finding-only outcomes (TP, FP, Unlabeled), excluding
+//!   FN because false negatives are truth-derived, not finding-derived.
+//!   This makes invalid states unrepresentable: a [`ClassifiedFinding`] can
+//!   never carry a `FalseNegative` label.
 //! - [`ClassifiedFinding`] — a finding paired with its [`FindingClass`],
 //!   carrying the confidence score needed for PRC-AUC threshold sweeping.
 //!
@@ -124,25 +120,20 @@ pub struct NormalizedFinding {
 }
 
 impl NormalizedFinding {
-    /// Create a new finding with debug-mode validity checks.
+    /// Create a new finding with validity checks.
     ///
     /// Fields remain `pub` for test construction, but production code should
     /// prefer this constructor to catch malformed data early.
     ///
-    /// # Panics (debug only)
-    ///
-    /// Uses `debug_assert!` — checks are compiled away in release builds.
-    /// The finding parser ([`crate::finding_parser`]) performs its own
-    /// release-mode validation before constructing findings, so these
-    /// assertions serve as a safety net during development only.
+    /// # Panics
     ///
     /// - `path` is empty
     /// - `rule` is empty
     /// - `byte_end < byte_start` (inverted span)
     pub fn new(path: String, byte_start: u64, byte_end: u64, rule: String, confidence: i8) -> Self {
-        debug_assert!(!path.is_empty(), "finding path must not be empty");
-        debug_assert!(!rule.is_empty(), "finding rule must not be empty");
-        debug_assert!(
+        assert!(!path.is_empty(), "finding path must not be empty");
+        assert!(!rule.is_empty(), "finding rule must not be empty");
+        assert!(
             byte_end >= byte_start,
             "inverted span: byte_end ({byte_end}) < byte_start ({byte_start})"
         );
@@ -238,14 +229,12 @@ pub struct TruthItem {
 }
 
 impl TruthItem {
-    /// Create a new truth item with debug-mode validity checks.
+    /// Create a new truth item with validity checks.
     ///
     /// Fields remain `pub` for test construction, but production code should
     /// prefer this constructor to catch malformed corpus data early.
     ///
-    /// # Panics (debug only)
-    ///
-    /// Uses `debug_assert!` — checks are compiled away in release builds.
+    /// # Panics
     ///
     /// - `path` is empty
     /// - `rule` is empty
@@ -258,10 +247,10 @@ impl TruthItem {
         label: TruthLabel,
         rule: String,
     ) -> Self {
-        debug_assert!(!path.is_empty(), "truth item path must not be empty");
-        debug_assert!(!rule.is_empty(), "truth item rule must not be empty");
-        debug_assert!(line_start > 0, "line_start must be 1-indexed, got 0");
-        debug_assert!(
+        assert!(!path.is_empty(), "truth item path must not be empty");
+        assert!(!rule.is_empty(), "truth item rule must not be empty");
+        assert!(line_start > 0, "line_start must be 1-indexed, got 0");
+        assert!(
             line_end >= line_start,
             "inverted line range: line_end ({line_end}) < line_start ({line_start})"
         );
@@ -316,71 +305,13 @@ impl std::fmt::Display for TruthLabel {
 
 // ── Match classification ────────────────────────────────────────────────
 
-/// Classification of a scanner finding after matching against ground truth.
-///
-/// The metrics layer uses these classifications to compute precision, recall,
-/// and PRC-AUC. The four variants arise from two independent domains:
-///
-/// - **Finding-derived** (one class per scanner finding):
-///   - [`TruePositive`](MatchClass::TruePositive) — matched a positive annotation.
-///   - [`FalsePositive`](MatchClass::FalsePositive) — matched a negative annotation.
-///   - [`Unlabeled`](MatchClass::Unlabeled) — no annotation at that location,
-///     or the only annotation is a Placeholder.
-///
-/// - **Truth-derived** (one class per unmatched ground-truth positive):
-///   - [`FalseNegative`](MatchClass::FalseNegative) — no finding matched this positive.
-///
-/// Together the four variants cover both domains without overlap.
-///
-/// The distinction between [`FalsePositive`](MatchClass::FalsePositive) and
-/// [`Unlabeled`](MatchClass::Unlabeled) matters for corpus coverage analysis:
-/// a high unlabeled rate signals that the corpus has annotation gaps, not
-/// necessarily that the scanner is noisy. Only `FalsePositive` penalizes
-/// precision; `Unlabeled` findings are excluded from the precision
-/// denominator.
-///
-/// [`Display`](std::fmt::Display) uses abbreviated forms (`TP`, `FP`, `FN`,
-/// `unlabeled`) for compact diagnostic output. See [`FindingClass`] for the
-/// finding-only subset that excludes `FalseNegative`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MatchClass {
-    /// Scanner found a secret where ground truth says one exists.
-    TruePositive,
-    /// Scanner found a secret where ground truth explicitly says none exists
-    /// (i.e., the location has a `TruthLabel::Negative` annotation).
-    FalsePositive,
-    /// Ground truth says a secret exists but scanner did not find it.
-    FalseNegative,
-    /// Scanner produced a finding at a location with no ground-truth
-    /// annotation, or the only overlapping annotation is a
-    /// `TruthLabel::Placeholder`. Distinct from `FalsePositive`, which
-    /// requires an explicit `TruthLabel::Negative` annotation.
-    Unlabeled,
-}
-
-impl std::fmt::Display for MatchClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::TruePositive => "TP",
-            Self::FalsePositive => "FP",
-            Self::FalseNegative => "FN",
-            Self::Unlabeled => "unlabeled",
-        })
-    }
-}
-
 /// Classification of a scanner finding (finding-derived only).
 ///
-/// Unlike [`MatchClass`], this enum intentionally excludes `FalseNegative`
-/// because false negatives are truth-derived (unmatched positive ground truth),
-/// not finding-derived. This is the "make invalid states unrepresentable"
-/// pattern: a [`ClassifiedFinding`] can never carry a `FalseNegative` label
-/// because the type system prevents it at compile time.
-///
-/// Use [`to_match_class`](FindingClass::to_match_class) when passing results
-/// to APIs that accept the broader [`MatchClass`] (e.g., aggregate
-/// reporting that includes false negatives alongside finding-derived counts).
+/// Intentionally excludes `FalseNegative` because false negatives are
+/// truth-derived (unmatched positive ground truth), not finding-derived.
+/// This is the "make invalid states unrepresentable" pattern: a
+/// [`ClassifiedFinding`] can never carry a `FalseNegative` label because
+/// the type system prevents it at compile time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingClass {
@@ -390,17 +321,6 @@ pub enum FindingClass {
     FalsePositive,
     /// No annotation at location, or matched a Placeholder.
     Unlabeled,
-}
-
-impl FindingClass {
-    /// Convert to the broader [`MatchClass`] for interop with [`crate::metrics`].
-    pub fn to_match_class(self) -> MatchClass {
-        match self {
-            Self::TruePositive => MatchClass::TruePositive,
-            Self::FalsePositive => MatchClass::FalsePositive,
-            Self::Unlabeled => MatchClass::Unlabeled,
-        }
-    }
 }
 
 impl std::fmt::Display for FindingClass {
@@ -561,25 +481,6 @@ mod tests {
             let serialized = serde_json::to_string(&variant).unwrap();
             assert_eq!(serialized, json, "{variant:?} serialization");
             let back: TruthLabel = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(back, variant, "{variant:?} roundtrip");
-            assert_eq!(variant.to_string(), display, "{variant:?} display");
-        }
-    }
-
-    // ── MatchClass traits (serde + display) ──────────────────
-
-    #[test]
-    fn match_class_traits() {
-        let cases: &[(MatchClass, &str, &str)] = &[
-            (MatchClass::TruePositive, r#""true_positive""#, "TP"),
-            (MatchClass::FalsePositive, r#""false_positive""#, "FP"),
-            (MatchClass::FalseNegative, r#""false_negative""#, "FN"),
-            (MatchClass::Unlabeled, r#""unlabeled""#, "unlabeled"),
-        ];
-        for &(variant, json, display) in cases {
-            let serialized = serde_json::to_string(&variant).unwrap();
-            assert_eq!(serialized, json, "{variant:?} serialization");
-            let back: MatchClass = serde_json::from_str(&serialized).unwrap();
             assert_eq!(back, variant, "{variant:?} roundtrip");
             assert_eq!(variant.to_string(), display, "{variant:?} display");
         }

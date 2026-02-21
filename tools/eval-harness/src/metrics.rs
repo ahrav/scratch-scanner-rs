@@ -227,13 +227,13 @@ impl EvalMetrics {
     /// ```
     #[must_use]
     pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Self {
-        debug_assert!(
+        assert!(
             ci.0 <= ci.1,
             "CI lower ({}) must not exceed upper ({})",
             ci.0,
             ci.1,
         );
-        debug_assert!(
+        assert!(
             ci.0 >= 0.0 && ci.1 <= 1.0,
             "CI bounds must be in [0.0, 1.0], got ({}, {})",
             ci.0,
@@ -367,6 +367,16 @@ pub fn compute_metrics(
 /// `(ci_lower, ci_upper)` as the `[alpha/2, 1 - alpha/2]` percentiles.
 /// Returns `(0.0, 0.0)` when there are zero TP *and* zero FP items
 /// (Unlabeled items are excluded from bootstrap resampling).
+///
+/// # Limitations
+///
+/// Bootstrap CI quality degrades when the scored set (TP + FP) is small.
+/// With fewer than ~30 scored items, resampling draws from a tiny pool and
+/// the resulting interval collapses toward a point estimate. In the extreme
+/// case (e.g., 1 TP + 0 FP), every resample produces the same AP, yielding
+/// a degenerate zero-width CI of `(1.0, 1.0)` regardless of `n_iterations`.
+/// Interpret narrow CIs on small scored sets as reflecting insufficient data
+/// rather than high certainty.
 pub fn bootstrap_ap_ci(
     classified: &[ClassifiedFinding],
     total_positives: u64,
@@ -1140,42 +1150,6 @@ mod tests {
         assert!(m.ap_ci.is_some());
         let ci = m.ap_ci.unwrap();
         assert!(ci.lower <= ci.upper);
-    }
-
-    // ── Percentile index verification ─────────────────────────
-
-    #[test]
-    fn bootstrap_percentile_indices_use_conservative_convention() {
-        // The reviewer claims indices should use p*(n-1) (numpy convention)
-        // instead of p*n. Verify the current code's convention: floor for lo,
-        // ceil for hi produces a conservative (wider) CI, which is documented
-        // and intentional. With alpha=0.05 and n=1000:
-        //   Current:  lo = floor(0.025 * 1000) = 25,  hi = ceil(0.975 * 1000) = 975
-        //   Proposed: lo = round(0.025 * 999)  = 25,  hi = round(0.975 * 999)  = 974
-        // The current convention yields index 975 vs 974 — one position wider.
-        let n: usize = 1000;
-        let alpha: f64 = 0.05;
-
-        // Current code convention (p * n with floor/ceil).
-        let lo_current = ((alpha / 2.0) * n as f64).floor() as usize;
-        let hi_current = ((1.0 - alpha / 2.0) * n as f64).ceil() as usize;
-
-        // Reviewer's proposed convention (p * (n-1) with round).
-        let lo_proposed = ((alpha / 2.0) * (n - 1) as f64).round() as usize;
-        let hi_proposed = ((1.0 - alpha / 2.0) * (n - 1) as f64).round() as usize;
-
-        // Both conventions produce lo=25.
-        assert_eq!(lo_current, 25);
-        assert_eq!(lo_proposed, 25);
-
-        // Current convention produces hi=975, proposed produces hi=974.
-        // The current CI is one index wider — conservative by design.
-        assert_eq!(hi_current, 975);
-        assert_eq!(hi_proposed, 974);
-
-        // The difference is 1 index out of 1000 — negligible in practice.
-        // Current convention is valid and intentionally conservative.
-        assert!(hi_current >= hi_proposed);
     }
 
     // ── Proptest properties ─────────────────────────────────────
