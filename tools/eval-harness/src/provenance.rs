@@ -11,26 +11,40 @@
 //!
 //! # Design: domain-separated BLAKE3
 //!
-//! All hashes use BLAKE3 with domain separation: a domain tag is fed to the
-//! hasher before any payload bytes. This prevents cross-context collisions
-//! (e.g., a corpus that happens to byte-match a binary will still produce
-//! different hashes) and follows the same pattern used elsewhere in the
-//! codebase for content-addressable storage.
+//! All hashes use BLAKE3 with domain separation: a domain tag followed by a
+//! NUL byte is fed to the hasher before any payload bytes. Two domain tags
+//! are defined:
+//!
+//! - [`CORPUS_DOMAIN`] — used by [`hash_corpus`] for the directory-level hash.
+//! - [`FILE_DOMAIN`] — used by [`hash_file_streaming`] and [`hash_file`] for
+//!   individual files (both the scanner binary and the ruleset).
+//!
+//! Domain separation prevents cross-context collisions: a corpus that happens
+//! to byte-match a binary will still produce different hashes because they are
+//! keyed with different domain tags. The scanner binary and ruleset share
+//! [`FILE_DOMAIN`] because they occupy separate fields in [`Provenance`] and
+//! are never cross-compared; identical content in both fields producing the
+//! same hash is correct behavior, not a collision.
 //!
 //! # Algorithm (corpus hash)
 //!
 //! 1. Recursively collect file paths under `corpus_dir` into a `Vec<PathBuf>`.
 //!    Symlinks and non-regular files are skipped to keep the hash stable
 //!    across environments with different link layouts.
-//! 2. Sort paths lexicographically by their full path bytes. Since all paths
-//!    share the same `corpus_dir` prefix, this produces the same order as
-//!    sorting by relative path, ensuring deterministic ordering regardless of
-//!    filesystem visit order.
-//! 3. Feed a single BLAKE3 hasher: for each file, update with
-//!    `relative_path_bytes || 0x00 || file_contents`. The NUL byte acts as
-//!    an unambiguous delimiter because NUL cannot appear in POSIX paths and
-//!    is vanishingly rare in practice on other platforms.
-//! 4. An empty directory produces a hash over just the domain tag and its NUL
+//! 2. Sort paths lexicographically by their full (absolute) path bytes. Since
+//!    all paths share the same `corpus_dir` prefix, this produces the same
+//!    order as sorting by relative path, ensuring deterministic ordering
+//!    regardless of filesystem visit order.
+//! 3. Initialize a BLAKE3 hasher with `CORPUS_DOMAIN || 0x00`.
+//! 4. For each file in sorted order, feed `relative_path_bytes || 0x00 ||
+//!    file_contents` to the hasher. The NUL byte between path and content is
+//!    an unambiguous delimiter within each file entry because NUL cannot
+//!    appear in POSIX paths and is vanishingly rare in practice on other
+//!    platforms. Note: there is no explicit delimiter between one file's
+//!    content and the next file's path — the encoding relies on path ordering
+//!    and NUL-free paths for structural integrity rather than being fully
+//!    self-delimiting.
+//! 5. An empty directory produces a hash over just the domain tag and its NUL
 //!    separator — still deterministic, but distinct from any non-empty corpus.
 //!
 //! # Performance
@@ -52,12 +66,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Domain separation tags prevent hash collisions across different input types.
+/// Domain tag for corpus-level hashing.
 ///
-/// Each tag is a unique byte string prepended to the hasher before payload
-/// bytes. The `eval.provenance.v1.` prefix scopes them to this module; the
-/// suffix distinguishes corpus-level hashing from single-file hashing.
+/// Fed to the BLAKE3 hasher before any file data in [`hash_corpus`]. The
+/// `eval.provenance.v1.` prefix scopes all domain tags to this module;
+/// the `corpus` suffix distinguishes directory hashing from the
+/// single-file domain ([`FILE_DOMAIN`]).
 const CORPUS_DOMAIN: &[u8] = b"eval.provenance.v1.corpus";
+
+/// Domain tag for single-file hashing (scanner binary and ruleset).
+///
+/// Shared by both [`hash_file_streaming`] (binary) and [`hash_file`]
+/// (ruleset). Using a single domain for both is intentional: these hashes
+/// live in separate [`Provenance`] fields and are never cross-compared,
+/// so identical files producing the same hash is correct, not a collision.
 const FILE_DOMAIN: &[u8] = b"eval.provenance.v1.file";
 
 /// Buffer size for streaming hash reads (64 KiB — fits L1d, amortizes syscalls).
@@ -72,9 +94,11 @@ const HASH_BUF_SIZE: usize = 64 * 1024;
 /// 2. **Scale**: how large was the evaluation corpus? (Check count and byte
 ///    fields for sanity when comparing runs of different sizes.)
 ///
-/// All hashes are hex-encoded BLAKE3 (64 hex chars = 32 bytes). `None` hash
-/// fields are omitted from serialized JSON via `skip_serializing_if`, keeping
-/// the output clean when optional inputs were not provided.
+/// All hashes are hex-encoded BLAKE3 (64 hex chars = 32 bytes) with domain
+/// separation — the corpus hash uses [`CORPUS_DOMAIN`] while the binary and
+/// ruleset hashes use [`FILE_DOMAIN`]. `None` hash fields are omitted from
+/// serialized JSON via `skip_serializing_if`, keeping the output clean when
+/// optional inputs were not provided.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provenance {
     /// BLAKE3 hash over all corpus files in sorted-path order.
@@ -101,10 +125,13 @@ pub struct Provenance {
 ///
 /// Returns `(hex_hash, file_count, total_bytes)`.
 ///
-/// The hash is deterministic for a given directory tree: files are visited in
-/// lexicographic order of their relative path bytes. Each file contributes
-/// `relative_path_bytes || 0x00 || file_contents` to the hasher, so path
-/// and content boundaries are unambiguous.
+/// The hash is deterministic for a given directory tree: files are sorted by
+/// their full (absolute) path bytes, then visited in that order. The hasher
+/// is initialized with `CORPUS_DOMAIN || 0x00`, then for each file:
+/// `relative_path_bytes || 0x00 || file_contents` is appended. The NUL byte
+/// between path and content is unambiguous because POSIX paths cannot contain
+/// NUL. Files are concatenated back-to-back with no inter-file delimiter;
+/// structural integrity relies on path ordering and NUL-free path bytes.
 ///
 /// # Edge cases
 ///
@@ -122,6 +149,8 @@ pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
     files.sort_unstable();
 
     let mut hasher = blake3::Hasher::new();
+    // Domain prefix: prevents a corpus hash from colliding with a single-file hash
+    // even if the byte streams happen to match.
     hasher.update(CORPUS_DOMAIN);
     hasher.update(&[0x00]);
 
@@ -154,7 +183,11 @@ pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
 ///
 /// Preferred over [`hash_file`] for potentially large files (e.g., the scanner
 /// binary, which can be hundreds of MB) because it never holds the entire file
-/// in memory. The `domain` parameter provides BLAKE3 domain separation.
+/// in memory. The hasher is initialized with `domain || 0x00` before reading
+/// any file bytes, providing BLAKE3 domain separation.
+///
+/// Produces the same hash as [`hash_file`] for the same file and domain —
+/// the streaming reads are purely an optimization, not a different encoding.
 ///
 /// # Errors
 ///
@@ -180,8 +213,9 @@ pub fn hash_file_streaming(path: &Path, domain: &[u8]) -> io::Result<String> {
 /// Hash a single file by reading it entirely into memory.
 ///
 /// Simpler than [`hash_file_streaming`] but allocates the full file contents
-/// on the heap. Use this for small files (ruleset config, typically < 1 MB)
-/// where the allocation is negligible.
+/// on the heap. The hasher is initialized with `domain || 0x00`, then the
+/// entire file content is fed in a single update. Use this for small files
+/// (ruleset config, typically < 1 MB) where the allocation is negligible.
 ///
 /// # Errors
 ///
@@ -198,8 +232,10 @@ pub fn hash_file(path: &Path, domain: &[u8]) -> io::Result<String> {
 /// Build complete [`Provenance`] from filesystem paths.
 ///
 /// This is the primary entry point for provenance construction. It hashes the
-/// corpus directory (required), and optionally hashes the scanner binary and
-/// ruleset file when their paths are provided.
+/// corpus directory (required) via [`hash_corpus`] with [`CORPUS_DOMAIN`],
+/// and optionally hashes the scanner binary (via [`hash_file_streaming`]) and
+/// ruleset file (via [`hash_file`]) when their paths are provided. Both
+/// single-file hashes use [`FILE_DOMAIN`].
 ///
 /// # Error propagation
 ///

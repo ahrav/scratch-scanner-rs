@@ -14,13 +14,13 @@
 //!    overlap gate (see below), classify as Pass/Warn/Block based on the
 //!    absolute drop against [`RegressionThresholds`].
 //! 2. **Precision check**: same threshold logic, no CI gate.
-//! 3. **Per-rule diff**: merge the per-rule `BTreeMap`s with a peekable
-//!    two-pointer scan to identify new, removed, and changed rules in
-//!    O(r_curr + r_base). These deltas are informational — they do not
-//!    influence the verdict.
-//! 4. **Overall verdict** = `max(ap_verdict, precision_verdict)`. Because
+//! 3. **Overall verdict** = `max(ap_verdict, precision_verdict)`. Because
 //!    [`Verdict`] derives `Ord` with Pass < Warn < Block, `max` yields the
 //!    worst verdict with no branching.
+//! 4. **Per-rule diff**: merge the per-rule `BTreeMap`s with a peekable
+//!    two-pointer scan to identify new, removed, and changed rules in
+//!    O(r_curr + r_base). These deltas are informational — they do not
+//!    influence the verdict and are computed after the verdict is finalized.
 //!
 //! # CI overlap gate
 //!
@@ -64,10 +64,13 @@ use crate::metrics::safe_div;
 /// [`Verdict::Pass`].
 ///
 /// Thresholds are compared against the **absolute drop** (`baseline - current`),
-/// so a value of 0.02 means "2 percentage points." The `warn` threshold must
-/// be less than or equal to `block` for the tiered gating to make sense; if
-/// inverted, the Warn band vanishes and every regression jumps straight from
-/// Pass to Block.
+/// so a value of 0.02 means "2 percentage points." The `warn` threshold should
+/// be less than or equal to `block` for the three-tier classification
+/// (Pass / Warn / Block) to work as intended. When inverted (`warn > block`),
+/// the Warn verdict becomes unreachable: any drop large enough for Warn has
+/// already triggered Block, so regressions jump directly from Pass to Block.
+/// This is not validated at construction time — it is a logical consequence of
+/// the evaluation order in `check_metric` (block checked before warn).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionThresholds {
     /// AP drop (absolute) that triggers Block. Default: 0.02 (2 percentage points).
@@ -183,7 +186,9 @@ pub struct RuleDelta {
     /// Baseline FP count (0 for new rules).
     pub baseline_fp: u64,
     /// Precision delta (`current_precision - baseline_precision`). Negative
-    /// means the rule's precision regressed.
+    /// means the rule's precision regressed. For New rules this equals the
+    /// current precision (baseline is implicitly 0.0); for Removed rules
+    /// this equals the negated baseline precision.
     pub precision_delta: f64,
     /// Whether this rule is new, removed, or present in both runs.
     pub status: RuleDeltaStatus,
@@ -296,6 +301,15 @@ pub fn check_regression(
 /// (`baseline - current`) is compared against the warn and block thresholds.
 /// Improvements (current > baseline) always produce Pass because the drop
 /// is non-positive.
+///
+/// # Threshold evaluation order
+///
+/// Block is checked before Warn: `if drop >= block { Block } else if drop >= warn { Warn }`.
+/// When `warn <= block` (the expected configuration), this produces a three-tier
+/// classification: `[0, warn)` = Pass, `[warn, block)` = Warn, `[block, inf)` = Block.
+/// When inverted (`warn > block`), the Warn branch becomes unreachable because
+/// any drop exceeding `warn` has already exceeded the smaller `block` threshold.
+/// See the `inverted_thresholds_skip_warn_band` test for a worked example.
 fn check_metric(
     metric_name: &str,
     current_val: f64,
@@ -571,6 +585,8 @@ mod tests {
 
     // ── Per-rule deltas ──────────────────────────────────────────────
 
+    /// Per-rule deltas correctly classify rules as New, Removed, or Changed
+    /// based on their presence in the current vs. baseline maps.
     #[test]
     fn per_rule_delta_statuses() {
         fn assert_rule_status(
@@ -615,6 +631,11 @@ mod tests {
         );
     }
 
+    /// Edge case: the two-pointer merge handles empty maps gracefully.
+    ///
+    /// Three sub-cases: both empty (no output), only current non-empty (all
+    /// New), only baseline non-empty (all Removed). Ensures the merge loop
+    /// terminates correctly when one or both iterators start exhausted.
     #[test]
     fn empty_per_rule_maps() {
         // Both maps empty → no deltas emitted.
@@ -643,10 +664,16 @@ mod tests {
         assert_eq!(result.per_rule_deltas[0].status, RuleDeltaStatus::Removed);
     }
 
+    /// Inverted thresholds (warn > block) eliminate the Warn band entirely.
+    ///
+    /// The threshold comparisons are evaluated in order: `drop >= block` first,
+    /// then `drop >= warn`. When `block < warn`, any drop large enough to
+    /// reach the Warn threshold has already exceeded the Block threshold, so
+    /// the Block branch fires first. Drops below the Block threshold are also
+    /// below the (higher) Warn threshold, so they produce Pass. No input can
+    /// ever reach Warn without first reaching Block — the Warn band is empty.
     #[test]
     fn inverted_thresholds_skip_warn_band() {
-        // When warn > block, the Warn band vanishes: regressions jump
-        // straight from Pass to Block because the block check fires first.
         let thresh = RegressionThresholds {
             ap_block: 0.005, // lower than warn
             ap_warn: 0.02,   // higher than block
@@ -658,8 +685,8 @@ mod tests {
         let result = check_regression(&metrics(0.91, 0.88), &metrics(0.92, 0.88), &thresh);
         assert_eq!(result.checks[0].verdict, Verdict::Block);
 
-        // 0.3pp drop (0.003): below block (0.005) → Pass. The Warn band
-        // (0.005–0.02) is unreachable because block fires first.
+        // 0.3pp drop (0.003): below block (0.005) → Pass, skipping Warn
+        // entirely. No drop value can satisfy `< 0.005 AND >= 0.02`.
         let result = check_regression(&metrics(0.917, 0.88), &metrics(0.92, 0.88), &thresh);
         assert_eq!(result.checks[0].verdict, Verdict::Pass);
     }
