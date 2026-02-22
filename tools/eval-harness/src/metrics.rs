@@ -215,6 +215,45 @@ impl Default for BootstrapConfig {
 }
 
 impl EvalMetrics {
+    /// Construct metrics from raw TP / FP / FN counts (count-based pipeline).
+    ///
+    /// Intended for the LeakyRepo count-based pipeline where findings lack
+    /// confidence scores, making confidence-aware metrics (AP, P@R, R@P,
+    /// bootstrap CI) meaningless. Those fields are set to degenerate
+    /// single-threshold stand-ins:
+    ///
+    /// - `average_precision` and `baseline_ap` are set to `precision` — the
+    ///   PR curve degenerates to a single operating point when all findings
+    ///   share the same (implicit) confidence.
+    /// - `precision_at_recall` and `recall_at_precision` are empty.
+    /// - `ap_ci` is `None`.
+    /// - `per_rule` is empty (count-based matching doesn't track rule names).
+    /// - `unlabeled` is 0 (count-based matching classifies every finding).
+    #[must_use]
+    pub fn from_counts(tp: u64, fp: u64, false_neg: u64) -> Self {
+        let precision = safe_div(tp as f64, (tp + fp) as f64);
+        let recall = safe_div(tp as f64, (tp + false_neg) as f64);
+        let f1 = safe_div(2.0 * precision * recall, precision + recall);
+        let f2 = safe_div(5.0 * precision * recall, 4.0 * precision + recall);
+
+        Self {
+            average_precision: precision,
+            precision,
+            recall,
+            f1,
+            f2,
+            tp,
+            fp,
+            false_neg,
+            unlabeled: 0,
+            baseline_ap: precision,
+            precision_at_recall: vec![],
+            recall_at_precision: vec![],
+            ap_ci: None,
+            per_rule: BTreeMap::new(),
+        }
+    }
+
     /// Consume `self` and return it with bootstrap CI fields populated.
     ///
     /// Intended as the second step after [`compute_metrics`]: compute the

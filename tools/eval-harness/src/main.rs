@@ -31,7 +31,7 @@
 //!                                                                   └─► EvalReport ──► JSON / table
 //!
 //! Count-based (leaky-repo):
-//!   expectations CSV ──► LeakyRepoExpectation[]
+//!   expectations CSV ──► FileExpectation[]
 //!                                    ├─► compare_counts ──► per-file TP/FP/FN
 //!   findings JSONL ──► NormalizedFinding[]                  └─► aggregate ──► EvalMetrics
 //!                                                                └─► EvalReport ──► JSON / table
@@ -55,7 +55,6 @@
 //! | 1    | Block — regression detected against a `--baseline` report |
 //! | 2    | Argument or runtime error |
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -69,9 +68,7 @@ use eval_harness::finding_parser::{
 };
 use eval_harness::leaky_repo::{compare_counts, parse_leaky_repo_csv};
 use eval_harness::matching::{MatchConfig, match_findings};
-use eval_harness::metrics::{
-    BootstrapConfig, EvalMetrics, bootstrap_ap_ci, compute_metrics, safe_div,
-};
+use eval_harness::metrics::{BootstrapConfig, EvalMetrics, bootstrap_ap_ci, compute_metrics};
 use eval_harness::provenance::{build_provenance, collect_files_recursive};
 use eval_harness::regression::{RegressionThresholds, check_regression};
 use eval_harness::report::{
@@ -113,18 +110,18 @@ enum Command {
     Synthetic(SyntheticArgs),
 }
 
-/// Arguments for evaluating against the CredData corpus.
+/// Shared arguments for position-based evaluation subcommands.
 ///
-/// CredData organizes ground truth as one CSV file per category inside a
-/// `meta/` directory. The harness loads all CSV files from `--meta-dir`,
-/// normalizes paths relative to `--corpus-root`, and feeds the resulting
-/// truth items into the position-based pipeline.
+/// Both `creddata` and `synthetic` use the same finding-loading, matching,
+/// metrics, and reporting pipeline — they differ only in how ground truth
+/// is loaded. This struct captures the arguments common to both, flattened
+/// into each subcommand via `#[command(flatten)]`.
+///
+/// Finding sources are mutually exclusive (enforced by clap argument group
+/// `"input"`): either `--findings` (pre-computed JSONL) or `--scan-corpus`
+/// (live scan) must be provided.
 #[derive(clap::Args)]
-struct CreddataArgs {
-    /// CredData CSV directory containing ground-truth annotations.
-    #[arg(long)]
-    meta_dir: PathBuf,
-
+struct PositionPipelineArgs {
     /// Pre-computed findings JSONL file.
     #[arg(long, group = "input")]
     findings: Option<PathBuf>,
@@ -148,6 +145,22 @@ struct CreddataArgs {
     /// Baseline JSON report for regression comparison.
     #[arg(long)]
     baseline: Option<PathBuf>,
+}
+
+/// Arguments for evaluating against the CredData corpus.
+///
+/// CredData organizes ground truth as one CSV file per category inside a
+/// `meta/` directory. The harness loads all CSV files from `--meta-dir`,
+/// normalizes paths relative to `--corpus-root`, and feeds the resulting
+/// truth items into the position-based pipeline.
+#[derive(clap::Args)]
+struct CreddataArgs {
+    /// CredData CSV directory containing ground-truth annotations.
+    #[arg(long)]
+    meta_dir: PathBuf,
+
+    #[command(flatten)]
+    common: PositionPipelineArgs,
 }
 
 /// Arguments for evaluating against the LeakyRepo corpus.
@@ -188,29 +201,8 @@ struct SyntheticArgs {
     #[arg(long)]
     manifest: PathBuf,
 
-    /// Pre-computed findings JSONL file.
-    #[arg(long, group = "input")]
-    findings: Option<PathBuf>,
-
-    /// Directory to live-scan for findings.
-    #[arg(long, group = "input")]
-    scan_corpus: Option<PathBuf>,
-
-    /// Path normalization root (stripped from finding and truth paths).
-    #[arg(long)]
-    corpus_root: PathBuf,
-
-    /// Output format.
-    #[arg(long, default_value = "json")]
-    format: OutputFormat,
-
-    /// Write JSON output to this file instead of stdout.
-    #[arg(long)]
-    output: Option<PathBuf>,
-
-    /// Baseline JSON report for regression comparison.
-    #[arg(long)]
-    baseline: Option<PathBuf>,
+    #[command(flatten)]
+    common: PositionPipelineArgs,
 }
 
 /// Report output format.
@@ -265,9 +257,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 /// (which are non-fatal to allow partial corpora), then delegates to
 /// [`run_position_pipeline`] for matching, metrics, and reporting.
 fn run_creddata(args: CreddataArgs) -> Result<i32, Box<dyn Error>> {
-    validate_output_format(args.format, args.output.as_deref())?;
-
-    let canonical_root = canonicalize_root(&args.corpus_root);
+    let canonical_root = canonicalize_root(&args.common.corpus_root);
 
     let dir_result = load_meta_dir(&args.meta_dir, &canonical_root)?;
     if !dir_result.file_errors.is_empty() {
@@ -275,18 +265,8 @@ fn run_creddata(args: CreddataArgs) -> Result<i32, Box<dyn Error>> {
             eprintln!("warning: {e}");
         }
     }
-    let truth = dir_result.parsed.items;
 
-    run_position_pipeline(
-        truth,
-        args.findings.as_deref(),
-        args.scan_corpus.as_deref(),
-        &canonical_root,
-        &args.corpus_root,
-        args.format,
-        args.output.as_deref(),
-        args.baseline.as_deref(),
-    )
+    run_position_pipeline(dir_result.parsed.items, &args.common)
 }
 
 /// Load a synthetic JSON manifest and evaluate via the position-based pipeline.
@@ -295,21 +275,10 @@ fn run_creddata(args: CreddataArgs) -> Result<i32, Box<dyn Error>> {
 /// [`load_synthetic_manifest`] reads a single JSON file rather than a
 /// directory of CSVs.
 fn run_synthetic(args: SyntheticArgs) -> Result<i32, Box<dyn Error>> {
-    validate_output_format(args.format, args.output.as_deref())?;
-
-    let canonical_root = canonicalize_root(&args.corpus_root);
+    let canonical_root = canonicalize_root(&args.common.corpus_root);
     let truth = load_synthetic_manifest(&args.manifest, &canonical_root)?;
 
-    run_position_pipeline(
-        truth,
-        args.findings.as_deref(),
-        args.scan_corpus.as_deref(),
-        &canonical_root,
-        &args.corpus_root,
-        args.format,
-        args.output.as_deref(),
-        args.baseline.as_deref(),
-    )
+    run_position_pipeline(truth, &args.common)
 }
 
 /// Run the count-based evaluation pipeline for LeakyRepo.
@@ -338,41 +307,15 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 
     let comparisons = compare_counts(parse_result.findings, &expectations);
 
-    // Collapse per-file results into corpus-wide totals so a single
-    // EvalMetrics can represent the entire benchmark.
-    let mut tp: u64 = 0;
-    let mut fp: u64 = 0;
-    let mut false_neg: u64 = 0;
+    // Collapse per-file results into corpus-wide totals.
+    let (mut tp, mut fp, mut false_neg) = (0u64, 0u64, 0u64);
     for c in &comparisons {
         tp += u64::from(c.tp);
         fp += u64::from(c.fp);
         false_neg += u64::from(c.false_neg);
     }
 
-    let total_positives = tp + false_neg;
-    let precision = safe_div(tp as f64, (tp + fp) as f64);
-    let recall = safe_div(tp as f64, total_positives as f64);
-    let f1 = safe_div(2.0 * precision * recall, precision + recall);
-    let f2 = safe_div(5.0 * precision * recall, 4.0 * precision + recall);
-
-    // AP set to precision: count-based matching has no confidence ranking,
-    // so the PR curve degenerates to a single operating point.
-    let metrics = EvalMetrics {
-        average_precision: precision,
-        precision,
-        recall,
-        f1,
-        f2,
-        tp,
-        fp,
-        false_neg,
-        unlabeled: 0,
-        baseline_ap: precision,
-        precision_at_recall: vec![],
-        recall_at_precision: vec![],
-        ap_ci: None,
-        per_rule: BTreeMap::new(),
-    };
+    let metrics = EvalMetrics::from_counts(tp, fp, false_neg);
 
     let provenance = build_provenance(
         args.secrets_csv.parent().unwrap_or_else(|| Path::new(".")),
@@ -402,42 +345,41 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 ///
 /// # Pipeline steps
 ///
-/// 1. **Load findings** — from pre-computed JSONL or a live scan.
-/// 2. **Dedup** — sort + dedup findings, retaining highest confidence per
+/// 1. **Validate** — reject invalid argument combinations (e.g.,
+///    `--output` + `--format table`).
+/// 2. **Load findings** — from pre-computed JSONL or a live scan.
+/// 3. **Dedup** — sort + dedup findings, retaining highest confidence per
 ///    identity (path, byte_start, byte_end, rule).
-/// 3. **Load corpus files** — read all files under `corpus_root` into
+/// 4. **Load corpus files** — read all files under `corpus_root` into
 ///    memory for byte-to-line conversion during matching.
-/// 4. **Match** — classify each finding as TP, FP, or Unlabeled using
+/// 5. **Match** — classify each finding as TP, FP, or Unlabeled using
 ///    position-based overlap with truth items. Rule matching is disabled
 ///    (`require_rule_match: false`) so any finding overlapping a truth
 ///    region counts as a match regardless of rule name.
-/// 5. **Compute metrics** — precision, recall, F1, F2, AP with tie
+/// 6. **Compute metrics** — precision, recall, F1, F2, AP with tie
 ///    collapsing, P@R, R@P, per-rule breakdown, and bootstrap CI.
-/// 6. **Regression check** — if a baseline report is provided, compare
+/// 7. **Regression check** — if a baseline report is provided, compare
 ///    current metrics against it using default thresholds (2pp block,
 ///    0.5pp warn) with CI overlap gating.
-/// 7. **Report** — assemble all outputs into an [`EvalReport`] and
+/// 8. **Report** — assemble all outputs into an [`EvalReport`] and
 ///    render to JSON or table format.
 ///
 /// # Exit code
 ///
 /// Returns the regression verdict's exit code (0 for pass/warn, 1 for
 /// block). When no baseline is provided, always returns 0.
-#[allow(clippy::too_many_arguments)]
 fn run_position_pipeline(
     truth: Vec<TruthItem>,
-    findings_path: Option<&Path>,
-    scan_corpus: Option<&Path>,
-    canonical_root: &str,
-    corpus_root: &Path,
-    format: OutputFormat,
-    output_path: Option<&Path>,
-    baseline_path: Option<&Path>,
+    args: &PositionPipelineArgs,
 ) -> Result<i32, Box<dyn Error>> {
-    let mut findings = load_findings(findings_path, scan_corpus, canonical_root)?;
+    validate_output_format(args.format, args.output.as_deref())?;
+    let canonical_root = canonicalize_root(&args.corpus_root);
+
+    let mut findings =
+        load_findings(args.findings.as_deref(), args.scan_corpus.as_deref(), &canonical_root)?;
     dedup_findings(&mut findings);
 
-    let file_contents = load_corpus_files(corpus_root)?;
+    let file_contents = load_corpus_files(&args.corpus_root)?;
     let config = MatchConfig {
         require_rule_match: false,
     };
@@ -455,9 +397,9 @@ fn run_position_pipeline(
     );
     let metrics = metrics.with_bootstrap_ci(ci);
 
-    let provenance = build_provenance(corpus_root, None, None)?;
+    let provenance = build_provenance(&args.corpus_root, None, None)?;
 
-    let regression = if let Some(bp) = baseline_path {
+    let regression = if let Some(bp) = args.baseline.as_deref() {
         let baseline_report = load_baseline(bp)?;
         let result = check_regression(
             &metrics,
@@ -488,7 +430,7 @@ fn run_position_pipeline(
         error_book: Some(error_book),
     };
 
-    output_report(&report, format, output_path)?;
+    output_report(&report, args.format, args.output.as_deref())?;
     Ok(exit_code)
 }
 
@@ -516,7 +458,9 @@ fn load_findings(
             Ok(result.findings)
         }
         (None, Some(dir)) => run_live_scan(dir, canonical_root),
-        _ => Err("exactly one of --findings or --scan-corpus is required".into()),
+        (Some(_), Some(_)) | (None, None) => {
+            Err("exactly one of --findings or --scan-corpus is required".into())
+        }
     }
 }
 
@@ -546,7 +490,16 @@ fn run_live_scan(
     let local_files: Vec<LocalFile> = files
         .into_iter()
         .map(|path| {
-            let size = path.metadata().map(|m: std::fs::Metadata| m.len()).unwrap_or(0);
+            let size = match path.metadata() {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not read metadata for {}: {e}",
+                        path.display(),
+                    );
+                    0
+                }
+            };
             LocalFile { path, size }
         })
         .collect();
