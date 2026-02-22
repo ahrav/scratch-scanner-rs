@@ -54,7 +54,7 @@
 //!
 //! | Code | Meaning |
 //! |------|---------|
-//! | 0    | Pass or warn — metrics meet thresholds |
+//! | 0    | Pass/warn for position-based pipelines; always 0 for `leaky-repo` (no regression gate) |
 //! | 1    | Block — regression detected against a `--baseline` report |
 //! | 2    | Argument or runtime error |
 
@@ -351,7 +351,9 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 /// This is the shared core of `creddata` and `synthetic` subcommands.
 /// The caller provides truth items (already loaded and normalized);
 /// this function handles everything from finding ingestion through
-/// final report output.
+/// final report output. It derives the canonical path root from
+/// `args.corpus_root` internally so path normalization has a single
+/// source of truth in this stage.
 ///
 /// # Pipeline steps
 ///

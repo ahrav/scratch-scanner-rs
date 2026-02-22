@@ -30,8 +30,9 @@
 //!
 //! FN entries cannot include byte-level context because [`TruthItem`] carries
 //! line-based coordinates, not byte offsets.
-//! Malformed byte offsets are dropped from context extraction and logged as
-//! warnings to stderr.
+//! Range-invalid offsets are dropped from context extraction and logged as
+//! warnings to stderr. Offsets that fail integer conversion (`u64` to `usize`)
+//! are dropped silently.
 //!
 //! # Determinism
 //!
@@ -42,7 +43,7 @@
 //! # Performance
 //!
 //! - `HashMap<&str, _>` for counting borrows rule strings from input (zero
-//!   allocation during the counting pass).
+//!   per-finding string allocation during the counting pass).
 //! - `fmt::Write` to a pre-allocated `String` for table rendering avoids N
 //!   intermediate `format!()` allocations.
 //! - 64 KiB `BufWriter` for file output matches codebase convention.
@@ -82,7 +83,9 @@ use crate::types::{ClassifiedFinding, FindingClass, TruthItem};
 ///
 /// Serialization includes `metrics_semantics` (`position_pr_curve` or
 /// `count_only`) derived from `metrics`. Deserialization accepts both new
-/// JSON with the field and legacy baseline JSON without it.
+/// JSON with the field and legacy baseline JSON without it, but runtime
+/// semantics are always re-derived from `metrics` to keep behavior tied to
+/// the payload rather than trusting a potentially stale discriminator.
 #[derive(Debug, Clone)]
 pub struct EvalReport {
     /// Aggregate evaluation metrics (precision, recall, AP, etc.).
@@ -158,6 +161,8 @@ struct EvalReportSer<'a> {
 #[derive(Deserialize)]
 struct EvalReportDe {
     #[serde(default)]
+    // Accepted for backward compatibility and wire-format stability.
+    // Runtime semantics are still inferred from `metrics` on use.
     metrics_semantics: MetricsSemantics,
     metrics: EvalMetrics,
     provenance: Provenance,
@@ -189,6 +194,8 @@ impl<'de> Deserialize<'de> for EvalReport {
         D: Deserializer<'de>,
     {
         let report = EvalReportDe::deserialize(deserializer)?;
+        // Keep backward compatibility with legacy reports that omit this field,
+        // and avoid trusting possibly stale/mismatched semantics values.
         let _semantics = report.metrics_semantics;
         Ok(Self {
             metrics: report.metrics,
@@ -369,14 +376,14 @@ pub fn build_error_book(
 
 /// Render the report as pretty-printed JSON.
 ///
-/// Validates that all metric fields are finite (not NaN or Inf) before
+/// Validates core metric fields are finite (not NaN or Inf) before
 /// serialization. NaN/Inf values cannot be represented in JSON and would
 /// produce corrupt output that downstream consumers cannot parse.
 ///
 /// # Errors
 ///
-/// Returns `serde_json::Error` if any metric field is non-finite or if
-/// serialization fails.
+/// Returns `serde_json::Error` if any validated metric field is non-finite
+/// or if serialization fails.
 pub fn render_json(report: &EvalReport) -> Result<String, serde_json::Error> {
     validate_finite(report)?;
     serde_json::to_string_pretty(report)
@@ -463,12 +470,12 @@ pub fn render_table(report: &EvalReport) -> String {
 /// `BufWriter` (matching the codebase convention for file I/O), and
 /// flushes before returning.
 ///
-/// Validates that all metric fields are finite before serialization.
+/// Validates core metric fields are finite before serialization.
 ///
 /// # Errors
 ///
-/// Returns `io::Error` if any metric field is non-finite, file creation
-/// fails, JSON serialization fails, or flush fails.
+/// Returns `io::Error` if any validated metric field is non-finite, file
+/// creation fails, JSON serialization fails, or flush fails.
 pub fn write_json_file(report: &EvalReport, path: &Path) -> io::Result<()> {
     validate_finite(report).map_err(io::Error::other)?;
     let file = std::fs::File::create(path)?;
@@ -531,13 +538,14 @@ fn build_fp_entries(
         .into_iter()
         .map(|(rule, count, conf, idx)| {
             let finding = &classified[idx].finding;
-            let context = extract_context(
-                file_contents,
-                &finding.path,
-                finding.byte_start as usize,
-                finding.byte_end as usize,
-                config,
-            );
+            // Conversion failures are treated as "no context available"
+            // without warning so we avoid noisy stderr on platforms where
+            // the source offsets cannot fit in usize.
+            let start = usize::try_from(finding.byte_start).ok();
+            let end = usize::try_from(finding.byte_end).ok();
+            let context = start
+                .zip(end)
+                .and_then(|(s, e)| extract_context(file_contents, &finding.path, s, e, config));
             ErrorBookEntry {
                 rule: rule.to_string(),
                 count,
@@ -605,7 +613,7 @@ fn build_fn_entries(
 /// - `byte_start > byte_end` (inverted span -- indicates corrupt offsets).
 /// - `byte_end` exceeds the file length (stale or corrupt byte offsets).
 ///
-/// Malformed offsets (`byte_start > byte_end` or `byte_end > file_len`) emit
+/// Range-invalid offsets (`byte_start > byte_end` or `byte_end > file_len`) emit
 /// a warning to stderr before returning `None`, so data-quality problems are
 /// visible without failing report generation.
 ///

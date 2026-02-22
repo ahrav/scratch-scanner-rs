@@ -68,7 +68,8 @@ use crate::types::{ClassifiedFinding, FindingClass};
 /// Error returned when metrics functions receive invalid inputs.
 ///
 /// Follows the same pattern as [`crate::regression::RegressionConfigError`]:
-/// a small enum of invariant violations with `Display` and `Error` derives.
+/// a small enum of invariant violations with `Display` and `Error`
+/// implementations.
 /// Each variant maps to a specific precondition check that was previously
 /// enforced via `assert!`.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,9 +81,10 @@ pub enum MetricsError {
         fn_count: u64,
         total_positives: u64,
     },
-    /// CI lower bound exceeds upper bound.
+    /// CI lower bound exceeds upper bound after range validation and before
+    /// boundary clamping.
     CiLowerExceedsUpper { lower: f64, upper: f64 },
-    /// CI bounds are outside `[0.0, 1.0]`.
+    /// CI bounds are materially outside `[0.0, 1.0]` (not tiny float drift).
     CiOutOfRange { lower: f64, upper: f64 },
     /// `BootstrapConfig::n_iterations` must be > 0.
     ZeroIterations,
@@ -342,25 +344,30 @@ impl EvalMetrics {
     ///
     /// # Errors
     ///
-    /// Returns [`MetricsError::CiLowerExceedsUpper`] if `ci.0 > ci.1`.
-    /// Returns [`MetricsError::CiOutOfRange`] if bounds are outside `[0.0, 1.0]`.
+    /// Returns [`MetricsError::CiLowerExceedsUpper`] if `lower > upper`.
+    /// Returns [`MetricsError::CiOutOfRange`] when bounds are materially
+    /// outside `[0.0, 1.0]`. Tiny rounding drift near the boundaries is
+    /// tolerated and clamped (for example `-1e-16` or `1.0000000000000002`).
     pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Result<Self, MetricsError> {
-        if ci.0 > ci.1 {
-            return Err(MetricsError::CiLowerExceedsUpper {
-                lower: ci.0,
-                upper: ci.1,
-            });
+        // Allow only tiny float-rounding drift near boundaries, but fail
+        // fast on materially out-of-range inputs.
+        const RANGE_EPSILON: f64 = 1e-12;
+        let lower = ci.0;
+        let upper = ci.1;
+
+        if !lower.is_finite()
+            || !upper.is_finite()
+            || lower < -RANGE_EPSILON
+            || upper > 1.0 + RANGE_EPSILON
+        {
+            return Err(MetricsError::CiOutOfRange { lower, upper });
         }
-        if ci.0 < 0.0 || ci.1 > 1.0 {
-            return Err(MetricsError::CiOutOfRange {
-                lower: ci.0,
-                upper: ci.1,
-            });
+        if lower > upper {
+            return Err(MetricsError::CiLowerExceedsUpper { lower, upper });
         }
-        self.ap_ci = Some(ConfidenceInterval {
-            lower: ci.0,
-            upper: ci.1,
-        });
+        let lower = lower.clamp(0.0, 1.0);
+        let upper = upper.clamp(0.0, 1.0);
+        self.ap_ci = Some(ConfidenceInterval { lower, upper });
         Ok(self)
     }
 }
@@ -1407,6 +1414,43 @@ mod tests {
         assert!(m.ap_ci.is_some());
         let ci = m.ap_ci.unwrap();
         assert!(ci.lower <= ci.upper);
+    }
+
+    #[test]
+    fn with_bootstrap_ci_clamps_tiny_rounding_drift() {
+        let metrics = EvalMetrics::from_counts(1, 0, 0);
+        let metrics = metrics.with_bootstrap_ci((-1e-16, 1.0000000000000002)).unwrap();
+        let ci = metrics.ap_ci.expect("ci must be present");
+        assert!((ci.lower - 0.0).abs() < EPS, "expected lower clamp to 0.0");
+        assert!((ci.upper - 1.0).abs() < EPS, "expected upper clamp to 1.0");
+    }
+
+    #[test]
+    fn with_bootstrap_ci_rejects_out_of_range_bounds() {
+        let metrics = EvalMetrics::from_counts(1, 0, 0);
+        assert_eq!(
+            metrics.clone().with_bootstrap_ci((-0.01, 0.9)).unwrap_err(),
+            MetricsError::CiOutOfRange {
+                lower: -0.01,
+                upper: 0.9,
+            }
+        );
+        assert_eq!(
+            metrics.with_bootstrap_ci((0.1, 1.01)).unwrap_err(),
+            MetricsError::CiOutOfRange {
+                lower: 0.1,
+                upper: 1.01,
+            }
+        );
+    }
+
+    #[test]
+    fn with_bootstrap_ci_rejects_non_finite_bounds() {
+        let metrics = EvalMetrics::from_counts(1, 0, 0);
+        assert!(matches!(
+            metrics.with_bootstrap_ci((f64::NAN, 0.9)).unwrap_err(),
+            MetricsError::CiOutOfRange { .. },
+        ));
     }
 
     // ── Proptest properties ─────────────────────────────────────
