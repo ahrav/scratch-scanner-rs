@@ -623,6 +623,29 @@ mod tests {
         }
     }
 
+    // ── Absolute corpus root ──────────────────────────────────
+
+    /// normalize_path correctly strips an absolute corpus root when the
+    /// canonical_root is produced by canonicalize_path (which strips
+    /// leading slashes, matching the normalization applied to raw paths).
+    #[test]
+    fn normalize_path_absolute_corpus_root() {
+        use scanner_rs::store::canonicalize_path;
+
+        let root = canonicalize_path("/home/user/corpus");
+        assert_eq!(
+            normalize_path("/home/user/corpus/file.txt", &root),
+            "file.txt",
+            "absolute corpus root must be stripped after canonicalization"
+        );
+        assert_eq!(
+            normalize_path("/home/user/corpus/sub/dir/file.txt", &root),
+            "sub/dir/file.txt",
+        );
+        // Relative paths unaffected by absolute root.
+        assert_eq!(normalize_path("other/file.txt", &root), "other/file.txt",);
+    }
+
     // ── Property tests ─────────────────────────────────────────
 
     mod prop {

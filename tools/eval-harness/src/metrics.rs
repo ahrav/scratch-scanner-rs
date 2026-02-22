@@ -25,6 +25,10 @@
 //!   reward classifiers that assign higher confidence to true positives.
 //!   Answer "how good is the confidence ranking?"
 //!
+//! Count-only evaluations use [`EvalMetrics::from_counts`] instead of the
+//! confidence-ranked path. In that mode, AP fields are schema-compatible
+//! stand-ins derived from counts rather than a PR-curve ranking quality signal.
+//!
 //! ## Average Precision algorithm
 //!
 //! Uses the step-function (rectangular) formula with **tie collapsing**:
@@ -58,6 +62,75 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{ClassifiedFinding, FindingClass};
+
+// ── Error type ──────────────────────────────────────────────────────────
+
+/// Error returned when metrics functions receive invalid inputs.
+///
+/// Follows the same pattern as [`crate::regression::RegressionConfigError`]:
+/// a small enum of invariant violations with `Display` and `Error` derives.
+/// Each variant maps to a specific precondition check that was previously
+/// enforced via `assert!`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricsError {
+    /// `tp + fn_count != total_positives` — the caller-provided counts
+    /// are inconsistent with the classified finding list.
+    TpFnMismatch {
+        tp: u64,
+        fn_count: u64,
+        total_positives: u64,
+    },
+    /// CI lower bound exceeds upper bound.
+    CiLowerExceedsUpper { lower: f64, upper: f64 },
+    /// CI bounds are outside `[0.0, 1.0]`.
+    CiOutOfRange { lower: f64, upper: f64 },
+    /// `BootstrapConfig::n_iterations` must be > 0.
+    ZeroIterations,
+    /// `BootstrapConfig::alpha` must be in the open interval `(0.0, 1.0)`.
+    AlphaOutOfRange { alpha: f64 },
+    /// `total_positives` is less than the observed TP count.
+    TotalPositivesLessThanTp { total_positives: u64, tp_count: u64 },
+}
+
+impl std::fmt::Display for MetricsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TpFnMismatch {
+                tp,
+                fn_count,
+                total_positives,
+            } => write!(
+                f,
+                "invariant violation: tp({tp}) + fn_count({fn_count}) != total_positives({total_positives})"
+            ),
+            Self::CiLowerExceedsUpper { lower, upper } => {
+                write!(f, "CI lower ({lower}) must not exceed upper ({upper})")
+            }
+            Self::CiOutOfRange { lower, upper } => {
+                write!(f, "CI bounds must be in [0.0, 1.0], got ({lower}, {upper})")
+            }
+            Self::ZeroIterations => {
+                write!(f, "BootstrapConfig::n_iterations must be > 0")
+            }
+            Self::AlphaOutOfRange { alpha } => {
+                write!(
+                    f,
+                    "BootstrapConfig::alpha must be in (0.0, 1.0), got {alpha}"
+                )
+            }
+            Self::TotalPositivesLessThanTp {
+                total_positives,
+                tp_count,
+            } => write!(
+                f,
+                "total_positives ({total_positives}) must be >= TP count ({tp_count}); \
+                 otherwise recall exceeds 1.0"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetricsError {}
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -116,6 +189,8 @@ pub struct EvalMetrics {
     /// Computed as `sum of (recall_i - recall_{i-1}) * precision_i` over
     /// collapsed operating points, matching sklearn's `average_precision_score`.
     /// This is *not* the trapezoidal area under the PR curve (`auc(recall, precision)`).
+    /// In count-only reports from [`EvalMetrics::from_counts`], this is set to
+    /// `precision` as a single-point stand-in (not a ranking-derived curve area).
     pub average_precision: f64,
     /// Threshold-free precision: TP / (TP + FP). Equals 0.0 when
     /// there are no positive predictions (TP + FP = 0).
@@ -146,6 +221,8 @@ pub struct EvalMetrics {
     /// beyond the raw detection rate. Uses scored positives (TP) rather
     /// than `total_positives` so the baseline stays achievable when recall is
     /// incomplete. Can exceed `average_precision` when recall is low.
+    /// In count-only reports from [`EvalMetrics::from_counts`], this equals
+    /// `precision` by construction.
     pub baseline_ap: f64,
     /// Precision at fixed recall targets.
     /// Default targets: 0.80, 0.90, 0.95.
@@ -215,6 +292,43 @@ impl Default for BootstrapConfig {
 }
 
 impl EvalMetrics {
+    /// Construct metrics from raw TP / FP / FN counts (count-based pipeline).
+    ///
+    /// Intended for the LeakyRepo count-based pipeline where findings lack
+    /// confidence scores, making confidence-aware metrics (AP, P@R, R@P,
+    /// bootstrap CI) meaningless. Those fields are set to degenerate
+    /// single-threshold stand-ins for report schema compatibility:
+    ///
+    /// - `average_precision` and `baseline_ap` are set to `precision` — the
+    ///   PR curve degenerates to a single operating point when all findings
+    ///   share the same (implicit) confidence. Do not interpret these values
+    ///   as confidence-ranking quality.
+    /// - `precision_at_recall` and `recall_at_precision` are empty.
+    /// - `ap_ci` is `None`.
+    /// - `per_rule` is empty (count-based matching doesn't track rule names).
+    /// - `unlabeled` is 0 (count-based matching classifies every finding).
+    #[must_use]
+    pub fn from_counts(tp: u64, fp: u64, false_neg: u64) -> Self {
+        let totals = count_score_totals(tp, fp, tp + false_neg);
+
+        Self {
+            average_precision: totals.precision,
+            precision: totals.precision,
+            recall: totals.recall,
+            f1: totals.f1,
+            f2: totals.f2,
+            tp,
+            fp,
+            false_neg,
+            unlabeled: 0,
+            baseline_ap: totals.baseline_ap,
+            precision_at_recall: vec![],
+            recall_at_precision: vec![],
+            ap_ci: None,
+            per_rule: BTreeMap::new(),
+        }
+    }
+
     /// Consume `self` and return it with bootstrap CI fields populated.
     ///
     /// Intended as the second step after [`compute_metrics`]: compute the
@@ -222,28 +336,32 @@ impl EvalMetrics {
     /// via [`bootstrap_ap_ci`].
     ///
     /// ```rust,ignore
-    /// let m = compute_metrics(&classified, fn_count, total_pos)
-    ///     .with_bootstrap_ci(bootstrap_ap_ci(&classified, total_pos, &cfg));
+    /// let m = compute_metrics(&classified, fn_count, total_pos)?
+    ///     .with_bootstrap_ci(bootstrap_ap_ci(&classified, total_pos, &cfg)?)?;
     /// ```
-    #[must_use]
-    pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Self {
-        assert!(
-            ci.0 <= ci.1,
-            "CI lower ({}) must not exceed upper ({})",
-            ci.0,
-            ci.1,
-        );
-        assert!(
-            ci.0 >= 0.0 && ci.1 <= 1.0,
-            "CI bounds must be in [0.0, 1.0], got ({}, {})",
-            ci.0,
-            ci.1,
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetricsError::CiLowerExceedsUpper`] if `ci.0 > ci.1`.
+    /// Returns [`MetricsError::CiOutOfRange`] if bounds are outside `[0.0, 1.0]`.
+    pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Result<Self, MetricsError> {
+        if ci.0 > ci.1 {
+            return Err(MetricsError::CiLowerExceedsUpper {
+                lower: ci.0,
+                upper: ci.1,
+            });
+        }
+        if ci.0 < 0.0 || ci.1 > 1.0 {
+            return Err(MetricsError::CiOutOfRange {
+                lower: ci.0,
+                upper: ci.1,
+            });
+        }
         self.ap_ci = Some(ConfidenceInterval {
             lower: ci.0,
             upper: ci.1,
         });
-        self
+        Ok(self)
     }
 }
 
@@ -268,16 +386,16 @@ impl EvalMetrics {
 /// - `fn_count`: number of ground-truth positives not matched by any finding.
 /// - `total_positives`: total ground-truth positive count (`tp + fn_count`).
 ///
-/// # Panics
+/// # Errors
 ///
-/// - If `tp + fn_count != total_positives` (invariant check).
+/// Returns [`MetricsError::TpFnMismatch`] if `tp + fn_count != total_positives`.
 ///
 /// [`with_bootstrap_ci`]: EvalMetrics::with_bootstrap_ci
 pub fn compute_metrics(
     classified: &[ClassifiedFinding],
     fn_count: u64,
     total_positives: u64,
-) -> EvalMetrics {
+) -> Result<EvalMetrics, MetricsError> {
     let mut tp: u64 = 0;
     let mut fp: u64 = 0;
     let mut unlabeled: u64 = 0;
@@ -290,20 +408,18 @@ pub fn compute_metrics(
         }
     }
 
-    assert_eq!(
-        tp + fn_count,
-        total_positives,
-        "invariant violation: tp({tp}) + fn_count({fn_count}) != total_positives({total_positives})"
-    );
+    if tp + fn_count != total_positives {
+        return Err(MetricsError::TpFnMismatch {
+            tp,
+            fn_count,
+            total_positives,
+        });
+    }
 
-    let precision = safe_div(tp as f64, (tp + fp) as f64);
-    let recall = safe_div(tp as f64, total_positives as f64);
-    let f1 = safe_div(2.0 * precision * recall, precision + recall);
-    let f2 = safe_div(5.0 * precision * recall, 4.0 * precision + recall);
+    let totals = count_score_totals(tp, fp, total_positives);
 
     let curve = build_pr_curve(classified, total_positives);
     let average_precision = ap_from_curve(&curve);
-    let baseline_ap = precision;
     let per_rule = compute_per_rule(classified);
 
     let par = DEFAULT_PAR_TARGETS
@@ -321,22 +437,22 @@ pub fn compute_metrics(
         })
         .collect();
 
-    EvalMetrics {
+    Ok(EvalMetrics {
         average_precision,
-        precision,
-        recall,
-        f1,
-        f2,
+        precision: totals.precision,
+        recall: totals.recall,
+        f1: totals.f1,
+        f2: totals.f2,
         tp,
         fp,
         false_neg: fn_count,
         unlabeled,
-        baseline_ap,
+        baseline_ap: totals.baseline_ap,
         precision_at_recall: par,
         recall_at_precision: rap,
         ap_ci: None,
         per_rule,
-    }
+    })
 }
 
 /// Compute a bootstrap confidence interval for Average Precision.
@@ -358,11 +474,12 @@ pub fn compute_metrics(
 /// The final percentile sort adds O(`n_iterations` log `n_iterations`),
 /// dominated by the main loop in practice.
 ///
-/// # Panics
+/// # Errors
 ///
-/// - If `config.n_iterations` is zero.
-/// - If `config.alpha` is not in the open interval `(0.0, 1.0)`.
-/// - If `total_positives` is less than the number of TP items in `classified`.
+/// Returns [`MetricsError::ZeroIterations`] if `config.n_iterations` is zero.
+/// Returns [`MetricsError::AlphaOutOfRange`] if `config.alpha` is not in `(0.0, 1.0)`.
+/// Returns [`MetricsError::TotalPositivesLessThanTp`] if `total_positives`
+/// is less than the number of TP items in `classified`.
 ///
 /// # Returns
 ///
@@ -383,7 +500,7 @@ pub fn bootstrap_ap_ci(
     classified: &[ClassifiedFinding],
     total_positives: u64,
     config: &BootstrapConfig,
-) -> (f64, f64) {
+) -> Result<(f64, f64), MetricsError> {
     // Extract lightweight (confidence, is_tp) pairs — avoids cloning full
     // NormalizedFinding structs on every bootstrap iteration.
     let tp_scores: Vec<i8> = classified
@@ -397,25 +514,23 @@ pub fn bootstrap_ap_ci(
         .map(|cf| cf.finding.confidence)
         .collect();
 
-    assert!(
-        config.n_iterations > 0,
-        "BootstrapConfig::n_iterations must be > 0, got {}",
-        config.n_iterations,
-    );
-    assert!(
-        config.alpha > 0.0 && config.alpha < 1.0,
-        "BootstrapConfig::alpha must be in (0.0, 1.0), got {}",
-        config.alpha,
-    );
-    assert!(
-        total_positives >= tp_scores.len() as u64,
-        "total_positives ({total_positives}) must be >= TP count ({}); \
-         otherwise recall exceeds 1.0",
-        tp_scores.len(),
-    );
+    if config.n_iterations == 0 {
+        return Err(MetricsError::ZeroIterations);
+    }
+    if config.alpha <= 0.0 || config.alpha >= 1.0 {
+        return Err(MetricsError::AlphaOutOfRange {
+            alpha: config.alpha,
+        });
+    }
+    if total_positives < tp_scores.len() as u64 {
+        return Err(MetricsError::TotalPositivesLessThanTp {
+            total_positives,
+            tp_count: tp_scores.len() as u64,
+        });
+    }
 
     if tp_scores.is_empty() && fp_scores.is_empty() {
-        return (0.0, 0.0);
+        return Ok((0.0, 0.0));
     }
 
     let mut rng = StdRng::seed_from_u64(config.seed);
@@ -442,10 +557,7 @@ pub fn bootstrap_ap_ci(
         ap_samples.push(ap_from_curve(&curve));
     }
 
-    ap_samples.sort_unstable_by(|a, b| {
-        a.partial_cmp(b)
-            .expect("AP values must be finite for bootstrap CI")
-    });
+    ap_samples.sort_unstable_by(|a, b| a.total_cmp(b));
 
     // Percentile extraction: floor for the lower bound, ceil for the upper
     // bound produces a conservative (wider) CI — the interval never
@@ -457,10 +569,49 @@ pub fn bootstrap_ap_ci(
     let lo_idx = lo_idx.min(ap_samples.len().saturating_sub(1));
     let hi_idx = hi_idx.min(ap_samples.len().saturating_sub(1));
 
-    (ap_samples[lo_idx], ap_samples[hi_idx])
+    Ok((ap_samples[lo_idx], ap_samples[hi_idx]))
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
+
+/// Threshold-free metrics that depend only on TP/FP/FN-style counts.
+///
+/// `baseline_ap` is included because it intentionally matches
+/// `precision = tp / (tp + fp)` for both count-based and position-based
+/// pipelines.
+#[derive(Debug, Clone, Copy)]
+struct CountScoreTotals {
+    precision: f64,
+    recall: f64,
+    f1: f64,
+    f2: f64,
+    baseline_ap: f64,
+}
+
+/// Compute precision/recall/F1/F2 and baseline AP from count totals.
+#[inline(always)]
+fn count_score_totals(tp: u64, fp: u64, total_positives: u64) -> CountScoreTotals {
+    let precision = safe_div(tp as f64, (tp + fp) as f64);
+    let recall = safe_div(tp as f64, total_positives as f64);
+
+    CountScoreTotals {
+        precision,
+        recall,
+        f1: f_beta_score(1.0, precision, recall),
+        f2: f_beta_score(2.0, precision, recall),
+        baseline_ap: precision,
+    }
+}
+
+/// F-beta from precision/recall with zero-denominator safety.
+#[inline(always)]
+fn f_beta_score(beta: f64, precision: f64, recall: f64) -> f64 {
+    let beta_sq = beta * beta;
+    safe_div(
+        (1.0 + beta_sq) * precision * recall,
+        beta_sq * precision + recall,
+    )
+}
 
 /// A single operating point on the precision-recall curve after tie
 /// collapsing. Each point represents the cumulative precision and recall
@@ -875,7 +1026,7 @@ mod tests {
             item(4, FindingClass::TruePositive),
             item(3, FindingClass::TruePositive),
         ];
-        let m = compute_metrics(&classified, 0, 3);
+        let m = compute_metrics(&classified, 0, 3).unwrap();
         assert!((m.average_precision - 1.0).abs() < EPS);
         assert!((m.precision - 1.0).abs() < EPS);
         assert!((m.recall - 1.0).abs() < EPS);
@@ -911,7 +1062,7 @@ mod tests {
             item(5, FindingClass::FalsePositive),
             item(4, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 3, 3);
+        let m = compute_metrics(&classified, 3, 3).unwrap();
         assert!(m.average_precision.abs() < EPS);
         assert!(m.precision.abs() < EPS);
         assert!(m.recall.abs() < EPS);
@@ -931,7 +1082,7 @@ mod tests {
 
     #[test]
     fn metrics_empty_input() {
-        let m = compute_metrics(&[], 0, 0);
+        let m = compute_metrics(&[], 0, 0).unwrap();
         assert!(m.average_precision.abs() < EPS);
         assert!(m.precision.abs() < EPS);
         assert!(m.recall.abs() < EPS);
@@ -957,7 +1108,7 @@ mod tests {
             item(6, FindingClass::Unlabeled),
             item(4, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 0, 1);
+        let m = compute_metrics(&classified, 0, 1).unwrap();
         assert!((m.precision - 0.5).abs() < EPS); // 1/(1+1)
         assert!((m.recall - 1.0).abs() < EPS); // 1/1
         assert_eq!(m.unlabeled, 2);
@@ -995,7 +1146,7 @@ mod tests {
             item(3, FindingClass::FalsePositive),
             item(2, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 2, 3);
+        let m = compute_metrics(&classified, 2, 3).unwrap();
         // tp=1, fp=3 → baseline = 1 / (1 + 3) = 0.25
         assert!((m.baseline_ap - 0.25).abs() < EPS);
     }
@@ -1007,7 +1158,7 @@ mod tests {
         // new formula gives tp/(tp+fp) = 1/(1+0) = 1.0.
         // The formulas only diverge when there are both FNs and FPs.
         let classified = vec![item(5, FindingClass::TruePositive)];
-        let m = compute_metrics(&classified, 99, 100);
+        let m = compute_metrics(&classified, 99, 100).unwrap();
         // tp=1, fp=0 → baseline = 1.0 (entire scored list is positive)
         assert!((m.baseline_ap - 1.0).abs() < EPS);
 
@@ -1021,7 +1172,7 @@ mod tests {
             item(3, FindingClass::FalsePositive),
             item(2, FindingClass::FalsePositive),
         ];
-        let m2 = compute_metrics(&classified2, 2, 3);
+        let m2 = compute_metrics(&classified2, 2, 3).unwrap();
         assert!(
             (m2.baseline_ap - 0.25).abs() < EPS,
             "expected baseline 0.25 (tp/(tp+fp)), got {}",
@@ -1047,7 +1198,7 @@ mod tests {
             item(2, FindingClass::FalsePositive),
             item(1, FindingClass::TruePositive),
         ];
-        let m = compute_metrics(&classified, 0, 3);
+        let m = compute_metrics(&classified, 0, 3).unwrap();
 
         // P@R: all targets (0.80, 0.90, 0.95) met at conf=1 (R=1.0, P=0.6).
         for r in &m.precision_at_recall {
@@ -1067,7 +1218,7 @@ mod tests {
             item(5, FindingClass::FalsePositive),
             item(4, FindingClass::TruePositive),
         ];
-        let m = compute_metrics(&classified, 0, 1);
+        let m = compute_metrics(&classified, 0, 1).unwrap();
         for r in &m.recall_at_precision {
             assert_eq!(
                 r.value, None,
@@ -1094,7 +1245,7 @@ mod tests {
             item(3, FindingClass::TruePositive),
             item(2, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 0, 3);
+        let m = compute_metrics(&classified, 0, 3).unwrap();
         let r = m.recall_at_precision[0].value.unwrap();
         assert!(
             (r - 1.0).abs() < EPS,
@@ -1111,7 +1262,7 @@ mod tests {
             item(5, FindingClass::TruePositive),
             item(4, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 0, 1);
+        let m = compute_metrics(&classified, 0, 1).unwrap();
         let expected_f2 = 5.0 / 6.0;
         assert!(
             (m.f2 - expected_f2).abs() < EPS,
@@ -1124,6 +1275,47 @@ mod tests {
             m.f2,
             m.f1
         );
+    }
+
+    #[test]
+    fn count_score_totals_matches_closed_form() {
+        let totals = count_score_totals(3, 2, 5);
+        let precision = 3.0 / 5.0;
+        let recall = 3.0 / 5.0;
+        let expected_f1 = 2.0 * precision * recall / (precision + recall);
+        let expected_f2 = 5.0 * precision * recall / (4.0 * precision + recall);
+
+        assert!((totals.precision - precision).abs() < EPS);
+        assert!((totals.recall - recall).abs() < EPS);
+        assert!((totals.f1 - expected_f1).abs() < EPS);
+        assert!((totals.f2 - expected_f2).abs() < EPS);
+        assert!((totals.baseline_ap - precision).abs() < EPS);
+    }
+
+    #[test]
+    fn from_counts_matches_compute_metrics_for_threshold_free_scores() {
+        let cases = &[
+            (0u64, 0u64, 0u64),
+            (0u64, 4u64, 3u64),
+            (1u64, 0u64, 2u64),
+            (3u64, 2u64, 5u64),
+            (10u64, 3u64, 0u64),
+        ];
+
+        for &(tp, fp, fn_count) in cases {
+            let mut classified = Vec::with_capacity((tp + fp) as usize);
+            classified.extend((0..tp).map(|_| item(10, FindingClass::TruePositive)));
+            classified.extend((0..fp).map(|_| item(10, FindingClass::FalsePositive)));
+
+            let from_counts = EvalMetrics::from_counts(tp, fp, fn_count);
+            let from_classified = compute_metrics(&classified, fn_count, tp + fn_count).unwrap();
+
+            assert!((from_counts.precision - from_classified.precision).abs() < EPS);
+            assert!((from_counts.recall - from_classified.recall).abs() < EPS);
+            assert!((from_counts.f1 - from_classified.f1).abs() < EPS);
+            assert!((from_counts.f2 - from_classified.f2).abs() < EPS);
+            assert!((from_counts.baseline_ap - from_classified.baseline_ap).abs() < EPS);
+        }
     }
 
     // ── Bootstrap CI tests ──────────────────────────────────────
@@ -1139,7 +1331,7 @@ mod tests {
             n_iterations: 100,
             ..Default::default()
         };
-        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config);
+        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config).unwrap();
         assert!(
             (lo - 1.0).abs() < EPS,
             "perfect CI lower should be 1.0, got {lo}"
@@ -1160,8 +1352,8 @@ mod tests {
             item(1, FindingClass::TruePositive),
         ];
         let config = BootstrapConfig::default();
-        let (lo1, hi1) = bootstrap_ap_ci(&classified, 3, &config);
-        let (lo2, hi2) = bootstrap_ap_ci(&classified, 3, &config);
+        let (lo1, hi1) = bootstrap_ap_ci(&classified, 3, &config).unwrap();
+        let (lo2, hi2) = bootstrap_ap_ci(&classified, 3, &config).unwrap();
         assert_eq!(lo1, lo2, "bootstrap should be deterministic");
         assert_eq!(hi1, hi2, "bootstrap should be deterministic");
     }
@@ -1181,7 +1373,7 @@ mod tests {
             n_iterations: 500,
             ..Default::default()
         };
-        let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config);
+        let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config).unwrap();
         assert!(lo <= ap + EPS, "ci_lower ({lo}) > AP ({ap})");
         assert!(hi >= ap - EPS, "ci_upper ({hi}) < AP ({ap})");
     }
@@ -1196,7 +1388,7 @@ mod tests {
             n_iterations: 100,
             ..Default::default()
         };
-        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config);
+        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config).unwrap();
         assert!(lo.abs() < EPS, "expected ci_lower=0.0, got {lo}");
         assert!(hi.abs() < EPS, "expected ci_upper=0.0, got {hi}");
     }
@@ -1207,11 +1399,11 @@ mod tests {
             item(5, FindingClass::TruePositive),
             item(4, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 0, 1);
+        let m = compute_metrics(&classified, 0, 1).unwrap();
         assert!(m.ap_ci.is_none());
 
-        let ci = bootstrap_ap_ci(&classified, 1, &BootstrapConfig::default());
-        let m = m.with_bootstrap_ci(ci);
+        let ci = bootstrap_ap_ci(&classified, 1, &BootstrapConfig::default()).unwrap();
+        let m = m.with_bootstrap_ci(ci).unwrap();
         assert!(m.ap_ci.is_some());
         let ci = m.ap_ci.unwrap();
         assert!(ci.lower <= ci.upper);
@@ -1330,7 +1522,7 @@ mod tests {
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
-                let m = compute_metrics(&classified, fn_count, total_pos);
+                let m = compute_metrics(&classified, fn_count, total_pos).unwrap();
                 prop_assert!(
                     m.f1 >= 0.0 && m.f1 <= 1.0,
                     "F1 out of bounds: {}", m.f1
@@ -1347,7 +1539,7 @@ mod tests {
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
-                let m = compute_metrics(&classified, fn_count, total_pos);
+                let m = compute_metrics(&classified, fn_count, total_pos).unwrap();
                 let am = (m.precision + m.recall) / 2.0;
                 prop_assert!(
                     m.f1 <= am + 1e-12,
@@ -1389,7 +1581,7 @@ mod tests {
                 let tp_count = classified.iter()
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
-                let m = compute_metrics(&classified, 0, tp_count);
+                let m = compute_metrics(&classified, 0, tp_count).unwrap();
                 prop_assert_eq!(
                     m.tp + m.fp + m.unlabeled,
                     classified.len() as u64,
@@ -1467,7 +1659,7 @@ mod tests {
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
-                let m = compute_metrics(&classified, fn_count, total_pos);
+                let m = compute_metrics(&classified, fn_count, total_pos).unwrap();
                 for r in &m.precision_at_recall {
                     if let Some(p) = r.value {
                         prop_assert!(
@@ -1488,7 +1680,7 @@ mod tests {
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
-                let m = compute_metrics(&classified, fn_count, total_pos);
+                let m = compute_metrics(&classified, fn_count, total_pos).unwrap();
                 for r in &m.recall_at_precision {
                     if let Some(v) = r.value {
                         prop_assert!(
@@ -1509,7 +1701,7 @@ mod tests {
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
-                let m = compute_metrics(&classified, fn_count, total_pos);
+                let m = compute_metrics(&classified, fn_count, total_pos).unwrap();
                 prop_assert!(
                     m.f2 >= 0.0 && m.f2 <= 1.0,
                     "F2 out of bounds: {}", m.f2
@@ -1527,7 +1719,7 @@ mod tests {
                     .filter(|cf| cf.class == FindingClass::TruePositive)
                     .count() as u64;
                 let total_pos = tp_count + fn_count;
-                let m = compute_metrics(&classified, fn_count, total_pos);
+                let m = compute_metrics(&classified, fn_count, total_pos).unwrap();
                 let eps = 1e-12;
                 if m.recall > m.precision + eps {
                     prop_assert!(
@@ -1552,7 +1744,7 @@ mod tests {
                     .count() as u64;
                 let total_pos = tp_count.max(1);
                 let config = BootstrapConfig { n_iterations: 50, ..Default::default() };
-                let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config);
+                let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config).unwrap();
                 prop_assert!(lo <= hi + 1e-12, "ci_lower ({lo}) > ci_upper ({hi})");
             }
 
@@ -1564,7 +1756,7 @@ mod tests {
                     .count() as u64;
                 let total_pos = tp_count.max(1);
                 let config = BootstrapConfig { n_iterations: 50, ..Default::default() };
-                let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config);
+                let (lo, hi) = bootstrap_ap_ci(&classified, total_pos, &config).unwrap();
                 prop_assert!((0.0..=1.0).contains(&lo), "ci_lower out of bounds: {lo}");
                 prop_assert!((0.0..=1.0).contains(&hi), "ci_upper out of bounds: {hi}");
             }
@@ -1628,7 +1820,7 @@ mod tests {
             item(4, FindingClass::TruePositive),
             item(3, FindingClass::FalsePositive),
         ];
-        let m = compute_metrics(&classified, 0, 2);
+        let m = compute_metrics(&classified, 0, 2).unwrap();
         let par_095 = m
             .precision_at_recall
             .iter()
@@ -1644,59 +1836,69 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "n_iterations must be > 0")]
-    fn bootstrap_zero_iterations_panics() {
+    fn bootstrap_zero_iterations_returns_err() {
         let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             n_iterations: 0,
             ..Default::default()
         };
-        bootstrap_ap_ci(&classified, 1, &config);
+        assert_eq!(
+            bootstrap_ap_ci(&classified, 1, &config).unwrap_err(),
+            MetricsError::ZeroIterations,
+        );
     }
 
     #[test]
-    #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
-    fn bootstrap_alpha_zero_panics() {
+    fn bootstrap_alpha_zero_returns_err() {
         let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             alpha: 0.0,
             ..Default::default()
         };
-        bootstrap_ap_ci(&classified, 1, &config);
+        assert!(matches!(
+            bootstrap_ap_ci(&classified, 1, &config).unwrap_err(),
+            MetricsError::AlphaOutOfRange { .. },
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
-    fn bootstrap_alpha_one_panics() {
+    fn bootstrap_alpha_one_returns_err() {
         let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             alpha: 1.0,
             ..Default::default()
         };
-        bootstrap_ap_ci(&classified, 1, &config);
+        assert!(matches!(
+            bootstrap_ap_ci(&classified, 1, &config).unwrap_err(),
+            MetricsError::AlphaOutOfRange { .. },
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "alpha must be in (0.0, 1.0)")]
-    fn bootstrap_alpha_negative_panics() {
+    fn bootstrap_alpha_negative_returns_err() {
         let classified = vec![item(5, FindingClass::TruePositive)];
         let config = BootstrapConfig {
             alpha: -0.5,
             ..Default::default()
         };
-        bootstrap_ap_ci(&classified, 1, &config);
+        assert!(matches!(
+            bootstrap_ap_ci(&classified, 1, &config).unwrap_err(),
+            MetricsError::AlphaOutOfRange { .. },
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "total_positives (1) must be >= TP count (3)")]
-    fn bootstrap_total_positives_less_than_tp_panics() {
+    fn bootstrap_total_positives_less_than_tp_returns_err() {
         let classified = vec![
             item(5, FindingClass::TruePositive),
             item(4, FindingClass::TruePositive),
             item(3, FindingClass::TruePositive),
         ];
         let config = BootstrapConfig::default();
-        bootstrap_ap_ci(&classified, 1, &config);
+        assert!(matches!(
+            bootstrap_ap_ci(&classified, 1, &config).unwrap_err(),
+            MetricsError::TotalPositivesLessThanTp { .. },
+        ));
     }
 
     #[test]
@@ -1709,7 +1911,7 @@ mod tests {
             n_iterations: 1,
             ..Default::default()
         };
-        let (lo, hi) = bootstrap_ap_ci(&classified, 1, &config);
+        let (lo, hi) = bootstrap_ap_ci(&classified, 1, &config).unwrap();
         assert!(lo <= hi, "single iteration CI should have lo <= hi");
         assert!((0.0..=1.0).contains(&lo), "ci_lower out of bounds: {lo}");
         assert!((0.0..=1.0).contains(&hi), "ci_upper out of bounds: {hi}");
@@ -1725,7 +1927,7 @@ mod tests {
             .map(|i| item(100 - i as i8, FindingClass::TruePositive))
             .collect();
         classified.extend((0..3).map(|i| item(50 - i as i8, FindingClass::FalsePositive)));
-        let m = compute_metrics(&classified, 3, 20);
+        let m = compute_metrics(&classified, 3, 20).unwrap();
 
         let par_80 = m
             .precision_at_recall
@@ -1759,7 +1961,7 @@ mod tests {
     fn bootstrap_empty_scored_input() {
         // Empty classified list → (0.0, 0.0).
         let config = BootstrapConfig::default();
-        let (lo, hi) = bootstrap_ap_ci(&[], 3, &config);
+        let (lo, hi) = bootstrap_ap_ci(&[], 3, &config).unwrap();
         assert!(lo.abs() < EPS, "expected 0.0, got {lo}");
         assert!(hi.abs() < EPS, "expected 0.0, got {hi}");
     }
@@ -1772,7 +1974,7 @@ mod tests {
             item(4, FindingClass::Unlabeled),
         ];
         let config = BootstrapConfig::default();
-        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config);
+        let (lo, hi) = bootstrap_ap_ci(&classified, 3, &config).unwrap();
         assert!(lo.abs() < EPS, "expected 0.0, got {lo}");
         assert!(hi.abs() < EPS, "expected 0.0, got {hi}");
     }
