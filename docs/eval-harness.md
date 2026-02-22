@@ -19,22 +19,22 @@ Use the harness after modifying detection rules, before releases, in CI pipeline
 
 The harness lives in `tools/eval-harness/` as a standalone crate with its own `Cargo.toml`. It depends on `scanner-rs` for the engine and path normalization utilities.
 
-| Module | Role |
-|--------|------|
-| `main.rs` | CLI entry point, subcommand dispatch, pipeline orchestration |
-| `types.rs` | Core domain types: `NormalizedFinding`, `TruthItem`, `TruthLabel`, `ClassifiedFinding`, `FindingClass` |
-| `creddata.rs` | CredData CSV truth loader |
-| `synthetic.rs` | Synthetic JSON manifest truth loader |
-| `leaky_repo.rs` | LeakyRepo CSV expectations and count-based comparison |
-| `finding_parser.rs` | Scanner JSONL output parser, deduplication |
-| `line_index.rs` | Byte-offset to line-number conversion (O(log n) binary search) |
-| `fs_walk.rs` | Recursive file collection (internal utility) |
-| `matching.rs` | Position-based finding-to-truth matching (greedy, confidence-sorted) |
-| `metrics.rs` | Precision, recall, F1, F2, AP, P@R, R@P, bootstrap CI, per-rule breakdown |
-| `provenance.rs` | BLAKE3 corpus/binary/ruleset hashing for reproducibility |
-| `regression.rs` | Baseline comparison with CI overlap gating and two-tier verdicts |
-| `report.rs` | Report assembly, JSON/table rendering, error book generation |
-| `lib.rs` | Module re-exports |
+| Module              | Role                                                                                                   |
+|---------------------|--------------------------------------------------------------------------------------------------------|
+| `main.rs`           | CLI entry point, subcommand dispatch, pipeline orchestration                                           |
+| `types.rs`          | Core domain types: `NormalizedFinding`, `TruthItem`, `TruthLabel`, `ClassifiedFinding`, `FindingClass` |
+| `creddata.rs`       | CredData CSV truth loader                                                                              |
+| `synthetic.rs`      | Synthetic JSON manifest truth loader                                                                   |
+| `leaky_repo.rs`     | LeakyRepo CSV expectations and count-based comparison                                                  |
+| `finding_parser.rs` | Scanner JSONL output parser, deduplication                                                             |
+| `line_index.rs`     | Byte-offset to line-number conversion (O(log n) binary search)                                         |
+| `fs_walk.rs`        | Recursive file collection (internal utility)                                                           |
+| `matching.rs`       | Position-based finding-to-truth matching (greedy, confidence-sorted)                                   |
+| `metrics.rs`        | Precision, recall, F1, F2, AP, P@R, R@P, bootstrap CI, per-rule breakdown                              |
+| `provenance.rs`     | BLAKE3 corpus/binary/ruleset hashing for reproducibility                                               |
+| `regression.rs`     | Baseline comparison with CI overlap gating and two-tier verdicts                                       |
+| `report.rs`         | Report assembly, JSON/table rendering, error book generation                                           |
+| `lib.rs`            | Module re-exports                                                                                      |
 
 ### Data Flow
 
@@ -88,18 +88,18 @@ Greedy matching is required for valid PRC-AUC: it produces nested TP sets across
 
 ### Metrics Computed
 
-| Metric | Description |
-|--------|-------------|
-| Average Precision (AP) | Step-function AP with tie collapsing (matches sklearn's `average_precision_score`) |
-| Precision | TP / (TP + FP) |
-| Recall | TP / (TP + FN) |
-| F1 | Harmonic mean of precision and recall |
-| F2 | Recall-weighted F-score (β=2); weights recall 4x more than precision |
-| Baseline AP | Class prevalence among scored items (`tp / (tp + fp)`); the expected AP of a random ranker |
-| P@R | Precision at fixed recall targets (default: 0.80, 0.90, 0.95) |
-| R@P | Recall at fixed precision targets (default: 0.95) |
-| Bootstrap CI | Percentile-based confidence interval for AP via stratified resampling (default: 1000 iterations, α=0.05, seed=42) |
-| Per-rule breakdown | TP, FP, and precision per detection rule |
+| Metric                 | Description                                                                                                       |
+|------------------------|-------------------------------------------------------------------------------------------------------------------|
+| Average Precision (AP) | Step-function AP with tie collapsing (matches sklearn's `average_precision_score`)                                |
+| Precision              | TP / (TP + FP)                                                                                                    |
+| Recall                 | TP / (TP + FN)                                                                                                    |
+| F1                     | Harmonic mean of precision and recall                                                                             |
+| F2                     | Recall-weighted F-score (β=2); weights recall 4x more than precision                                              |
+| Baseline AP            | Class prevalence among scored items (`tp / (tp + fp)`); the expected AP of a random ranker                        |
+| P@R                    | Precision at fixed recall targets (default: 0.80, 0.90, 0.95)                                                     |
+| R@P                    | Recall at fixed precision targets (default: 0.95)                                                                 |
+| Bootstrap CI           | Percentile-based confidence interval for AP via stratified resampling (default: 1000 iterations, α=0.05, seed=42) |
+| Per-rule breakdown     | TP, FP, and precision per detection rule                                                                          |
 
 ## CLI Usage
 
@@ -159,11 +159,11 @@ The `leaky-repo` subcommand only supports `--findings` (no live scan).
 
 ### Exit Codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Pass or Warn — metrics meet thresholds (or no baseline provided) |
-| 1 | Block — regression detected against `--baseline` report |
-| 2 | Argument or runtime error |
+| Code | Meaning                                                          |
+|------|------------------------------------------------------------------|
+| 0    | Pass or Warn — metrics meet thresholds (or no baseline provided) |
+| 1    | Block — regression detected against `--baseline` report          |
+| 2    | Argument or runtime error                                        |
 
 ## Quick Start
 
@@ -234,11 +234,11 @@ Secret scanning typically prioritizes recall (missed secrets are dangerous) over
 
 When a `--baseline` is provided, the harness compares current metrics against the baseline:
 
-| Verdict | Meaning | Default Threshold |
-|---------|---------|-------------------|
-| **Pass** | No meaningful regression detected | AP drop < 0.5pp AND precision drop < 0.5pp |
-| **Warn** | Small regression detected (non-blocking) | AP drop 0.5pp–2pp OR precision drop 0.5pp–2pp |
-| **Block** | Significant regression detected | AP drop ≥ 2pp OR precision drop ≥ 2pp |
+| Verdict   | Meaning                                  | Default Threshold                             |
+|-----------|------------------------------------------|-----------------------------------------------|
+| **Pass**  | No meaningful regression detected        | AP drop < 0.5pp AND precision drop < 0.5pp    |
+| **Warn**  | Small regression detected (non-blocking) | AP drop 0.5pp–2pp OR precision drop 0.5pp–2pp |
+| **Block** | Significant regression detected          | AP drop ≥ 2pp OR precision drop ≥ 2pp         |
 
 The **CI overlap gate** (enabled by default) provides a safety valve: if the baseline AP falls within the current run's bootstrap confidence interval, the drop is attributable to sampling noise and the check returns Pass regardless of the raw delta.
 
