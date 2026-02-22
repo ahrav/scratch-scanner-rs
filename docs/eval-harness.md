@@ -17,7 +17,7 @@ Use the harness after modifying detection rules, before releases, in CI pipeline
 
 ### Module Map
 
-The harness lives in `tools/eval-harness/` as a standalone crate (14 source files, ~10,700 lines) with its own `Cargo.toml`. It depends on `scanner-rs` for the engine and path normalization utilities.
+The harness lives in `tools/eval-harness/` as a standalone crate with its own `Cargo.toml`. It depends on `scanner-rs` for the engine and path normalization utilities.
 
 | Module | Role |
 |--------|------|
@@ -147,7 +147,7 @@ eval-harness leaky-repo \
 
 Position-based subcommands (`creddata`, `synthetic`) accept findings from two mutually exclusive sources:
 
-- **`--findings <path>`** — Pre-computed JSONL from a previous scanner run. Each line is a JSON object with `path`, `start_byte`, `end_byte`, `rule`, and optional `confidence` fields.
+- **`--findings <path>`** — Pre-computed JSONL from a previous scanner run. Finding lines use scanner wire fields: `type: "finding"`, `path`, `start`, `end`, `rule`, and optional `confidence_score`.
 - **`--scan-corpus <dir>`** — Live-scan a directory using the embedded `scanner_rs::demo_engine()` with the default ruleset. Findings are collected via an in-memory event sink and re-parsed through the same JSONL path. Intended for quick iteration during rule development on small-to-medium corpora.
 
 The `leaky-repo` subcommand only supports `--findings` (no live scan).
@@ -244,7 +244,7 @@ The **CI overlap gate** (enabled by default) provides a safety valve: if the bas
 
 ### Error Book
 
-In JSON output mode, the `error_book` field lists the top false positives and false negatives grouped by rule, sorted by frequency descending. Each FP entry includes a context window around the detection span (optionally BLAKE3-redacted). Use this to identify:
+In JSON output mode, the `error_book` field lists the top false positives and false negatives grouped by rule, sorted by frequency descending. Each FP entry may include a context window around the detection span (optionally BLAKE3-redacted). With the current CLI defaults, `redacted_context` is usually `null` unless context output is explicitly enabled. Use this to identify:
 
 - **Recurring FP patterns** — Rules that consistently fire on non-secrets (e.g., placeholder tokens, test fixtures).
 - **Missing detections** — Truth items that no finding matched, indicating gaps in rule coverage.

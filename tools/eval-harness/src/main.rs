@@ -54,7 +54,7 @@
 //!
 //! | Code | Meaning |
 //! |------|---------|
-//! | 0    | Pass or warn — metrics meet thresholds |
+//! | 0    | Pass/warn for position-based pipelines; always 0 for `leaky-repo` (no regression gate) |
 //! | 1    | Block — regression detected against a `--baseline` report |
 //! | 2    | Argument or runtime error |
 
@@ -279,7 +279,7 @@ fn run_creddata(args: CreddataArgs) -> Result<i32, Box<dyn Error>> {
         }
     }
 
-    run_position_pipeline(dir_result.parsed.items, &args.common, &canonical_root)
+    run_position_pipeline(dir_result.parsed.items, &args.common)
 }
 
 /// Load a synthetic JSON manifest and evaluate via the position-based pipeline.
@@ -291,7 +291,7 @@ fn run_synthetic(args: SyntheticArgs) -> Result<i32, Box<dyn Error>> {
     let canonical_root = canonicalize_root(&args.common.corpus_root);
     let truth = load_synthetic_manifest(&args.manifest, &canonical_root)?;
 
-    run_position_pipeline(truth, &args.common, &canonical_root)
+    run_position_pipeline(truth, &args.common)
 }
 
 /// Run the count-based evaluation pipeline for LeakyRepo.
@@ -351,7 +351,9 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 /// This is the shared core of `creddata` and `synthetic` subcommands.
 /// The caller provides truth items (already loaded and normalized);
 /// this function handles everything from finding ingestion through
-/// final report output.
+/// final report output. It derives the canonical path root from
+/// `args.corpus_root` internally so path normalization has a single
+/// source of truth in this stage.
 ///
 /// # Pipeline steps
 ///
@@ -383,14 +385,14 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 fn run_position_pipeline(
     truth: Vec<TruthItem>,
     args: &PositionPipelineArgs,
-    canonical_root: &str,
 ) -> Result<i32, Box<dyn Error>> {
     validate_output_format(args.format, args.output.as_deref())?;
+    let canonical_root = canonicalize_root(&args.corpus_root);
 
     let mut findings = load_findings(
         args.findings.as_deref(),
         args.scan_corpus.as_deref(),
-        canonical_root,
+        &canonical_root,
     )?;
     dedup_findings(&mut findings);
 
