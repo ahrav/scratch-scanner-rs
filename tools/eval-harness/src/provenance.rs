@@ -57,7 +57,7 @@
 //!   memory flat even when the corpus contains large files.
 
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -140,14 +140,10 @@ pub struct Provenance {
 ///   Empty files still contribute their path and a zero content-length field.
 pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
     let mut files = Vec::with_capacity(1024);
-    collect_files_recursive(corpus_dir, &mut files)?;
+    crate::fs_walk::collect_files_recursive(corpus_dir, &mut files)?;
     files.sort_unstable();
 
-    let mut hasher = blake3::Hasher::new();
-    // Domain prefix: prevents a corpus hash from colliding with a single-file hash
-    // even if the byte streams happen to match.
-    hasher.update(CORPUS_DOMAIN);
-    hasher.update(&[0x00]);
+    let mut hasher = init_corpus_hasher();
 
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
@@ -184,6 +180,55 @@ pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
         file_count,
         total_bytes,
     ))
+}
+
+/// Hash an in-memory corpus snapshot using the same framing as [`hash_corpus`].
+///
+/// The snapshot is represented as `(relative_path, bytes)` tuples and is sorted
+/// by raw relative-path bytes before hashing, so caller iteration order does not
+/// affect the digest. Framing and domain separation are identical to filesystem
+/// hashing:
+///
+/// `path_len_u64_le || relative_path_bytes || content_len_u64_le || bytes`
+///
+/// This allows callers that already have file bytes in memory to compute
+/// provenance without re-reading files from disk.
+pub fn hash_corpus_snapshot<'a, I>(snapshot: I) -> (String, u64, u64)
+where
+    I: IntoIterator<Item = (&'a Path, &'a [u8])>,
+{
+    let mut records: Vec<(&Path, &[u8])> = snapshot.into_iter().collect();
+    records.sort_unstable_by(|(left_path, _), (right_path, _)| {
+        path_bytes(left_path).cmp(path_bytes(right_path))
+    });
+
+    let mut hasher = init_corpus_hasher();
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+
+    for (rel_path, contents) in records {
+        update_len_prefixed(&mut hasher, path_bytes(rel_path));
+        hasher.update(&(contents.len() as u64).to_le_bytes());
+        hasher.update(contents);
+        file_count += 1;
+        total_bytes += contents.len() as u64;
+    }
+
+    (
+        hasher.finalize().to_hex().to_string(),
+        file_count,
+        total_bytes,
+    )
+}
+
+#[inline]
+fn init_corpus_hasher() -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    // Domain prefix: prevents a corpus hash from colliding with a single-file hash
+    // even if the byte streams happen to match.
+    hasher.update(CORPUS_DOMAIN);
+    hasher.update(&[0x00]);
+    hasher
 }
 
 #[inline]
@@ -268,6 +313,32 @@ pub fn build_provenance(
 ) -> io::Result<Provenance> {
     let (corpus_hash, corpus_file_count, corpus_total_bytes) = hash_corpus(corpus_dir)?;
 
+    build_provenance_from_precomputed(
+        corpus_hash,
+        corpus_file_count,
+        corpus_total_bytes,
+        binary_path,
+        ruleset_path,
+    )
+}
+
+/// Build [`Provenance`] from a precomputed corpus digest tuple.
+///
+/// This helper is for callers that already hold a corpus snapshot in memory
+/// (for example, a path->bytes map used during matching) and therefore should
+/// not re-read the corpus just to populate provenance.
+///
+/// `corpus_hash`, `corpus_file_count`, and `corpus_total_bytes` must have been
+/// computed with the same corpus framing/domain semantics as [`hash_corpus`] or
+/// [`hash_corpus_snapshot`]. Optional binary and ruleset hashes are still
+/// computed from disk when paths are provided.
+pub fn build_provenance_from_precomputed(
+    corpus_hash: String,
+    corpus_file_count: u64,
+    corpus_total_bytes: u64,
+    binary_path: Option<&Path>,
+    ruleset_path: Option<&Path>,
+) -> io::Result<Provenance> {
     let binary_hash = binary_path
         .map(|p| hash_file_streaming(p, FILE_DOMAIN))
         .transpose()?;
@@ -285,32 +356,19 @@ pub fn build_provenance(
     })
 }
 
-/// Recursively collect regular file paths under `dir` into `out`.
+/// Backward-compatible traversal wrapper.
 ///
-/// Symlinks and special files (sockets, FIFOs, device nodes) are intentionally
-/// skipped. Symlinks are excluded because they can point outside the corpus
-/// tree or create cycles, and their resolution depends on the host filesystem
-/// layout — including them would break cross-machine reproducibility.
-///
-/// Traversal is fail-fast: any `read_dir` / `file_type` error aborts
-/// immediately and is returned to the caller.
-pub fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            collect_files_recursive(&entry.path(), out)?;
-        } else if ft.is_file() {
-            out.push(entry.path());
-        }
-    }
-    Ok(())
+/// Ownership of recursion logic lives in [`crate::fs_walk`]; this function
+/// delegates there so existing callers can migrate incrementally.
+pub fn collect_files_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> io::Result<()> {
+    crate::fs_walk::collect_files_recursive(dir, out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Helper: create a temp dir with files, return the TempDir handle.
@@ -324,6 +382,21 @@ mod tests {
             fs::write(&path, contents).unwrap();
         }
         dir
+    }
+
+    /// Helper: build a `(relative_path, bytes)` snapshot from a corpus dir.
+    fn snapshot(corpus_root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        crate::fs_walk::collect_files_recursive(corpus_root, &mut files).unwrap();
+
+        files
+            .into_iter()
+            .map(|path| {
+                let rel = path.strip_prefix(corpus_root).unwrap().to_path_buf();
+                let bytes = fs::read(path).unwrap();
+                (rel, bytes)
+            })
+            .collect()
     }
 
     #[test]
@@ -345,6 +418,42 @@ mod tests {
         assert_eq!(h1, h2, "empty dir must produce deterministic hash");
         assert_eq!(count, 0);
         assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn hash_corpus_snapshot_matches_hash_corpus() {
+        let dir = corpus(&[
+            ("nested/a.txt", b"hello"),
+            ("nested/b.bin", b"\x00\xff\x12"),
+            ("root.txt", b"world"),
+        ]);
+        let expected = hash_corpus(dir.path()).unwrap();
+        let snap = snapshot(dir.path());
+
+        let actual = hash_corpus_snapshot(
+            snap.iter()
+                .map(|(rel_path, bytes)| (rel_path.as_path(), bytes.as_slice())),
+        );
+        assert_eq!(
+            actual, expected,
+            "snapshot hashing must match filesystem hashing for identical corpus contents"
+        );
+    }
+
+    #[test]
+    fn hash_corpus_snapshot_is_order_independent() {
+        let unordered = vec![
+            (Path::new("b.txt"), b"two".as_ref()),
+            (Path::new("a.txt"), b"one".as_ref()),
+        ];
+        let reversed = vec![
+            (Path::new("a.txt"), b"one".as_ref()),
+            (Path::new("b.txt"), b"two".as_ref()),
+        ];
+
+        let h1 = hash_corpus_snapshot(unordered);
+        let h2 = hash_corpus_snapshot(reversed);
+        assert_eq!(h1, h2, "snapshot hash must not depend on caller order");
     }
 
     #[test]
@@ -393,6 +502,31 @@ mod tests {
     }
 
     #[test]
+    fn build_provenance_from_precomputed_none_binary() {
+        let dir = corpus(&[("a.txt", b"data")]);
+        let snapshot = snapshot(dir.path());
+        let (corpus_hash, corpus_file_count, corpus_total_bytes) = hash_corpus_snapshot(
+            snapshot
+                .iter()
+                .map(|(rel_path, bytes)| (rel_path.as_path(), bytes.as_slice())),
+        );
+
+        let prov = build_provenance_from_precomputed(
+            corpus_hash,
+            corpus_file_count,
+            corpus_total_bytes,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(prov.binary_hash.is_none());
+        assert!(prov.ruleset_hash.is_none());
+        assert_eq!(prov.corpus_file_count, 1);
+        assert_eq!(prov.corpus_total_bytes, 4);
+    }
+
+    #[test]
     fn build_provenance_with_binary_and_ruleset() {
         let dir = corpus(&[("a.txt", b"corpus data")]);
 
@@ -417,6 +551,51 @@ mod tests {
         );
         assert_eq!(prov.corpus_file_count, 1);
         assert_eq!(prov.corpus_total_bytes, 11); // b"corpus data".len()
+    }
+
+    #[test]
+    fn build_provenance_from_precomputed_matches_full_build() {
+        let dir = corpus(&[("a.txt", b"corpus data"), ("nested/c.txt", b"more data")]);
+        let full = hash_corpus(dir.path()).unwrap();
+
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("scanner.bin");
+        fs::write(&bin_path, b"binary-content-bytes").unwrap();
+
+        let rule_dir = TempDir::new().unwrap();
+        let rule_path = rule_dir.path().join("rules.yaml");
+        fs::write(&rule_path, b"ruleset-content-bytes").unwrap();
+
+        let from_fs = build_provenance(dir.path(), Some(&bin_path), Some(&rule_path)).unwrap();
+        let from_precomputed = build_provenance_from_precomputed(
+            full.0,
+            full.1,
+            full.2,
+            Some(&bin_path),
+            Some(&rule_path),
+        )
+        .unwrap();
+
+        assert_eq!(
+            from_precomputed.corpus_hash, from_fs.corpus_hash,
+            "precomputed and full provenance builds must agree on corpus hash"
+        );
+        assert_eq!(
+            from_precomputed.binary_hash, from_fs.binary_hash,
+            "precomputed and full provenance builds must agree on binary hash"
+        );
+        assert_eq!(
+            from_precomputed.ruleset_hash, from_fs.ruleset_hash,
+            "precomputed and full provenance builds must agree on ruleset hash"
+        );
+        assert_eq!(
+            from_precomputed.corpus_file_count, from_fs.corpus_file_count,
+            "precomputed and full provenance builds must agree on file count"
+        );
+        assert_eq!(
+            from_precomputed.corpus_total_bytes, from_fs.corpus_total_bytes,
+            "precomputed and full provenance builds must agree on byte count"
+        );
     }
 
     #[test]

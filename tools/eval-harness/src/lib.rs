@@ -1,5 +1,6 @@
 pub mod creddata;
 pub mod finding_parser;
+pub(crate) mod fs_walk;
 pub mod leaky_repo;
 pub mod line_index;
 pub mod matching;

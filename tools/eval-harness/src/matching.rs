@@ -32,7 +32,7 @@
 //! - **Placeholder** truth items are **not** consumed — multiple findings at an
 //!   ignore region should all be excluded from scoring (Unlabeled).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -196,8 +196,12 @@ impl MatchResult {
 ///
 /// # Panics
 ///
-/// Panics (hard `assert!`, not debug-only) if the conservation invariants
-/// are violated after classification:
+/// Panics (hard `assert!`, not debug-only) if:
+///
+/// - `findings` contains duplicate identities by [`NormalizedFinding`] equality
+///   (`path`, `byte_start`, `byte_end`, `rule`; confidence is ignored):
+///   `findings must be deduplicated before matching`.
+/// - the conservation invariants are violated after classification:
 ///
 /// - `tp + fp + unlabeled != findings.len()`
 /// - `tp + fn != total positive truth items`
@@ -218,10 +222,12 @@ pub fn match_findings(
     config: MatchConfig,
 ) -> MatchResult {
     // ── Precondition: findings are deduplicated ────────────────────
-    // Precondition: duplicates inflate TP counts. The hard conservation
-    // assertions at the end of this function serve as an additional backstop.
+    // Identity-level duplicates inflate TP counts. Identity here matches
+    // NormalizedFinding Eq/Hash (path/start/end/rule), ignoring confidence.
+    // The hard conservation assertions below are an additional backstop.
+    let mut seen = HashSet::with_capacity(findings.len());
     assert!(
-        findings.windows(2).all(|w| w[0] != w[1]),
+        findings.iter().all(|finding| seen.insert(finding)),
         "findings must be deduplicated before matching"
     );
 
@@ -907,6 +913,21 @@ mod tests {
         // "r1" < "r2" in Ord, so r1 is processed first and gets TP.
         assert_eq!(result1.classified[0].class, FindingClass::TruePositive);
         assert_eq!(result1.classified[0].finding.rule, "r1");
+    }
+
+    #[test]
+    #[should_panic(expected = "findings must be deduplicated before matching")]
+    fn duplicate_findings_precondition_panics() {
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "dup", 10),
+            make_finding(SIMPLE_PATH, 5, 9, "other", 9),
+            // Duplicate identity (path/start/end/rule) with different confidence.
+            make_finding(SIMPLE_PATH, 0, 4, "dup", 1),
+        ];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 2, TruthLabel::Positive, "r")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+
+        let _ = match_findings(findings, truth, &fc, default_config());
     }
 
     #[test]

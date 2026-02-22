@@ -25,10 +25,12 @@
 //!   truth loader ──► TruthItem[]
 //!                                ├─► match_findings ──► ClassifiedFinding[]
 //!   finding source ──► NormalizedFinding[]              ├─► compute_metrics ──► EvalMetrics
-//!   corpus files ──► HashMap<path, bytes>               ├─► bootstrap_ap_ci ──► CI
+//!   corpus files ──► HashMap<path, bytes>               ├─► hash_corpus_snapshot ──► build_provenance_from_precomputed ──► Provenance
+//!                                                       ├─► bootstrap_ap_ci ──► CI
 //!                                                       ├─► check_regression ──► Verdict
-//!                                                       └─► build_error_book ──► ErrorBook
+//!                                                       └─► build_error_book [JSON only] ──► ErrorBook
 //!                                                                   └─► EvalReport ──► JSON / table
+//!                                                                                     (table leaves error_book unset)
 //!
 //! Count-based (leaky-repo):
 //!   expectations CSV ──► FileExpectation[]
@@ -40,7 +42,8 @@
 //! # Finding sources
 //!
 //! Position-based subcommands accept findings from two mutually exclusive
-//! sources (enforced by clap argument groups):
+//! sources (enforced by clap argument groups), and runtime checks ensure
+//! the selection is non-empty:
 //!
 //! - `--findings <path>` — pre-computed JSONL from a previous scanner run.
 //! - `--scan-corpus <dir>` — live-scan a directory using the embedded
@@ -67,12 +70,16 @@ use eval_harness::finding_parser::{
     JsonlParseResult, dedup_findings, parse_findings_file, parse_findings_jsonl,
 };
 use eval_harness::leaky_repo::{compare_counts, parse_leaky_repo_csv};
-use eval_harness::matching::{MatchConfig, match_findings};
+use eval_harness::matching::{MatchConfig, MatchResult, match_findings};
 use eval_harness::metrics::{BootstrapConfig, EvalMetrics, bootstrap_ap_ci, compute_metrics};
-use eval_harness::provenance::{build_provenance, collect_files_recursive};
-use eval_harness::regression::{RegressionThresholds, check_regression};
+use eval_harness::provenance::{
+    Provenance, build_provenance, build_provenance_from_precomputed, collect_files_recursive,
+    hash_corpus_snapshot,
+};
+use eval_harness::regression::{RegressionResult, RegressionThresholds, check_regression};
 use eval_harness::report::{
-    ErrorBookConfig, EvalReport, build_error_book, render_json, render_table, write_json_file,
+    ErrorBook, ErrorBookConfig, EvalReport, build_error_book, render_json, render_table,
+    write_json_file,
 };
 use eval_harness::synthetic::load_synthetic_manifest;
 use eval_harness::types::{NormalizedFinding, TruthItem, normalize_path};
@@ -119,7 +126,8 @@ enum Command {
 ///
 /// Finding sources are mutually exclusive (enforced by clap argument group
 /// `"input"`): either `--findings` (pre-computed JSONL) or `--scan-corpus`
-/// (live scan) must be provided.
+/// (live scan) must be provided. Runtime validation keeps this defense in
+/// depth by rejecting empty source selection.
 #[derive(clap::Args)]
 struct PositionPipelineArgs {
     /// Pre-computed findings JSONL file.
@@ -179,6 +187,11 @@ struct LeakyRepoArgs {
     /// Pre-computed findings JSONL file.
     #[arg(long)]
     findings: PathBuf,
+
+    /// Path normalization root (stripped from finding paths) and corpus root
+    /// used for provenance hashing.
+    #[arg(long)]
+    corpus_root: PathBuf,
 
     /// Output format.
     #[arg(long, default_value = "json")]
@@ -300,9 +313,10 @@ fn run_synthetic(args: SyntheticArgs) -> Result<i32, Box<dyn Error>> {
 /// `--baseline` flag), so the exit code is always 0.
 fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
     validate_output_format(args.format, args.output.as_deref())?;
+    let canonical_root = canonicalize_root(&args.corpus_root);
 
     let expectations = parse_leaky_repo_csv(&args.secrets_csv)?;
-    let parse_result = parse_findings_file(&args.findings, "")?;
+    let parse_result = parse_findings_file(&args.findings, &canonical_root)?;
     print_parse_diagnostics(&parse_result);
 
     let comparisons = compare_counts(parse_result.findings, &expectations);
@@ -317,13 +331,7 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 
     let metrics = EvalMetrics::from_counts(tp, fp, false_neg);
 
-    let provenance = build_provenance(
-        args.secrets_csv
-            .parent()
-            .ok_or("secrets CSV path must include a directory component")?,
-        None,
-        None,
-    )?;
+    let provenance = build_provenance(&args.corpus_root, None, None)?;
 
     let report = EvalReport {
         metrics,
@@ -352,8 +360,9 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 /// 2. **Load findings** — from pre-computed JSONL or a live scan.
 /// 3. **Dedup** — sort + dedup findings, retaining highest confidence per
 ///    identity (path, byte_start, byte_end, rule).
-/// 4. **Load corpus files** — read all files under `corpus_root` into
-///    memory for byte-to-line conversion during matching.
+/// 4. **Load corpus snapshot** — read all files under `corpus_root` once
+///    into memory for matching and derive corpus hash/count/bytes from that
+///    same snapshot for provenance (no second corpus read).
 /// 5. **Match** — classify each finding as TP, FP, or Unlabeled using
 ///    position-based overlap with truth items. Rule matching is disabled
 ///    (`require_rule_match: false`) so any finding overlapping a truth
@@ -363,8 +372,9 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 /// 7. **Regression check** — if a baseline report is provided, compare
 ///    current metrics against it using default thresholds (2pp block,
 ///    0.5pp warn) with CI overlap gating.
-/// 8. **Report** — assemble all outputs into an [`EvalReport`] and
-///    render to JSON or table format.
+/// 8. **Report** — assemble all outputs into an [`EvalReport`], building
+///    `error_book` only for JSON output mode (table mode skips the builder
+///    and keeps `error_book = None`), then render JSON or table.
 ///
 /// # Exit code
 ///
@@ -384,59 +394,115 @@ fn run_position_pipeline(
     )?;
     dedup_findings(&mut findings);
 
-    let file_contents = load_corpus_files(&args.corpus_root)?;
-    let config = MatchConfig {
-        require_rule_match: false,
-    };
-    let match_result = match_findings(findings, truth, &file_contents, config);
-
-    let total_positives = match_result.total_positives();
-    let fn_count = match_result.fn_count();
-
-    let metrics = compute_metrics(&match_result.classified, fn_count, total_positives)?;
-
-    let ci = bootstrap_ap_ci(
-        &match_result.classified,
-        total_positives,
-        &BootstrapConfig::default(),
-    )?;
-    let metrics = metrics.with_bootstrap_ci(ci)?;
-
-    let provenance = build_provenance(&args.corpus_root, None, None)?;
-
-    let regression = if let Some(bp) = args.baseline.as_deref() {
-        let baseline_report = load_baseline(bp)?;
-        let result = check_regression(
-            &metrics,
-            &baseline_report.metrics,
-            &RegressionThresholds::default(),
-        )?;
-        Some(result)
-    } else {
-        None
-    };
-
-    let error_book = build_error_book(
-        &match_result.classified,
-        &match_result.false_negatives,
-        &file_contents,
-        &ErrorBookConfig::default(),
-    );
-
-    let exit_code = regression
-        .as_ref()
-        .map(|r| r.verdict.exit_code())
-        .unwrap_or(0);
+    let snapshot = load_corpus_snapshot(&args.corpus_root)?;
+    let match_result = run_position_matching(findings, truth, &snapshot.file_contents);
+    let metrics = compute_position_metrics(&match_result)?;
+    let provenance = build_position_provenance(&snapshot)?;
+    let regression = maybe_check_regression(&metrics, args.baseline.as_deref())?;
+    let error_book = maybe_build_error_book_for_output(args.format, || {
+        build_error_book(
+            &match_result.classified,
+            &match_result.false_negatives,
+            &snapshot.file_contents,
+            &ErrorBookConfig::default(),
+        )
+    });
+    let exit_code = regression_exit_code(regression.as_ref());
 
     let report = EvalReport {
         metrics,
         provenance,
         regression,
-        error_book: Some(error_book),
+        error_book,
     };
 
     output_report(&report, args.format, args.output.as_deref())?;
     Ok(exit_code)
+}
+
+/// In-memory corpus snapshot used by the position-based pipeline.
+///
+/// The snapshot contains path-keyed file bytes for matching/error-book
+/// assembly, plus a precomputed corpus digest tuple used to build
+/// provenance without re-reading files from disk.
+struct CorpusSnapshot {
+    file_contents: HashMap<String, Vec<u8>>,
+    corpus_hash: String,
+    corpus_file_count: u64,
+    corpus_total_bytes: u64,
+}
+
+/// Match findings to truth using byte/line overlap semantics.
+fn run_position_matching(
+    findings: Vec<NormalizedFinding>,
+    truth: Vec<TruthItem>,
+    file_contents: &HashMap<String, Vec<u8>>,
+) -> MatchResult {
+    let config = MatchConfig {
+        require_rule_match: false,
+    };
+    match_findings(findings, truth, file_contents, config)
+}
+
+/// Compute confidence-aware metrics and AP bootstrap CI for a match result.
+fn compute_position_metrics(match_result: &MatchResult) -> Result<EvalMetrics, Box<dyn Error>> {
+    let total_positives = match_result.total_positives();
+    let fn_count = match_result.fn_count();
+    let metrics = compute_metrics(&match_result.classified, fn_count, total_positives)?;
+    let ci = bootstrap_ap_ci(
+        &match_result.classified,
+        total_positives,
+        &BootstrapConfig::default(),
+    )?;
+    Ok(metrics.with_bootstrap_ci(ci)?)
+}
+
+/// Build provenance from precomputed snapshot hash/count/bytes.
+fn build_position_provenance(snapshot: &CorpusSnapshot) -> Result<Provenance, Box<dyn Error>> {
+    Ok(build_provenance_from_precomputed(
+        snapshot.corpus_hash.clone(),
+        snapshot.corpus_file_count,
+        snapshot.corpus_total_bytes,
+        None,
+        None,
+    )?)
+}
+
+/// Compare metrics against a baseline report when provided.
+fn maybe_check_regression(
+    metrics: &EvalMetrics,
+    baseline_path: Option<&Path>,
+) -> Result<Option<RegressionResult>, Box<dyn Error>> {
+    let Some(path) = baseline_path else {
+        return Ok(None);
+    };
+    let baseline_report = load_baseline(path)?;
+    let result = check_regression(
+        metrics,
+        &baseline_report.metrics,
+        &RegressionThresholds::default(),
+    )?;
+    Ok(Some(result))
+}
+
+/// Build error_book only for JSON output mode.
+///
+/// For table output this returns `None` without invoking `build`, so
+/// expensive error-book assembly is skipped entirely.
+fn maybe_build_error_book_for_output<F>(format: OutputFormat, build: F) -> Option<ErrorBook>
+where
+    F: FnOnce() -> ErrorBook,
+{
+    if matches!(format, OutputFormat::Json) {
+        Some(build())
+    } else {
+        None
+    }
+}
+
+/// Convert optional regression verdict to process exit code.
+fn regression_exit_code(regression: Option<&RegressionResult>) -> i32 {
+    regression.map_or(0, |r| r.verdict.exit_code())
 }
 
 // ── Finding loaders ─────────────────────────────────────────────────────
@@ -445,9 +511,9 @@ fn run_position_pipeline(
 ///
 /// The clap `group = "input"` attribute on the CLI arguments enforces
 /// mutual exclusivity at the argument-parsing level. This function
-/// provides a runtime guard as a defense-in-depth check for the case
-/// where both or neither source is provided (e.g., programmatic callers
-/// that bypass clap).
+/// provides defense-in-depth runtime guards for non-empty selection:
+/// exactly one source must be present (both and neither are rejected),
+/// which protects programmatic callers that bypass clap.
 ///
 /// Diagnostics (malformed lines, skipped findings) are emitted to stderr
 /// regardless of the source to give visibility into data quality issues.
@@ -529,7 +595,8 @@ fn run_live_scan(
         ..LocalConfig::default()
     };
 
-    scan_local(engine, VecFileSource::new(local_files), cfg);
+    let report = scan_local(engine, VecFileSource::new(local_files), cfg);
+    validate_scan_health(&report)?;
 
     let bytes = sink.take();
     let jsonl = String::from_utf8(bytes).map_err(|e| {
@@ -545,23 +612,66 @@ fn run_live_scan(
     Ok(result.findings)
 }
 
+/// Validate live-scan health before consuming emitted findings.
+///
+/// The eval harness requires complete scan output. Any I/O errors,
+/// dropped findings, persistence emission failures, or explicit
+/// `persistence_incomplete` signal result in a runtime error.
+fn validate_scan_health(report: &scanner_rs::scheduler::LocalReport) -> Result<(), Box<dyn Error>> {
+    let stats = &report.stats;
+    let mut reasons: Vec<String> = Vec::with_capacity(4);
+
+    if stats.io_errors > 0 {
+        reasons.push(format!("io_errors={}", stats.io_errors));
+    }
+    if stats.dropped_findings > 0 {
+        reasons.push(format!("dropped_findings={}", stats.dropped_findings));
+    }
+    if stats.persistence_emit_failures > 0 {
+        reasons.push(format!(
+            "persistence_emit_failures={}",
+            stats.persistence_emit_failures,
+        ));
+    }
+    if stats.persistence_incomplete {
+        reasons.push("persistence_incomplete=true".to_string());
+    }
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("live scan did not complete cleanly: {}", reasons.join(", "),).into())
+    }
+}
+
 // ── Corpus file loader ──────────────────────────────────────────────────
 
-/// Read all files under `corpus_root` into a path-keyed map for matching.
+/// Read corpus files once into an in-memory snapshot.
 ///
-/// The keys are normalized relative paths (forward slashes, no `.`/`..`)
-/// that match the path format used by both [`NormalizedFinding`] and
-/// [`TruthItem`]. This allows the matching layer to look up file contents
-/// by exact string equality on the normalized path.
+/// The snapshot powers both matching (`file_contents`) and provenance
+/// (`corpus_hash`, `corpus_file_count`, `corpus_total_bytes`) so the
+/// position pipeline avoids a second corpus read.
 ///
-/// All file bytes are held in memory. For large corpora this can be
-/// significant — the position-based pipeline requires file contents for
-/// byte-to-line conversion via [`LineIndex`](eval_harness::line_index::LineIndex).
-fn load_corpus_files(corpus_root: &Path) -> Result<HashMap<String, Vec<u8>>, Box<dyn Error>> {
+/// Lightweight hardening guardrails reject implausibly large snapshots
+/// before memory usage becomes pathological.
+fn load_corpus_snapshot(corpus_root: &Path) -> Result<CorpusSnapshot, Box<dyn Error>> {
+    const MAX_SNAPSHOT_FILES: usize = 5_000_000;
+    const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024 * 1024; // 512 GiB
+
     let mut paths: Vec<PathBuf> = Vec::new();
     collect_files_recursive(corpus_root, &mut paths)?;
+    if paths.len() > MAX_SNAPSHOT_FILES {
+        return Err(format!(
+            "corpus snapshot exceeds file guardrail: {} files > {}",
+            paths.len(),
+            MAX_SNAPSHOT_FILES,
+        )
+        .into());
+    }
 
-    let mut contents = HashMap::with_capacity(paths.len());
+    let mut snapshot_records: Vec<(PathBuf, String, Vec<u8>)> = Vec::with_capacity(paths.len());
+    let mut observed_total_bytes: u64 = 0;
+
     for path in paths {
         let rel = path.strip_prefix(corpus_root).map_err(|e| {
             format!(
@@ -577,9 +687,53 @@ fn load_corpus_files(corpus_root: &Path) -> Result<HashMap<String, Vec<u8>>, Box
             continue;
         }
         let data = std::fs::read(&path)?;
-        contents.insert(key, data);
+        observed_total_bytes = observed_total_bytes
+            .checked_add(data.len() as u64)
+            .ok_or("corpus snapshot byte count overflowed u64")?;
+        if observed_total_bytes > MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "corpus snapshot exceeds byte guardrail: {observed_total_bytes} > {MAX_SNAPSHOT_BYTES}",
+            )
+            .into());
+        }
+        snapshot_records.push((rel.to_path_buf(), key, data));
     }
-    Ok(contents)
+
+    let (corpus_hash, corpus_file_count, corpus_total_bytes) = hash_corpus_snapshot(
+        snapshot_records
+            .iter()
+            .map(|(rel_path, _, bytes)| (rel_path.as_path(), bytes.as_slice())),
+    );
+
+    if corpus_file_count as usize != snapshot_records.len() {
+        return Err(format!(
+            "internal snapshot file-count mismatch: hash reports {}, loader has {}",
+            corpus_file_count,
+            snapshot_records.len(),
+        )
+        .into());
+    }
+    if corpus_total_bytes != observed_total_bytes {
+        return Err(format!(
+            "internal snapshot byte mismatch: hash reports {}, loader counted {}",
+            corpus_total_bytes, observed_total_bytes,
+        )
+        .into());
+    }
+
+    let mut file_contents = HashMap::with_capacity(snapshot_records.len());
+    for (_, key, data) in snapshot_records {
+        if file_contents.insert(key.clone(), data).is_some() {
+            eprintln!("warning: duplicate normalized corpus path in snapshot: {key}");
+        }
+    }
+
+    Ok(CorpusSnapshot {
+        file_contents,
+        corpus_hash,
+        corpus_file_count,
+        corpus_total_bytes,
+    })
 }
 
 // ── Baseline loader ─────────────────────────────────────────────────────
@@ -679,5 +833,87 @@ fn print_parse_diagnostics(result: &JsonlParseResult) {
         if let Some(ref reason) = result.first_skip_reason {
             eprintln!("  first skip reason: {reason}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaky_repo_requires_corpus_root_via_clap() {
+        let err = Cli::try_parse_from([
+            "eval-harness",
+            "leaky-repo",
+            "--secrets-csv",
+            "secrets.csv",
+            "--findings",
+            "findings.jsonl",
+        ])
+        .err()
+        .expect("clap parse should fail when --corpus-root is missing");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("--corpus-root"),
+            "error should mention missing --corpus-root: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_scan_health_accepts_clean_report() {
+        let report = scanner_rs::scheduler::LocalReport::default();
+        assert!(validate_scan_health(&report).is_ok());
+    }
+
+    #[test]
+    fn validate_scan_health_rejects_incomplete_report() {
+        let mut report = scanner_rs::scheduler::LocalReport::default();
+        report.stats.io_errors = 1;
+        report.stats.dropped_findings = 2;
+        report.stats.persistence_emit_failures = 3;
+        report.stats.persistence_incomplete = true;
+
+        let err = validate_scan_health(&report).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("io_errors=1"),
+            "missing io_errors detail: {msg}"
+        );
+        assert!(
+            msg.contains("dropped_findings=2"),
+            "missing dropped_findings detail: {msg}"
+        );
+        assert!(
+            msg.contains("persistence_emit_failures=3"),
+            "missing persistence_emit_failures detail: {msg}"
+        );
+        assert!(
+            msg.contains("persistence_incomplete=true"),
+            "missing persistence_incomplete detail: {msg}"
+        );
+    }
+
+    #[test]
+    fn table_output_skips_error_book_builder() {
+        let maybe = maybe_build_error_book_for_output(OutputFormat::Table, || {
+            panic!("table mode must not build error_book")
+        });
+        assert!(
+            maybe.is_none(),
+            "table mode should skip error_book assembly entirely"
+        );
+    }
+
+    #[test]
+    fn json_output_builds_error_book() {
+        let maybe = maybe_build_error_book_for_output(OutputFormat::Json, || ErrorBook {
+            false_positives: Vec::new(),
+            false_negatives: Vec::new(),
+        });
+        assert!(
+            maybe.is_some(),
+            "json mode should assemble error_book for serialized reports"
+        );
     }
 }

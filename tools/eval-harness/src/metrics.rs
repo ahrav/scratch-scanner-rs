@@ -25,6 +25,10 @@
 //!   reward classifiers that assign higher confidence to true positives.
 //!   Answer "how good is the confidence ranking?"
 //!
+//! Count-only evaluations use [`EvalMetrics::from_counts`] instead of the
+//! confidence-ranked path. In that mode, AP fields are schema-compatible
+//! stand-ins derived from counts rather than a PR-curve ranking quality signal.
+//!
 //! ## Average Precision algorithm
 //!
 //! Uses the step-function (rectangular) formula with **tie collapsing**:
@@ -85,10 +89,7 @@ pub enum MetricsError {
     /// `BootstrapConfig::alpha` must be in the open interval `(0.0, 1.0)`.
     AlphaOutOfRange { alpha: f64 },
     /// `total_positives` is less than the observed TP count.
-    TotalPositivesLessThanTp {
-        total_positives: u64,
-        tp_count: u64,
-    },
+    TotalPositivesLessThanTp { total_positives: u64, tp_count: u64 },
 }
 
 impl std::fmt::Display for MetricsError {
@@ -106,10 +107,7 @@ impl std::fmt::Display for MetricsError {
                 write!(f, "CI lower ({lower}) must not exceed upper ({upper})")
             }
             Self::CiOutOfRange { lower, upper } => {
-                write!(
-                    f,
-                    "CI bounds must be in [0.0, 1.0], got ({lower}, {upper})"
-                )
+                write!(f, "CI bounds must be in [0.0, 1.0], got ({lower}, {upper})")
             }
             Self::ZeroIterations => {
                 write!(f, "BootstrapConfig::n_iterations must be > 0")
@@ -191,6 +189,8 @@ pub struct EvalMetrics {
     /// Computed as `sum of (recall_i - recall_{i-1}) * precision_i` over
     /// collapsed operating points, matching sklearn's `average_precision_score`.
     /// This is *not* the trapezoidal area under the PR curve (`auc(recall, precision)`).
+    /// In count-only reports from [`EvalMetrics::from_counts`], this is set to
+    /// `precision` as a single-point stand-in (not a ranking-derived curve area).
     pub average_precision: f64,
     /// Threshold-free precision: TP / (TP + FP). Equals 0.0 when
     /// there are no positive predictions (TP + FP = 0).
@@ -221,6 +221,8 @@ pub struct EvalMetrics {
     /// beyond the raw detection rate. Uses scored positives (TP) rather
     /// than `total_positives` so the baseline stays achievable when recall is
     /// incomplete. Can exceed `average_precision` when recall is low.
+    /// In count-only reports from [`EvalMetrics::from_counts`], this equals
+    /// `precision` by construction.
     pub baseline_ap: f64,
     /// Precision at fixed recall targets.
     /// Default targets: 0.80, 0.90, 0.95.
@@ -295,33 +297,31 @@ impl EvalMetrics {
     /// Intended for the LeakyRepo count-based pipeline where findings lack
     /// confidence scores, making confidence-aware metrics (AP, P@R, R@P,
     /// bootstrap CI) meaningless. Those fields are set to degenerate
-    /// single-threshold stand-ins:
+    /// single-threshold stand-ins for report schema compatibility:
     ///
     /// - `average_precision` and `baseline_ap` are set to `precision` — the
     ///   PR curve degenerates to a single operating point when all findings
-    ///   share the same (implicit) confidence.
+    ///   share the same (implicit) confidence. Do not interpret these values
+    ///   as confidence-ranking quality.
     /// - `precision_at_recall` and `recall_at_precision` are empty.
     /// - `ap_ci` is `None`.
     /// - `per_rule` is empty (count-based matching doesn't track rule names).
     /// - `unlabeled` is 0 (count-based matching classifies every finding).
     #[must_use]
     pub fn from_counts(tp: u64, fp: u64, false_neg: u64) -> Self {
-        let precision = safe_div(tp as f64, (tp + fp) as f64);
-        let recall = safe_div(tp as f64, (tp + false_neg) as f64);
-        let f1 = safe_div(2.0 * precision * recall, precision + recall);
-        let f2 = safe_div(5.0 * precision * recall, 4.0 * precision + recall);
+        let totals = count_score_totals(tp, fp, tp + false_neg);
 
         Self {
-            average_precision: precision,
-            precision,
-            recall,
-            f1,
-            f2,
+            average_precision: totals.precision,
+            precision: totals.precision,
+            recall: totals.recall,
+            f1: totals.f1,
+            f2: totals.f2,
             tp,
             fp,
             false_neg,
             unlabeled: 0,
-            baseline_ap: precision,
+            baseline_ap: totals.baseline_ap,
             precision_at_recall: vec![],
             recall_at_precision: vec![],
             ap_ci: None,
@@ -416,14 +416,10 @@ pub fn compute_metrics(
         });
     }
 
-    let precision = safe_div(tp as f64, (tp + fp) as f64);
-    let recall = safe_div(tp as f64, total_positives as f64);
-    let f1 = safe_div(2.0 * precision * recall, precision + recall);
-    let f2 = safe_div(5.0 * precision * recall, 4.0 * precision + recall);
+    let totals = count_score_totals(tp, fp, total_positives);
 
     let curve = build_pr_curve(classified, total_positives);
     let average_precision = ap_from_curve(&curve);
-    let baseline_ap = precision;
     let per_rule = compute_per_rule(classified);
 
     let par = DEFAULT_PAR_TARGETS
@@ -443,15 +439,15 @@ pub fn compute_metrics(
 
     Ok(EvalMetrics {
         average_precision,
-        precision,
-        recall,
-        f1,
-        f2,
+        precision: totals.precision,
+        recall: totals.recall,
+        f1: totals.f1,
+        f2: totals.f2,
         tp,
         fp,
         false_neg: fn_count,
         unlabeled,
-        baseline_ap,
+        baseline_ap: totals.baseline_ap,
         precision_at_recall: par,
         recall_at_precision: rap,
         ap_ci: None,
@@ -577,6 +573,45 @@ pub fn bootstrap_ap_ci(
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
+
+/// Threshold-free metrics that depend only on TP/FP/FN-style counts.
+///
+/// `baseline_ap` is included because it intentionally matches
+/// `precision = tp / (tp + fp)` for both count-based and position-based
+/// pipelines.
+#[derive(Debug, Clone, Copy)]
+struct CountScoreTotals {
+    precision: f64,
+    recall: f64,
+    f1: f64,
+    f2: f64,
+    baseline_ap: f64,
+}
+
+/// Compute precision/recall/F1/F2 and baseline AP from count totals.
+#[inline(always)]
+fn count_score_totals(tp: u64, fp: u64, total_positives: u64) -> CountScoreTotals {
+    let precision = safe_div(tp as f64, (tp + fp) as f64);
+    let recall = safe_div(tp as f64, total_positives as f64);
+
+    CountScoreTotals {
+        precision,
+        recall,
+        f1: f_beta_score(1.0, precision, recall),
+        f2: f_beta_score(2.0, precision, recall),
+        baseline_ap: precision,
+    }
+}
+
+/// F-beta from precision/recall with zero-denominator safety.
+#[inline(always)]
+fn f_beta_score(beta: f64, precision: f64, recall: f64) -> f64 {
+    let beta_sq = beta * beta;
+    safe_div(
+        (1.0 + beta_sq) * precision * recall,
+        beta_sq * precision + recall,
+    )
+}
 
 /// A single operating point on the precision-recall curve after tie
 /// collapsing. Each point represents the cumulative precision and recall
@@ -897,7 +932,7 @@ fn compute_per_rule(classified: &[ClassifiedFinding]) -> BTreeMap<String, RuleMe
 /// Prevents NaN/Inf from propagating through metric computations when
 /// there are no positive predictions (precision denominator = 0) or no
 /// ground-truth positives (recall denominator = 0).
-pub fn safe_div(num: f64, den: f64) -> f64 {
+pub(crate) fn safe_div(num: f64, den: f64) -> f64 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 
@@ -1240,6 +1275,47 @@ mod tests {
             m.f2,
             m.f1
         );
+    }
+
+    #[test]
+    fn count_score_totals_matches_closed_form() {
+        let totals = count_score_totals(3, 2, 5);
+        let precision = 3.0 / 5.0;
+        let recall = 3.0 / 5.0;
+        let expected_f1 = 2.0 * precision * recall / (precision + recall);
+        let expected_f2 = 5.0 * precision * recall / (4.0 * precision + recall);
+
+        assert!((totals.precision - precision).abs() < EPS);
+        assert!((totals.recall - recall).abs() < EPS);
+        assert!((totals.f1 - expected_f1).abs() < EPS);
+        assert!((totals.f2 - expected_f2).abs() < EPS);
+        assert!((totals.baseline_ap - precision).abs() < EPS);
+    }
+
+    #[test]
+    fn from_counts_matches_compute_metrics_for_threshold_free_scores() {
+        let cases = &[
+            (0u64, 0u64, 0u64),
+            (0u64, 4u64, 3u64),
+            (1u64, 0u64, 2u64),
+            (3u64, 2u64, 5u64),
+            (10u64, 3u64, 0u64),
+        ];
+
+        for &(tp, fp, fn_count) in cases {
+            let mut classified = Vec::with_capacity((tp + fp) as usize);
+            classified.extend((0..tp).map(|_| item(10, FindingClass::TruePositive)));
+            classified.extend((0..fp).map(|_| item(10, FindingClass::FalsePositive)));
+
+            let from_counts = EvalMetrics::from_counts(tp, fp, fn_count);
+            let from_classified = compute_metrics(&classified, fn_count, tp + fn_count).unwrap();
+
+            assert!((from_counts.precision - from_classified.precision).abs() < EPS);
+            assert!((from_counts.recall - from_classified.recall).abs() < EPS);
+            assert!((from_counts.f1 - from_classified.f1).abs() < EPS);
+            assert!((from_counts.f2 - from_classified.f2).abs() < EPS);
+            assert!((from_counts.baseline_ap - from_classified.baseline_ap).abs() < EPS);
+        }
     }
 
     // ── Bootstrap CI tests ──────────────────────────────────────

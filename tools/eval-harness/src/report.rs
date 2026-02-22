@@ -15,7 +15,8 @@
 //!   (`regression`, `error_book`) are omitted from JSON when `None`.
 //! - **Terminal table** ([`render_table`]): human-readable fixed-width ASCII
 //!   summary for interactive use. Displays aggregate metrics, per-rule
-//!   breakdown, and regression verdict.
+//!   breakdown, and regression verdict. Does not render error-book entries;
+//!   the main pipeline also skips building `error_book` in table mode.
 //!
 //! # Error book
 //!
@@ -53,7 +54,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::metrics::EvalMetrics;
 use crate::provenance::Provenance;
@@ -65,8 +66,8 @@ use crate::types::{ClassifiedFinding, FindingClass, TruthItem};
 /// Top-level eval report combining all pipeline outputs.
 ///
 /// This is the single serializable artifact produced by an eval run.
-/// Required fields (`metrics`, `provenance`) are always present; optional
-/// fields are omitted from JSON when `None` via `skip_serializing_if`,
+/// Required fields (`metrics_semantics`, `metrics`, `provenance`) are always
+/// present in JSON. Optional fields are omitted from JSON when `None`,
 /// keeping the serialized output compact for minimal runs.
 ///
 /// Callers construct this struct directly -- there is no builder. The
@@ -76,21 +77,126 @@ use crate::types::{ClassifiedFinding, FindingClass, TruthItem};
 /// 2. [`crate::provenance::build_provenance`] produces `provenance`.
 /// 3. [`crate::regression::check_regression`] produces `regression` (if a
 ///    baseline exists).
-/// 4. [`build_error_book`] produces `error_book` (if requested).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 4. [`build_error_book`] produces `error_book` (if requested; current CLI
+///    requests this only for JSON mode).
+///
+/// Serialization includes `metrics_semantics` (`position_pr_curve` or
+/// `count_only`) derived from `metrics`. Deserialization accepts both new
+/// JSON with the field and legacy baseline JSON without it.
+#[derive(Debug, Clone)]
 pub struct EvalReport {
     /// Aggregate evaluation metrics (precision, recall, AP, etc.).
     pub metrics: EvalMetrics,
     /// Reproducibility metadata (corpus hash, binary hash, etc.).
     pub provenance: Provenance,
     /// Regression check result. `None` when no baseline was provided.
-    /// Omitted from serialized JSON when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub regression: Option<RegressionResult>,
     /// Top FP/FN entries for debugging. `None` when error book generation
-    /// was not requested. Omitted from serialized JSON when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// was not requested (including table-mode runs in the main CLI pipeline).
     pub error_book: Option<ErrorBook>,
+}
+
+/// Metrics interpretation model for report rendering/serialization.
+///
+/// - `position_pr_curve`: confidence-aware position pipeline with a real PR curve.
+/// - `count_only`: count-based pipeline with no confidence ranking; AP fields
+///   are count-derived stand-ins (`average_precision == precision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsSemantics {
+    /// Position-based metrics with confidence-ranked PR curve.
+    #[default]
+    PositionPrCurve,
+    /// Count-only metrics (no confidence ranking; AP is a count-derived stand-in).
+    CountOnly,
+}
+
+impl MetricsSemantics {
+    /// Infer semantics from the metric payload.
+    ///
+    /// Current discriminator: both threshold vectors empty => count-only.
+    /// This aligns with [`crate::metrics::EvalMetrics::from_counts`] while
+    /// remaining backward-compatible with legacy JSON missing
+    /// `metrics_semantics`.
+    #[must_use]
+    pub fn infer(metrics: &EvalMetrics) -> Self {
+        if metrics.precision_at_recall.is_empty() && metrics.recall_at_precision.is_empty() {
+            Self::CountOnly
+        } else {
+            Self::PositionPrCurve
+        }
+    }
+
+    #[must_use]
+    fn ap_table_label(self) -> &'static str {
+        match self {
+            Self::PositionPrCurve => "PRC-AUC (AP)",
+            Self::CountOnly => "AP (count-only)",
+        }
+    }
+}
+
+impl EvalReport {
+    /// Derive the metrics semantics discriminator for this report.
+    #[must_use]
+    pub fn semantics(&self) -> MetricsSemantics {
+        MetricsSemantics::infer(&self.metrics)
+    }
+}
+
+#[derive(Serialize)]
+struct EvalReportSer<'a> {
+    metrics_semantics: MetricsSemantics,
+    metrics: &'a EvalMetrics,
+    provenance: &'a Provenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regression: Option<&'a RegressionResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_book: Option<&'a ErrorBook>,
+}
+
+#[derive(Deserialize)]
+struct EvalReportDe {
+    #[serde(default)]
+    metrics_semantics: MetricsSemantics,
+    metrics: EvalMetrics,
+    provenance: Provenance,
+    #[serde(default)]
+    regression: Option<RegressionResult>,
+    #[serde(default)]
+    error_book: Option<ErrorBook>,
+}
+
+impl Serialize for EvalReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        EvalReportSer {
+            metrics_semantics: self.semantics(),
+            metrics: &self.metrics,
+            provenance: &self.provenance,
+            regression: self.regression.as_ref(),
+            error_book: self.error_book.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EvalReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let report = EvalReportDe::deserialize(deserializer)?;
+        let _semantics = report.metrics_semantics;
+        Ok(Self {
+            metrics: report.metrics,
+            provenance: report.provenance,
+            regression: report.regression,
+            error_book: report.error_book,
+        })
+    }
 }
 
 /// Error classification for the error book.
@@ -280,8 +386,8 @@ pub fn render_json(report: &EvalReport) -> Result<String, serde_json::Error> {
 ///
 /// Produces an ASCII table with three sections:
 ///
-/// 1. **Aggregate metrics**: AP (with CI if present), precision, recall,
-///    F1, F2, and raw TP/FP/FN counts.
+/// 1. **Aggregate metrics**: semantics-aware AP label (with CI if present),
+///    precision, recall, F1, F2, and raw TP/FP/FN counts.
 /// 2. **Per-rule breakdown** (omitted when empty): rule name (truncated
 ///    at byte offset 20, char-boundary-safe), TP, FP, and precision per rule.
 /// 3. **Regression verdict**: PASS/WARN/BLOCK or "N/A (no baseline)".
@@ -293,6 +399,7 @@ pub fn render_json(report: &EvalReport) -> Result<String, serde_json::Error> {
 pub fn render_table(report: &EvalReport) -> String {
     let rule_count = report.metrics.per_rule.len();
     let mut out = String::with_capacity(700 + rule_count * 80);
+    let semantics = report.semantics();
 
     let _ = writeln!(out, "+{:-<55}+", "");
     let _ = writeln!(out, "| {:<53} |", "Eval Report");
@@ -301,7 +408,7 @@ pub fn render_table(report: &EvalReport) -> String {
     // Aggregate metrics.
     write_metric_row(
         &mut out,
-        "PRC-AUC (AP)",
+        semantics.ap_table_label(),
         report.metrics.average_precision,
         report.metrics.ap_ci.as_ref(),
     );
@@ -644,9 +751,19 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::metrics::{ConfidenceInterval, RuleMetrics};
+    use crate::metrics::{ConfidenceInterval, RuleMetrics, ThresholdResult};
     use crate::regression::{RegressionThresholds, Verdict};
     use crate::types::NormalizedFinding;
+
+    fn sample_provenance() -> Provenance {
+        Provenance {
+            corpus_hash: "a".repeat(64),
+            binary_hash: None,
+            ruleset_hash: None,
+            corpus_file_count: 100,
+            corpus_total_bytes: 50000,
+        }
+    }
 
     /// Build a minimal EvalReport for testing.
     fn sample_report(with_regression: bool, with_error_book: bool) -> EvalReport {
@@ -679,8 +796,20 @@ mod tests {
             false_neg: 16,
             unlabeled: 5,
             baseline_ap: 0.8765,
-            precision_at_recall: vec![],
-            recall_at_precision: vec![],
+            precision_at_recall: vec![
+                ThresholdResult {
+                    target: 0.80,
+                    value: Some(0.93),
+                },
+                ThresholdResult {
+                    target: 0.90,
+                    value: Some(0.89),
+                },
+            ],
+            recall_at_precision: vec![ThresholdResult {
+                target: 0.95,
+                value: Some(0.78),
+            }],
             ap_ci: Some(ConfidenceInterval {
                 lower: 0.9012,
                 upper: 0.9456,
@@ -688,13 +817,7 @@ mod tests {
             per_rule,
         };
 
-        let provenance = Provenance {
-            corpus_hash: "a".repeat(64),
-            binary_hash: None,
-            ruleset_hash: None,
-            corpus_file_count: 100,
-            corpus_total_bytes: 50000,
-        };
+        let provenance = sample_provenance();
 
         let regression = if with_regression {
             Some(crate::regression::RegressionResult {
@@ -748,6 +871,15 @@ mod tests {
         }
     }
 
+    fn sample_count_only_report() -> EvalReport {
+        EvalReport {
+            metrics: EvalMetrics::from_counts(8, 2, 3),
+            provenance: sample_provenance(),
+            regression: None,
+            error_book: None,
+        }
+    }
+
     #[test]
     fn render_json_serialization() {
         // Round-trip: valid JSON object.
@@ -755,6 +887,13 @@ mod tests {
         let json = render_json(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_object());
+        assert_eq!(
+            parsed
+                .get("metrics_semantics")
+                .and_then(serde_json::Value::as_str),
+            Some("position_pr_curve"),
+            "position reports should include explicit semantics discriminator"
+        );
 
         // None fields are omitted from JSON output.
         let report = sample_report(false, false);
@@ -767,6 +906,53 @@ mod tests {
             !json.contains("\"error_book\""),
             "None error_book should be skipped"
         );
+    }
+
+    #[test]
+    fn deserialize_legacy_json_without_semantics_field() {
+        let report = sample_report(false, false);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("metrics_semantics");
+        let legacy_json = serde_json::to_string(&json).unwrap();
+
+        let parsed: EvalReport = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(parsed.metrics.tp, report.metrics.tp);
+        assert_eq!(parsed.semantics(), MetricsSemantics::PositionPrCurve);
+    }
+
+    #[test]
+    fn count_only_semantics_and_ap_labeling() {
+        let report = sample_count_only_report();
+        let table = render_table(&report);
+        assert!(
+            table.contains("AP (count-only)"),
+            "count-only table should disambiguate AP labeling"
+        );
+        assert!(
+            !table.contains("PRC-AUC (AP)"),
+            "count-only table should not claim PR curve area"
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        assert_eq!(
+            json.get("metrics_semantics")
+                .and_then(serde_json::Value::as_str),
+            Some("count_only"),
+            "count-only reports should serialize count-only semantics"
+        );
+    }
+
+    #[test]
+    fn deserialize_legacy_count_only_without_semantics_field() {
+        let report = sample_count_only_report();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("metrics_semantics");
+        let legacy_json = serde_json::to_string(&json).unwrap();
+
+        let parsed: EvalReport = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(parsed.semantics(), MetricsSemantics::CountOnly);
     }
 
     #[test]
