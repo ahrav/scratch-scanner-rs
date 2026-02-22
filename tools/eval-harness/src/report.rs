@@ -250,16 +250,17 @@ pub fn build_error_book(
 
 /// Render the report as pretty-printed JSON.
 ///
-/// In debug builds, asserts that all metric fields are finite (not NaN or
-/// Inf) before serialization, catching upstream computation errors early.
+/// Validates that all metric fields are finite (not NaN or Inf) before
+/// serialization. NaN/Inf values cannot be represented in JSON and would
+/// produce corrupt output that downstream consumers cannot parse.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if serde serialization fails, which should be impossible for
-/// the types in [`EvalReport`] (all fields are `Serialize`-safe).
-pub fn render_json(report: &EvalReport) -> String {
-    debug_assert_no_nan(report);
-    serde_json::to_string_pretty(report).expect("EvalReport serialization must not fail")
+/// Returns `serde_json::Error` if any metric field is non-finite or if
+/// serialization fails.
+pub fn render_json(report: &EvalReport) -> Result<String, serde_json::Error> {
+    validate_finite(report)?;
+    serde_json::to_string_pretty(report)
 }
 
 /// Render a terminal-friendly summary table.
@@ -269,7 +270,7 @@ pub fn render_json(report: &EvalReport) -> String {
 /// 1. **Aggregate metrics**: AP (with CI if present), precision, recall,
 ///    F1, F2, and raw TP/FP/FN counts.
 /// 2. **Per-rule breakdown** (omitted when empty): rule name (truncated
-///    to 20 chars), TP, FP, and precision per rule.
+///    at byte offset 20, char-boundary-safe), TP, FP, and precision per rule.
 /// 3. **Regression verdict**: PASS/WARN/BLOCK or "N/A (no baseline)".
 ///
 /// Uses `fmt::Write` to a pre-allocated `String` sized to
@@ -312,8 +313,10 @@ pub fn render_table(report: &EvalReport) -> String {
             "Rule", "TP", "FP", "Precision"
         );
         for (rule, rm) in &report.metrics.per_rule {
-            // Truncate long rule names to fit the fixed-width column.
-            let display_rule = &rule[..rule.floor_char_boundary(20)];
+            // Truncate long rule names to fit the 20-byte fixed-width column,
+            // snapping to the nearest char boundary to avoid splitting multi-byte chars.
+            let max_bytes = rule.len().min(20);
+            let display_rule = &rule[..rule.floor_char_boundary(max_bytes)];
             let _ = writeln!(
                 out,
                 "| {:<20} {:>5} {:>5} {:>10.4}           |",
@@ -340,15 +343,14 @@ pub fn render_table(report: &EvalReport) -> String {
 /// `BufWriter` (matching the codebase convention for file I/O), and
 /// flushes before returning.
 ///
-/// Like [`render_json`], runs a debug-only NaN/Inf assertion before
-/// serialization.
+/// Validates that all metric fields are finite before serialization.
 ///
 /// # Errors
 ///
-/// Returns `io::Error` if file creation, JSON serialization, or flush
-/// fails.
+/// Returns `io::Error` if any metric field is non-finite, file creation
+/// fails, JSON serialization fails, or flush fails.
 pub fn write_json_file(report: &EvalReport, path: &Path) -> io::Result<()> {
-    debug_assert_no_nan(report);
+    validate_finite(report).map_err(io::Error::other)?;
     let file = std::fs::File::create(path)?;
     let mut writer = BufWriter::with_capacity(64 * 1024, file);
     serde_json::to_writer_pretty(&mut writer, report).map_err(io::Error::other)?;
@@ -429,12 +431,12 @@ fn build_fp_entries(
 
 /// Build FN error book entries from false negative truth items.
 ///
-/// Follows the same two-phase algorithm as [`build_fp_entries`] but
-/// simpler: truth items have no confidence score, so the representative
-/// is the first item encountered for each rule (stable given consistent
-/// input ordering).
-///
-/// [`TruthItem`]: crate::types::TruthItem
+/// Follows the same two-phase (count, then rank) algorithm as
+/// [`build_fp_entries`] but simpler: truth items have no confidence
+/// score, so the representative is the first item encountered for each
+/// rule (stable given consistent input ordering). Context extraction is
+/// skipped entirely because [`TruthItem`](crate::types::TruthItem)
+/// carries line-based coordinates, not byte offsets.
 fn build_fn_entries(
     false_negatives: &[TruthItem],
     config: &ErrorBookConfig,
@@ -479,11 +481,16 @@ fn build_fn_entries(
 ///
 /// Returns `None` when:
 /// - `path` is not present in `file_contents` (file was not loaded).
+/// - `byte_start > byte_end` (inverted span -- indicates corrupt offsets).
 /// - `byte_end` exceeds the file length (stale or corrupt byte offsets).
 ///
 /// The context window is `[byte_start - context_window, byte_end + context_window]`
 /// clamped to `[0, data.len()]`, so it is always safe even when the span
-/// is near file boundaries.
+/// is near file boundaries. A zero-width span (`byte_start == byte_end`)
+/// is valid and produces a context window centered on that byte position
+/// with no secret portion; when redaction is enabled, the redaction
+/// placeholder hashes an empty slice, yielding a deterministic
+/// `[REDACTED:<hash_of_empty>]` token.
 ///
 /// When redaction is enabled, the output has the structure:
 /// `<prefix_bytes><[REDACTED:<keyed_hash_hex>]><suffix_bytes>`, where the
@@ -498,6 +505,11 @@ fn extract_context(
 ) -> Option<String> {
     let data = file_contents.get(path)?;
     if byte_start > byte_end || byte_end > data.len() {
+        eprintln!(
+            "warning: corrupt byte offsets for {path}: start={byte_start}, end={byte_end}, \
+             file_len={}",
+            data.len()
+        );
         return None;
     }
 
@@ -552,7 +564,7 @@ fn write_simple_row(out: &mut String, label: &str, value: f64) {
     let _ = writeln!(out, "| {:<17} {:<36.4} |", label, value);
 }
 
-/// Debug-only NaN/Inf guard over the six core `f64` metric fields.
+/// Validate that all core `f64` metric fields are finite (not NaN or Inf).
 ///
 /// Serializing NaN or Infinity to JSON produces invalid output that
 /// downstream consumers (CI parsers, baseline comparators) cannot handle.
@@ -560,24 +572,52 @@ fn write_simple_row(out: &mut String, label: &str, value: f64) {
 /// boundary rather than silently producing corrupt JSON.
 ///
 /// Checks: `average_precision`, `precision`, `recall`, `f1`, `f2`,
-/// `baseline_ap`. Per-rule and threshold metrics are not checked here
-/// because they flow through the same `safe_div` path.
+/// `baseline_ap`, per-rule precision values, and CI bounds when present.
 ///
-/// Effectively a no-op in release builds: `debug_assert!` compiles to
-/// nothing when `debug_assertions` is disabled.
-fn debug_assert_no_nan(report: &EvalReport) {
+/// # Scope limitations
+///
+/// This function does **not** validate `precision_at_recall`,
+/// `recall_at_precision`, or any fields inside
+/// [`RegressionResult`]. Those values flow through from upstream
+/// computations that use [`safe_div`](crate::metrics::safe_div) (which
+/// returns 0.0 rather than NaN), so non-finite values there are unlikely
+/// but not defensively guarded here.
+fn validate_finite(report: &EvalReport) -> Result<(), serde_json::Error> {
     let m = &report.metrics;
     let fields = [
-        m.average_precision,
-        m.precision,
-        m.recall,
-        m.f1,
-        m.f2,
-        m.baseline_ap,
+        ("average_precision", m.average_precision),
+        ("precision", m.precision),
+        ("recall", m.recall),
+        ("f1", m.f1),
+        ("f2", m.f2),
+        ("baseline_ap", m.baseline_ap),
     ];
-    for (i, &v) in fields.iter().enumerate() {
-        debug_assert!(v.is_finite(), "metric field index {i} is not finite: {v}");
+    for (name, v) in fields {
+        if !v.is_finite() {
+            return Err(serde::ser::Error::custom(format!(
+                "metric field '{name}' is not finite: {v}"
+            )));
+        }
     }
+    // Check per-rule precision values.
+    for (rule, rm) in &m.per_rule {
+        if !rm.precision.is_finite() {
+            return Err(serde::ser::Error::custom(format!(
+                "per-rule precision for '{rule}' is not finite: {}",
+                rm.precision
+            )));
+        }
+    }
+    // Check CI bounds when present.
+    if let Some(ci) = &m.ap_ci
+        && (!ci.lower.is_finite() || !ci.upper.is_finite())
+    {
+        return Err(serde::ser::Error::custom(format!(
+            "CI bounds are not finite: lower={}, upper={}",
+            ci.lower, ci.upper
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -640,7 +680,24 @@ mod tests {
         let regression = if with_regression {
             Some(crate::regression::RegressionResult {
                 verdict: Verdict::Pass,
-                checks: vec![],
+                checks: [
+                    crate::regression::MetricCheck {
+                        metric: crate::regression::MetricName::AveragePrecision,
+                        current: 0.9234,
+                        baseline: 0.8765,
+                        delta: 0.0469,
+                        verdict: Verdict::Pass,
+                        ci_gate_applied: false,
+                    },
+                    crate::regression::MetricCheck {
+                        metric: crate::regression::MetricName::Precision,
+                        current: 0.8765,
+                        baseline: 0.8765,
+                        delta: 0.0,
+                        verdict: Verdict::Pass,
+                        ci_gate_applied: false,
+                    },
+                ],
                 per_rule_deltas: vec![],
                 thresholds: RegressionThresholds::default(),
             })
@@ -676,13 +733,13 @@ mod tests {
     fn render_json_serialization() {
         // Round-trip: valid JSON object.
         let report = sample_report(true, true);
-        let json = render_json(&report);
+        let json = render_json(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_object());
 
         // None fields are omitted from JSON output.
         let report = sample_report(false, false);
-        let json = render_json(&report);
+        let json = render_json(&report).unwrap();
         assert!(
             !json.contains("\"regression\""),
             "None regression should be skipped"
@@ -690,6 +747,49 @@ mod tests {
         assert!(
             !json.contains("\"error_book\""),
             "None error_book should be skipped"
+        );
+    }
+
+    #[test]
+    fn render_json_rejects_nan_metrics() {
+        let mut report = sample_report(false, false);
+        report.metrics.average_precision = f64::NAN;
+        let err = render_json(&report).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("average_precision") && msg.contains("not finite"),
+            "error should name the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_json_rejects_inf_per_rule_precision() {
+        let mut report = sample_report(false, false);
+        report
+            .metrics
+            .per_rule
+            .values_mut()
+            .next()
+            .unwrap()
+            .precision = f64::INFINITY;
+        let err = render_json(&report).unwrap_err();
+        assert!(
+            err.to_string().contains("per-rule precision"),
+            "error should mention per-rule precision: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn write_json_file_rejects_nan() {
+        let mut report = sample_report(false, false);
+        report.metrics.f1 = f64::NAN;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = write_json_file(&report, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("f1"),
+            "error should name the offending field: {}",
+            err
         );
     }
 
@@ -747,6 +847,15 @@ mod tests {
         assert_eq!(book.false_positives[0].count, 3);
         assert_eq!(book.false_positives[1].rule, "rule_b");
         assert_eq!(book.false_positives[1].count, 2);
+        // Representative has highest confidence for that rule.
+        assert_eq!(
+            book.false_positives[0].confidence, 10,
+            "rule_a best confidence"
+        );
+        assert_eq!(
+            book.false_positives[1].confidence, 5,
+            "rule_b best confidence"
+        );
     }
 
     #[test]
@@ -864,6 +973,64 @@ mod tests {
     }
 
     #[test]
+    fn extract_context_span_exceeds_file_length() {
+        let mut fc = HashMap::new();
+        fc.insert("f.txt".to_string(), b"short".to_vec());
+        let config = ErrorBookConfig::default();
+
+        // byte_end exceeds file length — must return None.
+        let ctx = extract_context(&fc, "f.txt", 0, 100, &config);
+        assert!(ctx.is_none(), "span beyond file length must return None");
+    }
+
+    #[test]
+    fn build_error_book_verbatim_context() {
+        let classified = vec![ClassifiedFinding {
+            finding: NormalizedFinding::new("f.txt".into(), 10, 16, "rule_a".into(), 10),
+            class: FindingClass::FalsePositive,
+        }];
+        let mut fc = HashMap::new();
+        // Controlled content: "SECRET" at bytes [10..16].
+        let content = b"0123456789SECRETyz0123456789";
+        fc.insert("f.txt".to_string(), content.to_vec());
+
+        // Default config: no redaction key, small context window.
+        let config = ErrorBookConfig {
+            max_entries: 20,
+            redaction_key: None,
+            context_window: 5,
+        };
+
+        let book = build_error_book(&classified, &[], &fc, &config);
+        let ctx = book.false_positives[0].redacted_context.as_ref().unwrap();
+        // Context window: [10-5, 16+5] = [5, 21], so "56789SECRETyz012"
+        assert!(
+            ctx.contains("SECRET"),
+            "verbatim context must contain the secret: {ctx}"
+        );
+        assert!(ctx.contains("56789"), "context prefix: {ctx}");
+        assert!(ctx.contains("yz012"), "context suffix: {ctx}");
+    }
+
+    #[test]
+    fn render_table_empty_per_rule() {
+        let mut report = sample_report(true, false);
+        report.metrics.per_rule = BTreeMap::new();
+        let table = render_table(&report);
+
+        assert!(
+            !table.contains("Per-Rule Breakdown"),
+            "empty per_rule should omit the per-rule section"
+        );
+        // Aggregate metrics and regression line must still be present.
+        assert!(table.contains("PRC-AUC"), "missing aggregate metrics");
+        assert!(
+            table.contains("Regression: PASS"),
+            "missing regression verdict"
+        );
+    }
+
+    #[test]
     fn write_json_file_round_trip() {
         let report = sample_report(true, true);
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -971,6 +1138,16 @@ mod tests {
                 let b2 = build_error_book(&classified, &fns, &HashMap::new(), &config);
                 prop_assert_eq!(b1.false_positives.len(), b2.false_positives.len());
                 prop_assert_eq!(b1.false_negatives.len(), b2.false_negatives.len());
+                // Verify content equality, not just length.
+                for (a, b) in b1.false_positives.iter().zip(b2.false_positives.iter()) {
+                    prop_assert_eq!(&a.rule, &b.rule);
+                    prop_assert_eq!(a.count, b.count);
+                    prop_assert_eq!(a.confidence, b.confidence);
+                }
+                for (a, b) in b1.false_negatives.iter().zip(b2.false_negatives.iter()) {
+                    prop_assert_eq!(&a.rule, &b.rule);
+                    prop_assert_eq!(a.count, b.count);
+                }
             }
         }
     }

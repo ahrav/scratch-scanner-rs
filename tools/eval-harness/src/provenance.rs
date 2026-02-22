@@ -31,10 +31,10 @@
 //! 1. Recursively collect file paths under `corpus_dir` into a `Vec<PathBuf>`.
 //!    Symlinks and non-regular files are skipped to keep the hash stable
 //!    across environments with different link layouts.
-//! 2. Sort paths lexicographically by their full (absolute) path bytes. Since
-//!    all paths share the same `corpus_dir` prefix, this produces the same
-//!    order as sorting by relative path, ensuring deterministic ordering
-//!    regardless of filesystem visit order.
+//! 2. Sort paths lexicographically by their full path bytes (including the
+//!    `corpus_dir` prefix). Since all paths share this prefix, the ordering
+//!    is equivalent to sorting by relative path, ensuring deterministic
+//!    results regardless of filesystem visit order.
 //! 3. Initialize a BLAKE3 hasher with `CORPUS_DOMAIN || 0x00`.
 //! 4. For each file in sorted order, feed `relative_path_bytes || 0x00 ||
 //!    file_contents` to the hasher. The NUL byte between path and content is
@@ -69,10 +69,10 @@ use serde::{Deserialize, Serialize};
 /// Domain tag for corpus-level hashing.
 ///
 /// Fed to the BLAKE3 hasher before any file data in [`hash_corpus`]. The
-/// `eval.provenance.v1.` prefix scopes all domain tags to this module;
+/// `eval.provenance.` prefix scopes all domain tags to this module;
 /// the `corpus` suffix distinguishes directory hashing from the
 /// single-file domain ([`FILE_DOMAIN`]).
-const CORPUS_DOMAIN: &[u8] = b"eval.provenance.v1.corpus";
+const CORPUS_DOMAIN: &[u8] = b"eval.provenance.corpus";
 
 /// Domain tag for single-file hashing (scanner binary and ruleset).
 ///
@@ -80,7 +80,7 @@ const CORPUS_DOMAIN: &[u8] = b"eval.provenance.v1.corpus";
 /// (ruleset). Using a single domain for both is intentional: these hashes
 /// live in separate [`Provenance`] fields and are never cross-compared,
 /// so identical files producing the same hash is correct, not a collision.
-const FILE_DOMAIN: &[u8] = b"eval.provenance.v1.file";
+const FILE_DOMAIN: &[u8] = b"eval.provenance.file";
 
 /// Buffer size for streaming hash reads (64 KiB — fits L1d, amortizes syscalls).
 const HASH_BUF_SIZE: usize = 64 * 1024;
@@ -160,7 +160,12 @@ pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
     for path in &files {
         let rel = path
             .strip_prefix(corpus_dir)
-            .unwrap_or(path)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("corpus file {path:?} is not under corpus_dir {corpus_dir:?}: {e}"),
+                )
+            })?
             .to_string_lossy();
         let contents = std::fs::read(path)?;
 
@@ -340,6 +345,59 @@ mod tests {
         assert!(prov.ruleset_hash.is_none());
         assert_eq!(prov.corpus_file_count, 1);
         assert_eq!(prov.corpus_total_bytes, 4);
+    }
+
+    #[test]
+    fn build_provenance_with_binary_and_ruleset() {
+        let dir = corpus(&[("a.txt", b"corpus data")]);
+
+        // Place binary and ruleset outside the corpus dir so
+        // corpus_file_count reflects only the corpus contents.
+        let bin_dir = TempDir::new().unwrap();
+        let bin_path = bin_dir.path().join("scanner.bin");
+        fs::write(&bin_path, b"binary-content-bytes").unwrap();
+
+        let rule_dir = TempDir::new().unwrap();
+        let rule_path = rule_dir.path().join("rules.yaml");
+        fs::write(&rule_path, b"ruleset-content-bytes").unwrap();
+
+        let prov = build_provenance(dir.path(), Some(&bin_path), Some(&rule_path)).unwrap();
+        assert!(prov.binary_hash.is_some(), "binary_hash must be present");
+        assert!(prov.ruleset_hash.is_some(), "ruleset_hash must be present");
+        // Binary and ruleset have different content, so hashes must differ.
+        assert_ne!(
+            prov.binary_hash.as_ref().unwrap(),
+            prov.ruleset_hash.as_ref().unwrap(),
+            "different content must produce different hashes"
+        );
+        assert_eq!(prov.corpus_file_count, 1);
+        assert_eq!(prov.corpus_total_bytes, 11); // b"corpus data".len()
+    }
+
+    #[test]
+    fn domain_separation_corpus_vs_file() {
+        // Hashing the same single file via hash_corpus (CORPUS_DOMAIN) and
+        // hash_file (FILE_DOMAIN) must produce different hashes.
+        let dir = corpus(&[("only.txt", b"identical content")]);
+        let file_path = dir.path().join("only.txt");
+
+        let (corpus_h, _, _) = hash_corpus(dir.path()).unwrap();
+        let file_h = hash_file(&file_path, FILE_DOMAIN).unwrap();
+        assert_ne!(
+            corpus_h, file_h,
+            "corpus and file domains must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn modify_content_changes_hash() {
+        let dir = corpus(&[("a.txt", b"original")]);
+        let (h1, _, _) = hash_corpus(dir.path()).unwrap();
+
+        // Overwrite the file content.
+        fs::write(dir.path().join("a.txt"), b"modified").unwrap();
+        let (h2, _, _) = hash_corpus(dir.path()).unwrap();
+        assert_ne!(h1, h2, "changing file content must change the hash");
     }
 
     // ── Proptest ─────────────────────────────────────────────────────

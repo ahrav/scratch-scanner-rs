@@ -17,10 +17,10 @@
 //! 3. **Overall verdict** = `max(ap_verdict, precision_verdict)`. Because
 //!    [`Verdict`] derives `Ord` with Pass < Warn < Block, `max` yields the
 //!    worst verdict with no branching.
-//! 4. **Per-rule diff**: merge the per-rule `BTreeMap`s with a peekable
-//!    two-pointer scan to identify new, removed, and changed rules in
-//!    O(r_curr + r_base). These deltas are informational — they do not
-//!    influence the verdict and are computed after the verdict is finalized.
+//! 4. **Per-rule diff**: merge the per-rule `BTreeMap` keys via a
+//!    `BTreeSet` union to identify new, removed, and retained rules in
+//!    O(n log n). These deltas are informational — they do not influence
+//!    the verdict and are computed after the verdict is finalized.
 //!
 //! # CI overlap gate
 //!
@@ -87,6 +87,33 @@ pub struct RegressionThresholds {
     pub use_ci: bool,
 }
 
+impl RegressionThresholds {
+    /// Validate that all threshold values are sensible.
+    ///
+    /// Returns `Err` with a description when:
+    /// - Any threshold is non-finite (NaN or Inf).
+    /// - Any threshold is negative.
+    /// - `warn > block` for either metric pair (Warn band is unreachable).
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let pairs = [
+            (self.ap_warn, self.ap_block, "ap"),
+            (self.precision_warn, self.precision_block, "precision"),
+        ];
+        for (warn, block, _name) in pairs {
+            if !warn.is_finite() || !block.is_finite() {
+                return Err("threshold values must be finite");
+            }
+            if warn < 0.0 || block < 0.0 {
+                return Err("threshold values must be non-negative");
+            }
+            if warn > block {
+                return Err("warn threshold exceeds block threshold (Warn band unreachable)");
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for RegressionThresholds {
     fn default() -> Self {
         Self {
@@ -140,6 +167,29 @@ impl std::fmt::Display for Verdict {
     }
 }
 
+/// Which metric is being checked for regression.
+///
+/// Only two metrics are currently evaluated: average precision (AP) and
+/// precision. Using an enum instead of a raw string prevents typos and
+/// enables exhaustive matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricName {
+    /// Area under the precision-recall curve (average precision).
+    AveragePrecision,
+    /// Precision = TP / (TP + FP).
+    Precision,
+}
+
+impl std::fmt::Display for MetricName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AveragePrecision => "average_precision",
+            Self::Precision => "precision",
+        })
+    }
+}
+
 /// Result of checking a single metric (AP or precision) against thresholds.
 ///
 /// Each [`RegressionResult`] contains one `MetricCheck` per evaluated metric.
@@ -147,8 +197,8 @@ impl std::fmt::Display for Verdict {
 /// verdict in [`RegressionResult`] is the `max` across all checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricCheck {
-    /// Metric name (`"average_precision"` or `"precision"`).
-    pub metric: String,
+    /// Which metric this check evaluates.
+    pub metric: MetricName,
     /// Current run's value (0.0–1.0 as produced by [`EvalMetrics`]).
     pub current: f64,
     /// Baseline value (0.0–1.0 as produced by [`EvalMetrics`]).
@@ -173,6 +223,7 @@ pub struct MetricCheck {
 ///
 /// For [`RuleDeltaStatus::New`] rules, the baseline fields are zero.
 /// For [`RuleDeltaStatus::Removed`] rules, the current fields are zero.
+/// For [`RuleDeltaStatus::Retained`] rules, both sides are populated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleDelta {
     /// Rule name (matches the key in [`EvalMetrics::per_rule`]).
@@ -198,9 +249,8 @@ pub struct RuleDelta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleDeltaStatus {
-    /// Rule exists in both runs. Counts may differ or be identical —
-    /// "changed" means "present in both," not "values differ."
-    Changed,
+    /// Rule exists in both runs. Counts may differ or be identical.
+    Retained,
     /// Rule appears only in the current run (absent from baseline).
     New,
     /// Rule appears only in the baseline (absent from current).
@@ -220,9 +270,8 @@ pub enum RuleDeltaStatus {
 pub struct RegressionResult {
     /// Overall verdict — the worst (maximum) of all per-metric verdicts.
     pub verdict: Verdict,
-    /// Per-metric checks. Always contains exactly two entries:
-    /// `[average_precision, precision]`, in that order.
-    pub checks: Vec<MetricCheck>,
+    /// Per-metric checks: `[average_precision, precision]`, in that order.
+    pub checks: [MetricCheck; 2],
     /// Per-rule deltas between current and baseline. Informational only;
     /// these do not affect the verdict.
     pub per_rule_deltas: Vec<RuleDelta>,
@@ -255,7 +304,7 @@ pub fn check_regression(
     thresholds: &RegressionThresholds,
 ) -> RegressionResult {
     let ap_check = check_metric(
-        "average_precision",
+        MetricName::AveragePrecision,
         current.average_precision,
         baseline.average_precision,
         current.ap_ci.as_ref(),
@@ -265,7 +314,7 @@ pub fn check_regression(
     );
 
     let precision_check = check_metric(
-        "precision",
+        MetricName::Precision,
         current.precision,
         baseline.precision,
         None, // No CI gate for precision.
@@ -279,7 +328,7 @@ pub fn check_regression(
 
     RegressionResult {
         verdict,
-        checks: vec![ap_check, precision_check],
+        checks: [ap_check, precision_check],
         per_rule_deltas,
         thresholds: thresholds.clone(),
     }
@@ -311,7 +360,7 @@ pub fn check_regression(
 /// any drop exceeding `warn` has already exceeded the smaller `block` threshold.
 /// See the `inverted_thresholds_skip_warn_band` test for a worked example.
 fn check_metric(
-    metric_name: &str,
+    metric_name: MetricName,
     current_val: f64,
     baseline_val: f64,
     ci: Option<&ConfidenceInterval>,
@@ -319,6 +368,20 @@ fn check_metric(
     warn_threshold: f64,
     use_ci: bool,
 ) -> MetricCheck {
+    // Non-finite values (NaN, Inf) cannot be meaningfully compared against
+    // thresholds. IEEE 754 NaN comparisons always return false, which would
+    // silently produce Pass for arbitrarily bad data. Block immediately.
+    if !current_val.is_finite() || !baseline_val.is_finite() {
+        return MetricCheck {
+            metric: metric_name,
+            current: current_val,
+            baseline: baseline_val,
+            delta: current_val - baseline_val,
+            verdict: Verdict::Block,
+            ci_gate_applied: false,
+        };
+    }
+
     let delta = current_val - baseline_val;
 
     // CI overlap gate: if baseline falls within the current CI, the observed
@@ -329,7 +392,7 @@ fn check_metric(
         && baseline_val <= ci.upper
     {
         return MetricCheck {
-            metric: metric_name.to_string(),
+            metric: metric_name,
             current: current_val,
             baseline: baseline_val,
             delta,
@@ -350,7 +413,7 @@ fn check_metric(
     };
 
     MetricCheck {
-        metric: metric_name.to_string(),
+        metric: metric_name,
         current: current_val,
         baseline: baseline_val,
         delta,
@@ -359,102 +422,59 @@ fn check_metric(
     }
 }
 
-/// Compute per-rule deltas via a two-pointer merge of sorted `BTreeMap` iterators.
+/// Compute per-rule deltas by merging the current and baseline `BTreeMap` keys.
 ///
-/// Because `BTreeMap` iterates in sorted key order, we can merge both maps
-/// in a single pass without building a `HashMap`. The algorithm is identical
-/// to the merge step of merge-sort: advance the iterator whose current key
-/// is smaller, emitting New/Removed/Changed deltas as appropriate.
+/// Collects all rule names from both maps into a `BTreeSet` (automatic
+/// deduplication and sorted order), then classifies each rule as
+/// New/Removed/Retained based on map membership.
 ///
 /// # Complexity
 ///
-/// O(r_curr + r_base) time and space. The output Vec is pre-allocated to
-/// `max(r_curr, r_base)` as a lower-bound hint, but may grow to
-/// `r_curr + r_base` when the maps are disjoint.
-///
-/// # Output ordering
-///
-/// The returned Vec is sorted by rule name (lexicographic), inheriting the
-/// BTreeMap iteration order.
+/// O(n log n) where n = r_curr + r_base (dominated by BTreeSet insertion).
+/// Output is sorted by rule name, inheriting the BTreeSet iteration order.
 fn compute_per_rule_deltas(
     current: &BTreeMap<String, RuleMetrics>,
     baseline: &BTreeMap<String, RuleMetrics>,
 ) -> Vec<RuleDelta> {
-    let mut result = Vec::with_capacity(current.len().max(baseline.len()));
+    let all_rules: std::collections::BTreeSet<&str> = current
+        .keys()
+        .chain(baseline.keys())
+        .map(String::as_str)
+        .collect();
 
-    let mut curr_iter = current.iter().peekable();
-    let mut base_iter = baseline.iter().peekable();
-
-    loop {
-        match (curr_iter.peek(), base_iter.peek()) {
-            (Some(&(ck, _)), Some(&(bk, _))) => match ck.cmp(bk) {
-                std::cmp::Ordering::Equal => {
-                    let (rule, cm) = curr_iter.next().unwrap();
-                    let (_, bm) = base_iter.next().unwrap();
-                    result.push(RuleDelta {
-                        rule: rule.clone(),
-                        current_tp: cm.tp,
-                        baseline_tp: bm.tp,
-                        current_fp: cm.fp,
-                        baseline_fp: bm.fp,
-                        precision_delta: cm.precision - bm.precision,
-                        status: RuleDeltaStatus::Changed,
-                    });
-                }
-                std::cmp::Ordering::Less => {
-                    let (rule, cm) = curr_iter.next().unwrap();
-                    result.push(RuleDelta {
-                        rule: rule.clone(),
-                        current_tp: cm.tp,
-                        baseline_tp: 0,
-                        current_fp: cm.fp,
-                        baseline_fp: 0,
-                        precision_delta: cm.precision,
-                        status: RuleDeltaStatus::New,
-                    });
-                }
-                std::cmp::Ordering::Greater => {
-                    let (rule, bm) = base_iter.next().unwrap();
-                    result.push(RuleDelta {
-                        rule: rule.clone(),
-                        current_tp: 0,
-                        baseline_tp: bm.tp,
-                        current_fp: 0,
-                        baseline_fp: bm.fp,
-                        precision_delta: -bm.precision,
-                        status: RuleDeltaStatus::Removed,
-                    });
-                }
+    all_rules
+        .into_iter()
+        .map(|rule| match (current.get(rule), baseline.get(rule)) {
+            (Some(cm), Some(bm)) => RuleDelta {
+                rule: rule.to_string(),
+                current_tp: cm.tp,
+                baseline_tp: bm.tp,
+                current_fp: cm.fp,
+                baseline_fp: bm.fp,
+                precision_delta: cm.precision - bm.precision,
+                status: RuleDeltaStatus::Retained,
             },
-            (Some(_), None) => {
-                let (rule, cm) = curr_iter.next().unwrap();
-                result.push(RuleDelta {
-                    rule: rule.clone(),
-                    current_tp: cm.tp,
-                    baseline_tp: 0,
-                    current_fp: cm.fp,
-                    baseline_fp: 0,
-                    precision_delta: cm.precision,
-                    status: RuleDeltaStatus::New,
-                });
-            }
-            (None, Some(_)) => {
-                let (rule, bm) = base_iter.next().unwrap();
-                result.push(RuleDelta {
-                    rule: rule.clone(),
-                    current_tp: 0,
-                    baseline_tp: bm.tp,
-                    current_fp: 0,
-                    baseline_fp: bm.fp,
-                    precision_delta: -bm.precision,
-                    status: RuleDeltaStatus::Removed,
-                });
-            }
-            (None, None) => break,
-        }
-    }
-
-    result
+            (Some(cm), None) => RuleDelta {
+                rule: rule.to_string(),
+                current_tp: cm.tp,
+                baseline_tp: 0,
+                current_fp: cm.fp,
+                baseline_fp: 0,
+                precision_delta: cm.precision,
+                status: RuleDeltaStatus::New,
+            },
+            (None, Some(bm)) => RuleDelta {
+                rule: rule.to_string(),
+                current_tp: 0,
+                baseline_tp: bm.tp,
+                current_fp: 0,
+                baseline_fp: bm.fp,
+                precision_delta: -bm.precision,
+                status: RuleDeltaStatus::Removed,
+            },
+            (None, None) => unreachable!("rule came from one of the maps"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -585,7 +605,7 @@ mod tests {
 
     // ── Per-rule deltas ──────────────────────────────────────────────
 
-    /// Per-rule deltas correctly classify rules as New, Removed, or Changed
+    /// Per-rule deltas correctly classify rules as New, Removed, or Retained
     /// based on their presence in the current vs. baseline maps.
     #[test]
     fn per_rule_delta_statuses() {
@@ -622,20 +642,19 @@ mod tests {
             "rule_c",
             RuleDeltaStatus::New,
         );
-        // Rule in both → Changed.
+        // Rule in both → Retained.
         assert_rule_status(
             &[("rule_a", 12, 3)],
             &[("rule_a", 10, 2)],
             "rule_a",
-            RuleDeltaStatus::Changed,
+            RuleDeltaStatus::Retained,
         );
     }
 
-    /// Edge case: the two-pointer merge handles empty maps gracefully.
+    /// Edge case: the per-rule merge handles empty maps gracefully.
     ///
     /// Three sub-cases: both empty (no output), only current non-empty (all
-    /// New), only baseline non-empty (all Removed). Ensures the merge loop
-    /// terminates correctly when one or both iterators start exhausted.
+    /// New), only baseline non-empty (all Removed).
     #[test]
     fn empty_per_rule_maps() {
         // Both maps empty → no deltas emitted.
@@ -702,6 +721,148 @@ mod tests {
         assert_eq!(result.checks[1].verdict, Verdict::Pass);
     }
 
+    // ── Exact boundary tests ──────────────────────────────────────────
+
+    #[test]
+    fn exact_threshold_boundary() {
+        let thresh = RegressionThresholds::default();
+        // Default: ap_block = 0.02, ap_warn = 0.005.
+
+        // Drop exactly at block threshold (0.02) → Block.
+        let result = check_regression(&metrics(0.90, 0.88), &metrics(0.92, 0.88), &thresh);
+        assert_eq!(
+            result.checks[0].verdict,
+            Verdict::Block,
+            "drop == block threshold"
+        );
+
+        // Drop exactly at warn threshold (0.005) → Warn.
+        let result = check_regression(&metrics(0.915, 0.88), &metrics(0.92, 0.88), &thresh);
+        assert_eq!(
+            result.checks[0].verdict,
+            Verdict::Warn,
+            "drop == warn threshold"
+        );
+    }
+
+    #[test]
+    fn ci_gate_with_no_ci_data() {
+        // use_ci=true but ap_ci=None: CI gate should be skipped, fall
+        // through to threshold comparison.
+        let current = metrics(0.89, 0.88); // 3pp AP drop from baseline
+        let baseline = metrics(0.92, 0.88);
+        let thresh = RegressionThresholds {
+            use_ci: true,
+            ..Default::default()
+        };
+
+        let result = check_regression(&current, &baseline, &thresh);
+        // No CI data → gate cannot fire → threshold applies → Block.
+        assert_eq!(result.checks[0].verdict, Verdict::Block);
+        assert!(
+            !result.checks[0].ci_gate_applied,
+            "CI gate must not fire without CI data"
+        );
+    }
+
+    #[test]
+    fn nan_metric_produces_block() {
+        // NaN in current AP → Block, not a silent Pass from IEEE 754 semantics.
+        let current = metrics(f64::NAN, 0.88);
+        let baseline = metrics(0.92, 0.88);
+        let result = check_regression(&current, &baseline, &RegressionThresholds::default());
+        assert_eq!(
+            result.checks[0].verdict,
+            Verdict::Block,
+            "NaN current AP must Block"
+        );
+        assert!(!result.checks[0].ci_gate_applied);
+
+        // NaN in baseline precision → Block.
+        let current = metrics(0.92, 0.88);
+        let baseline = metrics(0.92, f64::NAN);
+        let result = check_regression(&current, &baseline, &RegressionThresholds::default());
+        assert_eq!(
+            result.checks[1].verdict,
+            Verdict::Block,
+            "NaN baseline precision must Block"
+        );
+
+        // Inf in current → Block.
+        let current = metrics(f64::INFINITY, 0.88);
+        let baseline = metrics(0.92, 0.88);
+        let result = check_regression(&current, &baseline, &RegressionThresholds::default());
+        assert_eq!(
+            result.checks[0].verdict,
+            Verdict::Block,
+            "Inf current AP must Block"
+        );
+    }
+
+    /// When `use_ci: false`, the CI gate must not fire even when CI data is
+    /// present. The raw threshold comparison should apply instead.
+    #[test]
+    fn use_ci_false_ignores_ci_data() {
+        // CI that would normally absorb the 1pp drop (baseline within CI).
+        let current = metrics_with_ci(0.91, 0.88, 0.89, 0.93);
+        let baseline = metrics(0.92, 0.88);
+        let thresh = RegressionThresholds {
+            use_ci: false,
+            ..Default::default()
+        };
+
+        let result = check_regression(&current, &baseline, &thresh);
+        // With use_ci=true this would be Pass (CI absorbs), but with
+        // use_ci=false the 1pp drop hits the warn threshold (0.005).
+        assert!(
+            !result.checks[0].ci_gate_applied,
+            "CI gate must not fire when use_ci=false"
+        );
+        assert_eq!(
+            result.checks[0].verdict,
+            Verdict::Warn,
+            "1pp AP drop with use_ci=false should Warn, not be absorbed by CI"
+        );
+    }
+
+    // ── Threshold validation ───────────────────────────────────────
+
+    #[test]
+    fn threshold_validate_valid() {
+        assert!(RegressionThresholds::default().validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_validate_nan() {
+        let t = RegressionThresholds {
+            ap_block: f64::NAN,
+            ..Default::default()
+        };
+        assert_eq!(t.validate(), Err("threshold values must be finite"));
+    }
+
+    #[test]
+    fn threshold_validate_negative() {
+        let t = RegressionThresholds {
+            precision_warn: -0.01,
+            ..Default::default()
+        };
+        assert_eq!(t.validate(), Err("threshold values must be non-negative"));
+    }
+
+    #[test]
+    fn threshold_validate_inverted() {
+        let t = RegressionThresholds {
+            ap_warn: 0.05,
+            ap_block: 0.02,
+            ..Default::default()
+        };
+        assert_eq!(
+            t.validate(),
+            Err("warn threshold exceeds block threshold (Warn band unreachable)")
+        );
+    }
+
     // ── Proptest ─────────────────────────────────────────────────────
 
     mod prop {
@@ -746,7 +907,6 @@ mod tests {
                 let r1 = check_regression(&current, &baseline, &thresh);
                 let r2 = check_regression(&current, &baseline, &thresh);
                 prop_assert_eq!(r1.verdict, r2.verdict);
-                prop_assert_eq!(r1.checks.len(), r2.checks.len());
                 for (a, b) in r1.checks.iter().zip(r2.checks.iter()) {
                     prop_assert_eq!(a.verdict, b.verdict);
                     prop_assert!((a.delta - b.delta).abs() < EPS);
