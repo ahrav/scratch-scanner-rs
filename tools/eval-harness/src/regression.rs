@@ -10,14 +10,17 @@
 //!
 //! # Algorithm
 //!
-//! 1. **AP check**: compute `current - baseline`, optionally apply the CI
+//! 1. **Threshold validation**: ensure warn/block values are finite,
+//!    non-negative, and ordered (`warn <= block`) via
+//!    [`RegressionThresholds::validate`].
+//! 2. **AP check**: compute `current - baseline`, optionally apply the CI
 //!    overlap gate (see below), classify as Pass/Warn/Block based on the
 //!    absolute drop against [`RegressionThresholds`].
-//! 2. **Precision check**: same threshold logic, no CI gate.
-//! 3. **Overall verdict** = `max(ap_verdict, precision_verdict)`. Because
+//! 3. **Precision check**: same threshold logic, no CI gate.
+//! 4. **Overall verdict** = `max(ap_verdict, precision_verdict)`. Because
 //!    [`Verdict`] derives `Ord` with Pass < Warn < Block, `max` yields the
 //!    worst verdict with no branching.
-//! 4. **Per-rule diff**: merge the per-rule `BTreeMap` keys via a
+//! 5. **Per-rule diff**: merge the per-rule `BTreeMap` keys via a
 //!    `BTreeSet` union to identify new, removed, and retained rules in
 //!    O(n log n). These deltas are informational — they do not influence
 //!    the verdict and are computed after the verdict is finalized.
@@ -44,7 +47,9 @@
 //! are intentionally not supported: a 2pp drop from 0.98 to 0.96 is
 //! operationally different from a 2pp drop from 0.52 to 0.50, but both
 //! should block equally because the eval harness treats the absolute
-//! quality floor as the gating criterion.
+//! quality floor as the gating criterion. Invalid ordering (`warn > block`)
+//! is rejected by [`RegressionThresholds::validate`] (called by
+//! [`check_regression`]) so the Warn band stays reachable.
 
 use std::collections::BTreeMap;
 
@@ -69,8 +74,9 @@ use crate::metrics::safe_div;
 /// (Pass / Warn / Block) to work as intended. When inverted (`warn > block`),
 /// the Warn verdict becomes unreachable: any drop large enough for Warn has
 /// already triggered Block, so regressions jump directly from Pass to Block.
-/// This is not validated at construction time — it is a logical consequence of
-/// the evaluation order in `check_metric` (block checked before warn).
+/// Construction does not enforce this; call [`RegressionThresholds::validate`]
+/// directly or use [`check_regression`], which validates before computing
+/// verdicts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegressionThresholds {
     /// AP drop (absolute) that triggers Block. Default: 0.02 (2 percentage points).
@@ -81,11 +87,36 @@ pub struct RegressionThresholds {
     pub precision_block: f64,
     /// Precision drop (absolute) that triggers Warn. Default: 0.005 (0.5 percentage points).
     pub precision_warn: f64,
-    /// Whether to apply the CI overlap gate for AP. When true and the current
-    /// run has a bootstrap CI, a drop where the baseline falls within the CI
-    /// is treated as noise and produces Pass. Default: true.
+    /// Whether to apply the one-sided CI gate for AP. When true and the current
+    /// run has a bootstrap CI, a drop is treated as noise (Pass) when
+    /// `baseline_ap <= current_ap_ci.upper`. Default: true.
     pub use_ci: bool,
 }
+
+/// Configuration error returned when regression thresholds are invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegressionConfigError {
+    /// One or more threshold values are NaN or Infinity.
+    NonFiniteThreshold,
+    /// One or more threshold values are negative.
+    NegativeThreshold,
+    /// Warn threshold is greater than block threshold, making Warn unreachable.
+    WarnExceedsBlock,
+}
+
+impl std::fmt::Display for RegressionConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NonFiniteThreshold => "threshold values must be finite",
+            Self::NegativeThreshold => "threshold values must be non-negative",
+            Self::WarnExceedsBlock => {
+                "warn threshold exceeds block threshold (Warn band unreachable)"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RegressionConfigError {}
 
 impl RegressionThresholds {
     /// Validate that all threshold values are sensible.
@@ -94,20 +125,20 @@ impl RegressionThresholds {
     /// - Any threshold is non-finite (NaN or Inf).
     /// - Any threshold is negative.
     /// - `warn > block` for either metric pair (Warn band is unreachable).
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), RegressionConfigError> {
         let pairs = [
             (self.ap_warn, self.ap_block, "ap"),
             (self.precision_warn, self.precision_block, "precision"),
         ];
         for (warn, block, _name) in pairs {
             if !warn.is_finite() || !block.is_finite() {
-                return Err("threshold values must be finite");
+                return Err(RegressionConfigError::NonFiniteThreshold);
             }
             if warn < 0.0 || block < 0.0 {
-                return Err("threshold values must be non-negative");
+                return Err(RegressionConfigError::NegativeThreshold);
             }
             if warn > block {
-                return Err("warn threshold exceeds block threshold (Warn band unreachable)");
+                return Err(RegressionConfigError::WarnExceedsBlock);
             }
         }
         Ok(())
@@ -293,6 +324,17 @@ pub struct RegressionResult {
 /// - A Vec of [`RuleDelta`] entries showing per-rule TP/FP/precision
 ///   changes (informational, does not affect the verdict).
 ///
+/// # Errors
+///
+/// Returns [`RegressionConfigError`] when `thresholds` are invalid
+/// (non-finite, negative, or `warn > block`).
+///
+/// # Non-finite metrics
+///
+/// Non-finite metric inputs (`NaN`, `+/-Inf`) are treated as hard failures:
+/// the affected metric check returns [`Verdict::Block`]. This avoids accidental
+/// Pass/Warn outcomes from IEEE-754 comparison behavior.
+///
 /// # Verdict composition
 ///
 /// `verdict = max(ap_check.verdict, precision_check.verdict)`.
@@ -302,7 +344,9 @@ pub fn check_regression(
     current: &EvalMetrics,
     baseline: &EvalMetrics,
     thresholds: &RegressionThresholds,
-) -> RegressionResult {
+) -> Result<RegressionResult, RegressionConfigError> {
+    thresholds.validate()?;
+
     let ap_check = check_metric(
         MetricName::AveragePrecision,
         current.average_precision,
@@ -326,12 +370,12 @@ pub fn check_regression(
     let verdict = ap_check.verdict.max(precision_check.verdict);
     let per_rule_deltas = compute_per_rule_deltas(&current.per_rule, &baseline.per_rule);
 
-    RegressionResult {
+    Ok(RegressionResult {
         verdict,
         checks: [ap_check, precision_check],
         per_rule_deltas,
         thresholds: thresholds.clone(),
-    }
+    })
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
@@ -358,7 +402,7 @@ pub fn check_regression(
 /// classification: `[0, warn)` = Pass, `[warn, block)` = Warn, `[block, inf)` = Block.
 /// When inverted (`warn > block`), the Warn branch becomes unreachable because
 /// any drop exceeding `warn` has already exceeded the smaller `block` threshold.
-/// See the `inverted_thresholds_skip_warn_band` test for a worked example.
+/// Invalid threshold ordering is rejected by [`check_regression`] validation.
 fn check_metric(
     metric_name: MetricName,
     current_val: f64,
@@ -527,6 +571,15 @@ mod tests {
         m
     }
 
+    fn check_regression(
+        current: &EvalMetrics,
+        baseline: &EvalMetrics,
+        thresholds: &RegressionThresholds,
+    ) -> RegressionResult {
+        super::check_regression(current, baseline, thresholds)
+            .expect("test thresholds should be valid unless explicitly testing errors")
+    }
+
     // ── Verdict properties ─────────────────────────────────────────────
 
     #[test]
@@ -683,16 +736,9 @@ mod tests {
         assert_eq!(result.per_rule_deltas[0].status, RuleDeltaStatus::Removed);
     }
 
-    /// Inverted thresholds (warn > block) eliminate the Warn band entirely.
-    ///
-    /// The threshold comparisons are evaluated in order: `drop >= block` first,
-    /// then `drop >= warn`. When `block < warn`, any drop large enough to
-    /// reach the Warn threshold has already exceeded the Block threshold, so
-    /// the Block branch fires first. Drops below the Block threshold are also
-    /// below the (higher) Warn threshold, so they produce Pass. No input can
-    /// ever reach Warn without first reaching Block — the Warn band is empty.
+    /// Inverted thresholds (warn > block) are rejected as invalid config.
     #[test]
-    fn inverted_thresholds_skip_warn_band() {
+    fn inverted_thresholds_are_rejected() {
         let thresh = RegressionThresholds {
             ap_block: 0.005, // lower than warn
             ap_warn: 0.02,   // higher than block
@@ -700,14 +746,9 @@ mod tests {
             precision_warn: 0.005,
             use_ci: false,
         };
-        // 1pp drop: exceeds block (0.005) → Block, not Warn.
-        let result = check_regression(&metrics(0.91, 0.88), &metrics(0.92, 0.88), &thresh);
-        assert_eq!(result.checks[0].verdict, Verdict::Block);
-
-        // 0.3pp drop (0.003): below block (0.005) → Pass, skipping Warn
-        // entirely. No drop value can satisfy `< 0.005 AND >= 0.02`.
-        let result = check_regression(&metrics(0.917, 0.88), &metrics(0.92, 0.88), &thresh);
-        assert_eq!(result.checks[0].verdict, Verdict::Pass);
+        let err = super::check_regression(&metrics(0.91, 0.88), &metrics(0.92, 0.88), &thresh)
+            .unwrap_err();
+        assert_eq!(err, RegressionConfigError::WarnExceedsBlock);
     }
 
     #[test]
@@ -838,7 +879,7 @@ mod tests {
             ap_block: f64::NAN,
             ..Default::default()
         };
-        assert_eq!(t.validate(), Err("threshold values must be finite"));
+        assert_eq!(t.validate(), Err(RegressionConfigError::NonFiniteThreshold));
     }
 
     #[test]
@@ -847,7 +888,7 @@ mod tests {
             precision_warn: -0.01,
             ..Default::default()
         };
-        assert_eq!(t.validate(), Err("threshold values must be non-negative"));
+        assert_eq!(t.validate(), Err(RegressionConfigError::NegativeThreshold));
     }
 
     #[test]
@@ -857,10 +898,21 @@ mod tests {
             ap_block: 0.02,
             ..Default::default()
         };
-        assert_eq!(
-            t.validate(),
-            Err("warn threshold exceeds block threshold (Warn band unreachable)")
-        );
+        assert_eq!(t.validate(), Err(RegressionConfigError::WarnExceedsBlock));
+    }
+
+    #[test]
+    fn check_regression_rejects_invalid_thresholds() {
+        let current = metrics(0.9, 0.9);
+        let baseline = metrics(0.9, 0.9);
+        let invalid = RegressionThresholds {
+            ap_warn: 0.05,
+            ap_block: 0.02,
+            ..Default::default()
+        };
+
+        let err = super::check_regression(&current, &baseline, &invalid).unwrap_err();
+        assert_eq!(err, RegressionConfigError::WarnExceedsBlock);
     }
 
     // ── Proptest ─────────────────────────────────────────────────────

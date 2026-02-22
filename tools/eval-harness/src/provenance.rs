@@ -31,19 +31,17 @@
 //! 1. Recursively collect file paths under `corpus_dir` into a `Vec<PathBuf>`.
 //!    Symlinks and non-regular files are skipped to keep the hash stable
 //!    across environments with different link layouts.
-//! 2. Sort paths lexicographically by their full path bytes (including the
-//!    `corpus_dir` prefix). Since all paths share this prefix, the ordering
-//!    is equivalent to sorting by relative path, ensuring deterministic
-//!    results regardless of filesystem visit order.
+//! 2. Sort paths lexicographically by their collected `PathBuf` bytes
+//!    (prefix form follows caller input: relative vs absolute). Since all
+//!    paths share the same `corpus_dir` prefix, the ordering is equivalent
+//!    to sorting by relative path, ensuring deterministic results regardless
+//!    of filesystem visit order.
 //! 3. Initialize a BLAKE3 hasher with `CORPUS_DOMAIN || 0x00`.
-//! 4. For each file in sorted order, feed `relative_path_bytes || 0x00 ||
-//!    file_contents` to the hasher. The NUL byte between path and content is
-//!    an unambiguous delimiter within each file entry because NUL cannot
-//!    appear in POSIX paths and is vanishingly rare in practice on other
-//!    platforms. Note: there is no explicit delimiter between one file's
-//!    content and the next file's path — the encoding relies on path ordering
-//!    and NUL-free paths for structural integrity rather than being fully
-//!    self-delimiting.
+//! 4. For each file in sorted order, feed a self-delimiting record:
+//!    `path_len_u64_le || relative_path_bytes || content_len_u64_le ||
+//!    file_contents`.
+//!    This framing avoids structural ambiguity between adjacent records even
+//!    when file contents contain arbitrary bytes.
 //! 5. An empty directory produces a hash over just the domain tag and its NUL
 //!    separator — still deterministic, but distinct from any non-empty corpus.
 //!
@@ -55,11 +53,8 @@
 //!   layout; sort has better cache behavior than B-tree pointer chasing.
 //! - **64 KiB streaming buffer for the scanner binary**: fits L1d on typical
 //!   hardware (64–128 KiB/core on Apple Silicon), amortizes syscall overhead.
-//!   Only the scanner binary is hashed via streaming reads
-//!   ([`hash_file_streaming`]); individual corpus files are read entirely into
-//!   memory via `std::fs::read` because they are typically small text fixtures
-//!   and the simpler code path avoids per-file `File::open` + read-loop
-//!   overhead.
+//!   Corpus hashing and scanner binary hashing both use streaming reads, keeping
+//!   memory flat even when the corpus contains large files.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -126,12 +121,11 @@ pub struct Provenance {
 /// Returns `(hex_hash, file_count, total_bytes)`.
 ///
 /// The hash is deterministic for a given directory tree: files are sorted by
-/// their full (absolute) path bytes, then visited in that order. The hasher
-/// is initialized with `CORPUS_DOMAIN || 0x00`, then for each file:
-/// `relative_path_bytes || 0x00 || file_contents` is appended. The NUL byte
-/// between path and content is unambiguous because POSIX paths cannot contain
-/// NUL. Files are concatenated back-to-back with no inter-file delimiter;
-/// structural integrity relies on path ordering and NUL-free path bytes.
+/// their collected path bytes (not canonicalized; relative/absolute form
+/// follows how `corpus_dir` was provided), then visited in that order. The
+/// hasher is initialized with `CORPUS_DOMAIN || 0x00`, then for each file:
+/// `path_len_u64_le || relative_path_bytes || content_len_u64_le || file_contents`
+/// is appended. Length prefixes make each record self-delimiting.
 ///
 /// # Edge cases
 ///
@@ -139,10 +133,11 @@ pub struct Provenance {
 ///   separator, with `file_count = 0` and `total_bytes = 0`.
 /// - **Unreadable files**: returns an `io::Error` at the first file that
 ///   cannot be read. The hash is not partially computed — it is all or nothing.
-/// - **Non-UTF-8 paths**: handled via `to_string_lossy`; replacement
-///   characters are hashed as-is, so two paths differing only in invalid
-///   sequences could theoretically collide. This is acceptable because corpus
-///   paths are expected to be valid UTF-8 in practice.
+/// - **Non-UTF-8 paths**: hashed as exact platform path bytes via
+///   `as_encoded_bytes()`, avoiding lossy UTF-8 replacement and preserving
+///   path identity.
+/// - **Dotfiles and zero-byte files**: included like any other regular file.
+///   Empty files still contribute their path and a zero content-length field.
 pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
     let mut files = Vec::with_capacity(1024);
     collect_files_recursive(corpus_dir, &mut files)?;
@@ -156,25 +151,32 @@ pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
 
     let mut file_count: u64 = 0;
     let mut total_bytes: u64 = 0;
+    let mut buf = vec![0u8; HASH_BUF_SIZE];
 
     for path in &files {
-        let rel = path
-            .strip_prefix(corpus_dir)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("corpus file {path:?} is not under corpus_dir {corpus_dir:?}: {e}"),
-                )
-            })?
-            .to_string_lossy();
-        let contents = std::fs::read(path)?;
+        let rel = path.strip_prefix(corpus_dir).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("corpus file {path:?} is not under corpus_dir {corpus_dir:?}: {e}"),
+            )
+        })?;
+        let rel_bytes = path_bytes(rel);
+        let mut file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
 
-        hasher.update(rel.as_bytes());
-        hasher.update(&[0x00]); // NUL delimiter between path and content.
-        hasher.update(&contents);
+        update_len_prefixed(&mut hasher, rel_bytes);
+        hasher.update(&file_len.to_le_bytes());
+
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total_bytes += n as u64;
+        }
 
         file_count += 1;
-        total_bytes += contents.len() as u64;
     }
 
     Ok((
@@ -182,6 +184,17 @@ pub fn hash_corpus(corpus_dir: &Path) -> io::Result<(String, u64, u64)> {
         file_count,
         total_bytes,
     ))
+}
+
+#[inline]
+fn update_len_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[inline]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
 }
 
 /// Hash a single file using streaming BLAKE3 with a 64 KiB read buffer.
@@ -278,6 +291,9 @@ pub fn build_provenance(
 /// skipped. Symlinks are excluded because they can point outside the corpus
 /// tree or create cycles, and their resolution depends on the host filesystem
 /// layout — including them would break cross-machine reproducibility.
+///
+/// Traversal is fail-fast: any `read_dir` / `file_type` error aborts
+/// immediately and is returned to the caller.
 fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -335,6 +351,35 @@ mod tests {
     fn missing_ruleset_file_returns_error() {
         let result = hash_file(Path::new("/nonexistent/ruleset.yaml"), FILE_DOMAIN);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn length_prefix_prevents_boundary_ambiguity() {
+        // Different content distributions across files must produce distinct hashes.
+        let dir_a = corpus(&[("a", b"XY"), ("b", b"Z")]);
+        let dir_b = corpus(&[("a", b"X"), ("b", b"YZ")]);
+
+        let (h_a, _, _) = hash_corpus(dir_a.path()).unwrap();
+        let (h_b, _, _) = hash_corpus(dir_b.path()).unwrap();
+        assert_ne!(
+            h_a, h_b,
+            "different record layouts must produce different corpus hashes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_bytes_are_preserved() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = vec![b'f', 0x80, b'g'];
+        let rel = std::path::PathBuf::from(OsString::from_vec(raw.clone()));
+        assert_eq!(
+            path_bytes(&rel),
+            raw.as_slice(),
+            "path hashing must use exact OS bytes without lossy conversion"
+        );
     }
 
     #[test]

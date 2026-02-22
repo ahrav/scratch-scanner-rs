@@ -22,13 +22,15 @@
 //! The error book extracts the top N false positives and false negatives
 //! grouped by rule, sorted descending by frequency. When multiple findings
 //! share a rule, the one with the highest confidence is selected as the
-//! representative (its path and context appear in the entry). Each entry
-//! includes an optional context window around the detection span, optionally
-//! redacted via BLAKE3 keyed hash when the secret value should not appear in
-//! reports.
+//! representative (ties keep the first encountered item, preserving stable
+//! input-order behavior). Each entry includes an optional context window
+//! around the detection span, optionally redacted via BLAKE3 keyed hash when
+//! the secret value should not appear in reports.
 //!
 //! FN entries cannot include byte-level context because [`TruthItem`] carries
 //! line-based coordinates, not byte offsets.
+//! Malformed byte offsets are dropped from context extraction and logged as
+//! warnings to stderr.
 //!
 //! # Determinism
 //!
@@ -148,7 +150,8 @@ pub struct ErrorBook {
 /// example.
 ///
 /// For FP entries, the representative is the finding with the highest
-/// confidence score (most confident mistake). For FN entries, the
+/// confidence score (most confident mistake). Equal-confidence ties keep the
+/// first encountered finding for deterministic output. For FN entries, the
 /// representative is the first truth item encountered for that rule
 /// (arbitrary but deterministic given stable input order).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +182,8 @@ pub struct ErrorBookEntry {
 /// the context window around each detection span, and whether secret
 /// values are redacted in the output.
 ///
-/// Default: 20 entries per category, no redaction, 64-byte context window.
+/// Default: 20 entries per category, no redaction key, plaintext context
+/// disabled, 64-byte context window.
 #[derive(Debug, Clone)]
 pub struct ErrorBookConfig {
     /// Maximum number of entries per category (FP and FN independently).
@@ -190,8 +194,13 @@ pub struct ErrorBookConfig {
     /// `[REDACTED:<hex>]` where `<hex>` is the keyed hash of the secret.
     /// This allows correlating redacted entries across runs (same secret
     /// produces the same hash with the same key) without exposing the
-    /// actual secret value. When `None`, the context is shown verbatim.
+    /// actual secret value.
     pub redaction_key: Option<[u8; 32]>,
+    /// Whether plaintext context is allowed when `redaction_key` is `None`.
+    ///
+    /// When `false` (default), no context is emitted unless redaction is
+    /// configured with a key. This is the secure default for CI artifacts.
+    pub allow_plaintext_context: bool,
     /// Number of bytes before and after the detection span to include as
     /// context. The actual window may be shorter at file boundaries
     /// (clamped via `saturating_sub` and `min(data.len())`).
@@ -203,6 +212,7 @@ impl Default for ErrorBookConfig {
         Self {
             max_entries: 20,
             redaction_key: None,
+            allow_plaintext_context: false,
             context_window: 64,
         }
     }
@@ -216,7 +226,8 @@ impl Default for ErrorBookConfig {
 ///
 /// 1. **FP pass**: filters `classified` to [`FindingClass::FalsePositive`]
 ///    items, groups by rule name, selects the highest-confidence finding
-///    as the representative, and extracts a context window from
+///    as the representative (equal-confidence ties keep first seen), and
+///    extracts a context window from
 ///    `file_contents`.
 /// 2. **FN pass**: groups `false_negatives` by rule name and selects the
 ///    first item as the representative. No context extraction (truth items
@@ -232,6 +243,7 @@ impl Default for ErrorBookConfig {
 /// - `false_negatives`: truth items that no finding matched.
 /// - `file_contents`: corpus file contents keyed by path, used to extract
 ///   context windows for FP entries. Missing paths produce `None` context.
+///   By default (no redaction key, plaintext disabled), context is omitted.
 /// - `config`: controls entry count, context window size, and redaction.
 pub fn build_error_book(
     classified: &[ClassifiedFinding],
@@ -368,7 +380,7 @@ pub fn write_json_file(report: &EvalReport, path: &Path) -> io::Result<()> {
 ///    a `HashMap<&str, _>`. Keys borrow from the input to avoid
 ///    per-finding string allocation. The `best_confidence` / `best_index`
 ///    track the highest-confidence finding per rule for representative
-///    selection.
+///    selection; equal-confidence ties keep the first observed index.
 ///
 /// 2. **Ranking pass**: sort by descending count, break ties
 ///    lexicographically by rule name for determinism, then truncate to
@@ -484,6 +496,10 @@ fn build_fn_entries(
 /// - `byte_start > byte_end` (inverted span -- indicates corrupt offsets).
 /// - `byte_end` exceeds the file length (stale or corrupt byte offsets).
 ///
+/// Malformed offsets (`byte_start > byte_end` or `byte_end > file_len`) emit
+/// a warning to stderr before returning `None`, so data-quality problems are
+/// visible without failing report generation.
+///
 /// The context window is `[byte_start - context_window, byte_end + context_window]`
 /// clamped to `[0, data.len()]`, so it is always safe even when the span
 /// is near file boundaries. A zero-width span (`byte_start == byte_end`)
@@ -533,8 +549,10 @@ fn extract_context(
         result.push_str(&format!("[REDACTED:{}]", hash.to_hex()));
         result.push_str(&String::from_utf8_lossy(suffix));
         Some(result)
-    } else {
+    } else if config.allow_plaintext_context {
         Some(String::from_utf8_lossy(span).into_owned())
+    } else {
+        None
     }
 }
 
@@ -578,10 +596,9 @@ fn write_simple_row(out: &mut String, label: &str, value: f64) {
 ///
 /// This function does **not** validate `precision_at_recall`,
 /// `recall_at_precision`, or any fields inside
-/// [`RegressionResult`]. Those values flow through from upstream
-/// computations that use [`safe_div`](crate::metrics::safe_div) (which
-/// returns 0.0 rather than NaN), so non-finite values there are unlikely
-/// but not defensively guarded here.
+/// [`RegressionResult`]. Non-finite values in those fields are still rejected
+/// later by `serde_json` during serialization; this helper only provides
+/// explicit field-by-field errors for core `EvalMetrics` values.
 fn validate_finite(report: &EvalReport) -> Result<(), serde_json::Error> {
     let m = &report.metrics;
     let fields = [
@@ -871,6 +888,7 @@ mod tests {
         let config = ErrorBookConfig {
             max_entries: 20,
             redaction_key: Some(key),
+            allow_plaintext_context: false,
             context_window: 64,
         };
 
@@ -898,6 +916,22 @@ mod tests {
         let book = build_error_book(&classified, &[], &fc, &config);
         assert_eq!(book.false_positives.len(), 1);
         assert!(book.false_positives[0].redacted_context.is_none());
+    }
+
+    #[test]
+    fn build_error_book_default_omits_plaintext_context() {
+        let classified = vec![ClassifiedFinding {
+            finding: NormalizedFinding::new("f.txt".into(), 5, 10, "rule_a".into(), 10),
+            class: FindingClass::FalsePositive,
+        }];
+        let mut fc = HashMap::new();
+        fc.insert("f.txt".to_string(), b"prefix-SECRET-suffix".to_vec());
+
+        let book = build_error_book(&classified, &[], &fc, &ErrorBookConfig::default());
+        assert!(
+            book.false_positives[0].redacted_context.is_none(),
+            "default config should omit context unless redaction key is configured"
+        );
     }
 
     #[test]
@@ -998,6 +1032,7 @@ mod tests {
         let config = ErrorBookConfig {
             max_entries: 20,
             redaction_key: None,
+            allow_plaintext_context: true,
             context_window: 5,
         };
 
