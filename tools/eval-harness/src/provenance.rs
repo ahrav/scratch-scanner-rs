@@ -31,11 +31,10 @@
 //! 1. Recursively collect file paths under `corpus_dir` into a `Vec<PathBuf>`.
 //!    Symlinks and non-regular files are skipped to keep the hash stable
 //!    across environments with different link layouts.
-//! 2. Sort paths lexicographically by their collected `PathBuf` bytes
-//!    (prefix form follows caller input: relative vs absolute). Since all
-//!    paths share the same `corpus_dir` prefix, the ordering is equivalent
-//!    to sorting by relative path, ensuring deterministic results regardless
-//!    of filesystem visit order.
+//! 2. Sort paths with `PathBuf`'s native ordering (`sort_unstable`).
+//!    Since all paths share the same `corpus_dir` prefix, this ordering is
+//!    equivalent to sorting by relative path, ensuring deterministic results
+//!    regardless of filesystem visit order.
 //! 3. Initialize a BLAKE3 hasher with `CORPUS_DOMAIN || 0x00`.
 //! 4. For each file in sorted order, feed a self-delimiting record:
 //!    `path_len_u64_le || relative_path_bytes || content_len_u64_le ||
@@ -121,9 +120,9 @@ pub struct Provenance {
 /// Returns `(hex_hash, file_count, total_bytes)`.
 ///
 /// The hash is deterministic for a given directory tree: files are sorted by
-/// their collected path bytes (not canonicalized; relative/absolute form
-/// follows how `corpus_dir` was provided), then visited in that order. The
-/// hasher is initialized with `CORPUS_DOMAIN || 0x00`, then for each file:
+/// `PathBuf` order (not canonicalized; relative/absolute form follows how
+/// `corpus_dir` was provided), then visited in that order. The hasher is
+/// initialized with `CORPUS_DOMAIN || 0x00`, then for each file:
 /// `path_len_u64_le || relative_path_bytes || content_len_u64_le || file_contents`
 /// is appended. Length prefixes make each record self-delimiting.
 ///

@@ -12,8 +12,8 @@
 //!   items by file path and byte/line overlap, producing confidence-ranked
 //!   classifications for PRC-AUC computation with bootstrap CIs.
 //! - **Count-based** (`leaky-repo`) — compares per-file finding counts against
-//!   expected counts. Coarser than position-based matching but sufficient for
-//!   regression testing against corpora that lack position annotations.
+//!   expected counts. Coarser than position-based matching but useful for
+//!   quality tracking against corpora that lack position annotations.
 //!
 //! # Data flow
 //!
@@ -544,9 +544,9 @@ fn load_findings(
 /// sources produce identical `NormalizedFinding` representations.
 ///
 /// The scan is synchronous: `scan_local` blocks until all files have been
-/// processed. All corpus file bytes and scanner events are held in memory
-/// simultaneously, so this path is intended for small-to-medium corpora
-/// used in development iteration, not for multi-GB production benchmarks.
+/// processed. This path keeps discovered file metadata and scanner event bytes
+/// in memory, so it is intended for small-to-medium corpora used in
+/// development iteration, not for multi-GB production benchmarks.
 fn run_live_scan(
     scan_dir: &Path,
     canonical_root: &str,
