@@ -418,7 +418,7 @@ eval-harness leaky-repo \
   --corpus-root /path/to/corpus
 ```
 
-LeakyRepo only accepts `--findings` (no `--scan-corpus` support) and does not support `--baseline` regression comparison. Exit code is always 0.
+LeakyRepo only accepts `--findings` (no `--scan-corpus` support) and does not support `--baseline` regression comparison. The evaluation verdict exit code is always 0 (no regression gate); argument or runtime errors still produce exit code 2 (see [Exit Codes](#exit-codes)).
 
 #### Comparison logic
 
