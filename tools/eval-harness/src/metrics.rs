@@ -80,10 +80,8 @@ pub enum MetricsError {
         fn_count: u64,
         total_positives: u64,
     },
-    /// CI lower bound exceeds upper bound.
+    /// CI lower bound exceeds upper bound (after clamping to `[0.0, 1.0]`).
     CiLowerExceedsUpper { lower: f64, upper: f64 },
-    /// CI bounds are outside `[0.0, 1.0]`.
-    CiOutOfRange { lower: f64, upper: f64 },
     /// `BootstrapConfig::n_iterations` must be > 0.
     ZeroIterations,
     /// `BootstrapConfig::alpha` must be in the open interval `(0.0, 1.0)`.
@@ -105,9 +103,6 @@ impl std::fmt::Display for MetricsError {
             ),
             Self::CiLowerExceedsUpper { lower, upper } => {
                 write!(f, "CI lower ({lower}) must not exceed upper ({upper})")
-            }
-            Self::CiOutOfRange { lower, upper } => {
-                write!(f, "CI bounds must be in [0.0, 1.0], got ({lower}, {upper})")
             }
             Self::ZeroIterations => {
                 write!(f, "BootstrapConfig::n_iterations must be > 0")
@@ -342,25 +337,18 @@ impl EvalMetrics {
     ///
     /// # Errors
     ///
-    /// Returns [`MetricsError::CiLowerExceedsUpper`] if `ci.0 > ci.1`.
-    /// Returns [`MetricsError::CiOutOfRange`] if bounds are outside `[0.0, 1.0]`.
+    /// Returns [`MetricsError::CiLowerExceedsUpper`] if `lower > upper`
+    /// after clamping both bounds to `[0.0, 1.0]`.
     pub fn with_bootstrap_ci(mut self, ci: (f64, f64)) -> Result<Self, MetricsError> {
-        if ci.0 > ci.1 {
-            return Err(MetricsError::CiLowerExceedsUpper {
-                lower: ci.0,
-                upper: ci.1,
-            });
+        // Clamp to [0.0, 1.0] before validation so that tiny float-rounding
+        // artifacts (e.g. -1e-16 or 1.0000000000000002) don't trip the range
+        // check.
+        let lower = ci.0.clamp(0.0, 1.0);
+        let upper = ci.1.clamp(0.0, 1.0);
+        if lower > upper {
+            return Err(MetricsError::CiLowerExceedsUpper { lower, upper });
         }
-        if ci.0 < 0.0 || ci.1 > 1.0 {
-            return Err(MetricsError::CiOutOfRange {
-                lower: ci.0,
-                upper: ci.1,
-            });
-        }
-        self.ap_ci = Some(ConfidenceInterval {
-            lower: ci.0,
-            upper: ci.1,
-        });
+        self.ap_ci = Some(ConfidenceInterval { lower, upper });
         Ok(self)
     }
 }

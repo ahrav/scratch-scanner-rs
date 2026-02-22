@@ -279,7 +279,7 @@ fn run_creddata(args: CreddataArgs) -> Result<i32, Box<dyn Error>> {
         }
     }
 
-    run_position_pipeline(dir_result.parsed.items, &args.common)
+    run_position_pipeline(dir_result.parsed.items, &args.common, &canonical_root)
 }
 
 /// Load a synthetic JSON manifest and evaluate via the position-based pipeline.
@@ -291,7 +291,7 @@ fn run_synthetic(args: SyntheticArgs) -> Result<i32, Box<dyn Error>> {
     let canonical_root = canonicalize_root(&args.common.corpus_root);
     let truth = load_synthetic_manifest(&args.manifest, &canonical_root)?;
 
-    run_position_pipeline(truth, &args.common)
+    run_position_pipeline(truth, &args.common, &canonical_root)
 }
 
 /// Run the count-based evaluation pipeline for LeakyRepo.
@@ -383,14 +383,14 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 fn run_position_pipeline(
     truth: Vec<TruthItem>,
     args: &PositionPipelineArgs,
+    canonical_root: &str,
 ) -> Result<i32, Box<dyn Error>> {
     validate_output_format(args.format, args.output.as_deref())?;
-    let canonical_root = canonicalize_root(&args.corpus_root);
 
     let mut findings = load_findings(
         args.findings.as_deref(),
         args.scan_corpus.as_deref(),
-        &canonical_root,
+        canonical_root,
     )?;
     dedup_findings(&mut findings);
 

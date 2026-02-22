@@ -531,13 +531,11 @@ fn build_fp_entries(
         .into_iter()
         .map(|(rule, count, conf, idx)| {
             let finding = &classified[idx].finding;
-            let context = extract_context(
-                file_contents,
-                &finding.path,
-                finding.byte_start as usize,
-                finding.byte_end as usize,
-                config,
-            );
+            let start = usize::try_from(finding.byte_start).ok();
+            let end = usize::try_from(finding.byte_end).ok();
+            let context = start
+                .zip(end)
+                .and_then(|(s, e)| extract_context(file_contents, &finding.path, s, e, config));
             ErrorBookEntry {
                 rule: rule.to_string(),
                 count,

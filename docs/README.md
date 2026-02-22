@@ -102,6 +102,12 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | [scheduler_test_harness_guide.md](scheduler_test_harness_guide.md) | Scheduler simulation harness usage | Work-stealing policy checks and deterministic replay |
 | [git_simulation_harness_guide.md](git_simulation_harness_guide.md) | Git simulation harness usage | Stage model, fault injection, and corpus replay |
 
+### 7. Evaluation & Accuracy
+
+| Document | Focus | Key Concepts |
+|----------|-------|--------------|
+| [eval-harness.md](eval-harness.md) | Accuracy measurement against labeled corpora | Precision, recall, AP, bootstrap CI, regression gating, CredData/synthetic/LeakyRepo pipelines |
+
 ---
 
 ## Finding Documentation
@@ -120,6 +126,8 @@ Documentation index for the scanner-rs secret scanning engine. This guide helps 
 | Understand FS persistence plumbing | [fs-persistence-pipeline.md](fs-persistence-pipeline.md) |
 | Understand persistence identity | [persistence-identity.md](persistence-identity.md) |
 | Configure `SCANNER_SECRET_KEY` | [persistence-identity.md](persistence-identity.md#key-bootstrap) |
+| Measure scanner accuracy | [eval-harness.md](eval-harness.md) |
+| Set up regression gating in CI | [eval-harness.md](eval-harness.md#regression-gating-with-baseline-comparison) |
 
 ---
 
