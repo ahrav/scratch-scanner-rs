@@ -386,7 +386,8 @@ pub fn write_json_file(report: &EvalReport, path: &Path) -> io::Result<()> {
 /// 2. **Ranking pass**: sort by descending count, break ties
 ///    lexicographically by rule name for determinism, then truncate to
 ///    `max_entries`. Context extraction happens only for surviving entries,
-///    so file I/O is bounded by `max_entries`, not by total FP count.
+///    so downstream context work is bounded by `max_entries`, not by total
+///    FP count.
 fn build_fp_entries(
     classified: &[ClassifiedFinding],
     file_contents: &HashMap<String, Vec<u8>>,
