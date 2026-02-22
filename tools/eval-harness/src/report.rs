@@ -170,8 +170,9 @@ pub struct ErrorBookEntry {
     pub path: String,
     /// Context window around the detection span, possibly redacted via
     /// BLAKE3 keyed hash. `None` when: the file is not in `file_contents`,
-    /// the byte span exceeds file length, or this is an FN entry (truth
-    /// items lack byte offsets).
+    /// the byte span is invalid (`start > end` or `end > len`), plaintext
+    /// context is disabled and no redaction key is configured, or this is
+    /// an FN entry (truth items lack byte offsets).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_context: Option<String>,
 }

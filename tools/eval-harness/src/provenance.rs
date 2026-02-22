@@ -1,8 +1,8 @@
 //! Reproducibility metadata for eval runs.
 //!
 //! Every eval report embeds a [`Provenance`] struct that cryptographically
-//! fingerprints the three inputs to an evaluation: the corpus directory, the
-//! scanner binary, and the ruleset file. This lets anyone verify whether two
+//! fingerprints the evaluation inputs: the corpus directory plus optional
+//! scanner binary and ruleset file. This lets anyone verify whether two
 //! reports were produced from identical inputs, or pinpoint exactly which input
 //! changed when metrics shift between runs.
 //!
