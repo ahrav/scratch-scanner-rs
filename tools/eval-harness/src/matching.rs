@@ -220,7 +220,7 @@ pub fn match_findings(
     // ── Precondition: findings are deduplicated ────────────────────
     // Precondition: duplicates inflate TP counts. The hard conservation
     // assertions at the end of this function serve as an additional backstop.
-    debug_assert!(
+    assert!(
         findings.windows(2).all(|w| w[0] != w[1]),
         "findings must be deduplicated before matching"
     );

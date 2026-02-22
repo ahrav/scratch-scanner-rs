@@ -318,7 +318,9 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
     let metrics = EvalMetrics::from_counts(tp, fp, false_neg);
 
     let provenance = build_provenance(
-        args.secrets_csv.parent().unwrap_or_else(|| Path::new(".")),
+        args.secrets_csv
+            .parent()
+            .ok_or("secrets CSV path must include a directory component")?,
         None,
         None,
     )?;
@@ -375,8 +377,11 @@ fn run_position_pipeline(
     validate_output_format(args.format, args.output.as_deref())?;
     let canonical_root = canonicalize_root(&args.corpus_root);
 
-    let mut findings =
-        load_findings(args.findings.as_deref(), args.scan_corpus.as_deref(), &canonical_root)?;
+    let mut findings = load_findings(
+        args.findings.as_deref(),
+        args.scan_corpus.as_deref(),
+        &canonical_root,
+    )?;
     dedup_findings(&mut findings);
 
     let file_contents = load_corpus_files(&args.corpus_root)?;
@@ -388,14 +393,14 @@ fn run_position_pipeline(
     let total_positives = match_result.total_positives();
     let fn_count = match_result.fn_count();
 
-    let metrics = compute_metrics(&match_result.classified, fn_count, total_positives);
+    let metrics = compute_metrics(&match_result.classified, fn_count, total_positives)?;
 
     let ci = bootstrap_ap_ci(
         &match_result.classified,
         total_positives,
         &BootstrapConfig::default(),
-    );
-    let metrics = metrics.with_bootstrap_ci(ci);
+    )?;
+    let metrics = metrics.with_bootstrap_ci(ci)?;
 
     let provenance = build_provenance(&args.corpus_root, None, None)?;
 
@@ -487,22 +492,36 @@ fn run_live_scan(
 
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files_recursive(scan_dir, &mut files)?;
+    let mut metadata_failures: usize = 0;
     let local_files: Vec<LocalFile> = files
         .into_iter()
-        .map(|path| {
-            let size = match path.metadata() {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    eprintln!(
-                        "warning: could not read metadata for {}: {e}",
-                        path.display(),
-                    );
-                    0
-                }
-            };
-            LocalFile { path, size }
+        .filter_map(|path| match path.metadata() {
+            Ok(m) => Some(LocalFile {
+                path,
+                size: m.len(),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read metadata for {}: {e}",
+                    path.display(),
+                );
+                metadata_failures += 1;
+                None
+            }
         })
         .collect();
+    if metadata_failures > 0 {
+        let total = metadata_failures + local_files.len();
+        let failure_rate = metadata_failures as f64 / total as f64;
+        eprintln!("warning: {metadata_failures}/{total} files failed metadata read");
+        if failure_rate > 0.05 {
+            return Err(format!(
+                "too many metadata failures: {metadata_failures}/{total} ({:.1}%)",
+                failure_rate * 100.0,
+            )
+            .into());
+        }
+    }
 
     let sink = Arc::new(VecEventSink::new());
     let cfg = LocalConfig {
@@ -513,7 +532,13 @@ fn run_live_scan(
     scan_local(engine, VecFileSource::new(local_files), cfg);
 
     let bytes = sink.take();
-    let jsonl = String::from_utf8_lossy(&bytes);
+    let jsonl = String::from_utf8(bytes).map_err(|e| {
+        format!(
+            "scanner output is not valid UTF-8 (byte offset {}): \
+             non-UTF-8 scanner output cannot be evaluated",
+            e.utf8_error().valid_up_to(),
+        )
+    })?;
     let result = parse_findings_jsonl(&jsonl, canonical_root);
     print_parse_diagnostics(&result);
 
@@ -532,15 +557,19 @@ fn run_live_scan(
 /// All file bytes are held in memory. For large corpora this can be
 /// significant — the position-based pipeline requires file contents for
 /// byte-to-line conversion via [`LineIndex`](eval_harness::line_index::LineIndex).
-fn load_corpus_files(
-    corpus_root: &Path,
-) -> Result<HashMap<String, Vec<u8>>, Box<dyn Error>> {
+fn load_corpus_files(corpus_root: &Path) -> Result<HashMap<String, Vec<u8>>, Box<dyn Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     collect_files_recursive(corpus_root, &mut paths)?;
 
     let mut contents = HashMap::with_capacity(paths.len());
     for path in paths {
-        let rel = path.strip_prefix(corpus_root).unwrap_or(&path);
+        let rel = path.strip_prefix(corpus_root).map_err(|e| {
+            format!(
+                "corpus file {} not under corpus root {}: {e}",
+                path.display(),
+                corpus_root.display(),
+            )
+        })?;
         // Empty root: corpus_root prefix is already stripped by
         // strip_prefix, so normalize_path only canonicalizes slashes.
         let key = normalize_path(&rel.to_string_lossy(), "");
@@ -557,9 +586,8 @@ fn load_corpus_files(
 
 /// Deserialize a previously saved JSON report for regression comparison.
 ///
-/// The baseline must have been produced by the same version of the
-/// harness (or at least a schema-compatible one). Deserialization
-/// failures surface as the returned error.
+/// The baseline must conform to the current `EvalReport` JSON schema.
+/// Deserialization failures surface as the returned error.
 fn load_baseline(path: &Path) -> Result<EvalReport, Box<dyn Error>> {
     let contents = std::fs::read_to_string(path)?;
     let report: EvalReport = serde_json::from_str(&contents)?;
@@ -597,15 +625,17 @@ fn output_report(
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Convert the corpus root path to a forward-slash string for use as
+/// Convert the corpus root path to a canonical string for use as
 /// the `canonical_root` argument to [`normalize_path`].
 ///
-/// This is a lightweight text transformation (backslash to forward slash),
-/// not filesystem canonicalization — no symlink resolution or existence
-/// checks. The result is suitable for prefix-stripping in path
-/// normalization on any platform.
+/// Delegates to [`scanner_rs::store::canonicalize_path`] so the root
+/// undergoes the same lexical normalization (backslash → forward slash,
+/// collapse `.`/`..`, strip leading `/`) applied to finding and truth
+/// paths. Without this, an absolute `--corpus-root /abs/path` would
+/// retain the leading slash while [`normalize_path`] strips it from
+/// finding paths, breaking prefix removal.
 fn canonicalize_root(corpus_root: &Path) -> String {
-    corpus_root.to_string_lossy().replace('\\', "/")
+    scanner_rs::store::canonicalize_path(&corpus_root.to_string_lossy())
 }
 
 /// Reject the `--output` + `--format table` combination.
