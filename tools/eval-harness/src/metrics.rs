@@ -781,7 +781,7 @@ fn compute_per_rule(classified: &[ClassifiedFinding]) -> BTreeMap<String, RuleMe
 /// Prevents NaN/Inf from propagating through metric computations when
 /// there are no positive predictions (precision denominator = 0) or no
 /// ground-truth positives (recall denominator = 0).
-pub(crate) fn safe_div(num: f64, den: f64) -> f64 {
+pub fn safe_div(num: f64, den: f64) -> f64 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 

@@ -294,7 +294,7 @@ pub fn build_provenance(
 ///
 /// Traversal is fail-fast: any `read_dir` / `file_type` error aborts
 /// immediately and is returned to the caller.
-fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+pub fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let ft = entry.file_type()?;
