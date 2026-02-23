@@ -157,6 +157,9 @@ pub struct LocalFsUringConfig {
 
     /// When `true`, run cross-rule winner dedupe after prefix pruning.
     ///
+    /// Cross-rule dedupe respects each finding's `dedupe_with_span()` flag so
+    /// spans only participate when the engine can provide stable offsets.
+    ///
     /// Mode interaction:
     /// - `true`: cross-rule winner pass (always runs when >1 finding)
     /// - `false`: same-rule-only dedupe path (gated by `dedupe_within_chunk`)

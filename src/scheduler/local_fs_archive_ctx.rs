@@ -283,6 +283,8 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
         self.scan_scratch.drain_findings_into(self.pending);
 
         let before_mode_pass = self.pending.len();
+        // When enabled, cross-rule dedupe runs on per-finding span keys tracked
+        // via `dedupe_with_span()`, so spans only count when offsets stay stable.
         if self.cross_rule_dedupe && before_mode_pass > 1 {
             let engine = self.engine;
             dedupe_findings_cross_rule(self.pending, |lhs, rhs| {

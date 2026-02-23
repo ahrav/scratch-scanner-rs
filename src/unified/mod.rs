@@ -143,6 +143,8 @@ pub struct FsScanConfig {
     /// When `true`, enable scanner-side cross-rule dedupe winner selection.
     ///
     /// Default is `true`; pass `--no-cross-rule-dedupe` to disable.
+    /// Span inclusion follows each finding's `dedupe_with_span()` indicator so
+    /// spans only contribute when offsets remain stable.
     pub cross_rule_dedupe: bool,
 }
 

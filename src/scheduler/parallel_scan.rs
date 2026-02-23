@@ -305,6 +305,8 @@ pub struct ParallelScanConfig {
     /// Enable cross-rule winner dedupe in scheduler scan loops.
     ///
     /// Defaults to `true`; set to `false` to fall back to same-rule-only dedupe.
+    /// Span participation follows each finding's `dedupe_with_span()` flag so
+    /// cross-rule keys only include spans when offsets are stable.
     pub cross_rule_dedupe: bool,
 
     /// Optional persistence producer for post-dedupe FS findings.

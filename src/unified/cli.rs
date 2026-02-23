@@ -708,7 +708,7 @@ FILE TYPE OPTIONS:
     --scan-archives         Scan archives (undo --skip-archives) [default: scan]
     --scan-binary           Scan binary files instead of skipping [default: skip]
     --skip-binary           Skip binary files (undo --scan-binary) [default: skip]
-    --cross-rule-dedupe     Enable cross-rule winner dedupe [default: on]
+    --cross-rule-dedupe     Enable cross-rule winner dedupe (spans only count when offsets stay stable) [default: on]
     --no-cross-rule-dedupe  Disable cross-rule winner dedupe
 
 OUTPUT OPTIONS:
