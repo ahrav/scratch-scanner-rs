@@ -1299,30 +1299,29 @@ mod tests {
         assert!((totals.baseline_ap - precision).abs() < EPS);
     }
 
-    #[test]
-    fn from_counts_matches_compute_metrics_for_threshold_free_scores() {
-        let cases = &[
-            (0u64, 0u64, 0u64),
-            (0u64, 4u64, 3u64),
-            (1u64, 0u64, 2u64),
-            (3u64, 2u64, 5u64),
-            (10u64, 3u64, 0u64),
-        ];
+    #[rstest::rstest]
+    #[case::all_zero(0, 0, 0)]
+    #[case::no_tp(0, 4, 3)]
+    #[case::no_fp(1, 0, 2)]
+    #[case::mixed(3, 2, 5)]
+    #[case::no_fn(10, 3, 0)]
+    fn from_counts_matches_compute_metrics_for_threshold_free_scores(
+        #[case] tp: u64,
+        #[case] fp: u64,
+        #[case] fn_count: u64,
+    ) {
+        let mut classified = Vec::with_capacity((tp + fp) as usize);
+        classified.extend((0..tp).map(|_| item(10, FindingClass::TruePositive)));
+        classified.extend((0..fp).map(|_| item(10, FindingClass::FalsePositive)));
 
-        for &(tp, fp, fn_count) in cases {
-            let mut classified = Vec::with_capacity((tp + fp) as usize);
-            classified.extend((0..tp).map(|_| item(10, FindingClass::TruePositive)));
-            classified.extend((0..fp).map(|_| item(10, FindingClass::FalsePositive)));
+        let from_counts = EvalMetrics::from_counts(tp, fp, fn_count);
+        let from_classified = compute_metrics(&classified, fn_count, tp + fn_count).unwrap();
 
-            let from_counts = EvalMetrics::from_counts(tp, fp, fn_count);
-            let from_classified = compute_metrics(&classified, fn_count, tp + fn_count).unwrap();
-
-            assert!((from_counts.precision - from_classified.precision).abs() < EPS);
-            assert!((from_counts.recall - from_classified.recall).abs() < EPS);
-            assert!((from_counts.f1 - from_classified.f1).abs() < EPS);
-            assert!((from_counts.f2 - from_classified.f2).abs() < EPS);
-            assert!((from_counts.baseline_ap - from_classified.baseline_ap).abs() < EPS);
-        }
+        assert!((from_counts.precision - from_classified.precision).abs() < EPS);
+        assert!((from_counts.recall - from_classified.recall).abs() < EPS);
+        assert!((from_counts.f1 - from_classified.f1).abs() < EPS);
+        assert!((from_counts.f2 - from_classified.f2).abs() < EPS);
+        assert!((from_counts.baseline_ap - from_classified.baseline_ap).abs() < EPS);
     }
 
     // ── Bootstrap CI tests ──────────────────────────────────────

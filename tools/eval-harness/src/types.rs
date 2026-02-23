@@ -470,20 +470,16 @@ mod tests {
 
     // ── TruthLabel traits (serde + display) ────────────────────
 
-    #[test]
-    fn truth_label_traits() {
-        let cases: &[(TruthLabel, &str, &str)] = &[
-            (TruthLabel::Positive, r#""positive""#, "positive"),
-            (TruthLabel::Negative, r#""negative""#, "negative"),
-            (TruthLabel::Placeholder, r#""placeholder""#, "placeholder"),
-        ];
-        for &(variant, json, display) in cases {
-            let serialized = serde_json::to_string(&variant).unwrap();
-            assert_eq!(serialized, json, "{variant:?} serialization");
-            let back: TruthLabel = serde_json::from_str(&serialized).unwrap();
-            assert_eq!(back, variant, "{variant:?} roundtrip");
-            assert_eq!(variant.to_string(), display, "{variant:?} display");
-        }
+    #[rstest::rstest]
+    #[case::positive(TruthLabel::Positive, r#""positive""#, "positive")]
+    #[case::negative(TruthLabel::Negative, r#""negative""#, "negative")]
+    #[case::placeholder(TruthLabel::Placeholder, r#""placeholder""#, "placeholder")]
+    fn truth_label_traits(#[case] variant: TruthLabel, #[case] json: &str, #[case] display: &str) {
+        let serialized = serde_json::to_string(&variant).unwrap();
+        assert_eq!(serialized, json, "{variant:?} serialization");
+        let back: TruthLabel = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(back, variant, "{variant:?} roundtrip");
+        assert_eq!(variant.to_string(), display, "{variant:?} display");
     }
 
     // ── NormalizedFinding ordering contract ────────────────────
@@ -584,43 +580,23 @@ mod tests {
 
     // ── normalize_path examples ───────────────────────────────
 
-    #[test]
-    fn normalize_path_examples() {
-        let cases: &[(&str, &str, &str)] = &[
-            // (raw, corpus_root, expected)
-            ("corpus/foo/bar.txt", "corpus", "foo/bar.txt"),
-            ("foo\\bar.txt", "", "foo/bar.txt"),
-            ("./foo/bar.txt", "", "foo/bar.txt"),
-            ("", "", ""),
-            ("unrelated/bar.txt", "corpus", "unrelated/bar.txt"),
-            // Edge case: path equals corpus root exactly. strip_prefix
-            // yields "", which has no leading '/' to strip, so the
-            // canonical path is returned unchanged.
-            ("corpus", "corpus", "corpus"),
-            // Multi-component corpus root.
-            ("a/b/c/file.txt", "a/b", "c/file.txt"),
-            // Un-canonicalized root with trailing slash — strip_prefix
-            // consumes the slash so the second strip_prefix('/') sees no
-            // leading '/' and falls back. Reinforces the API contract that
-            // canonical_root must be pre-canonicalized.
-            ("a/b/c/file.txt", "a/b/", "a/b/c/file.txt"),
-            // Root is a prefix of a segment name — must not strip partial
-            // segments (e.g., "corpus" must not strip from "corpus_data").
-            ("corpus_data/file.txt", "corpus", "corpus_data/file.txt"),
-            // Deeper variant of the segment-prefix case.
-            (
-                "corpusextra/sub/file.txt",
-                "corpus",
-                "corpusextra/sub/file.txt",
-            ),
-        ];
-        for &(raw, root, expected) in cases {
-            assert_eq!(
-                normalize_path(raw, root),
-                expected,
-                "normalize_path({raw:?}, {root:?})"
-            );
-        }
+    #[rstest::rstest]
+    #[case::strip_corpus_root("corpus/foo/bar.txt", "corpus", "foo/bar.txt")]
+    #[case::backslash_to_forward("foo\\bar.txt", "", "foo/bar.txt")]
+    #[case::leading_dot_slash("./foo/bar.txt", "", "foo/bar.txt")]
+    #[case::empty("", "", "")]
+    #[case::unrelated_root("unrelated/bar.txt", "corpus", "unrelated/bar.txt")]
+    #[case::path_equals_root("corpus", "corpus", "corpus")]
+    #[case::multi_component_root("a/b/c/file.txt", "a/b", "c/file.txt")]
+    #[case::trailing_slash_root("a/b/c/file.txt", "a/b/", "a/b/c/file.txt")]
+    #[case::segment_prefix("corpus_data/file.txt", "corpus", "corpus_data/file.txt")]
+    #[case::segment_prefix_deeper("corpusextra/sub/file.txt", "corpus", "corpusextra/sub/file.txt")]
+    fn normalize_path_examples(#[case] raw: &str, #[case] root: &str, #[case] expected: &str) {
+        assert_eq!(
+            normalize_path(raw, root),
+            expected,
+            "normalize_path({raw:?}, {root:?})"
+        );
     }
 
     // ── Absolute corpus root ──────────────────────────────────

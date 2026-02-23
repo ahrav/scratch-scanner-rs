@@ -619,26 +619,24 @@ mod tests {
     const SIMPLE_FILE: &[u8] = b"aaaa\nbbbb\ncccc\n";
     const SIMPLE_PATH: &str = "f.txt";
 
-    #[test]
-    fn single_finding_classification() {
-        // Each truth label maps to exactly one finding class.
-        let cases = [
-            (TruthLabel::Positive, FindingClass::TruePositive),
-            (TruthLabel::Negative, FindingClass::FalsePositive),
-            (TruthLabel::Placeholder, FindingClass::Unlabeled),
-        ];
-        for (label, expected_class) in cases {
-            let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
-            let truth = vec![make_truth(SIMPLE_PATH, 1, 1, label, "r")];
-            let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+    #[rstest::rstest]
+    #[case::positive(TruthLabel::Positive, FindingClass::TruePositive)]
+    #[case::negative(TruthLabel::Negative, FindingClass::FalsePositive)]
+    #[case::placeholder(TruthLabel::Placeholder, FindingClass::Unlabeled)]
+    fn single_finding_classification(
+        #[case] label: TruthLabel,
+        #[case] expected_class: FindingClass,
+    ) {
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r", 5)];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, label, "r")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
-            let result = match_findings(findings, truth, &fc, default_config());
-            assert_eq!(result.classified.len(), 1);
-            assert_eq!(
-                result.classified[0].class, expected_class,
-                "label={label:?} should produce {expected_class:?}"
-            );
-        }
+        let result = match_findings(findings, truth, &fc, default_config());
+        assert_eq!(result.classified.len(), 1);
+        assert_eq!(
+            result.classified[0].class, expected_class,
+            "label={label:?} should produce {expected_class:?}"
+        );
     }
 
     #[test]

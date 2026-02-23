@@ -439,48 +439,45 @@ mod tests {
         assert!(matches!(err, LeakyRepoError::DuplicatePath { line: 2, .. }));
     }
 
-    #[test]
-    fn parse_invalid_row_cases() {
-        let cases: &[(&str, &str, usize)] = &[
-            ("non-numeric field", "file.txt,abc,2\n", 1),
-            ("missing fields", "file.txt,1\n", 1),
-            ("negative number", "file.txt,-1,2\n", 1),
-            ("overflow", "file.txt,4294967295,1\n", 1),
-        ];
-        for &(label, csv, expected_line) in cases {
-            let err = parse(csv).unwrap_err();
-            assert!(
-                matches!(err, LeakyRepoError::InvalidRow { line, .. } if line == expected_line),
-                "{label}: expected InvalidRow at line {expected_line}, got {err:?}"
-            );
-        }
+    #[rstest::rstest]
+    #[case::non_numeric_field("file.txt,abc,2\n", 1)]
+    #[case::missing_fields("file.txt,1\n", 1)]
+    #[case::negative_number("file.txt,-1,2\n", 1)]
+    #[case::overflow("file.txt,4294967295,1\n", 1)]
+    fn parse_invalid_row_cases(#[case] csv: &str, #[case] expected_line: usize) {
+        let err = parse(csv).unwrap_err();
+        assert!(
+            matches!(err, LeakyRepoError::InvalidRow { line, .. } if line == expected_line),
+            "expected InvalidRow at line {expected_line}, got {err:?}"
+        );
     }
 
     // ── compare_counts: core logic ───────────────────────────
 
-    #[test]
-    fn compare_formula_cases() {
-        // (label, expected_count, num_findings, expected_tp, expected_fp, expected_fn)
-        let cases: &[(&str, u32, u32, u32, u32, u32)] = &[
-            ("overcounting: 3 expected, 5 actual", 3, 5, 3, 2, 0),
-            ("undercounting: 3 expected, 1 actual", 3, 1, 1, 0, 2),
-            ("zero expected, 3 actual", 0, 3, 0, 3, 0),
-            ("3 expected, no findings", 3, 0, 0, 0, 3),
-        ];
-        for &(label, expected_count, num_findings, exp_tp, exp_fp, exp_fn) in cases {
-            let expectations = vec![FileExpectation {
-                path: "a.txt".into(),
-                expected_count,
-            }];
-            let findings: Vec<NormalizedFinding> = (0..num_findings)
-                .map(|i| finding("a.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
-                .collect();
-            let result = compare_counts(findings, &expectations);
-            assert_eq!(result.len(), 1, "{label}: result count");
-            assert_eq!(result[0].tp, exp_tp, "{label}: tp");
-            assert_eq!(result[0].fp, exp_fp, "{label}: fp");
-            assert_eq!(result[0].false_neg, exp_fn, "{label}: false_neg");
-        }
+    #[rstest::rstest]
+    #[case::overcounting(3, 5, 3, 2, 0)]
+    #[case::undercounting(3, 1, 1, 0, 2)]
+    #[case::zero_expected(0, 3, 0, 3, 0)]
+    #[case::no_findings(3, 0, 0, 0, 3)]
+    fn compare_formula_cases(
+        #[case] expected_count: u32,
+        #[case] num_findings: u32,
+        #[case] exp_tp: u32,
+        #[case] exp_fp: u32,
+        #[case] exp_fn: u32,
+    ) {
+        let expectations = vec![FileExpectation {
+            path: "a.txt".into(),
+            expected_count,
+        }];
+        let findings: Vec<NormalizedFinding> = (0..num_findings)
+            .map(|i| finding("a.txt", u64::from(i) * 10, u64::from(i) * 10 + 5))
+            .collect();
+        let result = compare_counts(findings, &expectations);
+        assert_eq!(result.len(), 1, "result count");
+        assert_eq!(result[0].tp, exp_tp, "tp");
+        assert_eq!(result[0].fp, exp_fp, "fp");
+        assert_eq!(result[0].false_neg, exp_fn, "false_neg");
     }
 
     #[test]

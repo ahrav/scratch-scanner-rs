@@ -625,54 +625,56 @@ mod tests {
 
     // ── Metric threshold verdicts ───────────────────────────────────
 
-    #[test]
-    fn metric_threshold_verdicts() {
-        // (curr_ap, curr_prec, base_ap, base_prec, check_idx, expected_verdict)
-        let cases = [
-            (0.92, 0.88, 0.92, 0.88, 0, Verdict::Pass),  // identical
-            (0.90, 0.88, 0.93, 0.88, 0, Verdict::Block), // AP 3pp drop
-            (0.91, 0.88, 0.92, 0.88, 0, Verdict::Warn),  // AP 1pp drop
-            (0.917, 0.88, 0.92, 0.88, 0, Verdict::Pass), // AP 0.3pp drop
-            (0.92, 0.85, 0.92, 0.88, 1, Verdict::Block), // Prec 3pp drop
-            (0.92, 0.87, 0.92, 0.88, 1, Verdict::Warn),  // Prec 1pp drop
-        ];
-        for (curr_ap, curr_prec, base_ap, base_prec, idx, expected) in cases {
-            let result = check_regression(
-                &metrics(curr_ap, curr_prec),
-                &metrics(base_ap, base_prec),
-                &RegressionThresholds::default(),
-            );
-            assert_eq!(
-                result.checks[idx].verdict, expected,
-                "curr=({curr_ap},{curr_prec}) base=({base_ap},{base_prec}) check[{idx}]"
-            );
-        }
+    #[rstest::rstest]
+    #[case::identical(0.92, 0.88, 0.92, 0.88, 0, Verdict::Pass)]
+    #[case::ap_3pp_drop(0.90, 0.88, 0.93, 0.88, 0, Verdict::Block)]
+    #[case::ap_1pp_drop(0.91, 0.88, 0.92, 0.88, 0, Verdict::Warn)]
+    #[case::ap_03pp_drop(0.917, 0.88, 0.92, 0.88, 0, Verdict::Pass)]
+    #[case::prec_3pp_drop(0.92, 0.85, 0.92, 0.88, 1, Verdict::Block)]
+    #[case::prec_1pp_drop(0.92, 0.87, 0.92, 0.88, 1, Verdict::Warn)]
+    fn metric_threshold_verdicts(
+        #[case] curr_ap: f64,
+        #[case] curr_prec: f64,
+        #[case] base_ap: f64,
+        #[case] base_prec: f64,
+        #[case] idx: usize,
+        #[case] expected: Verdict,
+    ) {
+        let result = check_regression(
+            &metrics(curr_ap, curr_prec),
+            &metrics(base_ap, base_prec),
+            &RegressionThresholds::default(),
+        );
+        assert_eq!(
+            result.checks[idx].verdict, expected,
+            "curr=({curr_ap},{curr_prec}) base=({base_ap},{base_prec}) check[{idx}]"
+        );
     }
 
     // ── CI gate ──────────────────────────────────────────────────────
 
-    #[test]
-    fn ci_gate_behavior() {
-        // (curr_ap, ci_lower, ci_upper, base_ap, expected_verdict, ci_applied)
-        let cases = [
-            // CI includes baseline → noise, not regression.
-            (0.91, 0.89, 0.93, 0.92, Verdict::Pass, true),
-            // CI upper below baseline → real regression.
-            (0.89, 0.87, 0.91, 0.92, Verdict::Block, false),
-        ];
-        for (curr_ap, ci_lo, ci_hi, base_ap, expected, ci_applied) in cases {
-            let current = metrics_with_ci(curr_ap, 0.88, ci_lo, ci_hi);
-            let baseline = metrics(base_ap, 0.88);
-            let result = check_regression(&current, &baseline, &RegressionThresholds::default());
-            assert_eq!(
-                result.checks[0].verdict, expected,
-                "ap={curr_ap} ci=[{ci_lo},{ci_hi}] base={base_ap}"
-            );
-            assert_eq!(
-                result.checks[0].ci_gate_applied, ci_applied,
-                "ci_gate_applied mismatch for ap={curr_ap}"
-            );
-        }
+    #[rstest::rstest]
+    #[case::ci_includes_baseline(0.91, 0.89, 0.93, 0.92, Verdict::Pass, true)]
+    #[case::ci_below_baseline(0.89, 0.87, 0.91, 0.92, Verdict::Block, false)]
+    fn ci_gate_behavior(
+        #[case] curr_ap: f64,
+        #[case] ci_lo: f64,
+        #[case] ci_hi: f64,
+        #[case] base_ap: f64,
+        #[case] expected: Verdict,
+        #[case] ci_applied: bool,
+    ) {
+        let current = metrics_with_ci(curr_ap, 0.88, ci_lo, ci_hi);
+        let baseline = metrics(base_ap, 0.88);
+        let result = check_regression(&current, &baseline, &RegressionThresholds::default());
+        assert_eq!(
+            result.checks[0].verdict, expected,
+            "ap={curr_ap} ci=[{ci_lo},{ci_hi}] base={base_ap}"
+        );
+        assert_eq!(
+            result.checks[0].ci_gate_applied, ci_applied,
+            "ci_gate_applied mismatch for ap={curr_ap}"
+        );
     }
 
     // ── Per-rule deltas ──────────────────────────────────────────────
