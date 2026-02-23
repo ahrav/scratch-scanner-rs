@@ -44,6 +44,7 @@ jobs:
               - 'tests/**'
               - 'benches/**'
               - 'examples/**'
+              - 'tools/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'default_rules.yaml'
@@ -102,6 +103,27 @@ jobs:
           save-cache: "false"
 
       - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
+
+  eval-harness:
+    name: Eval Harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes, clippy]
+    env:
+      PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+        working-directory: tools/eval-harness
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: tools/eval-harness
+      - run: cargo test
+        working-directory: tools/eval-harness
 
   clippy-aarch64:
     name: Clippy (aarch64)

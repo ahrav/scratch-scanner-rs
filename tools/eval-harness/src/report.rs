@@ -1320,6 +1320,22 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_config_partial_eq_detects_mismatch() {
+        let a = EvalPipelineConfig {
+            cross_rule_dedup: false,
+        };
+        let b = EvalPipelineConfig {
+            cross_rule_dedup: true,
+        };
+        assert_ne!(a, b, "configs with different cross_rule_dedup must differ");
+        assert_eq!(a, a, "identical configs must be equal");
+        assert!(
+            !EvalPipelineConfig::default().cross_rule_dedup,
+            "default cross_rule_dedup must be false"
+        );
+    }
+
+    #[test]
     fn pipeline_config_cross_rule_dedup_roundtrips() {
         let mut report = sample_report(false, false);
         report.pipeline_config = EvalPipelineConfig {

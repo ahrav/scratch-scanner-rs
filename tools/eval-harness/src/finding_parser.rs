@@ -750,6 +750,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cross_rule_dedup_empty_vec() {
+        let mut findings: Vec<NormalizedFinding> = Vec::new();
+        cross_rule_dedup_findings(&mut findings);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn cross_rule_dedup_single_finding_unchanged() {
+        let mut findings = vec![NormalizedFinding::new(
+            "a.rs".into(),
+            0,
+            10,
+            "rule".into(),
+            5,
+        )];
+        cross_rule_dedup_findings(&mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "rule");
+        assert_eq!(findings[0].confidence, 5);
+    }
+
+    #[test]
+    fn cross_rule_dedup_all_distinct_spans_is_noop() {
+        let mut findings = vec![
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r1".into(), 5),
+            NormalizedFinding::new("a.rs".into(), 20, 30, "r2".into(), 3),
+            NormalizedFinding::new("b.rs".into(), 0, 10, "r3".into(), 7),
+        ];
+        cross_rule_dedup_findings(&mut findings);
+        assert_eq!(
+            findings.len(),
+            3,
+            "all-distinct spans must survive cross-rule dedup"
+        );
+    }
+
+    #[test]
+    fn cross_rule_dedup_output_is_sorted() {
+        let mut findings = vec![
+            NormalizedFinding::new("c.rs".into(), 50, 60, "r1".into(), 1),
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r2".into(), 2),
+            NormalizedFinding::new("a.rs".into(), 20, 30, "r3".into(), 3),
+            NormalizedFinding::new("b.rs".into(), 0, 10, "r1".into(), 4),
+        ];
+        cross_rule_dedup_findings(&mut findings);
+        assert!(
+            findings.windows(2).all(|w| {
+                (w[0].path.as_str(), w[0].byte_start, w[0].byte_end)
+                    <= (w[1].path.as_str(), w[1].byte_start, w[1].byte_end)
+            }),
+            "output must be sorted by (path, byte_start, byte_end)"
+        );
+    }
+
     // ── Property tests ──────────────────────────────────────────
 
     mod prop {
