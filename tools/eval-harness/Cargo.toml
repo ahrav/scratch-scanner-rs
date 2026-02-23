@@ -21,4 +21,5 @@ scanner-rs = { path = "../..", features = ["tiger-harness"] }
 
 [dev-dependencies]
 proptest = "1.5"
+rstest = "0.24"
 tempfile = "3"

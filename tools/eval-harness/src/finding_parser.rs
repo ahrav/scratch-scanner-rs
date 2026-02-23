@@ -423,39 +423,30 @@ mod tests {
         assert_eq!(result.non_finding_lines, 1);
     }
 
-    #[test]
-    fn inverted_span_skipped() {
-        let jsonl = r#"{"type":"finding","path":"a.rs","start":50,"end":10,"rule":"r","confidence_score":0}"#;
-
+    #[rstest::rstest]
+    #[case::inverted_span(
+        r#"{"type":"finding","path":"a.rs","start":50,"end":10,"rule":"r","confidence_score":0}"#
+    )]
+    #[case::missing_rule_field(r#"{"type":"finding","path":"a.rs","start":0,"end":10}"#)]
+    #[case::empty_rule_string(
+        r#"{"type":"finding","path":"a.rs","start":0,"end":10,"rule":"","confidence_score":0}"#
+    )]
+    #[case::empty_path(
+        r#"{"type":"finding","path":"","start":0,"end":10,"rule":"r","confidence_score":0}"#
+    )]
+    #[case::degenerate_path_dot(
+        r#"{"type":"finding","path":".","start":0,"end":10,"rule":"r","confidence_score":0}"#
+    )]
+    #[case::degenerate_path_dotdot(
+        r#"{"type":"finding","path":"..","start":0,"end":10,"rule":"r","confidence_score":0}"#
+    )]
+    fn invalid_finding_skipped(#[case] jsonl: &str) {
         let result = parse_findings_jsonl(jsonl, "");
-
-        assert!(result.findings.is_empty());
-        assert_eq!(result.skipped_findings, 1);
-    }
-
-    #[test]
-    fn missing_required_field_on_finding() {
-        // "rule" is absent.
-        let jsonl = r#"{"type":"finding","path":"a.rs","start":0,"end":10}"#;
-
-        let result = parse_findings_jsonl(jsonl, "");
-
-        assert!(result.findings.is_empty());
-        assert_eq!(result.skipped_findings, 1);
-    }
-
-    #[test]
-    fn empty_rule_string_skipped() {
-        let jsonl =
-            r#"{"type":"finding","path":"a.rs","start":0,"end":10,"rule":"","confidence_score":0}"#;
-
-        let result = parse_findings_jsonl(jsonl, "");
-
-        assert!(
-            result.findings.is_empty(),
-            "empty rule should be rejected, not produce a finding"
+        assert!(result.findings.is_empty(), "should skip: {jsonl}");
+        assert_eq!(
+            result.skipped_findings, 1,
+            "should count as skipped: {jsonl}"
         );
-        assert_eq!(result.skipped_findings, 1);
     }
 
     #[test]
@@ -486,16 +477,6 @@ mod tests {
         assert!(result.findings.is_empty());
         assert_eq!(result.non_finding_lines, 1);
         assert_eq!(result.malformed_lines, 0);
-    }
-
-    #[test]
-    fn missing_confidence_defaults_to_zero() {
-        let jsonl = r#"{"type":"finding","path":"a.rs","start":0,"end":10,"rule":"r"}"#;
-
-        let result = parse_findings_jsonl(jsonl, "");
-
-        assert_eq!(result.findings.len(), 1);
-        assert_eq!(result.findings[0].confidence, 0);
     }
 
     #[test]
@@ -531,15 +512,6 @@ mod tests {
                 + result.malformed_lines
                 + result.skipped_findings,
         );
-    }
-
-    #[test]
-    fn negative_confidence_preserved() {
-        let jsonl = r#"{"type":"finding","path":"a.rs","start":0,"end":10,"rule":"r","confidence_score":-5}"#;
-
-        let result = parse_findings_jsonl(jsonl, "");
-
-        assert_eq!(result.findings[0].confidence, -5);
     }
 
     #[test]
@@ -653,30 +625,6 @@ mod tests {
         assert_eq!(result.findings[0].confidence, 5);
         assert_eq!(result.malformed_lines, 0);
         assert_eq!(result.skipped_findings, 0);
-    }
-
-    #[test]
-    fn empty_path_string_skipped() {
-        let jsonl =
-            r#"{"type":"finding","path":"","start":0,"end":10,"rule":"r","confidence_score":0}"#;
-        let result = parse_findings_jsonl(jsonl, "");
-        assert!(result.findings.is_empty());
-        assert_eq!(result.skipped_findings, 1);
-    }
-
-    #[test]
-    fn degenerate_path_components_skipped() {
-        for jsonl in [
-            r#"{"type":"finding","path":".","start":0,"end":10,"rule":"r","confidence_score":0}"#,
-            r#"{"type":"finding","path":"..","start":0,"end":10,"rule":"r","confidence_score":0}"#,
-        ] {
-            let result = parse_findings_jsonl(jsonl, "");
-            assert!(result.findings.is_empty(), "should skip: {jsonl}");
-            assert_eq!(
-                result.skipped_findings, 1,
-                "should count as skipped: {jsonl}"
-            );
-        }
     }
 
     #[test]

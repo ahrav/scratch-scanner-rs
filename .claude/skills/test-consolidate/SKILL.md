@@ -35,16 +35,14 @@ The hierarchy of consolidation (prefer higher):
 
 2. **Parameterized test (rstest)** — When you have a finite, important set of
    (input, expected) pairs and no general invariant. One `#[rstest]` with a
-   `#[case]` list replaces N identical test bodies.
+   `#[case]` list replaces N identical test bodies. **Always prefer rstest
+   over table-driven tests** — rstest gives you named sub-cases in test
+   output, better failure diagnostics, and no manual loop boilerplate.
 
-3. **Table-driven test** — When the inputs and outputs fit a simple table.
-   A `for` loop over a `Vec<(Input, Expected)>` inside a single `#[test]`.
-   Simpler than rstest if there's no need for individual test names.
-
-4. **Fuzz test** — When exploring adversarial or untrusted input spaces. One
+3. **Fuzz test** — When exploring adversarial or untrusted input spaces. One
    fuzz target can subsume hundreds of hand-crafted "weird input" tests.
 
-5. **Individual unit tests** — The last resort. Only when each test truly
+4. **Individual unit tests** — The last resort. Only when each test truly
    exercises unique setup, distinct error paths, or documents a specific bug.
 
 **Never consolidate for the sake of shorter code.** The goal is less code to
@@ -108,8 +106,8 @@ For each cluster, answer:
 | Question | If Yes | If No |
 |----------|--------|-------|
 | Can I state one invariant covering all cases? | proptest | Next question |
-| Are all test bodies structurally identical? | rstest or table-driven | Partial consolidation |
-| Do >3 tests share the same assertion pattern? | At minimum table-driven | Probably keep individual |
+| Are all test bodies structurally identical? | rstest | Partial consolidation |
+| Do >3 tests share the same assertion pattern? | At minimum rstest | Probably keep individual |
 | Would adding a new case require a new function? | Consolidate (adding cases should be trivial) | Fine as-is |
 | Do tests differ only in values, not in logic? | Strong consolidation candidate | Keep separate |
 
@@ -168,29 +166,6 @@ fn status_text_mapping(#[case] code: u16, #[case] expected: &str) {
 }
 ```
 
-#### Table-Driven — Best for simple mappings without rstest
-
-Use when: Cases are simple, no need for individual test names in output.
-
-```rust
-// AFTER: 1 table-driven test
-#[test]
-fn status_text_cases() {
-    let cases = [
-        (200, "OK"),
-        (201, "Created"),
-        (400, "Bad Request"),
-        (404, "Not Found"),
-        (500, "Internal Server Error"),
-        (999, "Unknown"),
-        (0, "Unknown"),
-    ];
-    for (code, expected) in cases {
-        assert_eq!(status_text(code), expected, "code={code}");
-    }
-}
-```
-
 #### Fuzz Test — Best for adversarial input exploration
 
 Use when: Tests are exploring "weird inputs" to find crashes.
@@ -221,9 +196,9 @@ Before recommending consolidation, verify:
   variants may need individual tests if the exact error matters.
 - [ ] **Readability anchors**: Keep one simple example test per public function
   as documentation, even if a property test covers it.
-- [ ] **rstest availability**: This project does not currently use rstest.
-  If recommending it, note that `rstest = "0.23"` needs to be added to
-  `[dev-dependencies]` in Cargo.toml.
+- [ ] **rstest availability**: rstest is available in eval-harness
+  (`rstest = "0.24"` in dev-dependencies). For other crates, add it to
+  `[dev-dependencies]` in the relevant Cargo.toml.
 
 ### Step 6: Produce Consolidation Plan
 
@@ -251,7 +226,8 @@ For each cluster, specify:
 - Simulation harnesses: `sim-harness`, `scheduler-sim`
 
 ### Dependencies to add if recommending new tools
-- **rstest**: Add `rstest = "0.23"` to `[dev-dependencies]` in Cargo.toml
+- **rstest**: Add `rstest = "0.24"` to `[dev-dependencies]` in Cargo.toml
+  (already present in eval-harness)
 - **proptest**: Already available behind `stdx-proptest` feature
 - **cargo-fuzz**: External tool, no Cargo.toml change needed
 
@@ -309,14 +285,14 @@ proptest! {
 
 ### Dependency Changes
 
-- [ ] Add `rstest = "0.23"` to `[dev-dependencies]` (if rstest recommended)
+- [ ] Add `rstest = "0.24"` to `[dev-dependencies]` (if rstest recommended)
 - [ ] No new dependencies needed (if only proptest/fuzz)
 
 ### Migration Order
 
 1. Add proptest for Cluster 1 (highest value: 8 tests → 1)
 2. Add rstest for Cluster 3 (6 tests → 1 parameterized)
-3. Rewrite Cluster 5 as table-driven (4 tests → 1)
+3. Add rstest for Cluster 5 (4 tests → 1 parameterized)
 4. Run full test suite to verify no coverage loss
 5. Delete subsumed unit tests
 ```
@@ -335,11 +311,11 @@ proptest! {
 - The mapping is arbitrary (no mathematical relationship)
 - You want each case to appear as a named sub-test in output
 
-### When to prefer table-driven over rstest
-- Cases are simple value pairs
-- You don't need individual test names in CI output
-- You want to avoid adding a dependency
-- The table fits in <20 lines
+**Always prefer rstest over table-driven loops.** rstest gives you named
+sub-cases in test output, better failure diagnostics with the exact failing
+case visible in the test name, and no manual loop/assertion boilerplate.
+There is no scenario where a hand-rolled `for` loop over a table is
+preferable to `#[rstest]` with `#[case]` attributes.
 
 ### When to prefer fuzz over all else
 - The function processes untrusted/external input
