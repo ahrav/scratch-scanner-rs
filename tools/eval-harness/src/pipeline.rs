@@ -18,13 +18,13 @@ pub enum DedupMode {
 
 /// Processing flags that affect finding/matching semantics in eval runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct PipelineConfig {
+#[serde(default)]
+pub struct EvalPipelineConfig {
     /// Whether cross-rule dedup was applied before matching.
-    #[serde(default)]
     pub cross_rule_dedup: bool,
 }
 
-impl PipelineConfig {
+impl EvalPipelineConfig {
     /// Convert wire-level flags to the internal dedup strategy enum.
     #[must_use]
     pub fn dedup_mode(&self) -> DedupMode {

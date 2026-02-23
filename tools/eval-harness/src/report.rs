@@ -58,7 +58,7 @@ use std::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::metrics::EvalMetrics;
-use crate::pipeline::PipelineConfig;
+use crate::pipeline::EvalPipelineConfig;
 use crate::provenance::Provenance;
 use crate::regression::RegressionResult;
 use crate::types::{ClassifiedFinding, FindingClass, TruthItem};
@@ -103,7 +103,7 @@ pub struct EvalReport {
     ///
     /// Stored in report JSON so regression checks can detect baseline/config
     /// mismatches (for example, comparing dedup and non-dedup runs).
-    pub pipeline_config: PipelineConfig,
+    pub pipeline_config: EvalPipelineConfig,
 }
 
 /// Metrics interpretation model for report rendering/serialization.
@@ -164,7 +164,7 @@ struct EvalReportSer<'a> {
     metrics_semantics: MetricsSemantics,
     metrics: &'a EvalMetrics,
     provenance: &'a Provenance,
-    pipeline_config: &'a PipelineConfig,
+    pipeline_config: &'a EvalPipelineConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     regression: Option<&'a RegressionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,7 +184,7 @@ struct EvalReportDe {
     metrics: EvalMetrics,
     provenance: Provenance,
     #[serde(default)]
-    pipeline_config: PipelineConfig,
+    pipeline_config: EvalPipelineConfig,
     #[serde(default)]
     regression: Option<RegressionResult>,
     #[serde(default)]
@@ -904,7 +904,7 @@ mod tests {
             provenance,
             regression,
             error_book,
-            pipeline_config: PipelineConfig::default(),
+            pipeline_config: EvalPipelineConfig::default(),
         }
     }
 
@@ -914,7 +914,7 @@ mod tests {
             provenance: sample_provenance(),
             regression: None,
             error_book: None,
-            pipeline_config: PipelineConfig::default(),
+            pipeline_config: EvalPipelineConfig::default(),
         }
     }
 
@@ -967,7 +967,7 @@ mod tests {
         let parsed: EvalReport = serde_json::from_str(&legacy_json).unwrap();
         assert_eq!(parsed.metrics.tp, report.metrics.tp);
         assert_eq!(parsed.semantics(), MetricsSemantics::PositionPrCurve);
-        assert_eq!(parsed.pipeline_config, PipelineConfig::default());
+        assert_eq!(parsed.pipeline_config, EvalPipelineConfig::default());
     }
 
     #[test]
@@ -1003,7 +1003,7 @@ mod tests {
 
         let parsed: EvalReport = serde_json::from_str(&legacy_json).unwrap();
         assert_eq!(parsed.semantics(), MetricsSemantics::CountOnly);
-        assert_eq!(parsed.pipeline_config, PipelineConfig::default());
+        assert_eq!(parsed.pipeline_config, EvalPipelineConfig::default());
     }
 
     #[test]
@@ -1317,6 +1317,17 @@ mod tests {
         assert!(parsed.get("provenance").is_some());
         assert!(parsed.get("regression").is_some());
         assert!(parsed.get("error_book").is_some());
+    }
+
+    #[test]
+    fn pipeline_config_cross_rule_dedup_roundtrips() {
+        let mut report = sample_report(false, false);
+        report.pipeline_config = EvalPipelineConfig {
+            cross_rule_dedup: true,
+        };
+        let json = render_json(&report).unwrap();
+        let parsed: EvalReport = serde_json::from_str(&json).unwrap();
+        assert!(parsed.pipeline_config.cross_rule_dedup);
     }
 
     // ── Proptest ─────────────────────────────────────────────────────

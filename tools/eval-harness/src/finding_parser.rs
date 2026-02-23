@@ -58,11 +58,8 @@ struct WireLine<'a> {
     /// Optional on the wire so non-finding event shapes remain parseable.
     /// Required only when `event_type == "finding"`.
     path: Option<Cow<'a, str>>,
-    /// Optional on the wire for forward compatibility; required for findings.
     start: Option<u64>,
-    /// Optional on the wire for forward compatibility; required for findings.
     end: Option<u64>,
-    /// Optional on the wire for forward compatibility; required for findings.
     rule: Option<Cow<'a, str>>,
     /// Optional confidence score. Missing values default to 0 during parse.
     confidence_score: Option<i8>,
@@ -248,7 +245,7 @@ pub fn dedup_findings_with_mode(findings: &mut Vec<NormalizedFinding>, mode: Ded
 ///
 /// Idempotent and `O(n log n)` due to sorting.
 pub fn cross_rule_dedup_findings(findings: &mut Vec<NormalizedFinding>) {
-    findings.sort_by(|a, b| {
+    findings.sort_unstable_by(|a, b| {
         a.path
             .cmp(&b.path)
             .then(a.byte_start.cmp(&b.byte_start))
@@ -737,6 +734,20 @@ mod tests {
         assert_eq!(findings[0].rule, "r2");
         assert_eq!(findings[1].path, "b.rs");
         assert_eq!(findings[1].rule, "r2");
+    }
+
+    #[test]
+    fn cross_rule_dedup_preserves_overlapping_non_identical_spans() {
+        let mut findings = vec![
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r1".into(), 20),
+            NormalizedFinding::new("a.rs".into(), 5, 15, "r2".into(), 30),
+        ];
+        cross_rule_dedup_findings(&mut findings);
+        assert_eq!(
+            findings.len(),
+            2,
+            "overlapping spans with different boundaries must both survive"
+        );
     }
 
     // ── Property tests ──────────────────────────────────────────

@@ -71,7 +71,7 @@ Count-based (leaky-repo):
 
 **`EvalReport`** — Top-level serializable artifact combining required `EvalMetrics`, `Provenance`, and required `pipeline_config`, plus optional `RegressionResult` and optional `ErrorBook`.
 
-**`PipelineConfig`** — Pipeline semantics used for this run. Currently includes `cross_rule_dedup` (default `false`). Legacy baseline JSON without this field deserializes with `cross_rule_dedup = false`.
+**`EvalPipelineConfig`** — Pipeline semantics used for this run. Currently includes `cross_rule_dedup` (default `false`). Legacy baseline JSON without this field deserializes with `cross_rule_dedup = false`.
 
 ### Matching Algorithm
 

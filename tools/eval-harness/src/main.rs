@@ -73,7 +73,7 @@ use eval_harness::finding_parser::{
 use eval_harness::leaky_repo::{compare_counts, parse_leaky_repo_csv};
 use eval_harness::matching::{MatchConfig, MatchResult, match_findings};
 use eval_harness::metrics::{BootstrapConfig, EvalMetrics, bootstrap_ap_ci, compute_metrics};
-use eval_harness::pipeline::PipelineConfig;
+use eval_harness::pipeline::EvalPipelineConfig;
 use eval_harness::provenance::{
     Provenance, build_provenance, build_provenance_from_precomputed, collect_files_recursive,
     hash_corpus_snapshot,
@@ -345,7 +345,7 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
         provenance,
         regression: None,
         error_book: None,
-        pipeline_config: PipelineConfig::default(),
+        pipeline_config: EvalPipelineConfig::default(),
     };
 
     output_report(&report, args.format, args.output.as_deref())?;
@@ -405,13 +405,22 @@ fn run_position_pipeline(
         args.scan_corpus.as_deref(),
         &canonical_root,
     )?;
-    let pipeline_config = PipelineConfig {
+    let pipeline_config = EvalPipelineConfig {
         cross_rule_dedup: args.cross_rule_dedup,
     };
+    let pre_dedup_count = findings.len();
     dedup_findings_with_mode(&mut findings, pipeline_config.dedup_mode());
+    let collapsed = pre_dedup_count.saturating_sub(findings.len());
+    if collapsed > 0 {
+        eprintln!(
+            "info: cross-rule dedup collapsed {collapsed} finding(s) ({pre_dedup_count} -> {})",
+            findings.len(),
+        );
+    }
 
     let snapshot = load_corpus_snapshot(&args.corpus_root)?;
-    let match_result = run_position_matching(findings, truth, &snapshot.file_contents, &pipeline_config);
+    let match_result =
+        run_position_matching(findings, truth, &snapshot.file_contents, &pipeline_config);
     let metrics = compute_position_metrics(&match_result)?;
     let provenance = build_position_provenance(&snapshot)?;
     let regression = maybe_check_regression(&metrics, &pipeline_config, args.baseline.as_deref())?;
@@ -447,9 +456,7 @@ struct CorpusSnapshot {
     file_contents: HashMap<String, Vec<u8>>,
     /// BLAKE3 digest of the snapshot using provenance framing.
     corpus_hash: String,
-    /// Number of files included in the snapshot hash.
     corpus_file_count: u64,
-    /// Total bytes across all files included in the snapshot hash.
     corpus_total_bytes: u64,
 }
 
@@ -458,7 +465,7 @@ fn run_position_matching(
     findings: Vec<NormalizedFinding>,
     truth: Vec<TruthItem>,
     file_contents: &HashMap<String, Vec<u8>>,
-    pipeline_config: &PipelineConfig,
+    pipeline_config: &EvalPipelineConfig,
 ) -> MatchResult {
     let config = MatchConfig {
         require_rule_match: false,
@@ -499,7 +506,7 @@ fn build_position_provenance(snapshot: &CorpusSnapshot) -> Result<Provenance, Bo
 /// be apples-to-apples.
 fn maybe_check_regression(
     metrics: &EvalMetrics,
-    current_pipeline_config: &PipelineConfig,
+    current_pipeline_config: &EvalPipelineConfig,
     baseline_path: Option<&Path>,
 ) -> Result<Option<RegressionResult>, Box<dyn Error>> {
     let Some(path) = baseline_path else {
@@ -513,12 +520,11 @@ fn maybe_check_regression(
     )?;
     if &baseline_report.pipeline_config != current_pipeline_config {
         let warning = format!(
-            "pipeline config mismatch with baseline: current={current_pipeline_config:?}, baseline={:?}",
-            baseline_report.pipeline_config
+            "pipeline config mismatch with baseline: current: cross_rule_dedup={}, baseline: cross_rule_dedup={}",
+            current_pipeline_config.cross_rule_dedup,
+            baseline_report.pipeline_config.cross_rule_dedup,
         );
-        eprintln!(
-            "warning: {warning}"
-        );
+        eprintln!("warning: {warning}");
         result.baseline_comparable = false;
         result.comparison_warnings.push(warning);
     }
@@ -698,7 +704,6 @@ fn validate_scan_health(report: &scanner_rs::scheduler::LocalReport) -> Result<(
 /// Lightweight hardening guardrails reject implausibly large snapshots
 /// before memory usage becomes pathological.
 fn load_corpus_snapshot(corpus_root: &Path) -> Result<CorpusSnapshot, Box<dyn Error>> {
-    // Safety rails for accidental mega-corpora in local eval runs.
     const MAX_SNAPSHOT_FILES: usize = 5_000_000;
     const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024 * 1024; // 512 GiB
 
