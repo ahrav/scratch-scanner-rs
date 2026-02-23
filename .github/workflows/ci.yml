@@ -111,6 +111,7 @@ jobs:
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes, clippy]
     env:
+      RUSTC_WRAPPER: ""
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
