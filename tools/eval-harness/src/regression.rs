@@ -308,6 +308,20 @@ pub struct RegressionResult {
     pub per_rule_deltas: Vec<RuleDelta>,
     /// The thresholds that were applied, echoed back for auditability.
     pub thresholds: RegressionThresholds,
+    /// Whether the current run and baseline used comparable pipeline semantics.
+    ///
+    /// Defaults to `true` for backward compatibility and is set to `false` by
+    /// the caller when out-of-band config checks detect mismatches (for
+    /// example cross-rule dedup enabled in only one run).
+    #[serde(default = "default_true")]
+    pub baseline_comparable: bool,
+    /// Human-readable warnings about baseline comparability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comparison_warnings: Vec<String>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -323,6 +337,9 @@ pub struct RegressionResult {
 /// - Two [`MetricCheck`] entries: one for AP, one for precision.
 /// - A Vec of [`RuleDelta`] entries showing per-rule TP/FP/precision
 ///   changes (informational, does not affect the verdict).
+/// - Baseline comparability metadata initialized to compatible with no
+///   warnings; callers may override these fields if external checks find
+///   semantic mismatches.
 ///
 /// # Errors
 ///
@@ -375,6 +392,8 @@ pub fn check_regression(
         checks: [ap_check, precision_check],
         per_rule_deltas,
         thresholds: thresholds.clone(),
+        baseline_comparable: true,
+        comparison_warnings: Vec::new(),
     })
 }
 

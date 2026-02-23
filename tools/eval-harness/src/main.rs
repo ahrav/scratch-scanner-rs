@@ -73,7 +73,7 @@ use eval_harness::finding_parser::{
 use eval_harness::leaky_repo::{compare_counts, parse_leaky_repo_csv};
 use eval_harness::matching::{MatchConfig, MatchResult, match_findings};
 use eval_harness::metrics::{BootstrapConfig, EvalMetrics, bootstrap_ap_ci, compute_metrics};
-use eval_harness::pipeline::{DedupMode, PipelineConfig};
+use eval_harness::pipeline::PipelineConfig;
 use eval_harness::provenance::{
     Provenance, build_provenance, build_provenance_from_precomputed, collect_files_recursive,
     hash_corpus_snapshot,

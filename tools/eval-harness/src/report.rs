@@ -876,6 +876,8 @@ mod tests {
                 ],
                 per_rule_deltas: vec![],
                 thresholds: RegressionThresholds::default(),
+                baseline_comparable: true,
+                comparison_warnings: Vec::new(),
             })
         } else {
             None

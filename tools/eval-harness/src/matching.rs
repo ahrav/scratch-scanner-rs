@@ -205,9 +205,14 @@ impl MatchResult {
 ///
 /// Panics (hard `assert!`, not debug-only) if:
 ///
-/// - `findings` contains duplicate identities by [`NormalizedFinding`] equality
-///   (`path`, `byte_start`, `byte_end`, `rule`; confidence is ignored):
-///   `findings must be deduplicated before matching`.
+/// - `config.dedup_mode == ByRule` and `findings` contains duplicate identities
+///   by [`NormalizedFinding`] equality (`path`, `byte_start`, `byte_end`, `rule`;
+///   confidence is ignored): `findings must be deduplicated by rule before matching`.
+/// - `config.dedup_mode == AcrossRules` and `findings` contains duplicate spans
+///   (`path`, `byte_start`, `byte_end`): `findings must be deduplicated by span
+///   before cross-rule matching`.
+/// - `config.dedup_mode == AcrossRules` with `require_rule_match = true`:
+///   `require_rule_match cannot be combined with cross-rule dedup mode`.
 /// - the conservation invariants are violated after classification:
 ///
 /// - `tp + fp + unlabeled != findings.len()`
@@ -945,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "findings must be deduplicated before matching")]
+    #[should_panic(expected = "findings must be deduplicated by rule before matching")]
     fn duplicate_findings_precondition_panics() {
         let findings = vec![
             make_finding(SIMPLE_PATH, 0, 4, "dup", 10),
@@ -957,6 +962,37 @@ mod tests {
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
         let _ = match_findings(findings, truth, &fc, default_config());
+    }
+
+    #[test]
+    #[should_panic(expected = "findings must be deduplicated by span before cross-rule matching")]
+    fn cross_rule_duplicate_span_precondition_panics() {
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "r1", 10),
+            make_finding(SIMPLE_PATH, 0, 4, "r2", 9),
+        ];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r1")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+        let config = MatchConfig {
+            require_rule_match: false,
+            dedup_mode: DedupMode::AcrossRules,
+        };
+
+        let _ = match_findings(findings, truth, &fc, config);
+    }
+
+    #[test]
+    #[should_panic(expected = "require_rule_match cannot be combined with cross-rule dedup mode")]
+    fn cross_rule_mode_rejects_rule_match_requirement() {
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r1", 10)];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r1")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+        let config = MatchConfig {
+            require_rule_match: true,
+            dedup_mode: DedupMode::AcrossRules,
+        };
+
+        let _ = match_findings(findings, truth, &fc, config);
     }
 
     #[test]
