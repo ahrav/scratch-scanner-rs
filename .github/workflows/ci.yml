@@ -115,10 +115,12 @@ jobs:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
           components: rustfmt, clippy
+          shared-key: eval-harness-linux
+          cache-workspaces: "tools/eval-harness -> target"
       - run: cargo fmt --check
         working-directory: tools/eval-harness
       - run: cargo clippy --all-targets --all-features -- -D warnings
