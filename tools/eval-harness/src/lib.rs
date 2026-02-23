@@ -5,6 +5,7 @@ pub mod leaky_repo;
 pub mod line_index;
 pub mod matching;
 pub mod metrics;
+pub mod pipeline;
 pub mod provenance;
 pub mod regression;
 pub mod report;

@@ -24,7 +24,8 @@
 //! Position-based (creddata / synthetic):
 //!   truth loader ──► TruthItem[]
 //!                                ├─► match_findings ──► ClassifiedFinding[]
-//!   finding source ──► NormalizedFinding[]              ├─► compute_metrics ──► EvalMetrics
+//!   finding source ──► NormalizedFinding[] ──► dedup pipeline (identity, optional cross-rule)
+//!                                                       ├─► compute_metrics ──► EvalMetrics
 //!   corpus files ──► HashMap<path, bytes>               ├─► hash_corpus_snapshot ──► build_provenance_from_precomputed ──► Provenance
 //!                                                       ├─► bootstrap_ap_ci ──► CI
 //!                                                       ├─► check_regression ──► Verdict
@@ -67,11 +68,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use eval_harness::creddata::load_meta_dir;
 use eval_harness::finding_parser::{
-    JsonlParseResult, dedup_findings, parse_findings_file, parse_findings_jsonl,
+    JsonlParseResult, dedup_findings_with_mode, parse_findings_file, parse_findings_jsonl,
 };
 use eval_harness::leaky_repo::{compare_counts, parse_leaky_repo_csv};
 use eval_harness::matching::{MatchConfig, MatchResult, match_findings};
 use eval_harness::metrics::{BootstrapConfig, EvalMetrics, bootstrap_ap_ci, compute_metrics};
+use eval_harness::pipeline::EvalPipelineConfig;
 use eval_harness::provenance::{
     Provenance, build_provenance, build_provenance_from_precomputed, collect_files_recursive,
     hash_corpus_snapshot,
@@ -153,6 +155,11 @@ struct PositionPipelineArgs {
     /// Baseline JSON report for regression comparison.
     #[arg(long)]
     baseline: Option<PathBuf>,
+
+    /// Collapse findings from different rules at the same byte span, keeping
+    /// only the highest-confidence finding per location.
+    #[arg(long)]
+    cross_rule_dedup: bool,
 }
 
 /// Arguments for evaluating against the CredData corpus.
@@ -338,6 +345,7 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
         provenance,
         regression: None,
         error_book: None,
+        pipeline_config: EvalPipelineConfig::default(),
     };
 
     output_report(&report, args.format, args.output.as_deref())?;
@@ -360,8 +368,11 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 /// 1. **Validate** — reject invalid argument combinations (e.g.,
 ///    `--output` + `--format table`).
 /// 2. **Load findings** — from pre-computed JSONL or a live scan.
-/// 3. **Dedup** — sort + dedup findings, retaining highest confidence per
-///    identity (path, byte_start, byte_end, rule).
+/// 3. **Dedup** — apply typed dedup semantics:
+///    - `ByRule`: keep highest confidence per `(path, byte_start, byte_end, rule)`.
+///    - `AcrossRules` (`--cross-rule-dedup`): keep highest confidence per
+///      `(path, byte_start, byte_end)` across all rules (tie-break: lexicographically
+///      smallest rule).
 /// 4. **Load corpus snapshot** — read all files under `corpus_root` once
 ///    into memory for matching and derive corpus hash/count/bytes from that
 ///    same snapshot for provenance (no second corpus read).
@@ -394,13 +405,25 @@ fn run_position_pipeline(
         args.scan_corpus.as_deref(),
         &canonical_root,
     )?;
-    dedup_findings(&mut findings);
+    let pipeline_config = EvalPipelineConfig {
+        cross_rule_dedup: args.cross_rule_dedup,
+    };
+    let pre_dedup_count = findings.len();
+    dedup_findings_with_mode(&mut findings, pipeline_config.dedup_mode());
+    let collapsed = pre_dedup_count.saturating_sub(findings.len());
+    if collapsed > 0 {
+        eprintln!(
+            "info: cross-rule dedup collapsed {collapsed} finding(s) ({pre_dedup_count} -> {})",
+            findings.len(),
+        );
+    }
 
     let snapshot = load_corpus_snapshot(&args.corpus_root)?;
-    let match_result = run_position_matching(findings, truth, &snapshot.file_contents);
+    let match_result =
+        run_position_matching(findings, truth, &snapshot.file_contents, &pipeline_config);
     let metrics = compute_position_metrics(&match_result)?;
     let provenance = build_position_provenance(&snapshot)?;
-    let regression = maybe_check_regression(&metrics, args.baseline.as_deref())?;
+    let regression = maybe_check_regression(&metrics, &pipeline_config, args.baseline.as_deref())?;
     let error_book = maybe_build_error_book_for_output(args.format, || {
         build_error_book(
             &match_result.classified,
@@ -416,6 +439,7 @@ fn run_position_pipeline(
         provenance,
         regression,
         error_book,
+        pipeline_config,
     };
 
     output_report(&report, args.format, args.output.as_deref())?;
@@ -428,7 +452,9 @@ fn run_position_pipeline(
 /// assembly, plus a precomputed corpus digest tuple used to build
 /// provenance without re-reading files from disk.
 struct CorpusSnapshot {
+    /// Normalized relative path -> full file bytes.
     file_contents: HashMap<String, Vec<u8>>,
+    /// BLAKE3 digest of the snapshot using provenance framing.
     corpus_hash: String,
     corpus_file_count: u64,
     corpus_total_bytes: u64,
@@ -439,9 +465,11 @@ fn run_position_matching(
     findings: Vec<NormalizedFinding>,
     truth: Vec<TruthItem>,
     file_contents: &HashMap<String, Vec<u8>>,
+    pipeline_config: &EvalPipelineConfig,
 ) -> MatchResult {
     let config = MatchConfig {
         require_rule_match: false,
+        dedup_mode: pipeline_config.dedup_mode(),
     };
     match_findings(findings, truth, file_contents, config)
 }
@@ -471,19 +499,35 @@ fn build_position_provenance(snapshot: &CorpusSnapshot) -> Result<Provenance, Bo
 }
 
 /// Compare metrics against a baseline report when provided.
+///
+/// A pipeline-config mismatch is reported as a warning but not treated as a
+/// hard error. The harness still computes regression deltas so users can see
+/// the numeric impact, while making it explicit that the comparison may not
+/// be apples-to-apples.
 fn maybe_check_regression(
     metrics: &EvalMetrics,
+    current_pipeline_config: &EvalPipelineConfig,
     baseline_path: Option<&Path>,
 ) -> Result<Option<RegressionResult>, Box<dyn Error>> {
     let Some(path) = baseline_path else {
         return Ok(None);
     };
     let baseline_report = load_baseline(path)?;
-    let result = check_regression(
+    let mut result = check_regression(
         metrics,
         &baseline_report.metrics,
         &RegressionThresholds::default(),
     )?;
+    if &baseline_report.pipeline_config != current_pipeline_config {
+        let warning = format!(
+            "pipeline config mismatch with baseline: current: cross_rule_dedup={}, baseline: cross_rule_dedup={}",
+            current_pipeline_config.cross_rule_dedup,
+            baseline_report.pipeline_config.cross_rule_dedup,
+        );
+        eprintln!("warning: {warning}");
+        result.baseline_comparable = false;
+        result.comparison_warnings.push(warning);
+    }
     Ok(Some(result))
 }
 
@@ -582,6 +626,9 @@ fn run_live_scan(
         let total = metadata_failures + local_files.len();
         let failure_rate = metadata_failures as f64 / total as f64;
         eprintln!("warning: {metadata_failures}/{total} files failed metadata read");
+        // Keep minor filesystem churn (deleted/permission-changed files)
+        // non-fatal, but fail once losses are large enough to compromise
+        // evaluation representativeness.
         if failure_rate > 0.05 {
             return Err(format!(
                 "too many metadata failures: {metadata_failures}/{total} ({:.1}%)",
@@ -725,6 +772,8 @@ fn load_corpus_snapshot(corpus_root: &Path) -> Result<CorpusSnapshot, Box<dyn Er
 
     let mut file_contents = HashMap::with_capacity(snapshot_records.len());
     for (_, key, data) in snapshot_records {
+        // If multiple filesystem paths normalize to the same logical key,
+        // retain the last inserted bytes and surface the collision.
         if file_contents.insert(key.clone(), data).is_some() {
             eprintln!("warning: duplicate normalized corpus path in snapshot: {key}");
         }

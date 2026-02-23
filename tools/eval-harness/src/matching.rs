@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::line_index::LineIndex;
+use crate::pipeline::DedupMode;
 use crate::types::{ClassifiedFinding, FindingClass, NormalizedFinding, TruthItem, TruthLabel};
 use scanner_rs::stdx::bitset::DynamicBitSet;
 
@@ -61,8 +62,9 @@ struct FileInfo<'a> {
 
 /// Configuration for the matching algorithm.
 ///
-/// All fields have sensible defaults for location-only matching. The
-/// `require_rule_match` toggle adds an additional constraint when ground
+/// Callers set fields explicitly. For location-only matching use
+/// `require_rule_match = false` with `dedup_mode = DedupMode::ByRule`.
+/// The `require_rule_match` toggle adds an additional constraint when ground
 /// truth uses rule-specific annotations (e.g., CredData categories).
 #[derive(Clone, Copy, Debug)]
 pub struct MatchConfig {
@@ -72,6 +74,12 @@ pub struct MatchConfig {
     /// is purely location-based — any finding overlapping a truth item's
     /// line range is considered a match regardless of rule name.
     pub require_rule_match: bool,
+    /// Dedup mode applied to findings before matching.
+    ///
+    /// `AcrossRules` means per-span rule alternatives were collapsed before
+    /// matching, so rule-sensitive matching (`require_rule_match = true`) is
+    /// invalid and rejected by a hard precondition.
+    pub dedup_mode: DedupMode,
 }
 
 /// Result of matching findings against ground truth.
@@ -198,9 +206,14 @@ impl MatchResult {
 ///
 /// Panics (hard `assert!`, not debug-only) if:
 ///
-/// - `findings` contains duplicate identities by [`NormalizedFinding`] equality
-///   (`path`, `byte_start`, `byte_end`, `rule`; confidence is ignored):
-///   `findings must be deduplicated before matching`.
+/// - `config.dedup_mode == ByRule` and `findings` contains duplicate identities
+///   by [`NormalizedFinding`] equality (`path`, `byte_start`, `byte_end`, `rule`;
+///   confidence is ignored): `findings must be deduplicated by rule before matching`.
+/// - `config.dedup_mode == AcrossRules` and `findings` contains duplicate spans
+///   (`path`, `byte_start`, `byte_end`): `findings must be deduplicated by span
+///   before cross-rule matching`.
+/// - `config.dedup_mode == AcrossRules` with `require_rule_match = true`:
+///   `require_rule_match cannot be combined with cross-rule dedup mode`.
 /// - the conservation invariants are violated after classification:
 ///
 /// - `tp + fp + unlabeled != findings.len()`
@@ -221,15 +234,34 @@ pub fn match_findings(
     file_contents: &HashMap<String, Vec<u8>>,
     config: MatchConfig,
 ) -> MatchResult {
-    // ── Precondition: findings are deduplicated ────────────────────
-    // Identity-level duplicates inflate TP counts. Identity here matches
-    // NormalizedFinding Eq/Hash (path/start/end/rule), ignoring confidence.
-    // The hard conservation assertions below are an additional backstop.
-    let mut seen = HashSet::with_capacity(findings.len());
-    assert!(
-        findings.iter().all(|finding| seen.insert(finding)),
-        "findings must be deduplicated before matching"
-    );
+    // ── Precondition: findings are deduplicated using the configured mode ─
+    match config.dedup_mode {
+        DedupMode::ByRule => {
+            // Identity-level duplicates inflate TP counts. Identity here
+            // matches NormalizedFinding Eq/Hash (path/start/end/rule),
+            // ignoring confidence.
+            let mut seen = HashSet::with_capacity(findings.len());
+            assert!(
+                findings.iter().all(|finding| seen.insert(finding)),
+                "findings must be deduplicated by rule before matching"
+            );
+        }
+        DedupMode::AcrossRules => {
+            assert!(
+                !config.require_rule_match,
+                "require_rule_match cannot be combined with cross-rule dedup mode"
+            );
+            let mut seen = HashSet::with_capacity(findings.len());
+            assert!(
+                findings.iter().all(|finding| seen.insert((
+                    finding.path.as_str(),
+                    finding.byte_start,
+                    finding.byte_end,
+                ))),
+                "findings must be deduplicated by span before cross-rule matching"
+            );
+        }
+    }
 
     let findings_len = findings.len();
 
@@ -568,6 +600,7 @@ mod tests {
     fn default_config() -> MatchConfig {
         MatchConfig {
             require_rule_match: false,
+            dedup_mode: DedupMode::ByRule,
         }
     }
 
@@ -771,6 +804,7 @@ mod tests {
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
         let config = MatchConfig {
             require_rule_match: true,
+            dedup_mode: DedupMode::ByRule,
         };
 
         let result = match_findings(findings, truth, &fc, config);
@@ -806,6 +840,7 @@ mod tests {
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
         let config = MatchConfig {
             require_rule_match: true,
+            dedup_mode: DedupMode::ByRule,
         };
 
         let result = match_findings(findings, truth, &fc, config);
@@ -916,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "findings must be deduplicated before matching")]
+    #[should_panic(expected = "findings must be deduplicated by rule before matching")]
     fn duplicate_findings_precondition_panics() {
         let findings = vec![
             make_finding(SIMPLE_PATH, 0, 4, "dup", 10),
@@ -928,6 +963,37 @@ mod tests {
         let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
 
         let _ = match_findings(findings, truth, &fc, default_config());
+    }
+
+    #[test]
+    #[should_panic(expected = "findings must be deduplicated by span before cross-rule matching")]
+    fn cross_rule_duplicate_span_precondition_panics() {
+        let findings = vec![
+            make_finding(SIMPLE_PATH, 0, 4, "r1", 10),
+            make_finding(SIMPLE_PATH, 0, 4, "r2", 9),
+        ];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r1")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+        let config = MatchConfig {
+            require_rule_match: false,
+            dedup_mode: DedupMode::AcrossRules,
+        };
+
+        let _ = match_findings(findings, truth, &fc, config);
+    }
+
+    #[test]
+    #[should_panic(expected = "require_rule_match cannot be combined with cross-rule dedup mode")]
+    fn cross_rule_mode_rejects_rule_match_requirement() {
+        let findings = vec![make_finding(SIMPLE_PATH, 0, 4, "r1", 10)];
+        let truth = vec![make_truth(SIMPLE_PATH, 1, 1, TruthLabel::Positive, "r1")];
+        let fc = contents(&[(SIMPLE_PATH, SIMPLE_FILE)]);
+        let config = MatchConfig {
+            require_rule_match: true,
+            dedup_mode: DedupMode::AcrossRules,
+        };
+
+        let _ = match_findings(findings, truth, &fc, config);
     }
 
     #[test]
