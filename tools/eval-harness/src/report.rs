@@ -58,6 +58,7 @@ use std::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::metrics::EvalMetrics;
+use crate::pipeline::PipelineConfig;
 use crate::provenance::Provenance;
 use crate::regression::RegressionResult;
 use crate::types::{ClassifiedFinding, FindingClass, TruthItem};
@@ -103,14 +104,6 @@ pub struct EvalReport {
     /// Stored in report JSON so regression checks can detect baseline/config
     /// mismatches (for example, comparing dedup and non-dedup runs).
     pub pipeline_config: PipelineConfig,
-}
-
-/// Processing flags that affect finding/matching semantics in eval runs.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct PipelineConfig {
-    /// Whether cross-rule dedup was applied before matching.
-    #[serde(default)]
-    pub cross_rule_dedup: bool,
 }
 
 /// Metrics interpretation model for report rendering/serialization.

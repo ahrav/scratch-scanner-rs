@@ -10,10 +10,8 @@
 //! - [`parse_findings_jsonl`] — in-memory, infallible (errors become counters)
 //! - [`parse_findings_file`] — reads from disk, returns `Result` for I/O errors
 //!
-//! After parsing, call [`dedup_findings`] to collapse duplicate detections at
-//! the same `(path, byte_start, byte_end, rule)` identity, retaining the
-//! highest confidence score. Optionally call [`cross_rule_dedup_findings`]
-//! afterward to collapse same-span detections across different rules.
+//! After parsing, call [`dedup_findings_with_mode`] to apply the selected
+//! dedup semantics before matching.
 //!
 //! # Wire format
 //!
@@ -36,6 +34,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline::DedupMode;
 use crate::types::{FileReadError, NormalizedFinding, normalize_path};
 
 // ── Wire format ──────────────────────────────────────────────────────────
@@ -217,12 +216,25 @@ pub fn dedup_findings(findings: &mut Vec<NormalizedFinding>) {
     });
 }
 
+/// Apply deduplication according to the selected pipeline mode.
+///
+/// - [`DedupMode::ByRule`]: keep one finding per
+///   `(path, byte_start, byte_end, rule)` with max confidence.
+/// - [`DedupMode::AcrossRules`]: keep one finding per
+///   `(path, byte_start, byte_end)` across all rules.
+pub fn dedup_findings_with_mode(findings: &mut Vec<NormalizedFinding>, mode: DedupMode) {
+    match mode {
+        DedupMode::ByRule => dedup_findings(findings),
+        DedupMode::AcrossRules => cross_rule_dedup_findings(findings),
+    }
+}
+
 /// Sort and deduplicate findings in place across rules, retaining the highest
 /// confidence per `(path, byte_start, byte_end)` span.
 ///
-/// This function is intended to run after [`dedup_findings`], so each
-/// `(path, byte_start, byte_end, rule)` identity appears at most once before
-/// cross-rule collapsing begins.
+/// This pass is self-contained: callers do not need to run [`dedup_findings`]
+/// first. Identity duplicates and cross-rule collisions are both resolved by
+/// the same ordering + dedup scan.
 ///
 /// Tie-breaking is deterministic:
 /// - higher confidence wins
