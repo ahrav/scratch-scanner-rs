@@ -377,6 +377,11 @@ impl FindingRecord for FindingRec {
     }
 
     #[inline]
+    fn dedupe_with_span(&self) -> bool {
+        true
+    }
+
+    #[inline]
     fn confidence_score(&self) -> i8 {
         self.confidence_score
     }

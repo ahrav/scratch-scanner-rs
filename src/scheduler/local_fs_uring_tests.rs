@@ -87,6 +87,79 @@ impl ScanEngine for DuplicateDropEngine {
     }
 }
 
+struct DistinctHashEngine;
+
+struct DistinctHashScratch {
+    findings: Vec<FindingWithHash<FindingRec>>,
+}
+
+impl EngineScratch for DistinctHashScratch {
+    type Finding = FindingWithHash<FindingRec>;
+
+    fn clear(&mut self) {
+        self.findings.clear();
+    }
+
+    fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
+        self.findings
+            .retain(|f| f.root_hint_end() >= new_bytes_start);
+    }
+
+    fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
+        out.append(&mut self.findings);
+    }
+
+    fn pending_findings_len(&self) -> usize {
+        self.findings.len()
+    }
+}
+
+impl ScanEngine for DistinctHashEngine {
+    type Scratch = DistinctHashScratch;
+
+    fn required_overlap(&self) -> usize {
+        0
+    }
+
+    fn new_scratch(&self) -> Self::Scratch {
+        DistinctHashScratch {
+            findings: Vec::with_capacity(8),
+        }
+    }
+
+    fn scan_chunk_into(
+        &self,
+        data: &[u8],
+        _file_id: FileId,
+        _base_offset: u64,
+        scratch: &mut Self::Scratch,
+    ) {
+        scratch.clear();
+        if data.is_empty() {
+            return;
+        }
+
+        let rec = FindingRec {
+            rule_id: RuleId(0),
+            root_hint_start: 0,
+            root_hint_end: 6,
+            span_start: 0,
+            span_end: 6,
+            confidence_score: 0,
+        };
+        scratch.findings.push(FindingWithHash::new(rec, [0xA1; 32]));
+        scratch.findings.push(FindingWithHash::new(rec, [0xB2; 32]));
+    }
+
+    fn rule_name(&self, _rule_id: u32) -> &str {
+        "distinct-hash"
+    }
+
+    fn max_findings_per_chunk(&self) -> usize {
+        8
+    }
+}
+
 #[test]
 fn uring_finds_boundary_spanning_match() -> io::Result<()> {
     // Create a mock engine that looks for "SECRET"
@@ -130,6 +203,7 @@ fn uring_finds_boundary_spanning_match() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(),
@@ -204,6 +278,7 @@ fn uring_open_stat_parity_with_blocking() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(),
@@ -271,6 +346,7 @@ fn blocking_mode_skips_open_stat_ops() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(),
@@ -322,6 +398,7 @@ fn uring_binary_skipped_counted() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: true,
         archive: ArchiveConfig {
@@ -375,6 +452,7 @@ fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: true,
         archive: ArchiveConfig {
@@ -391,6 +469,59 @@ fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
     assert_eq!(
         cpu_metrics.findings_dropped, 1,
         "extraction path should count effective dropped findings (engine drops minus scheduler prunes)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn uring_cross_rule_mode_uses_hash_aware_winner_pass() -> io::Result<()> {
+    let engine = Arc::new(DistinctHashEngine);
+    let dir = tempdir()?;
+    let file_path = dir.path().join("a.txt");
+    std::fs::write(&file_path, b"SECRET")?;
+
+    let mut cfg = LocalFsUringConfig {
+        cpu_workers: 2,
+        io_threads: 1,
+        ring_entries: 64,
+        io_depth: 16,
+        chunk_size: 64,
+        max_in_flight_files: 8,
+        file_queue_cap: 8,
+        pool_buffers: 32,
+        use_registered_buffers: false,
+        open_stat_mode: OpenStatMode::BlockingOnly,
+        resolve_policy: ResolvePolicy::Default,
+        follow_symlinks: false,
+        max_file_size: None,
+        seed: 123,
+        dedupe_within_chunk: true,
+        cross_rule_dedupe: false,
+        pin_threads: false,
+        skip_binary: false,
+        archive: ArchiveConfig {
+            enabled: false,
+            ..ArchiveConfig::default()
+        },
+    };
+
+    let sink_off = Arc::new(VecEventSink::new());
+    let (_summary, _io_stats, off_metrics) = scan_local_fs_uring(
+        Arc::clone(&engine),
+        &[dir.path().to_path_buf()],
+        cfg.clone(),
+        sink_off,
+    )?;
+    assert_eq!(off_metrics.findings_emitted, 1);
+
+    cfg.cross_rule_dedupe = true;
+    let sink_on = Arc::new(VecEventSink::new());
+    let (_summary, _io_stats, on_metrics) =
+        scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink_on)?;
+    assert_eq!(
+        on_metrics.findings_emitted, 2,
+        "cross-rule mode must route through hash-aware helper and preserve distinct hashes"
     );
 
     Ok(())
@@ -439,7 +570,7 @@ fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
     drop(tx);
 
     let sink = Arc::new(VecEventSink::new());
-    let stats = extract_worker_loop(rx, engine, sink.clone(), true);
+    let stats = extract_worker_loop(rx, engine, sink.clone(), true, false);
 
     assert_eq!(stats.files_extracted, 1, "expected extraction from open fd");
     assert_eq!(stats.io_errors, 0);
@@ -490,6 +621,7 @@ fn uring_archive_sniffed_counted() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true by default
@@ -557,6 +689,7 @@ fn uring_sniff_detected_gzip_emits_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true
@@ -630,6 +763,7 @@ fn uring_extension_routed_archive_emits_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true
@@ -696,6 +830,7 @@ fn uring_sniff_detected_zip_emits_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true

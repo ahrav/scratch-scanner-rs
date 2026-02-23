@@ -9,8 +9,8 @@ use std::fs::File;
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
-    FileTask, LocalScratch,
+    account_effective_dropped_findings, dedupe_findings, dedupe_findings_cross_rule, emit_findings,
+    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Read a file with an extractable binary format, extract text, and scan it.
@@ -93,19 +93,24 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
     );
     let engine_dropped = scratch.scan_scratch.dropped_findings();
     let before_prefix = scratch.scan_scratch.pending_findings_len();
+    let after_prefix = before_prefix;
 
     scratch.pending.clear();
     scratch
         .scan_scratch
         .drain_findings_into(&mut scratch.pending);
 
-    let before_dedupe = scratch.pending.len();
-    if scratch.dedupe_within_chunk {
+    let before_mode_pass = scratch.pending.len();
+    if scratch.cross_rule_dedupe && before_mode_pass > 1 {
+        dedupe_findings_cross_rule(&mut scratch.pending, |lhs, rhs| {
+            engine.rule_name(lhs).cmp(engine.rule_name(rhs))
+        });
+    } else if scratch.dedupe_within_chunk && before_mode_pass > 1 {
         dedupe_findings(&mut scratch.pending);
     }
     let scheduler_pruned = before_prefix
-        .saturating_sub(before_dedupe)
-        .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+        .saturating_sub(after_prefix)
+        .saturating_add(before_mode_pass.saturating_sub(scratch.pending.len()));
     account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
     if !scratch.pending.is_empty() {
         emit_persistence_batch(

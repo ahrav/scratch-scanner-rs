@@ -302,6 +302,11 @@ pub struct ParallelScanConfig {
     /// Defaults to [`NullEventSink`](crate::unified::events::NullEventSink).
     pub event_sink: Arc<dyn crate::unified::events::EventSink>,
 
+    /// Enable cross-rule winner dedupe in scheduler scan loops.
+    ///
+    /// Defaults to `true`; set to `false` to fall back to same-rule-only dedupe.
+    pub cross_rule_dedupe: bool,
+
     /// Optional persistence producer for post-dedupe FS findings.
     ///
     /// When `Some`, the scheduler calls [`StoreProducer::emit_fs_batch`] for
@@ -329,6 +334,7 @@ impl Default for ParallelScanConfig {
             pin_threads: super::affinity::default_pin_threads(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
+            cross_rule_dedupe: true,
             store_producer: None,
         }
     }
@@ -351,6 +357,7 @@ impl std::fmt::Debug for ParallelScanConfig {
             .field("pin_threads", &self.pin_threads)
             .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
+            .field("cross_rule_dedupe", &self.cross_rule_dedupe)
             .field(
                 "store_producer",
                 &self.store_producer.as_ref().map(|_| "<dyn StoreProducer>"),
@@ -369,8 +376,7 @@ impl ParallelScanConfig {
     ///
     /// `dedupe_within_chunk` is hardcoded to `true` because directory scans
     /// always process overlapping chunks and must suppress duplicate findings
-    /// at chunk boundaries. Callers that need to disable dedup should use
-    /// `scan_local` directly.
+    /// at chunk boundaries. `cross_rule_dedupe` is forwarded from this config.
     fn to_local_config(&self) -> LocalConfig {
         LocalConfig {
             workers: self.workers,
@@ -382,6 +388,7 @@ impl ParallelScanConfig {
             seed: self.seed,
             pin_threads: self.pin_threads,
             dedupe_within_chunk: true,
+            cross_rule_dedupe: self.cross_rule_dedupe,
             archive: self.archive.clone(),
             skip_binary: self.skip_binary,
             event_sink: self.event_sink.clone(),
@@ -692,6 +699,7 @@ mod tests {
             pin_threads: false,
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
+            cross_rule_dedupe: true,
             store_producer: None,
         }
     }
@@ -702,6 +710,34 @@ mod tests {
         let mut cfg = small_config();
         cfg.event_sink = Arc::clone(&sink) as Arc<dyn crate::unified::events::EventSink>;
         (cfg, sink)
+    }
+
+    #[test]
+    fn to_local_config_forwards_cross_rule_dedupe_enabled() {
+        let mut cfg = small_config();
+        cfg.cross_rule_dedupe = true;
+
+        let local = cfg.to_local_config();
+        assert!(
+            local.cross_rule_dedupe,
+            "cross_rule_dedupe should propagate into LocalConfig"
+        );
+        assert!(
+            local.dedupe_within_chunk,
+            "directory scans must keep legacy within-chunk dedupe enabled"
+        );
+    }
+
+    #[test]
+    fn to_local_config_forwards_cross_rule_dedupe_disabled() {
+        let mut cfg = small_config();
+        cfg.cross_rule_dedupe = false;
+
+        let local = cfg.to_local_config();
+        assert!(
+            !local.cross_rule_dedupe,
+            "cross_rule_dedupe=false should propagate into LocalConfig"
+        );
     }
 
     #[test]

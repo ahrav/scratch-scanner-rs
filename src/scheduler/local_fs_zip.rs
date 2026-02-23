@@ -16,8 +16,8 @@ use super::local_fs_archive_ctx::{
     charge_discarded_bytes, ArchiveEnd, ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
 };
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
-    FileTask, LocalScratch,
+    account_effective_dropped_findings, dedupe_findings, dedupe_findings_cross_rule, emit_findings,
+    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Scan a ZIP file using file-backed random access.
@@ -37,6 +37,7 @@ pub(super) fn process_zip_file<E: ScanEngine>(
     };
     let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
     let dedupe = scratch.dedupe_within_chunk;
+    let cross_rule_dedupe = scratch.cross_rule_dedupe;
     let LocalScratch {
         engine,
         pool,
@@ -398,13 +399,17 @@ pub(super) fn process_zip_file<E: ScanEngine>(
             pending.clear();
             scan_scratch.drain_findings_into(pending);
 
-            let before_dedupe = pending.len();
-            if dedupe && before_dedupe > 1 {
+            let before_mode_pass = pending.len();
+            if cross_rule_dedupe && before_mode_pass > 1 {
+                dedupe_findings_cross_rule(pending, |lhs, rhs| {
+                    engine.rule_name(lhs).cmp(engine.rule_name(rhs))
+                });
+            } else if dedupe && before_mode_pass > 1 {
                 dedupe_findings(pending);
             }
             let scheduler_pruned = before_prefix
                 .saturating_sub(after_prefix)
-                .saturating_add(before_dedupe.saturating_sub(pending.len()));
+                .saturating_add(before_mode_pass.saturating_sub(pending.len()));
             account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
 
             metrics.findings_emitted = metrics.findings_emitted.wrapping_add(pending.len() as u64);

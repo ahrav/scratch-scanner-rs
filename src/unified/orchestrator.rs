@@ -219,6 +219,7 @@ fn run_fs(
         skip_hidden: false,
         respect_gitignore: false,
         event_sink: Arc::clone(&event_sink),
+        cross_rule_dedupe: cfg.cross_rule_dedupe,
         ..Default::default()
     };
     if let Some(ref producer) = store_producer {
@@ -264,6 +265,7 @@ fn run_fs(
                     max_in_flight_files: ps_config.max_in_flight_objects,
                     max_file_size: Some(ps_config.max_file_size),
                     dedupe_within_chunk: true,
+                    cross_rule_dedupe: ps_config.cross_rule_dedupe,
                     seed: ps_config.seed,
                     skip_binary: ps_config.skip_binary,
                     archive: ps_config.archive.clone(),

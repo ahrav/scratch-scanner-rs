@@ -75,6 +75,7 @@ use crate::archive::{
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 use crate::store::{FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer};
 
+use std::cmp::Ordering as CmpOrdering;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -135,6 +136,13 @@ pub struct LocalConfig {
     /// Cross-chunk deduplication is handled separately by `drop_prefix_findings`.
     pub dedupe_within_chunk: bool,
 
+    /// When `true`, run cross-rule winner dedupe after prefix pruning.
+    ///
+    /// Mode interaction:
+    /// - `true`: cross-rule winner pass (always runs when >1 finding)
+    /// - `false`: same-rule-only dedupe path (gated by `dedupe_within_chunk`)
+    pub cross_rule_dedupe: bool,
+
     /// Archive scanning configuration.
     pub archive: ArchiveConfig,
 
@@ -163,6 +171,7 @@ impl Default for LocalConfig {
             seed: 0x853c49e6748fea9b,
             pin_threads: super::affinity::default_pin_threads(),
             dedupe_within_chunk: true,
+            cross_rule_dedupe: true,
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),
@@ -183,6 +192,7 @@ impl std::fmt::Debug for LocalConfig {
             .field("seed", &self.seed)
             .field("pin_threads", &self.pin_threads)
             .field("dedupe_within_chunk", &self.dedupe_within_chunk)
+            .field("cross_rule_dedupe", &self.cross_rule_dedupe)
             .field("archive", &self.archive)
             .field("skip_binary", &self.skip_binary)
             .field("event_sink", &"<dyn EventSink>")
@@ -368,6 +378,7 @@ pub(super) struct LocalScratch<E: ScanEngine> {
 
     /// Configuration flags.
     pub(super) dedupe_within_chunk: bool,
+    pub(super) cross_rule_dedupe: bool,
     pub(super) chunk_size: usize,
     pub(super) max_file_size: u64,
     pub(super) archive: ArchiveConfig,
@@ -509,15 +520,14 @@ pub(super) fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
         return;
     }
 
-    findings.sort_unstable_by_key(|f| {
-        (
-            f.rule_id(),
-            f.root_hint_start(),
-            f.root_hint_end(),
-            f.span_start(),
-            f.span_end(),
-            *f.norm_hash(),
-        )
+    findings.sort_unstable_by(|a, b| {
+        a.rule_id()
+            .cmp(&b.rule_id())
+            .then_with(|| a.root_hint_start().cmp(&b.root_hint_start()))
+            .then_with(|| a.root_hint_end().cmp(&b.root_hint_end()))
+            .then_with(|| a.span_start().cmp(&b.span_start()))
+            .then_with(|| a.span_end().cmp(&b.span_end()))
+            .then_with(|| a.norm_hash().cmp(b.norm_hash()))
     });
 
     findings.dedup_by(|a, b| {
@@ -526,6 +536,68 @@ pub(super) fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
             && a.root_hint_end() == b.root_hint_end()
             && a.span_start() == b.span_start()
             && a.span_end() == b.span_end()
+            && a.norm_hash() == b.norm_hash()
+    });
+}
+
+/// Cross-rule winner dedupe in place by `(root_hint, span-projection, norm_hash)`.
+///
+/// Winner selection for findings that share a group key:
+/// 1. Higher `confidence_score`
+/// 2. Lexical rule-name order (caller-provided comparator)
+/// 3. Lower `rule_id`
+///
+/// Span participation is conditional per finding:
+/// - `dedupe_with_span == true`: include `span_start/span_end`
+/// - `dedupe_with_span == false`: zero span components in the key
+#[inline]
+pub(super) fn dedupe_findings_cross_rule<F, C>(findings: &mut Vec<F>, mut rule_cmp: C)
+where
+    F: FindingWithHashRecord,
+    C: FnMut(u32, u32) -> CmpOrdering,
+{
+    if findings.len() <= 1 {
+        return;
+    }
+
+    findings.sort_unstable_by(|a, b| {
+        a.root_hint_start()
+            .cmp(&b.root_hint_start())
+            .then_with(|| a.root_hint_end().cmp(&b.root_hint_end()))
+            .then_with(|| {
+                let a_span = if a.dedupe_with_span() {
+                    (a.span_start(), a.span_end())
+                } else {
+                    (0, 0)
+                };
+                let b_span = if b.dedupe_with_span() {
+                    (b.span_start(), b.span_end())
+                } else {
+                    (0, 0)
+                };
+                a_span.cmp(&b_span)
+            })
+            .then_with(|| a.norm_hash().cmp(b.norm_hash()))
+            .then_with(|| b.confidence_score().cmp(&a.confidence_score()))
+            .then_with(|| rule_cmp(a.rule_id(), b.rule_id()))
+            .then_with(|| a.rule_id().cmp(&b.rule_id()))
+    });
+
+    findings.dedup_by(|a, b| {
+        let a_span = if a.dedupe_with_span() {
+            (a.span_start(), a.span_end())
+        } else {
+            (0, 0)
+        };
+        let b_span = if b.dedupe_with_span() {
+            (b.span_start(), b.span_end())
+        } else {
+            (0, 0)
+        };
+
+        a.root_hint_start() == b.root_hint_start()
+            && a.root_hint_end() == b.root_hint_end()
+            && a_span == b_span
             && a.norm_hash() == b.norm_hash()
     });
 }
@@ -1018,14 +1090,17 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .scan_scratch
             .drain_findings_into(&mut scratch.pending);
 
-        // Optional within-chunk dedupe (only needed if engine can emit duplicates)
-        let before_dedupe = scratch.pending.len();
-        if scratch.dedupe_within_chunk && before_dedupe > 1 {
+        let before_mode_pass = scratch.pending.len();
+        if scratch.cross_rule_dedupe && before_mode_pass > 1 {
+            dedupe_findings_cross_rule(&mut scratch.pending, |lhs, rhs| {
+                engine.rule_name(lhs).cmp(engine.rule_name(rhs))
+            });
+        } else if scratch.dedupe_within_chunk && before_mode_pass > 1 {
             dedupe_findings(&mut scratch.pending);
         }
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+            .saturating_add(before_mode_pass.saturating_sub(scratch.pending.len()));
         account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
 
         // Count findings before emitting (pending.len() is the count for this chunk)
@@ -1206,6 +1281,7 @@ where
 
     // Capture config values before moving into closure
     let dedupe = cfg.dedupe_within_chunk;
+    let cross_rule_dedupe = cfg.cross_rule_dedupe;
     let chunk_size = cfg.chunk_size;
     let event_sink = cfg.event_sink.clone();
     let store_producer = cfg.store_producer.clone();
@@ -1273,6 +1349,7 @@ where
                     event_sink: Arc::clone(&event_sink),
                     store_producer: store_producer.clone(),
                     dedupe_within_chunk: dedupe,
+                    cross_rule_dedupe,
                     chunk_size,
                     max_file_size: cfg.max_file_size,
                     archive: archive_cfg.clone(),

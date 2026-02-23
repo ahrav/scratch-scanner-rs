@@ -140,6 +140,10 @@ pub struct FsScanConfig {
     /// backend. The default backend writes to a SQLite database under the
     /// configured store root.
     pub persist_findings: bool,
+    /// When `true`, enable scanner-side cross-rule dedupe winner selection.
+    ///
+    /// Default is `true`; pass `--no-cross-rule-dedupe` to disable.
+    pub cross_rule_dedupe: bool,
 }
 
 /// Controls which debug output is emitted to stderr after a git scan.

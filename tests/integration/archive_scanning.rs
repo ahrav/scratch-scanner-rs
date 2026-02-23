@@ -587,6 +587,9 @@ impl FindingRecord for DummyFinding {
     fn span_end(&self) -> u64 {
         0
     }
+    fn dedupe_with_span(&self) -> bool {
+        true
+    }
     fn confidence_score(&self) -> i8 {
         0
     }

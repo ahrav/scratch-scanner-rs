@@ -2,7 +2,9 @@ use super::*;
 use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
 use crate::archive::PartialReason;
 use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
-use crate::scheduler::engine_trait::{EngineScratch, FindingWithHash, ScanEngine};
+use crate::scheduler::engine_trait::{
+    EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
+};
 use crate::scheduler::local_fs_archive_ctx::{apply_entry_budget_clamp, ArchiveEnd};
 use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
 use crate::unified::events::VecEventSink;
@@ -39,6 +41,7 @@ fn small_config_with_sink(sink: Arc<VecEventSink>) -> LocalConfig {
         seed: 12345,
         pin_threads: false,
         dedupe_within_chunk: true,
+        cross_rule_dedupe: true,
         archive: ArchiveConfig::default(),
         skip_binary: true,
         event_sink: sink,
@@ -730,6 +733,202 @@ fn dedupe_same_span_same_hash_collapses() {
         v.len(),
         1,
         "identical span and norm_hash should collapse to one"
+    );
+}
+
+#[test]
+fn cross_rule_dedupe_prefers_higher_confidence() {
+    let mut v = vec![
+        FindingWithHash::new(
+            FindingRec {
+                rule_id: RuleId(0),
+                root_hint_start: 10,
+                root_hint_end: 16,
+                span_start: 10,
+                span_end: 16,
+                confidence_score: 2,
+            },
+            [0xDD; 32],
+        ),
+        FindingWithHash::new(
+            FindingRec {
+                rule_id: RuleId(1),
+                root_hint_start: 10,
+                root_hint_end: 16,
+                span_start: 10,
+                span_end: 16,
+                confidence_score: 7,
+            },
+            [0xDD; 32],
+        ),
+    ];
+
+    dedupe_findings_cross_rule(&mut v, |_lhs, _rhs| std::cmp::Ordering::Equal);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].rule_id(), 1);
+}
+
+#[test]
+fn cross_rule_dedupe_tie_breaks_by_rule_name_then_rule_id() {
+    let names = ["zeta", "alpha", "alpha"];
+    let mut v = vec![
+        FindingWithHash::new(
+            FindingRec {
+                rule_id: RuleId(0),
+                root_hint_start: 20,
+                root_hint_end: 26,
+                span_start: 20,
+                span_end: 26,
+                confidence_score: 5,
+            },
+            [0xEF; 32],
+        ),
+        FindingWithHash::new(
+            FindingRec {
+                rule_id: RuleId(2),
+                root_hint_start: 20,
+                root_hint_end: 26,
+                span_start: 20,
+                span_end: 26,
+                confidence_score: 5,
+            },
+            [0xEF; 32],
+        ),
+        FindingWithHash::new(
+            FindingRec {
+                rule_id: RuleId(1),
+                root_hint_start: 20,
+                root_hint_end: 26,
+                span_start: 20,
+                span_end: 26,
+                confidence_score: 5,
+            },
+            [0xEF; 32],
+        ),
+    ];
+
+    dedupe_findings_cross_rule(&mut v, |lhs, rhs| {
+        names[lhs as usize].cmp(names[rhs as usize])
+    });
+    assert_eq!(v.len(), 1);
+    assert_eq!(
+        v[0].rule_id(),
+        1,
+        "same-confidence ties should prefer lexical rule_name, then lower rule_id"
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpanModeFinding {
+    rule_id: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+    span_start: u64,
+    span_end: u64,
+    dedupe_with_span: bool,
+    confidence_score: i8,
+    norm_hash: [u8; 32],
+}
+
+impl FindingRecord for SpanModeFinding {
+    fn rule_id(&self) -> u32 {
+        self.rule_id
+    }
+
+    fn root_hint_start(&self) -> u64 {
+        self.root_hint_start
+    }
+
+    fn root_hint_end(&self) -> u64 {
+        self.root_hint_end
+    }
+
+    fn span_start(&self) -> u64 {
+        self.span_start
+    }
+
+    fn span_end(&self) -> u64 {
+        self.span_end
+    }
+
+    fn dedupe_with_span(&self) -> bool {
+        self.dedupe_with_span
+    }
+
+    fn confidence_score(&self) -> i8 {
+        self.confidence_score
+    }
+}
+
+impl FindingWithHashRecord for SpanModeFinding {
+    fn norm_hash(&self) -> &[u8; 32] {
+        &self.norm_hash
+    }
+}
+
+#[test]
+fn cross_rule_dedupe_zeros_span_when_dedupe_with_span_is_false() {
+    let mut v = vec![
+        SpanModeFinding {
+            rule_id: 0,
+            root_hint_start: 100,
+            root_hint_end: 120,
+            span_start: 100,
+            span_end: 110,
+            dedupe_with_span: false,
+            confidence_score: 1,
+            norm_hash: [0x11; 32],
+        },
+        SpanModeFinding {
+            rule_id: 1,
+            root_hint_start: 100,
+            root_hint_end: 120,
+            span_start: 111,
+            span_end: 120,
+            dedupe_with_span: false,
+            confidence_score: 2,
+            norm_hash: [0x11; 32],
+        },
+    ];
+
+    dedupe_findings_cross_rule(&mut v, |_lhs, _rhs| std::cmp::Ordering::Equal);
+    assert_eq!(
+        v.len(),
+        1,
+        "span should be ignored when dedupe_with_span=false"
+    );
+}
+
+#[test]
+fn cross_rule_dedupe_preserves_distinct_spans_when_dedupe_with_span_is_true() {
+    let mut v = vec![
+        SpanModeFinding {
+            rule_id: 0,
+            root_hint_start: 100,
+            root_hint_end: 120,
+            span_start: 100,
+            span_end: 110,
+            dedupe_with_span: true,
+            confidence_score: 1,
+            norm_hash: [0x22; 32],
+        },
+        SpanModeFinding {
+            rule_id: 1,
+            root_hint_start: 100,
+            root_hint_end: 120,
+            span_start: 111,
+            span_end: 120,
+            dedupe_with_span: true,
+            confidence_score: 2,
+            norm_hash: [0x22; 32],
+        },
+    ];
+
+    dedupe_findings_cross_rule(&mut v, |_lhs, _rhs| std::cmp::Ordering::Equal);
+    assert_eq!(
+        v.len(),
+        2,
+        "span should remain part of key when dedupe_with_span=true"
     );
 }
 
