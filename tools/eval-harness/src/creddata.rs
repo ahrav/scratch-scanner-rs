@@ -484,20 +484,22 @@ mod tests {
         assert_eq!(result.items[2].label, TruthLabel::Placeholder);
     }
 
-    #[test]
-    fn parse_skips_invalid_rows() {
-        let cases: &[(&str, &str, i64, i64, &str, &str)] = &[
-            ("unknown label", "a.py", 1, 1, "Q", "Password"),
-            ("inverted range", "a.py", 10, 5, "T", "Key"),
-            ("empty category", "a.py", 1, 1, "T", ""),
-            ("empty filepath", "", 1, 1, "T", "Password"),
-        ];
-        for &(desc, path, start, end, label, cat) in cases {
-            let csv = format!("{HEADER}\n{}", make_row(path, start, end, label, cat));
-            let result = parse_str(&csv, "");
-            assert!(result.items.is_empty(), "{desc}: expected no items");
-            assert_eq!(result.skipped_rows, 1, "{desc}: expected 1 skipped row");
-        }
+    #[rstest::rstest]
+    #[case::unknown_label("a.py", 1, 1, "Q", "Password")]
+    #[case::inverted_range("a.py", 10, 5, "T", "Key")]
+    #[case::empty_category("a.py", 1, 1, "T", "")]
+    #[case::empty_filepath("", 1, 1, "T", "Password")]
+    fn parse_skips_invalid_rows(
+        #[case] path: &str,
+        #[case] start: i64,
+        #[case] end: i64,
+        #[case] label: &str,
+        #[case] cat: &str,
+    ) {
+        let csv = format!("{HEADER}\n{}", make_row(path, start, end, label, cat));
+        let result = parse_str(&csv, "");
+        assert!(result.items.is_empty(), "expected no items");
+        assert_eq!(result.skipped_rows, 1, "expected 1 skipped row");
     }
 
     #[test]
