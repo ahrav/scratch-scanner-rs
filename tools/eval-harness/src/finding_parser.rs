@@ -703,7 +703,6 @@ mod tests {
             NormalizedFinding::new("a.rs".into(), 10, 20, "entropy".into(), 30),
             NormalizedFinding::new("a.rs".into(), 10, 20, "generic".into(), 18),
         ];
-        dedup_findings(&mut findings);
         cross_rule_dedup_findings(&mut findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, "entropy");
@@ -717,7 +716,6 @@ mod tests {
             NormalizedFinding::new("a.rs".into(), 10, 20, "aa-rule".into(), 42),
             NormalizedFinding::new("a.rs".into(), 10, 20, "mm-rule".into(), 42),
         ];
-        dedup_findings(&mut findings);
         cross_rule_dedup_findings(&mut findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, "aa-rule");
@@ -732,7 +730,6 @@ mod tests {
             NormalizedFinding::new("b.rs".into(), 0, 10, "r1".into(), 5),
             NormalizedFinding::new("b.rs".into(), 0, 10, "r2".into(), 7),
         ];
-        dedup_findings(&mut findings);
         cross_rule_dedup_findings(&mut findings);
 
         assert_eq!(findings.len(), 2);

@@ -44,7 +44,8 @@ Both pipelines follow a **load-match-measure-report** pattern:
 Position-based (creddata / synthetic):
   truth loader ──► TruthItem[]
                                ├─► match_findings ──► ClassifiedFinding[]
-  finding source ──► NormalizedFinding[]              ├─► compute_metrics ──► EvalMetrics
+  finding source ──► NormalizedFinding[] ──► dedup pipeline (identity, optional cross-rule)
+                                                      ├─► compute_metrics ──► EvalMetrics
   corpus files ──► HashMap<path, bytes>               ├─► hash_corpus_snapshot ──► Provenance
                                                       ├─► bootstrap_ap_ci ──► CI
                                                       ├─► check_regression ──► Verdict
@@ -68,7 +69,9 @@ Count-based (leaky-repo):
 
 **`EvalMetrics`** — Aggregate metrics: AP, precision, recall, F1, F2, baseline AP, P@R targets, R@P targets, bootstrap CI, per-rule breakdown (`BTreeMap<String, RuleMetrics>`).
 
-**`EvalReport`** — Top-level serializable artifact combining `EvalMetrics`, `Provenance`, optional `RegressionResult`, and optional `ErrorBook`.
+**`EvalReport`** — Top-level serializable artifact combining required `EvalMetrics`, `Provenance`, and required `pipeline_config`, plus optional `RegressionResult` and optional `ErrorBook`.
+
+**`PipelineConfig`** — Pipeline semantics used for this run. Currently includes `cross_rule_dedup` (default `false`). Legacy baseline JSON without this field deserializes with `cross_rule_dedup = false`.
 
 ### Matching Algorithm
 
@@ -115,6 +118,7 @@ eval-harness creddata \
   --corpus-root <DIR>    \   # Path normalization root (stripped from finding/truth paths)
   --findings <JSONL>     \   # Pre-computed findings JSONL file   ─┐ mutually
   --scan-corpus <DIR>    \   # OR: directory to live-scan          ─┘ exclusive
+  --cross-rule-dedup     \   # Optional: collapse same-span findings across rules
   --format <json|table>  \   # Output format (default: json)
   --output <PATH>        \   # Write JSON to file instead of stdout
   --baseline <JSON>          # Baseline report for regression comparison
@@ -128,6 +132,7 @@ eval-harness synthetic \
   --corpus-root <DIR>    \   # Path normalization root
   --findings <JSONL>     \   # Pre-computed findings JSONL file   ─┐ mutually
   --scan-corpus <DIR>    \   # OR: directory to live-scan          ─┘ exclusive
+  --cross-rule-dedup     \   # Optional: collapse same-span findings across rules
   --format <json|table>  \   # Output format (default: json)
   --output <PATH>        \   # Write JSON to file instead of stdout
   --baseline <JSON>          # Baseline report for regression comparison
@@ -152,6 +157,11 @@ Position-based subcommands (`creddata`, `synthetic`) accept findings from two mu
 - **`--scan-corpus <dir>`** — Live-scan a directory using the embedded `scanner_rs::demo_engine()` with the default ruleset. Findings are collected via an in-memory event sink and re-parsed through the same JSONL path. Intended for quick iteration during rule development on small-to-medium corpora.
 
 The `leaky-repo` subcommand only supports `--findings` (no live scan).
+
+When `--cross-rule-dedup` is enabled, the harness keeps one finding per
+`(path, start, end)` span across all rules before matching. Winner selection
+is deterministic: highest confidence wins, and equal-confidence ties resolve to
+the lexicographically smaller rule name.
 
 ### Output Formats
 
@@ -298,6 +308,10 @@ eval-harness creddata \
 echo "Exit code: $?"
 ```
 
+If current and baseline pipeline configs differ (for example one run enabled
+`--cross-rule-dedup` and the other did not), the harness emits a warning and
+also records machine-readable comparability metadata in the regression JSON.
+
 #### Published benchmark reference
 
 Samsung published cross-scanner benchmarks on CredData (results may vary by CredData version and scanner configuration):
@@ -363,7 +377,8 @@ Validation is fail-fast: the first invalid entry halts loading with an error tha
 eval-harness synthetic \
   --manifest tests/synthetic/manifest.json \
   --corpus-root tests/synthetic/corpus \
-  --scan-corpus tests/synthetic/corpus
+  --scan-corpus tests/synthetic/corpus \
+  --cross-rule-dedup
 
 # Pre-computed findings
 eval-harness synthetic \
@@ -376,6 +391,7 @@ eval-harness synthetic \
   --manifest tests/synthetic/manifest.json \
   --corpus-root tests/synthetic/corpus \
   --scan-corpus tests/synthetic/corpus \
+  --cross-rule-dedup \
   --baseline baseline.json
 ```
 
