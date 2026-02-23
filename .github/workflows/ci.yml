@@ -216,6 +216,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
+          components: rust-src
           shared-key: nightly-linux-fuzz
           extra-apt: "clang llvm"
           cache-workspaces: "fuzz -> target"
@@ -254,6 +255,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
+          components: rust-src
           shared-key: nightly-linux-fuzz
           extra-apt: "clang llvm"
           cache-workspaces: "fuzz -> target"
@@ -307,6 +309,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
+          components: rust-src
           shared-key: nightly-macos-fuzz
           cache-workspaces: "fuzz -> target"
 
@@ -325,25 +328,25 @@ jobs:
         run: |
           export BOOST_ROOT="$(brew --prefix boost)"
           export CMAKE_PREFIX_PATH="${BOOST_ROOT}:${CMAKE_PREFIX_PATH:-}"
-          cargo +nightly fuzz run fuzz_anchor_soundness -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_build_and_scan -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_determinism -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_b64_gate_differential -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_parse_delta -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_inflate_stream -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_delta_into -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pack_exec -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_json_write_equivalence -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_encode_pipeline -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_tiger_chunking -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_atomic_bitset -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_vs_cache_load -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_pyc_extract -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_java_class_extract -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_hit_pool_callback -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_text_sanitize_path -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_simd_classify -- -runs=${FUZZ_RUNS}
-          cargo +nightly fuzz run fuzz_offline_validators -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_anchor_soundness --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_b64_gate_build_and_scan --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_b64_gate_determinism --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_b64_gate_differential --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_parse_delta --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_inflate_stream --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_delta_into --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pack_exec --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_json_write_equivalence --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_encode_pipeline --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_tiger_chunking --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_atomic_bitset --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_vs_cache_load --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_pyc_extract --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_java_class_extract --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_hit_pool_callback --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_text_sanitize_path --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_simd_classify --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
+          cargo +nightly fuzz run fuzz_offline_validators --target aarch64-apple-darwin -- -runs=${FUZZ_RUNS}
 
   # ---------------------------------------------------------------------------
   # Miri: scheduled nightly
@@ -408,6 +411,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
+          components: rust-src
           shared-key: nightly-linux-asan
 
       - name: Run ASAN tests on SIMD and offline_validate modules
