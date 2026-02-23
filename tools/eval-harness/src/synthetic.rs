@@ -361,23 +361,23 @@ mod tests {
     #[rstest::rstest]
     #[case::empty_path(
         r#"[{"path":"","line_start":1,"line_end":1,"label":"positive","rule":"r"}]"#,
-        "path",
+        "path"
     )]
     #[case::zero_line_start(
         r#"[{"path":"x.py","line_start":0,"line_end":1,"label":"positive","rule":"r"}]"#,
-        "line_start",
+        "line_start"
     )]
     #[case::zero_line_end(
         r#"[{"path":"x.py","line_start":1,"line_end":0,"label":"positive","rule":"r"}]"#,
-        "line_end",
+        "line_end"
     )]
     #[case::empty_rule(
         r#"[{"path":"x.py","line_start":1,"line_end":1,"label":"positive","rule":""}]"#,
-        "rule",
+        "rule"
     )]
     #[case::inverted_range(
         r#"[{"path":"x.py","line_start":10,"line_end":5,"label":"positive","rule":"r"}]"#,
-        "line_end",
+        "line_end"
     )]
     fn validation_rejects_bad_items(#[case] json: &str, #[case] keyword: &str) {
         let f = temp_json(json);

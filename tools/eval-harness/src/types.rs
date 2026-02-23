@@ -474,11 +474,7 @@ mod tests {
     #[case::positive(TruthLabel::Positive, r#""positive""#, "positive")]
     #[case::negative(TruthLabel::Negative, r#""negative""#, "negative")]
     #[case::placeholder(TruthLabel::Placeholder, r#""placeholder""#, "placeholder")]
-    fn truth_label_traits(
-        #[case] variant: TruthLabel,
-        #[case] json: &str,
-        #[case] display: &str,
-    ) {
+    fn truth_label_traits(#[case] variant: TruthLabel, #[case] json: &str, #[case] display: &str) {
         let serialized = serde_json::to_string(&variant).unwrap();
         assert_eq!(serialized, json, "{variant:?} serialization");
         let back: TruthLabel = serde_json::from_str(&serialized).unwrap();
