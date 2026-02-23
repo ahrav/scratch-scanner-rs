@@ -793,6 +793,28 @@ mod tests {
             })
         }
 
+        fn expected_cross_rule_winners(
+            input: &[NormalizedFinding],
+        ) -> BTreeMap<(String, u64, u64), (i8, String)> {
+            let mut expected = BTreeMap::<(String, u64, u64), (i8, String)>::new();
+            for finding in input {
+                let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
+                expected
+                    .entry(key)
+                    .and_modify(|(best_conf, best_rule)| {
+                        if finding.confidence > *best_conf
+                            || (finding.confidence == *best_conf
+                                && finding.rule.as_str() < best_rule.as_str())
+                        {
+                            *best_conf = finding.confidence;
+                            *best_rule = finding.rule.clone();
+                        }
+                    })
+                    .or_insert_with(|| (finding.confidence, finding.rule.clone()));
+            }
+            expected
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -868,25 +890,18 @@ mod tests {
             fn cross_rule_dedup_idempotent_and_preserves_max_confidence(
                 input in cross_rule_scenario(),
             ) {
-                let mut expected_max = BTreeMap::<(String, u64, u64), i8>::new();
-                for finding in &input {
-                    let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
-                    expected_max
-                        .entry(key)
-                        .and_modify(|c| *c = (*c).max(finding.confidence))
-                        .or_insert(finding.confidence);
-                }
+                let expected = expected_cross_rule_winners(&input);
 
                 let mut findings = input.clone();
                 cross_rule_dedup_findings(&mut findings);
-                prop_assert_eq!(findings.len(), expected_max.len());
+                prop_assert_eq!(findings.len(), expected.len());
 
                 let mut seen = BTreeSet::new();
                 for finding in &findings {
                     let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
                     prop_assert!(seen.insert(key.clone()));
-                    let expected = expected_max.get(&key).copied().unwrap();
-                    prop_assert_eq!(finding.confidence, expected);
+                    let (best_conf, _) = expected.get(&key).unwrap();
+                    prop_assert_eq!(finding.confidence, *best_conf);
                 }
 
                 let snapshot = findings.clone();
@@ -899,22 +914,7 @@ mod tests {
             fn cross_rule_dedup_tie_breaks_deterministically(
                 input in cross_rule_scenario(),
             ) {
-                let mut expected = BTreeMap::<(String, u64, u64), (i8, String)>::new();
-                for finding in &input {
-                    let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
-                    expected
-                        .entry(key)
-                        .and_modify(|(best_conf, best_rule)| {
-                            if finding.confidence > *best_conf
-                                || (finding.confidence == *best_conf
-                                    && finding.rule.as_str() < best_rule.as_str())
-                            {
-                                *best_conf = finding.confidence;
-                                *best_rule = finding.rule.clone();
-                            }
-                        })
-                        .or_insert_with(|| (finding.confidence, finding.rule.clone()));
-                }
+                let expected = expected_cross_rule_winners(&input);
 
                 let mut findings = input;
                 cross_rule_dedup_findings(&mut findings);
