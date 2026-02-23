@@ -12,7 +12,8 @@
 //!
 //! After parsing, call [`dedup_findings`] to collapse duplicate detections at
 //! the same `(path, byte_start, byte_end, rule)` identity, retaining the
-//! highest confidence score.
+//! highest confidence score. Optionally call [`cross_rule_dedup_findings`]
+//! afterward to collapse same-span detections across different rules.
 //!
 //! # Wire format
 //!
@@ -55,10 +56,16 @@ struct WireLine<'a> {
     /// `type` is a Rust keyword.
     #[serde(rename = "type")]
     event_type: Cow<'a, str>,
+    /// Optional on the wire so non-finding event shapes remain parseable.
+    /// Required only when `event_type == "finding"`.
     path: Option<Cow<'a, str>>,
+    /// Optional on the wire for forward compatibility; required for findings.
     start: Option<u64>,
+    /// Optional on the wire for forward compatibility; required for findings.
     end: Option<u64>,
+    /// Optional on the wire for forward compatibility; required for findings.
     rule: Option<Cow<'a, str>>,
+    /// Optional confidence score. Missing values default to 0 during parse.
     confidence_score: Option<i8>,
 }
 
@@ -210,9 +217,46 @@ pub fn dedup_findings(findings: &mut Vec<NormalizedFinding>) {
     });
 }
 
+/// Sort and deduplicate findings in place across rules, retaining the highest
+/// confidence per `(path, byte_start, byte_end)` span.
+///
+/// This function is intended to run after [`dedup_findings`], so each
+/// `(path, byte_start, byte_end, rule)` identity appears at most once before
+/// cross-rule collapsing begins.
+///
+/// Tie-breaking is deterministic:
+/// - higher confidence wins
+/// - equal confidence resolves to lexicographically smaller rule name
+///
+/// This function mutates ordering: output is sorted by
+/// `(path, byte_start, byte_end)` with deterministic tie-breaks.
+/// Running it discards per-rule alternatives at identical spans, which is
+/// useful for rule-agnostic location scoring but loses "which rule fired"
+/// detail for those collapsed spans.
+///
+/// Idempotent and `O(n log n)` due to sorting.
+pub fn cross_rule_dedup_findings(findings: &mut Vec<NormalizedFinding>) {
+    findings.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.byte_start.cmp(&b.byte_start))
+            .then(a.byte_end.cmp(&b.byte_end))
+            // Descending confidence: winner leads each span group.
+            .then(b.confidence.cmp(&a.confidence))
+            // Ascending rule name for deterministic tie-breaks.
+            .then(a.rule.cmp(&b.rule))
+    });
+    findings.dedup_by(|a, b| {
+        a.path == b.path && a.byte_start == b.byte_start && a.byte_end == b.byte_end
+    });
+}
+
 // ── Internal ─────────────────────────────────────────────────────────────
 
 /// Record a skipped finding with a reason, updating counters.
+///
+/// `first_skip_reason` is sticky: once set, later reasons are ignored so
+/// diagnostics stay compact while preserving a representative failure cause.
 fn record_skip(result: &mut JsonlParseResult, reason: &str) {
     if result.first_skip_reason.is_none() {
         result.first_skip_reason = Some(reason.to_owned());
@@ -231,6 +275,9 @@ fn record_skip(result: &mut JsonlParseResult, reason: &str) {
 /// | Non-finding event type, or empty line (after `\r` trimming) | `non_finding_lines` | Count only |
 /// | Unparseable JSON | `malformed_lines` | Count only |
 /// | Finding-typed but invalid (missing fields, empty rule, inverted span, empty path) | `skipped_findings` | [`record_skip`] |
+///
+/// A missing `"type"` discriminator cannot deserialize into [`WireLine`] and
+/// therefore falls into `malformed_lines` (not `skipped_findings`).
 ///
 /// Handles Windows-style CRLF line endings by stripping trailing `\r`
 /// before attempting JSON parse, so the caller can split on `\n` alone.
@@ -637,11 +684,102 @@ mod tests {
         assert_eq!(findings[1].confidence, 5);
     }
 
+    #[test]
+    fn cross_rule_dedup_keeps_highest_confidence() {
+        let mut findings = vec![
+            NormalizedFinding::new("a.rs".into(), 10, 20, "aws".into(), 12),
+            NormalizedFinding::new("a.rs".into(), 10, 20, "entropy".into(), 30),
+            NormalizedFinding::new("a.rs".into(), 10, 20, "generic".into(), 18),
+        ];
+        dedup_findings(&mut findings);
+        cross_rule_dedup_findings(&mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "entropy");
+        assert_eq!(findings[0].confidence, 30);
+    }
+
+    #[test]
+    fn cross_rule_dedup_tie_breaks_by_rule_name() {
+        let mut findings = vec![
+            NormalizedFinding::new("a.rs".into(), 10, 20, "zz-rule".into(), 42),
+            NormalizedFinding::new("a.rs".into(), 10, 20, "aa-rule".into(), 42),
+            NormalizedFinding::new("a.rs".into(), 10, 20, "mm-rule".into(), 42),
+        ];
+        dedup_findings(&mut findings);
+        cross_rule_dedup_findings(&mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "aa-rule");
+        assert_eq!(findings[0].confidence, 42);
+    }
+
+    #[test]
+    fn cross_rule_dedup_mixed_paths_independent() {
+        let mut findings = vec![
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r1".into(), 10),
+            NormalizedFinding::new("a.rs".into(), 0, 10, "r2".into(), 20),
+            NormalizedFinding::new("b.rs".into(), 0, 10, "r1".into(), 5),
+            NormalizedFinding::new("b.rs".into(), 0, 10, "r2".into(), 7),
+        ];
+        dedup_findings(&mut findings);
+        cross_rule_dedup_findings(&mut findings);
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].path, "a.rs");
+        assert_eq!(findings[0].rule, "r2");
+        assert_eq!(findings[1].path, "b.rs");
+        assert_eq!(findings[1].rule, "r2");
+    }
+
     // ── Property tests ──────────────────────────────────────────
 
     mod prop {
         use super::*;
+        use std::collections::{BTreeMap, BTreeSet};
+
         use proptest::prelude::*;
+
+        /// Generate findings with guaranteed cross-rule collisions by creating
+        /// 2-3 span templates and emitting three rule variants per span.
+        fn cross_rule_scenario() -> impl Strategy<Value = Vec<NormalizedFinding>> {
+            proptest::collection::vec(
+                (
+                    prop_oneof![
+                        Just("a.txt".to_string()),
+                        Just("b.txt".to_string()),
+                        Just("c.txt".to_string())
+                    ],
+                    0u64..50,
+                    1u64..50,
+                    -128i8..=127i8,
+                    -128i8..=127i8,
+                    -128i8..=127i8,
+                ),
+                2..=3,
+            )
+            .prop_map(|templates| {
+                let mut findings = Vec::with_capacity(templates.len() * 3);
+                for (path, start, span_len, c1, c2, c3) in templates {
+                    let end = start + span_len;
+                    findings.push(NormalizedFinding::new(
+                        path.clone(),
+                        start,
+                        end,
+                        "r1".into(),
+                        c1,
+                    ));
+                    findings.push(NormalizedFinding::new(
+                        path.clone(),
+                        start,
+                        end,
+                        "r2".into(),
+                        c2,
+                    ));
+                    findings.push(NormalizedFinding::new(path, start, end, "r3".into(), c3));
+                }
+                dedup_findings(&mut findings);
+                findings
+            })
+        }
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
@@ -711,6 +849,71 @@ mod tests {
 
                 dedup_findings(&mut findings);
                 prop_assert!(findings.len() <= original_len);
+            }
+
+            /// Cross-rule dedup is idempotent and preserves max confidence per span.
+            #[test]
+            fn cross_rule_dedup_idempotent_and_preserves_max_confidence(
+                input in cross_rule_scenario(),
+            ) {
+                let mut expected_max = BTreeMap::<(String, u64, u64), i8>::new();
+                for finding in &input {
+                    let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
+                    expected_max
+                        .entry(key)
+                        .and_modify(|c| *c = (*c).max(finding.confidence))
+                        .or_insert(finding.confidence);
+                }
+
+                let mut findings = input.clone();
+                cross_rule_dedup_findings(&mut findings);
+                prop_assert_eq!(findings.len(), expected_max.len());
+
+                let mut seen = BTreeSet::new();
+                for finding in &findings {
+                    let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
+                    prop_assert!(seen.insert(key.clone()));
+                    let expected = expected_max.get(&key).copied().unwrap();
+                    prop_assert_eq!(finding.confidence, expected);
+                }
+
+                let snapshot = findings.clone();
+                cross_rule_dedup_findings(&mut findings);
+                prop_assert_eq!(findings, snapshot);
+            }
+
+            /// Equal-confidence cross-rule ties resolve to lexicographically smallest rule.
+            #[test]
+            fn cross_rule_dedup_tie_breaks_deterministically(
+                input in cross_rule_scenario(),
+            ) {
+                let mut expected = BTreeMap::<(String, u64, u64), (i8, String)>::new();
+                for finding in &input {
+                    let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
+                    expected
+                        .entry(key)
+                        .and_modify(|(best_conf, best_rule)| {
+                            if finding.confidence > *best_conf
+                                || (finding.confidence == *best_conf
+                                    && finding.rule.as_str() < best_rule.as_str())
+                            {
+                                *best_conf = finding.confidence;
+                                *best_rule = finding.rule.clone();
+                            }
+                        })
+                        .or_insert_with(|| (finding.confidence, finding.rule.clone()));
+                }
+
+                let mut findings = input;
+                cross_rule_dedup_findings(&mut findings);
+                prop_assert_eq!(findings.len(), expected.len());
+
+                for finding in &findings {
+                    let key = (finding.path.clone(), finding.byte_start, finding.byte_end);
+                    let (best_conf, best_rule) = expected.get(&key).unwrap();
+                    prop_assert_eq!(finding.confidence, *best_conf);
+                    prop_assert_eq!(finding.rule.as_str(), best_rule.as_str());
+                }
             }
 
             /// Valid JSONL finding lines always parse into a finding with matching fields.

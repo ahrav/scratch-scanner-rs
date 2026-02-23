@@ -1419,7 +1419,9 @@ mod tests {
     #[test]
     fn with_bootstrap_ci_clamps_tiny_rounding_drift() {
         let metrics = EvalMetrics::from_counts(1, 0, 0);
-        let metrics = metrics.with_bootstrap_ci((-1e-16, 1.0000000000000002)).unwrap();
+        let metrics = metrics
+            .with_bootstrap_ci((-1e-16, 1.0000000000000002))
+            .unwrap();
         let ci = metrics.ap_ci.expect("ci must be present");
         assert!((ci.lower - 0.0).abs() < EPS, "expected lower clamp to 0.0");
         assert!((ci.upper - 1.0).abs() < EPS, "expected upper clamp to 1.0");

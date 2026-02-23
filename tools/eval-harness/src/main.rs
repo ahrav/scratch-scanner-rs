@@ -67,7 +67,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use eval_harness::creddata::load_meta_dir;
 use eval_harness::finding_parser::{
-    JsonlParseResult, dedup_findings, parse_findings_file, parse_findings_jsonl,
+    JsonlParseResult, cross_rule_dedup_findings, dedup_findings, parse_findings_file,
+    parse_findings_jsonl,
 };
 use eval_harness::leaky_repo::{compare_counts, parse_leaky_repo_csv};
 use eval_harness::matching::{MatchConfig, MatchResult, match_findings};
@@ -78,8 +79,8 @@ use eval_harness::provenance::{
 };
 use eval_harness::regression::{RegressionResult, RegressionThresholds, check_regression};
 use eval_harness::report::{
-    ErrorBook, ErrorBookConfig, EvalReport, build_error_book, render_json, render_table,
-    write_json_file,
+    ErrorBook, ErrorBookConfig, EvalReport, PipelineConfig, build_error_book, render_json,
+    render_table, write_json_file,
 };
 use eval_harness::synthetic::load_synthetic_manifest;
 use eval_harness::types::{NormalizedFinding, TruthItem, normalize_path};
@@ -153,6 +154,11 @@ struct PositionPipelineArgs {
     /// Baseline JSON report for regression comparison.
     #[arg(long)]
     baseline: Option<PathBuf>,
+
+    /// Collapse findings from different rules at the same byte span, keeping
+    /// only the highest-confidence finding per location.
+    #[arg(long)]
+    cross_rule_dedup: bool,
 }
 
 /// Arguments for evaluating against the CredData corpus.
@@ -338,6 +344,7 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
         provenance,
         regression: None,
         error_book: None,
+        pipeline_config: PipelineConfig::default(),
     };
 
     output_report(&report, args.format, args.output.as_deref())?;
@@ -361,7 +368,8 @@ fn run_leaky_repo(args: LeakyRepoArgs) -> Result<i32, Box<dyn Error>> {
 ///    `--output` + `--format table`).
 /// 2. **Load findings** — from pre-computed JSONL or a live scan.
 /// 3. **Dedup** — sort + dedup findings, retaining highest confidence per
-///    identity (path, byte_start, byte_end, rule).
+///    identity (path, byte_start, byte_end, rule); optionally collapse across
+///    rules per span when `--cross-rule-dedup` is enabled.
 /// 4. **Load corpus snapshot** — read all files under `corpus_root` once
 ///    into memory for matching and derive corpus hash/count/bytes from that
 ///    same snapshot for provenance (no second corpus read).
@@ -395,12 +403,19 @@ fn run_position_pipeline(
         &canonical_root,
     )?;
     dedup_findings(&mut findings);
+    if args.cross_rule_dedup {
+        cross_rule_dedup_findings(&mut findings);
+    }
+
+    let pipeline_config = PipelineConfig {
+        cross_rule_dedup: args.cross_rule_dedup,
+    };
 
     let snapshot = load_corpus_snapshot(&args.corpus_root)?;
     let match_result = run_position_matching(findings, truth, &snapshot.file_contents);
     let metrics = compute_position_metrics(&match_result)?;
     let provenance = build_position_provenance(&snapshot)?;
-    let regression = maybe_check_regression(&metrics, args.baseline.as_deref())?;
+    let regression = maybe_check_regression(&metrics, &pipeline_config, args.baseline.as_deref())?;
     let error_book = maybe_build_error_book_for_output(args.format, || {
         build_error_book(
             &match_result.classified,
@@ -416,6 +431,7 @@ fn run_position_pipeline(
         provenance,
         regression,
         error_book,
+        pipeline_config,
     };
 
     output_report(&report, args.format, args.output.as_deref())?;
@@ -428,9 +444,13 @@ fn run_position_pipeline(
 /// assembly, plus a precomputed corpus digest tuple used to build
 /// provenance without re-reading files from disk.
 struct CorpusSnapshot {
+    /// Normalized relative path -> full file bytes.
     file_contents: HashMap<String, Vec<u8>>,
+    /// BLAKE3 digest of the snapshot using provenance framing.
     corpus_hash: String,
+    /// Number of files included in the snapshot hash.
     corpus_file_count: u64,
+    /// Total bytes across all files included in the snapshot hash.
     corpus_total_bytes: u64,
 }
 
@@ -471,14 +491,26 @@ fn build_position_provenance(snapshot: &CorpusSnapshot) -> Result<Provenance, Bo
 }
 
 /// Compare metrics against a baseline report when provided.
+///
+/// A pipeline-config mismatch is reported as a warning but not treated as a
+/// hard error. The harness still computes regression deltas so users can see
+/// the numeric impact, while making it explicit that the comparison may not
+/// be apples-to-apples.
 fn maybe_check_regression(
     metrics: &EvalMetrics,
+    current_pipeline_config: &PipelineConfig,
     baseline_path: Option<&Path>,
 ) -> Result<Option<RegressionResult>, Box<dyn Error>> {
     let Some(path) = baseline_path else {
         return Ok(None);
     };
     let baseline_report = load_baseline(path)?;
+    if &baseline_report.pipeline_config != current_pipeline_config {
+        eprintln!(
+            "warning: pipeline config mismatch with baseline: current={current_pipeline_config:?}, baseline={:?}",
+            baseline_report.pipeline_config
+        );
+    }
     let result = check_regression(
         metrics,
         &baseline_report.metrics,
@@ -582,6 +614,9 @@ fn run_live_scan(
         let total = metadata_failures + local_files.len();
         let failure_rate = metadata_failures as f64 / total as f64;
         eprintln!("warning: {metadata_failures}/{total} files failed metadata read");
+        // Keep minor filesystem churn (deleted/permission-changed files)
+        // non-fatal, but fail once losses are large enough to compromise
+        // evaluation representativeness.
         if failure_rate > 0.05 {
             return Err(format!(
                 "too many metadata failures: {metadata_failures}/{total} ({:.1}%)",
@@ -657,6 +692,7 @@ fn validate_scan_health(report: &scanner_rs::scheduler::LocalReport) -> Result<(
 /// Lightweight hardening guardrails reject implausibly large snapshots
 /// before memory usage becomes pathological.
 fn load_corpus_snapshot(corpus_root: &Path) -> Result<CorpusSnapshot, Box<dyn Error>> {
+    // Safety rails for accidental mega-corpora in local eval runs.
     const MAX_SNAPSHOT_FILES: usize = 5_000_000;
     const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024 * 1024; // 512 GiB
 
@@ -725,6 +761,8 @@ fn load_corpus_snapshot(corpus_root: &Path) -> Result<CorpusSnapshot, Box<dyn Er
 
     let mut file_contents = HashMap::with_capacity(snapshot_records.len());
     for (_, key, data) in snapshot_records {
+        // If multiple filesystem paths normalize to the same logical key,
+        // retain the last inserted bytes and surface the collision.
         if file_contents.insert(key.clone(), data).is_some() {
             eprintln!("warning: duplicate normalized corpus path in snapshot: {key}");
         }

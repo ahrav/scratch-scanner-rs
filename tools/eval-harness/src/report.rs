@@ -67,9 +67,10 @@ use crate::types::{ClassifiedFinding, FindingClass, TruthItem};
 /// Top-level eval report combining all pipeline outputs.
 ///
 /// This is the single serializable artifact produced by an eval run.
-/// Required fields (`metrics_semantics`, `metrics`, `provenance`) are always
-/// present in JSON. Optional fields are omitted from JSON when `None`,
-/// keeping the serialized output compact for minimal runs.
+/// Required fields (`metrics_semantics`, `metrics`, `provenance`,
+/// `pipeline_config`) are always present in JSON. Optional fields are omitted
+/// from JSON when `None`, keeping the serialized output compact for minimal
+/// runs.
 ///
 /// Callers construct this struct directly -- there is no builder. The
 /// typical flow is:
@@ -97,6 +98,19 @@ pub struct EvalReport {
     /// Top FP/FN entries for debugging. `None` when error book generation
     /// was not requested (including table-mode runs in the main CLI pipeline).
     pub error_book: Option<ErrorBook>,
+    /// Pipeline processing flags applied during this eval run.
+    ///
+    /// Stored in report JSON so regression checks can detect baseline/config
+    /// mismatches (for example, comparing dedup and non-dedup runs).
+    pub pipeline_config: PipelineConfig,
+}
+
+/// Processing flags that affect finding/matching semantics in eval runs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Whether cross-rule dedup was applied before matching.
+    #[serde(default)]
+    pub cross_rule_dedup: bool,
 }
 
 /// Metrics interpretation model for report rendering/serialization.
@@ -147,17 +161,27 @@ impl EvalReport {
     }
 }
 
+/// Serialization adapter for [`EvalReport`].
+///
+/// Keeps the public struct ergonomic while enforcing wire-shape policy:
+/// always emit `metrics_semantics`, and omit optional fields when absent.
 #[derive(Serialize)]
 struct EvalReportSer<'a> {
+    /// Derived discriminator emitted for explicit metrics interpretation.
     metrics_semantics: MetricsSemantics,
     metrics: &'a EvalMetrics,
     provenance: &'a Provenance,
+    pipeline_config: &'a PipelineConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     regression: Option<&'a RegressionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_book: Option<&'a ErrorBook>,
 }
 
+/// Deserialization adapter for [`EvalReport`].
+///
+/// Accepts both current and legacy report JSON. Legacy payloads may omit
+/// `metrics_semantics` and `pipeline_config`, so both fields default here.
 #[derive(Deserialize)]
 struct EvalReportDe {
     #[serde(default)]
@@ -166,6 +190,8 @@ struct EvalReportDe {
     metrics_semantics: MetricsSemantics,
     metrics: EvalMetrics,
     provenance: Provenance,
+    #[serde(default)]
+    pipeline_config: PipelineConfig,
     #[serde(default)]
     regression: Option<RegressionResult>,
     #[serde(default)]
@@ -181,6 +207,7 @@ impl Serialize for EvalReport {
             metrics_semantics: self.semantics(),
             metrics: &self.metrics,
             provenance: &self.provenance,
+            pipeline_config: &self.pipeline_config,
             regression: self.regression.as_ref(),
             error_book: self.error_book.as_ref(),
         }
@@ -196,10 +223,12 @@ impl<'de> Deserialize<'de> for EvalReport {
         let report = EvalReportDe::deserialize(deserializer)?;
         // Keep backward compatibility with legacy reports that omit this field,
         // and avoid trusting possibly stale/mismatched semantics values.
+        // Semantics are always re-derived from metric payload at call sites.
         let _semantics = report.metrics_semantics;
         Ok(Self {
             metrics: report.metrics,
             provenance: report.provenance,
+            pipeline_config: report.pipeline_config,
             regression: report.regression,
             error_book: report.error_book,
         })
@@ -520,6 +549,7 @@ fn build_fp_entries(
             .entry(cf.finding.rule.as_str())
             .or_insert((0, i8::MIN, idx));
         entry.0 += 1;
+        // Strict `>` preserves first-seen representative on equal confidence.
         if cf.finding.confidence > entry.1 {
             entry.1 = cf.finding.confidence;
             entry.2 = idx;
@@ -695,6 +725,9 @@ fn write_metric_row(
 }
 
 /// Write a single `| label  value |` row to the table string.
+///
+/// Uses the same fixed widths as header/metric rows so column alignment
+/// stays stable regardless of metric label length.
 fn write_simple_row(out: &mut String, label: &str, value: f64) {
     let _ = writeln!(out, "| {:<17} {:<36.4} |", label, value);
 }
@@ -876,6 +909,7 @@ mod tests {
             provenance,
             regression,
             error_book,
+            pipeline_config: PipelineConfig::default(),
         }
     }
 
@@ -885,6 +919,7 @@ mod tests {
             provenance: sample_provenance(),
             regression: None,
             error_book: None,
+            pipeline_config: PipelineConfig::default(),
         }
     }
 
@@ -901,6 +936,15 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("position_pr_curve"),
             "position reports should include explicit semantics discriminator"
+        );
+        assert_eq!(
+            parsed
+                .get("pipeline_config")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|cfg| cfg.get("cross_rule_dedup"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "report JSON should include pipeline configuration flags"
         );
 
         // None fields are omitted from JSON output.
@@ -922,11 +966,13 @@ mod tests {
         let mut json: serde_json::Value =
             serde_json::from_str(&render_json(&report).unwrap()).unwrap();
         json.as_object_mut().unwrap().remove("metrics_semantics");
+        json.as_object_mut().unwrap().remove("pipeline_config");
         let legacy_json = serde_json::to_string(&json).unwrap();
 
         let parsed: EvalReport = serde_json::from_str(&legacy_json).unwrap();
         assert_eq!(parsed.metrics.tp, report.metrics.tp);
         assert_eq!(parsed.semantics(), MetricsSemantics::PositionPrCurve);
+        assert_eq!(parsed.pipeline_config, PipelineConfig::default());
     }
 
     #[test]
@@ -957,10 +1003,12 @@ mod tests {
         let mut json: serde_json::Value =
             serde_json::from_str(&render_json(&report).unwrap()).unwrap();
         json.as_object_mut().unwrap().remove("metrics_semantics");
+        json.as_object_mut().unwrap().remove("pipeline_config");
         let legacy_json = serde_json::to_string(&json).unwrap();
 
         let parsed: EvalReport = serde_json::from_str(&legacy_json).unwrap();
         assert_eq!(parsed.semantics(), MetricsSemantics::CountOnly);
+        assert_eq!(parsed.pipeline_config, PipelineConfig::default());
     }
 
     #[test]
