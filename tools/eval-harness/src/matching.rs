@@ -62,8 +62,9 @@ struct FileInfo<'a> {
 
 /// Configuration for the matching algorithm.
 ///
-/// All fields have sensible defaults for location-only matching. The
-/// `require_rule_match` toggle adds an additional constraint when ground
+/// Callers set fields explicitly. For location-only matching use
+/// `require_rule_match = false` with `dedup_mode = DedupMode::ByRule`.
+/// The `require_rule_match` toggle adds an additional constraint when ground
 /// truth uses rule-specific annotations (e.g., CredData categories).
 #[derive(Clone, Copy, Debug)]
 pub struct MatchConfig {
