@@ -75,6 +75,7 @@ classDiagram
 
     class RuleCold {
         -&'static str name
+        -i8 min_confidence
     }
 
     class TwoPhaseCompiled {
@@ -619,7 +620,7 @@ See [persistence-identity.md](persistence-identity.md) for contract details and 
 | Source | Relationship | Target | Description |
 |--------|--------------|--------|-------------|
 | `Engine` | contains | `RuleCompiled` | Compiled detection rules |
-| `Engine` | contains | `RuleCold` | Cold rule metadata (`name`) |
+| `Engine` | contains | `RuleCold` | Cold rule metadata (`name`, `min_confidence`) |
 | `Engine` | contains | `TransformConfig` | Transform configurations |
 | `Engine` | creates | `ScanScratch` | Per-scan scratch state |
 | `Engine` | contains | `OfflineValidationSpec` | Offline validation gate pool |

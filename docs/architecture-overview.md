@@ -106,7 +106,7 @@ graph TB
 | **Engine**          | `src/engine/core.rs`           | Compiled scanning engine with anchor patterns, rules, and transforms |
 | **RuleSpec**        | `src/api.rs:596`               | Rule definitions and specification for rule-based scanning           |
 | **RuleCompiled**    | `src/engine/rule_repr.rs`  | Hot compiled rule representation used in scan-loop validation      |
-| **RuleCold**        | `src/engine/rule_repr.rs`  | Cold per-rule metadata (`name`) stored parallel to hot rules       |
+| **RuleCold**        | `src/engine/rule_repr.rs`  | Cold per-rule metadata (`name`, `min_confidence`) stored parallel to hot rules       |
 | **Vectorscan**      | `vectorscan-rs-sys` crate      | Multi-pattern anchor prefilter (raw + UTF-16 variants)               |
 | **Vectorscan DB Cache** | `src/engine/vs_cache.rs` | Best-effort on-disk cache for serialized prefilter/stream DBs        |
 | **TransformConfig** | `src/api.rs:132`               | Transform stage configuration (URL percent, Base64)                  |

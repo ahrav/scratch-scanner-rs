@@ -702,12 +702,20 @@ pub struct RuleSpec {
 
     /// Optional per-rule minimum confidence threshold metadata.
     ///
-    /// This field is currently schema-level only: YAML parsing and
-    /// [`RuleSpec::assert_valid`] preserve/validate it, but scan-time filtering
-    /// by confidence is not yet wired into the engine hot path.
+    /// During engine build, the effective threshold is materialized into cold
+    /// rule metadata (`RuleCold.min_confidence`) and can be queried via
+    /// [`crate::Engine::rule_min_confidence`]. Scan-time matching does not
+    /// branch on this threshold; downstream policy can consume it out-of-band.
     ///
-    /// `None` means no per-rule override is specified. `Some(v)` stores the
-    /// configured threshold for downstream phases that consume it.
+    /// `Some(v)` is an explicit override. `None` selects an auto-default based
+    /// on compiled rule signals:
+    /// - keyword + entropy gates present => `KEYWORD_PRESENT + ENTROPY_PASS`
+    /// - assignment-shape check enabled (currently `generic-api-key`) => `ASSIGNMENT_SHAPE`
+    /// - otherwise => `0`
+    ///
+    /// Offline validation is excluded from auto-derivation: the signal is only
+    /// scored on root-semantic findings, so transform-derived findings can never
+    /// earn it. Rules that want an offline-tier threshold should set `Some(5)`.
     ///
     /// # Valid range
     /// `v` must be in `0..=10` (Phase 1 confidence ceiling).
@@ -1009,15 +1017,10 @@ pub mod confidence {
     pub const OFFLINE_VALID: i8 = 5;
 }
 
-/// Compile-time guard: Phase 1 weights must sum to at most 10 (the documented ceiling).
-/// Any value ≤ 10 trivially fits in `i8`, so a separate `i8::MAX` check is unnecessary.
-const _: () = assert!(
-    (confidence::ENTROPY_PASS as i16
-        + confidence::KEYWORD_PRESENT as i16
-        + confidence::ASSIGNMENT_SHAPE as i16
-        + confidence::OFFLINE_VALID as i16)
-        <= 10
-);
+// Compile-time guard: every auto-derived tier must fit the Phase 1 ceiling (0..=10).
+const _: () = assert!(confidence::OFFLINE_VALID <= 10);
+const _: () = assert!((confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS) <= 10);
+const _: () = assert!(confidence::ASSIGNMENT_SHAPE <= 10);
 
 #[cfg(test)]
 mod tests {
