@@ -369,8 +369,7 @@ impl ParallelScanConfig {
     ///
     /// `dedupe_within_chunk` is hardcoded to `true` because directory scans
     /// always process overlapping chunks and must suppress duplicate findings
-    /// at chunk boundaries. Callers that need to disable dedup should use
-    /// `scan_local` directly.
+    /// at chunk boundaries.
     fn to_local_config(&self) -> LocalConfig {
         LocalConfig {
             workers: self.workers,

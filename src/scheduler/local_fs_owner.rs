@@ -75,6 +75,7 @@ use crate::archive::{
 use crate::scheduler::engine_stub::BUFFER_LEN_MAX;
 use crate::store::{FsFindingBatch, FsFindingRecord, FsRunLoss, StoreProducer};
 
+use std::cmp::Ordering as CmpOrdering;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -367,7 +368,6 @@ pub(super) struct LocalScratch<E: ScanEngine> {
     pub(super) store_producer: Option<Arc<dyn StoreProducer>>,
 
     /// Configuration flags.
-    pub(super) dedupe_within_chunk: bool,
     pub(super) chunk_size: usize,
     pub(super) max_file_size: u64,
     pub(super) archive: ArchiveConfig,
@@ -473,61 +473,87 @@ impl<const N: usize> std::fmt::Write for StackMsg<N> {
     }
 }
 
-/// Deduplicate findings in place by (rule_id, root_hint, span, norm_hash).
+/// Cross-rule winner dedupe in place by `(root_hint, span-projection, norm_hash)`.
 ///
-/// # Algorithm
+/// Winner selection for findings that share a group key:
+/// 1. Higher `confidence_score`
+/// 2. Lexical rule-name order (caller-provided comparator)
+/// 3. Lower `rule_id`
 ///
-/// 1. Sort by `(rule_id, root_hint_start, root_hint_end, span_start, span_end, norm_hash)` — O(n log n)
-/// 2. Dedup adjacent elements with matching keys — O(n)
-///
-/// Total: O(n log n) vs O(n²) for pairwise comparison.
-///
-/// # Why Sort Before Dedup?
-///
-/// `Vec::dedup_by` only removes *adjacent* duplicates. Sorting brings
-/// identical findings together, ensuring all duplicates are removed.
-/// The sort key ordering provides deterministic output ordering (the key
-/// covers all dedup fields, so instability of `sort_unstable_by_key` does
-/// not affect the post-dedup result).
-///
-/// # When This Is Needed
-///
-/// This handles within-chunk duplicates (same finding emitted multiple times
-/// by the engine). Cross-chunk duplicates are handled by `drop_prefix_findings`.
-///
-/// # CRITICAL: `norm_hash` must remain in the dedup key
-///
-/// Two findings with identical `(rule_id, root_hint, span)` but different
-/// `norm_hash` values represent **distinct secrets** and must NOT be collapsed.
-/// This occurs when transform chains produce different decoded values at the
-/// same encoded location. Removing `norm_hash` from the key causes silent
-/// data loss. The git-scan path uses `FindingKey` (which includes
-/// `secret_hash`, the equivalent field) for the same reason.
+/// Span participation is conditional per finding:
+/// - `dedupe_with_span == true`: include `span_start/span_end`
+/// - `dedupe_with_span == false`: zero span components in the key
 #[inline]
-pub(super) fn dedupe_findings<F: FindingWithHashRecord>(findings: &mut Vec<F>) {
+pub(super) fn dedupe_findings_cross_rule<F, C>(findings: &mut Vec<F>, mut rule_cmp: C)
+where
+    F: FindingWithHashRecord,
+    C: FnMut(u32, u32) -> CmpOrdering,
+{
     if findings.len() <= 1 {
         return;
     }
 
-    findings.sort_unstable_by_key(|f| {
-        (
-            f.rule_id(),
-            f.root_hint_start(),
-            f.root_hint_end(),
-            f.span_start(),
-            f.span_end(),
-            *f.norm_hash(),
-        )
+    findings.sort_unstable_by(|a, b| {
+        a.root_hint_start()
+            .cmp(&b.root_hint_start())
+            .then_with(|| a.root_hint_end().cmp(&b.root_hint_end()))
+            .then_with(|| {
+                let a_span = if a.dedupe_with_span() {
+                    (a.span_start(), a.span_end())
+                } else {
+                    (0, 0)
+                };
+                let b_span = if b.dedupe_with_span() {
+                    (b.span_start(), b.span_end())
+                } else {
+                    (0, 0)
+                };
+                a_span.cmp(&b_span)
+            })
+            .then_with(|| a.norm_hash().cmp(b.norm_hash()))
+            .then_with(|| b.confidence_score().cmp(&a.confidence_score()))
+            .then_with(|| rule_cmp(a.rule_id(), b.rule_id()))
+            .then_with(|| a.rule_id().cmp(&b.rule_id()))
     });
 
     findings.dedup_by(|a, b| {
-        a.rule_id() == b.rule_id()
-            && a.root_hint_start() == b.root_hint_start()
+        let a_span = if a.dedupe_with_span() {
+            (a.span_start(), a.span_end())
+        } else {
+            (0, 0)
+        };
+        let b_span = if b.dedupe_with_span() {
+            (b.span_start(), b.span_end())
+        } else {
+            (0, 0)
+        };
+
+        a.root_hint_start() == b.root_hint_start()
             && a.root_hint_end() == b.root_hint_end()
-            && a.span_start() == b.span_start()
-            && a.span_end() == b.span_end()
+            && a_span == b_span
             && a.norm_hash() == b.norm_hash()
     });
+}
+
+/// Apply cross-rule winner dedupe and return the number of removed findings.
+///
+/// Convenience wrapper around [`dedupe_findings_cross_rule`] that skips
+/// trivially-small vectors and returns a count suitable for scheduler
+/// pruning arithmetic.
+#[inline]
+pub(super) fn apply_cross_rule_dedupe<F, E>(findings: &mut Vec<F>, engine: &E) -> usize
+where
+    F: FindingWithHashRecord,
+    E: ScanEngine,
+{
+    let before = findings.len();
+    if before <= 1 {
+        return 0;
+    }
+    dedupe_findings_cross_rule(findings, |lhs, rhs| {
+        engine.rule_name(lhs).cmp(engine.rule_name(rhs))
+    });
+    before - findings.len()
 }
 
 /// Account for effective drop loss after scheduler-side pruning.
@@ -729,7 +755,7 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
 ///     │  2. read(new_bytes)              │                │
 ///     │  3. scan_chunk_into()            │                │
 ///     │  4. drop_prefix_findings()       │                │
-///     │  5. drain + dedupe_findings()    │                │
+///     │  5. drain + apply_cross_rule_dedupe() │             │
 ///     │  6. emit_persistence_batch()     │                │
 ///     │  7. emit_findings()              │                │
 ///     └──────────────┬───────────────────┘                │
@@ -1018,14 +1044,10 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             .scan_scratch
             .drain_findings_into(&mut scratch.pending);
 
-        // Optional within-chunk dedupe (only needed if engine can emit duplicates)
-        let before_dedupe = scratch.pending.len();
-        if scratch.dedupe_within_chunk && before_dedupe > 1 {
-            dedupe_findings(&mut scratch.pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+            .saturating_add(dedupe_removed);
         account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
 
         // Count findings before emitting (pending.len() is the count for this chunk)
@@ -1205,7 +1227,6 @@ where
     let abort_run = Arc::new(AtomicBool::new(false));
 
     // Capture config values before moving into closure
-    let dedupe = cfg.dedupe_within_chunk;
     let chunk_size = cfg.chunk_size;
     let event_sink = cfg.event_sink.clone();
     let store_producer = cfg.store_producer.clone();
@@ -1272,7 +1293,6 @@ where
                     abort_run: Arc::clone(&abort_run),
                     event_sink: Arc::clone(&event_sink),
                     store_producer: store_producer.clone(),
-                    dedupe_within_chunk: dedupe,
                     chunk_size,
                     max_file_size: cfg.max_file_size,
                     archive: archive_cfg.clone(),

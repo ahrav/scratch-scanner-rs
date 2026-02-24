@@ -41,6 +41,7 @@ use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::file_id_alloc::FileIdAllocator;
+use super::local_fs_owner::{account_effective_dropped_findings, apply_cross_rule_dedupe};
 use super::metrics::MetricsSnapshot;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
@@ -567,48 +568,11 @@ struct CpuScratch<E: ScanEngine> {
     event_sink: Arc<dyn EventSink>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
-    dedupe_within_chunk: bool,
 }
 
 // ============================================================================
 // Deduplication Helpers
 // ============================================================================
-
-/// In-place dedupe of findings by (rule_id, root_hint, span).
-///
-/// # Note on `norm_hash` omission
-///
-/// The local_fs_owner path uses [`FindingWithHashRecord`] which includes
-/// `norm_hash` in the dedup key to avoid collapsing distinct secrets at the
-/// same location. This function uses the base [`FindingRecord`] trait which
-/// does not expose `norm_hash`. If the engine's `Finding` type carries a
-/// hash, two findings with identical `(rule_id, root_hint, span)` but
-/// different normalized secrets will be collapsed here. This is acceptable
-/// for within-chunk dedupe (same bytes produce same secrets), but callers
-/// should be aware of this limitation for engines with transform chains.
-fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
-    if p.len() <= 1 {
-        return;
-    }
-
-    p.sort_unstable_by_key(|f| {
-        (
-            f.rule_id(),
-            f.root_hint_start(),
-            f.root_hint_end(),
-            f.span_start(),
-            f.span_end(),
-        )
-    });
-
-    p.dedup_by(|a, b| {
-        a.rule_id() == b.rule_id()
-            && a.root_hint_start() == b.root_hint_start()
-            && a.root_hint_end() == b.root_hint_end()
-            && a.span_start() == b.span_start()
-            && a.span_end() == b.span_end()
-    });
-}
 
 /// Emit findings as [`FindingEvent`]s through the event sink.
 ///
@@ -680,20 +644,15 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
                 .scratch
                 .drain_findings_into(&mut ctx.scratch.pending);
 
-            let before_dedupe = ctx.scratch.pending.len();
-            if ctx.scratch.dedupe_within_chunk {
-                dedupe_pending_in_place(&mut ctx.scratch.pending);
-            }
+            let _before_mode_pass = ctx.scratch.pending.len();
+            let dedupe_removed =
+                apply_cross_rule_dedupe(&mut ctx.scratch.pending, &*ctx.scratch.engine);
 
             // Account for dropped findings: engine drops minus scheduler pruning.
             let scheduler_pruned = before_prefix
                 .saturating_sub(after_prefix)
-                .saturating_add(before_dedupe.saturating_sub(ctx.scratch.pending.len()));
-            let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
-            ctx.metrics.findings_dropped = ctx
-                .metrics
-                .findings_dropped
-                .saturating_add(effective_dropped);
+                .saturating_add(dedupe_removed);
+            account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
 
             emit_findings(
                 engine,
@@ -735,10 +694,10 @@ struct UringArchiveSink<'a, E: ScanEngine> {
     next_entry_index: u32,
     file_ids: Arc<FileIdAllocator>,
     file_id: FileId,
-    dedupe: bool,
     bytes_scanned: u64,
     chunks_scanned: u64,
     findings_emitted: u64,
+    findings_dropped: u64,
 }
 
 impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
@@ -759,14 +718,20 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
     fn on_entry_chunk(&mut self, chunk: EntryChunk<'_>) -> Result<(), Self::Error> {
         self.engine
             .scan_chunk_into(chunk.data, self.file_id, chunk.base_offset, self.scratch);
+        let engine_dropped = self.scratch.dropped_findings();
+        let before_prefix = self.scratch.pending_findings_len();
         self.scratch.drop_prefix_findings(chunk.new_bytes_start);
+        let after_prefix = self.scratch.pending_findings_len();
 
         self.pending.clear();
         self.scratch.drain_findings_into(self.pending);
 
-        if self.dedupe {
-            dedupe_pending_in_place(self.pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(self.pending, self.engine);
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(dedupe_removed);
+        let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
+        self.findings_dropped = self.findings_dropped.saturating_add(effective_dropped);
 
         self.findings_emitted += self.pending.len() as u64;
         emit_findings(self.engine, self.event_sink, &self.display, self.pending);
@@ -787,6 +752,7 @@ struct ArchiveWorkerStats {
     bytes_scanned: u64,
     chunks_scanned: u64,
     findings_emitted: u64,
+    findings_dropped: u64,
     archives_open_failed: u64,
     archives_scan_errors: u64,
     archive_stats: ArchiveStats,
@@ -805,7 +771,6 @@ fn archive_worker_loop<E: ScanEngine>(
     event_sink: Arc<dyn EventSink>,
     file_ids: Arc<FileIdAllocator>,
     cfg: ArchiveConfig,
-    dedupe: bool,
 ) -> ArchiveWorkerStats {
     let overlap = engine.required_overlap();
     let chunk_size = 256 * 1024; // Match ARCHIVE_STREAM_READ_MAX ceiling.
@@ -817,6 +782,7 @@ fn archive_worker_loop<E: ScanEngine>(
     let mut total_bytes = 0u64;
     let mut total_chunks = 0u64;
     let mut total_findings = 0u64;
+    let mut total_dropped = 0u64;
 
     let mut archives_open_failed = 0u64;
     let mut archives_scan_errors = 0u64;
@@ -846,10 +812,10 @@ fn archive_worker_loop<E: ScanEngine>(
             next_entry_index: 0,
             file_ids: Arc::clone(&file_ids),
             file_id: work.token.file_id,
-            dedupe,
             bytes_scanned: 0,
             chunks_scanned: 0,
             findings_emitted: 0,
+            findings_dropped: 0,
         };
 
         let scan_result = match work.kind {
@@ -900,6 +866,7 @@ fn archive_worker_loop<E: ScanEngine>(
         total_bytes += sink.bytes_scanned;
         total_chunks += sink.chunks_scanned;
         total_findings += sink.findings_emitted;
+        total_dropped += sink.findings_dropped;
 
         // Token drop releases the CountPermit, unblocking discovery.
         drop(work.token);
@@ -909,6 +876,7 @@ fn archive_worker_loop<E: ScanEngine>(
         bytes_scanned: total_bytes,
         chunks_scanned: total_chunks,
         findings_emitted: total_findings,
+        findings_dropped: total_dropped,
         archives_open_failed,
         archives_scan_errors,
         archive_stats,
@@ -942,7 +910,6 @@ fn extract_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ExtractWork>,
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
-    dedupe: bool,
 ) -> ExtractWorkerStats {
     use crate::content_policy::extract::{
         extract_content, ExtractResult, EXTRACT_INPUT_CAP, EXTRACT_OUTPUT_CAP, JAR_ENTRY_CAP,
@@ -992,17 +959,15 @@ fn extract_worker_loop<E: ScanEngine>(
         let engine_dropped = scratch.dropped_findings();
         let before_prefix = scratch.pending_findings_len();
         scratch.drop_prefix_findings(0);
+        let after_prefix = scratch.pending_findings_len();
 
         pending.clear();
         scratch.drain_findings_into(&mut pending);
 
-        let before_dedupe = pending.len();
-        if dedupe {
-            dedupe_pending_in_place(&mut pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(&mut pending, engine.as_ref());
         let scheduler_pruned = before_prefix
-            .saturating_sub(before_dedupe)
-            .saturating_add(before_dedupe.saturating_sub(pending.len()));
+            .saturating_sub(after_prefix)
+            .saturating_add(dedupe_removed);
         let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
         total_dropped = total_dropped.saturating_add(effective_dropped);
 
@@ -2531,7 +2496,6 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         {
             let engine = Arc::clone(&engine);
             let event_sink = Arc::clone(&event_sink);
-            let dedupe = cfg.dedupe_within_chunk;
             move |_wid| CpuScratch {
                 engine: Arc::clone(&engine),
                 event_sink: Arc::clone(&event_sink),
@@ -2539,7 +2503,6 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                 // Match the local scan default: avoid steady-state allocs without
                 // relying on engine-specific tuning details.
                 pending: Vec::with_capacity(4096),
-                dedupe_within_chunk: dedupe,
             }
         },
         cpu_runner::<E>,
@@ -2573,13 +2536,12 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             let event_sink = Arc::clone(&event_sink);
             let file_ids = Arc::clone(&file_ids);
             let archive_cfg = cfg.archive.clone();
-            let dedupe = cfg.dedupe_within_chunk;
 
             archive_threads.push(
                 thread::Builder::new()
                     .name(format!("uring-archive-{wid}"))
                     .spawn(move || {
-                        archive_worker_loop(rx, engine, event_sink, file_ids, archive_cfg, dedupe)
+                        archive_worker_loop(rx, engine, event_sink, file_ids, archive_cfg)
                     })
                     .expect("failed to spawn archive worker thread"),
             );
@@ -2609,12 +2571,11 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             let rx = erx.clone();
             let engine = Arc::clone(&engine);
             let event_sink = Arc::clone(&event_sink);
-            let dedupe = cfg.dedupe_within_chunk;
 
             extract_threads.push(
                 thread::Builder::new()
                     .name(format!("uring-extract-{wid}"))
-                    .spawn(move || extract_worker_loop(rx, engine, event_sink, dedupe))
+                    .spawn(move || extract_worker_loop(rx, engine, event_sink))
                     .expect("failed to spawn extraction worker thread"),
             );
         }
@@ -2691,6 +2652,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     let mut archive_bytes = 0u64;
     let mut archive_chunks = 0u64;
     let mut archive_findings = 0u64;
+    let mut archive_dropped_findings = 0u64;
     let mut archive_open_errors = 0u64;
     let mut archive_scan_errors = 0u64;
     let mut total_archive_stats = ArchiveStats::default();
@@ -2700,6 +2662,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                 archive_bytes += ws.bytes_scanned;
                 archive_chunks += ws.chunks_scanned;
                 archive_findings += ws.findings_emitted;
+                archive_dropped_findings += ws.findings_dropped;
                 archive_open_errors += ws.archives_open_failed;
                 archive_scan_errors += ws.archives_scan_errors;
                 total_archive_stats.merge_from(&ws.archive_stats);
@@ -2741,6 +2704,9 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     cpu_metrics.bytes_scanned = cpu_metrics.bytes_scanned.wrapping_add(archive_bytes);
     cpu_metrics.chunks_scanned = cpu_metrics.chunks_scanned.wrapping_add(archive_chunks);
     cpu_metrics.findings_emitted = cpu_metrics.findings_emitted.wrapping_add(archive_findings);
+    cpu_metrics.findings_dropped = cpu_metrics
+        .findings_dropped
+        .wrapping_add(archive_dropped_findings);
     cpu_metrics.binary_skipped = cpu_metrics
         .binary_skipped
         .wrapping_add(io_stats.binary_skipped);

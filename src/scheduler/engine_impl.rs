@@ -74,6 +74,11 @@ impl FindingRecord for ApiFindingRec {
     }
 
     #[inline]
+    fn dedupe_with_span(&self) -> bool {
+        self.dedupe_with_span
+    }
+
+    #[inline]
     fn confidence_score(&self) -> i8 {
         self.confidence_score
     }

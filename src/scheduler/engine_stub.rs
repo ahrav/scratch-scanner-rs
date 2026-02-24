@@ -78,7 +78,7 @@ pub struct RuleId(pub u16);
 /// `root_hint_end < new_bytes_start` are dropped because the previous chunk
 /// owns them (see [`ScanScratch::drop_prefix_findings`]).
 ///
-/// **Within-chunk** dedupe (in [`local_fs_owner::dedupe_findings`]) uses the
+/// **Within-chunk** dedupe (in [`local_fs_owner::apply_cross_rule_dedupe`]) uses the
 /// full 6-tuple `(rule_id, root_hint_start, root_hint_end, span_start,
 /// span_end, norm_hash)` from the [`FindingWithHash`] carrier -- not from this
 /// stub struct directly (the stub lacks a `norm_hash` field; the hash is
@@ -374,6 +374,11 @@ impl FindingRecord for FindingRec {
     #[inline]
     fn span_end(&self) -> u64 {
         self.span_end
+    }
+
+    #[inline]
+    fn dedupe_with_span(&self) -> bool {
+        true
     }
 
     #[inline]

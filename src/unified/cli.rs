@@ -698,7 +698,6 @@ FILE TYPE OPTIONS:
     --scan-archives         Scan archives (undo --skip-archives) [default: scan]
     --scan-binary           Scan binary files instead of skipping [default: skip]
     --skip-binary           Skip binary files (undo --scan-binary) [default: skip]
-
 OUTPUT OPTIONS:
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl|text|json|sarif  Output format (default: jsonl)

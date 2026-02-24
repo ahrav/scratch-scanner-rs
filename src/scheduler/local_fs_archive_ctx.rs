@@ -20,8 +20,8 @@ use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_gzip::process_gzip_file;
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
-    FileTask, LocalScratch,
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
+    emit_persistence_batch, FileTask, LocalScratch,
 };
 use super::local_fs_tar::{process_tar_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
@@ -201,7 +201,6 @@ pub(super) struct ArchiveScanCtx<'a, E: ScanEngine> {
     pub(super) next_virtual_file_id: &'a mut u32,
     pub(super) metrics: &'a mut WorkerMetricsLocal,
     pub(super) archive: &'a ArchiveConfig,
-    pub(super) dedupe: bool,
     pub(super) chunk_size: usize,
     /// Shared abort flag; set by `FailRun` policy handlers.
     pub(super) abort_run: &'a AtomicBool,
@@ -234,7 +233,6 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             next_virtual_file_id: &mut scratch.next_virtual_file_id,
             metrics,
             archive: &scratch.archive,
-            dedupe: scratch.dedupe_within_chunk,
             chunk_size: scratch.chunk_size,
             abort_run: scratch.abort_run.as_ref(),
         }
@@ -280,13 +278,10 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
         self.pending.clear();
         self.scan_scratch.drain_findings_into(self.pending);
 
-        let before_dedupe = self.pending.len();
-        if self.dedupe && before_dedupe > 1 {
-            dedupe_findings(self.pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(self.pending, self.engine.as_ref());
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_dedupe.saturating_sub(self.pending.len()));
+            .saturating_add(dedupe_removed);
         account_effective_dropped_findings(self.metrics, engine_dropped, scheduler_pruned);
 
         self.metrics.findings_emitted = self

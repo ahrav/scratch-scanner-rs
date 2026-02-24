@@ -1,0 +1,4 @@
+# Store is set via MXBAI_STORE env var in .envrc (direnv)
+# .mgreprc.yaml only supports maxFileSize and maxFileCount
+maxFileSize: 5242880
+maxFileCount: 5000

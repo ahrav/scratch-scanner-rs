@@ -9,8 +9,8 @@ use std::fs::File;
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
-    FileTask, LocalScratch,
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
+    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Read a file with an extractable binary format, extract text, and scan it.
@@ -93,19 +93,17 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
     );
     let engine_dropped = scratch.scan_scratch.dropped_findings();
     let before_prefix = scratch.scan_scratch.pending_findings_len();
+    let after_prefix = before_prefix;
 
     scratch.pending.clear();
     scratch
         .scan_scratch
         .drain_findings_into(&mut scratch.pending);
 
-    let before_dedupe = scratch.pending.len();
-    if scratch.dedupe_within_chunk {
-        dedupe_findings(&mut scratch.pending);
-    }
+    let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
     let scheduler_pruned = before_prefix
-        .saturating_sub(before_dedupe)
-        .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+        .saturating_sub(after_prefix)
+        .saturating_add(dedupe_removed);
     account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
     if !scratch.pending.is_empty() {
         emit_persistence_batch(

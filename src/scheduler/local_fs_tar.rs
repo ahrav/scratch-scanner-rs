@@ -23,8 +23,8 @@ use super::local_fs_archive_ctx::{
 };
 use super::local_fs_gzip::scan_gzip_stream_nested;
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
-    FileTask, LocalScratch,
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
+    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Scan a tar stream (plain or gzip-wrapped), optionally recursing into nested archives.
@@ -44,7 +44,6 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
 ) -> ArchiveEnd {
     let budgets = &mut *scan.budgets;
     let chunk_size = scan.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
-    let dedupe = scan.dedupe;
     let overlap = scan.engine.required_overlap();
     let max_len = scan.archive.max_virtual_path_len_per_entry;
     let max_depth = scan.archive.max_archive_depth;
@@ -228,7 +227,6 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                     next_virtual_file_id: scan.next_virtual_file_id,
                                     metrics: scan.metrics,
                                     archive: scan.archive,
-                                    dedupe: scan.dedupe,
                                     chunk_size: scan.chunk_size,
                                     abort_run: scan.abort_run,
                                 };
@@ -307,7 +305,6 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                     next_virtual_file_id: scan.next_virtual_file_id,
                                     metrics: scan.metrics,
                                     archive: scan.archive,
-                                    dedupe: scan.dedupe,
                                     chunk_size: scan.chunk_size,
                                     abort_run: scan.abort_run,
                                 };
@@ -340,7 +337,6 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                     next_virtual_file_id: scan.next_virtual_file_id,
                                     metrics: scan.metrics,
                                     archive: scan.archive,
-                                    dedupe: scan.dedupe,
                                     chunk_size: scan.chunk_size,
                                     abort_run: scan.abort_run,
                                 };
@@ -535,13 +531,10 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
             scan.pending.clear();
             scan.scan_scratch.drain_findings_into(scan.pending);
 
-            let before_dedupe = scan.pending.len();
-            if dedupe && before_dedupe > 1 {
-                dedupe_findings(scan.pending);
-            }
+            let dedupe_removed = apply_cross_rule_dedupe(scan.pending, scan.engine.as_ref());
             let scheduler_pruned = before_prefix
                 .saturating_sub(after_prefix)
-                .saturating_add(before_dedupe.saturating_sub(scan.pending.len()));
+                .saturating_add(dedupe_removed);
             account_effective_dropped_findings(scan.metrics, engine_dropped, scheduler_pruned);
 
             scan.metrics.findings_emitted = scan

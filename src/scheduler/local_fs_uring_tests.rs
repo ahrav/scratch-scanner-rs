@@ -87,6 +87,79 @@ impl ScanEngine for DuplicateDropEngine {
     }
 }
 
+struct DistinctHashEngine;
+
+struct DistinctHashScratch {
+    findings: Vec<FindingWithHash<FindingRec>>,
+}
+
+impl EngineScratch for DistinctHashScratch {
+    type Finding = FindingWithHash<FindingRec>;
+
+    fn clear(&mut self) {
+        self.findings.clear();
+    }
+
+    fn drop_prefix_findings(&mut self, new_bytes_start: u64) {
+        self.findings
+            .retain(|f| f.root_hint_end() >= new_bytes_start);
+    }
+
+    fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
+        out.append(&mut self.findings);
+    }
+
+    fn pending_findings_len(&self) -> usize {
+        self.findings.len()
+    }
+}
+
+impl ScanEngine for DistinctHashEngine {
+    type Scratch = DistinctHashScratch;
+
+    fn required_overlap(&self) -> usize {
+        0
+    }
+
+    fn new_scratch(&self) -> Self::Scratch {
+        DistinctHashScratch {
+            findings: Vec::with_capacity(8),
+        }
+    }
+
+    fn scan_chunk_into(
+        &self,
+        data: &[u8],
+        _file_id: FileId,
+        _base_offset: u64,
+        scratch: &mut Self::Scratch,
+    ) {
+        scratch.clear();
+        if data.is_empty() {
+            return;
+        }
+
+        let rec = FindingRec {
+            rule_id: RuleId(0),
+            root_hint_start: 0,
+            root_hint_end: 6,
+            span_start: 0,
+            span_end: 6,
+            confidence_score: 0,
+        };
+        scratch.findings.push(FindingWithHash::new(rec, [0xA1; 32]));
+        scratch.findings.push(FindingWithHash::new(rec, [0xB2; 32]));
+    }
+
+    fn rule_name(&self, _rule_id: u32) -> &str {
+        "distinct-hash"
+    }
+
+    fn max_findings_per_chunk(&self) -> usize {
+        8
+    }
+}
+
 #[test]
 fn uring_finds_boundary_spanning_match() -> io::Result<()> {
     // Create a mock engine that looks for "SECRET"
@@ -397,6 +470,48 @@ fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
 }
 
 #[test]
+fn uring_cross_rule_mode_uses_hash_aware_winner_pass() -> io::Result<()> {
+    let engine = Arc::new(DistinctHashEngine);
+    let dir = tempdir()?;
+    let file_path = dir.path().join("a.txt");
+    std::fs::write(&file_path, b"SECRET")?;
+
+    let cfg = LocalFsUringConfig {
+        cpu_workers: 2,
+        io_threads: 1,
+        ring_entries: 64,
+        io_depth: 16,
+        chunk_size: 64,
+        max_in_flight_files: 8,
+        file_queue_cap: 8,
+        pool_buffers: 32,
+        use_registered_buffers: false,
+        open_stat_mode: OpenStatMode::BlockingOnly,
+        resolve_policy: ResolvePolicy::Default,
+        follow_symlinks: false,
+        max_file_size: None,
+        seed: 123,
+        dedupe_within_chunk: true,
+        pin_threads: false,
+        skip_binary: false,
+        archive: ArchiveConfig {
+            enabled: false,
+            ..ArchiveConfig::default()
+        },
+    };
+
+    let sink = Arc::new(VecEventSink::new());
+    let (_summary, _io_stats, metrics) =
+        scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
+    assert_eq!(
+        metrics.findings_emitted, 2,
+        "distinct hashes must preserve both findings"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
     let engine = Arc::new(MockEngine::with_tuning(
         vec![MockRule {
@@ -439,7 +554,7 @@ fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
     drop(tx);
 
     let sink = Arc::new(VecEventSink::new());
-    let stats = extract_worker_loop(rx, engine, sink.clone(), true);
+    let stats = extract_worker_loop(rx, engine, sink.clone());
 
     assert_eq!(stats.files_extracted, 1, "expected extraction from open fd");
     assert_eq!(stats.io_errors, 0);

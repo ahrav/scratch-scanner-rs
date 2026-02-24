@@ -56,8 +56,8 @@ BLAKE3 domain-separated hashes before storing them.
                      │   drop_prefix_findings()      (cross-chunk overlap dedupe)   │
                      │          │                                                   │
                      │          ▼                                                   │
-                     │   dedupe_findings()            (within-chunk dedupe)         │
-                     │          │                     now includes norm_hash in key │
+                     │   apply_cross_rule_dedupe()    (cross-rule winner dedupe)    │
+                     │          │                     includes norm_hash in key    │
                      │          ▼                                                   │
                      │   ┌──────┴──────────────┐                                   │
                      │   │                     │                                   │
@@ -453,7 +453,7 @@ producer instance.
 
 ## Deduplication Changes
 
-The within-chunk dedup function `dedupe_findings()` was updated to include
+The cross-rule dedupe function `apply_cross_rule_dedupe()` includes
 `norm_hash` in the dedup key:
 
 **Before**: `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`

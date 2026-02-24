@@ -111,6 +111,12 @@ pub trait FindingRecord: Clone + Send + 'static {
     /// Full match span end offset (byte position in original buffer).
     fn span_end(&self) -> u64;
 
+    /// Whether `span_start/span_end` participates in dedupe identity.
+    ///
+    /// For findings that use coarse root hints, callers may opt into span-aware
+    /// dedupe to avoid collapsing distinct occurrences that share a root range.
+    fn dedupe_with_span(&self) -> bool;
+
     /// Additive confidence score from gate signals (Phase 1 range: 0–10).
     ///
     /// Does **not** participate in dedup keys — two findings at the same span
@@ -181,6 +187,11 @@ impl<F: FindingRecord> FindingRecord for FindingWithHash<F> {
     #[inline]
     fn span_end(&self) -> u64 {
         self.finding.span_end()
+    }
+
+    #[inline]
+    fn dedupe_with_span(&self) -> bool {
+        self.finding.dedupe_with_span()
     }
 
     #[inline]
@@ -353,6 +364,7 @@ mod tests {
         root_end: u64,
         span_start: u64,
         span_end: u64,
+        dedupe_with_span: bool,
     }
 
     impl FindingRecord for DummyFinding {
@@ -376,6 +388,10 @@ mod tests {
             self.span_end
         }
 
+        fn dedupe_with_span(&self) -> bool {
+            self.dedupe_with_span
+        }
+
         fn confidence_score(&self) -> i8 {
             0
         }
@@ -389,6 +405,7 @@ mod tests {
             root_end: 111,
             span_start: 101,
             span_end: 110,
+            dedupe_with_span: true,
         };
         let wrapped = FindingWithHash::new(inner, [0xAB; 32]);
 

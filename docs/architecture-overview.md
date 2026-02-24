@@ -371,7 +371,7 @@ Scheduler harness code lives in `src/scheduler/sim_executor_harness.rs`.
 1. **Input**: CLI parses `scan fs`/`scan git` and builds unified config
 2. **Dispatch**: Unified orchestrator routes to `parallel_scan_dir` or `run_git_scan`
 3. **FS Discovery**: `IterWalker` discovers files and `scan_local` assigns work to workers
-4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, and dedupe overlap findings
+4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, dedupe overlap findings, and apply cross-rule winner selection (keeping the highest-confidence rule per location)
 5. **Output**: Findings stream through `EventSink` implementations to stdout
 6. **Persistence**: When enabled (`--persist-findings`), post-dedupe findings are emitted
    to a `StoreProducer` backend (default: SQLite star-schema with WAL mode);

@@ -16,8 +16,8 @@ use super::local_fs_archive_ctx::{
     ArchiveScanCtx, ARCHIVE_STREAM_READ_MAX,
 };
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, emit_findings, emit_persistence_batch,
-    FileTask, LocalScratch,
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
+    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Scan a `.gz` file as a single virtual entry (`<gunzip>`).
@@ -34,7 +34,6 @@ pub(super) fn process_gzip_file<E: ScanEngine>(
     let engine = &scratch.engine;
     let overlap = engine.required_overlap();
     let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
-    let dedupe = scratch.dedupe_within_chunk;
 
     let file = match File::open(&task.path) {
         Ok(f) => f,
@@ -205,13 +204,10 @@ pub(super) fn process_gzip_file<E: ScanEngine>(
             .scan_scratch
             .drain_findings_into(&mut scratch.pending);
 
-        let before_dedupe = scratch.pending.len();
-        if dedupe && before_dedupe > 1 {
-            dedupe_findings(&mut scratch.pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_dedupe.saturating_sub(scratch.pending.len()));
+            .saturating_add(dedupe_removed);
         account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
 
         metrics.findings_emitted = metrics

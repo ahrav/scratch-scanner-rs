@@ -298,27 +298,23 @@ CPU:
 - Buffer released (RAII) when task completes
 ```
 
-### FindingRecord Deduplication
+### Cross-Rule Finding Deduplication
 
-Findings are deduplicated within each chunk by `(rule_id, root_hint, span)`:
+Findings are deduplicated via `apply_cross_rule_dedupe` (imported from `local_fs_owner`), which runs unconditionally at all scan sites (CPU tasks, archive entries, and extract entries). This performs cross-rule winner selection: when multiple rules match the same location and content, only the best match survives.
+
+**Group key**: `(root_hint_start, root_hint_end, span_projection, norm_hash)` where `span_projection` is `(span_start, span_end)` when the rule participates in span-based dedup (`dedupe_with_span()`), or `(0, 0)` otherwise.
+
+**Winner cascade** (within each group, first element kept):
+1. Highest `confidence_score`
+2. Lexicographically first rule name
+3. Lowest `rule_id`
 
 ```rust
-fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
-    p.sort_unstable_by(|a, b| {
-        (a.rule_id, a.root_hint_start, a.root_hint_end, a.span_start, a.span_end)
-            .cmp(&(...))
-    });
-    p.dedup_by(|a, b| {
-        a.rule_id == b.rule_id
-            && a.root_hint_start == b.root_hint_start
-            && a.root_hint_end == b.root_hint_end
-            && a.span_start == b.span_start
-            && a.span_end == b.span_end
-    });
-}
+// Called unconditionally at every scan site:
+let dedupe_removed = apply_cross_rule_dedupe(&mut pending, &*engine);
 ```
 
-**Purpose**: Overlap regions can generate duplicate findings across chunks. Sorting + dedup ensures each finding is reported once per chunk.
+**Purpose**: Overlap regions and multi-rule matching can generate duplicate or redundant findings. Cross-rule dedup ensures each distinct match location reports only the highest-confidence winner.
 
 ## First-Chunk Classification
 
@@ -935,6 +931,9 @@ pub struct LocalFsUringConfig {
     pub max_file_size: Option<u64>,
     pub seed: u64,
     pub dedupe_within_chunk: bool,
+    pub pin_threads: bool,
+    pub skip_binary: bool,
+    pub archive: ArchiveConfig,
 }
 
 impl LocalFsUringConfig {
@@ -1078,11 +1077,14 @@ struct UringArchiveSink<'a, E: ScanEngine> {
     pending: &'a mut Vec<Finding>,
     event_sink: &'a dyn EventSink,
     display: Vec<u8>,               // Current entry display path
-    file_id: FileId,                // Deterministic per-entry ID
-    dedupe: bool,
+    container_file_id: FileId,      // ID of the archive file itself
+    next_entry_index: u32,          // Monotonic index for deterministic entry IDs
+    file_ids: Arc<FileIdAllocator>, // Allocator for per-entry FileIds
+    file_id: FileId,                // Current entry's file ID
     bytes_scanned: u64,
     chunks_scanned: u64,
     findings_emitted: u64,
+    findings_dropped: u64,          // Findings removed by cross-rule dedup
 }
 ```
 
@@ -1106,9 +1108,16 @@ fn archive_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ArchiveWork>,
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
+    file_ids: Arc<FileIdAllocator>,     // Allocator for per-entry FileIds
     cfg: ArchiveConfig,
-    dedupe: bool,
 ) -> ArchiveWorkerStats;
+
+// Extract worker loop (content-policy extraction + scan)
+fn extract_worker_loop<E: ScanEngine>(
+    rx: chan::Receiver<ExtractWork>,
+    engine: Arc<E>,
+    event_sink: Arc<dyn EventSink>,
+) -> ExtractWorkerStats;
 
 // Discovery DFS walk
 fn walk_and_send_files(
@@ -1117,7 +1126,7 @@ fn walk_and_send_files(
     budget: &Arc<CountBudget>,         // In-flight file limit
     tx: &chan::Sender<FileWork>,
     archive_tx: &Option<chan::Sender<ArchiveWork>>, // Direct archive routing
-    next_file_id: &mut u32,
+    file_ids: &FileIdAllocator,        // Shared file ID allocator
     summary: &mut LocalFsSummary,
 ) -> io::Result<()>;
 
@@ -1135,8 +1144,8 @@ fn drain_in_flight(
 // CPU worker task runner
 fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch<E>>);
 
-// Deduplication helper
-fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>);
+// Cross-rule dedup (imported from local_fs_owner, called at all scan sites)
+// apply_cross_rule_dedupe<F, E>(findings: &mut Vec<F>, engine: &E) -> usize;
 
 // Emit findings as structured events
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
