@@ -529,6 +529,73 @@ Default max rounds: 3. Override with `--rounds=N` (1-3).
 
 ---
 
+## Phase 5 --- Create Tasks (Optional, `--create-tasks`)
+
+Activated only when `--create-tasks` flag is passed. Converts the finalized plan
+into tracked beads tasks following the Task Quality Standard.
+
+### Steps
+
+1. **Identify taskable steps**: For each step in the final plan that has
+   acceptance criteria, create a beads task.
+
+2. **Map plan fields to task template sections**:
+
+   | Plan Field | Task Section |
+   |-----------|-------------|
+   | Problem Statement | Context |
+   | Codebase Context | Current State |
+   | Step → What | Desired State |
+   | Step → Files | Implementation Guidance → Files to Modify |
+   | Step → Tests | Testing Strategy (conditional section) |
+   | Step → Acceptance criteria | Acceptance Criteria |
+   | Codebase Context (patterns) | Implementation Guidance → Patterns to Follow |
+   | Open Items (WATCH) | Pointers |
+
+3. **Create tasks**: For each step:
+   - Write the full task description to a temp file using the standard template
+   - Run `bd create --title="{Step Title}" --type=task --priority=2 --body-file="$TMPFILE"`
+   - Add `--parent={EPIC_ID}` if an epic was created (see step 5)
+
+4. **Add sequential dependencies**: If steps have explicit ordering requirements:
+   ```bash
+   bd dep add <step-N-id> <step-N-minus-1-id>
+   ```
+   Only add dependencies where the plan explicitly states ordering. Independent
+   steps should remain independent.
+
+5. **Create parent epic** (if 3+ tasks): If 3 or more tasks are created:
+   ```bash
+   bd create --title="{Plan Title}" --type=epic --priority=2
+   ```
+   Then link all child tasks with `--parent` when creating them, or update
+   after creation.
+
+6. **Report summary**:
+
+   ```markdown
+   ## Tasks Created from Plan
+
+   **Epic**: {epic_id} (if created)
+   **Tasks**: {count}
+
+   | # | Task ID | Title | Priority | Dependencies |
+   |---|---------|-------|----------|-------------|
+   | 1 | {id} | {title} | P2 | — |
+   | 2 | {id} | {title} | P2 | depends on #1 |
+   | 3 | {id} | {title} | P2 | — |
+   ```
+
+### Relationship to `/create-task`
+
+This phase uses the same template and quality standard as `/create-task` but
+does NOT spawn Explore agents for each step (the plan already contains codebase
+context from Phase 0). If a step lacks sufficient context for a section, the
+section is included with `[NEEDS ENRICHMENT]` — the implementing agent can
+run `/create-task --quick` to fill in gaps.
+
+---
+
 ## Configuration
 
 | Flag | Effect |
@@ -537,6 +604,7 @@ Default max rounds: 3. Override with `--rounds=N` (1-3).
 | `--focus=<domain>` | Adds domain-specific pitfall context to all agent prompts. |
 | `--plan-only` | Create plan (Phase 0), skip all reviews. |
 | `--review-only <path>` | Skip plan creation, review existing plan at `<path>`. |
+| `--create-tasks` | After Phase 4, convert plan steps to beads tasks (Phase 5). |
 
 ### Focus Domain Pitfalls
 
