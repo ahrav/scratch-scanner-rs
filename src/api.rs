@@ -562,7 +562,7 @@ impl LocalContextSpec {
 /// # Invariants
 /// - `name` must be non-empty.
 /// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
-///   `entropy`, `char_class`, `local_context`, `offline_validation`, and
+///   `entropy`, `char_class`, `local_context`, `offline_validation`,
 ///   `secret_group`, and `min_confidence` must be valid when present.
 ///
 /// # Design Notes
