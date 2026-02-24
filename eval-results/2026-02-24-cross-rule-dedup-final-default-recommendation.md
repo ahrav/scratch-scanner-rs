@@ -89,10 +89,17 @@ Status: **validated in Linux container**.
 4. Keep Linux uring parity checks in CI on a Linux runner (to avoid Docker seccomp false negatives).
 5. Extend representative labeled validation from subset to fuller CredData coverage when practical.
 
-## 7) Reproducible Commands (Executed)
+## 7) Commands Executed During Evaluation
+
+> **Note:** The scanner-OFF cells (cells 1 and 3) were collected using a
+> temporary `SCANNER_NO_CROSS_RULE_DEDUP=1` toggle that was removed after
+> the measurement pass (see Section 3). Re-running those commands against
+> the current tree will use the default scanner behavior (dedup ON) and
+> produce cell-2/cell-4 results instead. The scanner-ON commands
+> (cells 2 and 4) remain directly reproducible.
 
 ```bash
-# Representative CredData subset cells (scanner OFF via temporary toggle)
+# Scanner OFF cells — requires re-introducing the temporary toggle (see Section 3)
 SCANNER_NO_CROSS_RULE_DEDUP=1 cargo run --manifest-path tools/eval-harness/Cargo.toml -- creddata \
   --meta-dir ../CredData/meta.subset \
   --corpus-root ../CredData \
@@ -124,10 +131,10 @@ cargo run --manifest-path tools/eval-harness/Cargo.toml -- creddata \
   --format json \
   --output eval-results/2026-02-24-cross-rule-final/creddata-subset/cell-4-scanner-on-eval-on.json
 
-# Representative repo scans
+# Representative repo scans (scanner-OFF line requires temporary toggle)
 RUSTFLAGS="-C target-cpu=native" cargo build --release --bin scanner-rs
 ./target/release/scanner-rs scan fs ../linux --null-sink
-SCANNER_NO_CROSS_RULE_DEDUP=1 ./target/release/scanner-rs scan fs ../linux --null-sink
+SCANNER_NO_CROSS_RULE_DEDUP=1 ./target/release/scanner-rs scan fs ../linux --null-sink  # needs toggle
 
 # Linux uring parity checks (Docker; privileged needed for io_uring syscalls)
 docker run --rm --privileged -v "$PWD":/work -w /work rust:1.90 bash -lc '
