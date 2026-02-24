@@ -154,6 +154,8 @@ pub(crate) struct YamlRule {
     pub secret_group: Option<u16>,
     #[serde(default)]
     pub uuid_format_secret: bool,
+    #[serde(default)]
+    pub min_confidence: Option<i8>,
 }
 
 /// Entropy gate parameters for a rule.
@@ -488,6 +490,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             offline_validation,
             secret_group,
             uuid_format_secret,
+            min_confidence,
         } = yr;
 
         let re = super::build_regex(&regex).map_err(|error| RulesError::Regex {
@@ -590,6 +593,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             offline_validation,
             uuid_format_secret,
             secret_group,
+            min_confidence,
             re,
         });
     }

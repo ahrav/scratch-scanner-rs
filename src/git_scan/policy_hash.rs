@@ -27,12 +27,13 @@
 //!
 //! # Fields deliberately excluded
 //!
-//! `RuleSpec::local_context` and `RuleSpec::uuid_format_secret` are not
-//! encoded by [`RuleSpec::encode_policy`](crate::api::RuleSpec). These
-//! fields affect post-extraction false-positive suppression but not core
-//! detection (anchor matching, window construction, regex evaluation), so
-//! changing them is accepted as a minor staleness trade-off rather than
-//! forcing a full rescan.
+//! `RuleSpec::local_context`, `RuleSpec::uuid_format_secret`, and
+//! `RuleSpec::min_confidence` are not encoded by
+//! [`RuleSpec::encode_policy`](crate::api::RuleSpec). These fields affect
+//! post-extraction suppression/thresholding rather than core detection
+//! (anchor matching, window construction, regex evaluation), so changing
+//! them is accepted as a minor staleness trade-off rather than forcing a
+//! full rescan.
 //!
 //! # Invariants
 //! - Identical inputs yield identical hashes across platforms and runs.
@@ -118,8 +119,8 @@ const POLICY_HASH_VERSION: u8 = 1;
 ///
 /// Each component delegates to its `encode_policy` method in
 /// [`crate::api`]. Fields that do not affect finding detection
-/// (`local_context`, `uuid_format_secret`) are deliberately excluded;
-/// see the module-level docs for rationale.
+/// (`local_context`, `uuid_format_secret`, `min_confidence`) are
+/// deliberately excluded; see the module-level docs for rationale.
 #[must_use]
 pub fn policy_hash(
     rules: &[RuleSpec],
@@ -247,6 +248,7 @@ mod tests {
             char_class: None,
             local_context: None,
             secret_group: None,
+            min_confidence: None,
             offline_validation: None,
             uuid_format_secret: false,
             re: Regex::new(pattern).unwrap(),
@@ -289,6 +291,24 @@ mod tests {
         assert_ne!(
             h1, h2,
             "changing value_suppressors_any must change the policy hash"
+        );
+    }
+
+    #[test]
+    fn encode_policy_excludes_min_confidence_threshold() {
+        let mut left = rule("a", "a", &[b"a"]);
+        let mut right = rule("a", "a", &[b"a"]);
+        left.min_confidence = None;
+        right.min_confidence = Some(5);
+
+        let mut left_bytes = Vec::new();
+        let mut right_bytes = Vec::new();
+        left.encode_policy(&mut left_bytes);
+        right.encode_policy(&mut right_bytes);
+
+        assert_eq!(
+            left_bytes, right_bytes,
+            "changing min_confidence should not change rule policy encoding"
         );
     }
 

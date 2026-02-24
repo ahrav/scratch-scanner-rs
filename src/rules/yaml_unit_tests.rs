@@ -148,6 +148,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         offline_validation,
         secret_group: rule.secret_group,
         uuid_format_secret: rule.uuid_format_secret,
+        min_confidence: rule.min_confidence,
     }
 }
 
@@ -346,6 +347,13 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
         assert_eq!(
             orig.secret_group, parsed.secret_group,
             "secret_group mismatch for {}",
+            orig.name
+        );
+
+        // Min confidence threshold.
+        assert_eq!(
+            orig.min_confidence, parsed.min_confidence,
+            "min_confidence mismatch for {}",
             orig.name
         );
 
@@ -860,6 +868,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
         "offline_validation",
         "secret_group",
         "uuid_format_secret",
+        "min_confidence",
     ];
     let offline_validation_fields: &[&str] =
         &["type", "prefix_skip", "payload_len", "checksum_len"];
@@ -2065,6 +2074,50 @@ rules:
         .expect("absent should auto-enable");
     assert_eq!(cc_null.max_lower_pct, cc_absent.max_lower_pct);
     assert_eq!(cc_null.min_window_len, cc_absent.min_window_len);
+}
+
+#[test]
+fn parse_min_confidence_explicit_integer() {
+    let yaml = r#"
+rules:
+  - name: "mc-explicit"
+    regex: 'tok_[A-Za-z0-9]{12}'
+    anchors: ["tok_"]
+    radius: 64
+    min_confidence: 7
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse YAML with min_confidence");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].min_confidence, Some(7));
+}
+
+#[test]
+fn parse_min_confidence_absent_is_none() {
+    let yaml = r#"
+rules:
+  - name: "mc-absent"
+    regex: 'tok_[A-Za-z0-9]{12}'
+    anchors: ["tok_"]
+    radius: 64
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse YAML without min_confidence");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].min_confidence, None);
+}
+
+#[test]
+fn parse_min_confidence_null_is_none() {
+    let yaml = r#"
+rules:
+  - name: "mc-null"
+    regex: 'tok_[A-Za-z0-9]{12}'
+    anchors: ["tok_"]
+    radius: 64
+    min_confidence: null
+"#;
+    let rules = parse_yaml_rules(yaml).expect("parse YAML with null min_confidence");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].min_confidence, None);
 }
 
 /// Verify that rules whose regex captures UUID-format secrets have the

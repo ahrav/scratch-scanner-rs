@@ -669,6 +669,7 @@ mod tests {
             char_class: None,
             local_context: None,
             secret_group: None,
+            min_confidence: None,
             offline_validation: None,
             uuid_format_secret: false,
             re: Regex::new(r"SECRET[A-Z0-9]{8}").unwrap(),
