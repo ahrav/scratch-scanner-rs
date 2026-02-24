@@ -644,7 +644,7 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
                 .scratch
                 .drain_findings_into(&mut ctx.scratch.pending);
 
-            let before_mode_pass = ctx.scratch.pending.len();
+            let _before_mode_pass = ctx.scratch.pending.len();
             let dedupe_removed =
                 apply_cross_rule_dedupe(&mut ctx.scratch.pending, &*ctx.scratch.engine);
 
