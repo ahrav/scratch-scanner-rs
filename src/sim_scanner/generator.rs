@@ -387,6 +387,7 @@ pub fn materialize_rules(suite: &RuleSuiteSpec) -> Result<Vec<RuleSpec>, String>
             char_class: None,
             local_context: None,
             secret_group: None,
+            min_confidence: None,
             offline_validation: None,
             uuid_format_secret: false,
             re,

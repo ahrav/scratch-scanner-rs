@@ -40,6 +40,7 @@ fn rule(name: &'static str, pattern: &str, anchors: &'static [&'static [u8]]) ->
         char_class: None,
         local_context: None,
         secret_group: None,
+        min_confidence: None,
         offline_validation: None,
         uuid_format_secret: false,
         re: Regex::new(pattern).expect("regex must compile"),

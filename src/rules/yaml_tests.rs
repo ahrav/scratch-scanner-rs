@@ -34,6 +34,7 @@ struct RuleCase {
     two_phase: Option<(usize, usize, Vec<String>)>,
     local_context: Option<LocalContextCase>,
     secret_group: Option<u16>,
+    min_confidence: Option<i8>,
 }
 
 impl RuleCase {
@@ -87,6 +88,7 @@ impl RuleCase {
             secret_group: self.secret_group,
             offline_validation: None,
             uuid_format_secret: false,
+            min_confidence: self.min_confidence,
         }
     }
 }
@@ -177,6 +179,7 @@ fn arb_rule_case() -> impl Strategy<Value = RuleCase> {
         arb_two_phase(),
         arb_local_context(),
         prop_oneof![Just(None), (0u16..=64).prop_map(Some)],
+        prop_oneof![Just(None), (0i8..=10).prop_map(Some)],
     )
         .prop_map(
             |(
@@ -191,6 +194,7 @@ fn arb_rule_case() -> impl Strategy<Value = RuleCase> {
                 two_phase,
                 local_context,
                 secret_group,
+                min_confidence,
             )| RuleCase {
                 name: format!("prop-rule-{name_idx}"),
                 regex: REGEX_POOL[regex_idx].to_string(),
@@ -206,6 +210,7 @@ fn arb_rule_case() -> impl Strategy<Value = RuleCase> {
                 two_phase,
                 local_context,
                 secret_group,
+                min_confidence,
             },
         )
 }
@@ -243,6 +248,7 @@ proptest! {
         prop_assert_eq!(rule.radius, case.radius);
         prop_assert_eq!(rule.validator, ValidatorKind::None);
         prop_assert_eq!(rule.secret_group, case.secret_group);
+        prop_assert_eq!(rule.min_confidence, case.min_confidence);
 
         let parsed_anchors = bytes_slice_to_strings(rule.anchors);
         prop_assert_eq!(parsed_anchors, case.anchors.clone());

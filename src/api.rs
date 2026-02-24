@@ -562,8 +562,8 @@ impl LocalContextSpec {
 /// # Invariants
 /// - `name` must be non-empty.
 /// - `two_phase`, `must_contain`, `keywords_any`, `value_suppressors_any`,
-///   `entropy`, `char_class`, `local_context`, `offline_validation`, and
-///   `secret_group` must be valid when present.
+///   `entropy`, `char_class`, `local_context`, `offline_validation`,
+///   `secret_group`, and `min_confidence` must be valid when present.
 ///
 /// # Design Notes
 /// - Anchors should be ASCII-ish; UTF-16 variants are derived automatically.
@@ -700,6 +700,19 @@ pub struct RuleSpec {
     /// construction.
     pub secret_group: Option<u16>,
 
+    /// Optional per-rule minimum confidence threshold metadata.
+    ///
+    /// This field is currently schema-level only: YAML parsing and
+    /// [`RuleSpec::assert_valid`] preserve/validate it, but scan-time filtering
+    /// by confidence is not yet wired into the engine hot path.
+    ///
+    /// `None` means no per-rule override is specified. `Some(v)` stores the
+    /// configured threshold for downstream phases that consume it.
+    ///
+    /// # Valid range
+    /// `v` must be in `0..=10` (Phase 1 confidence ceiling).
+    pub min_confidence: Option<i8>,
+
     /// Final check. Bytes regex (no UTF-8 assumption).
     pub re: Regex,
 }
@@ -749,6 +762,12 @@ impl RuleSpec {
                 "secret_group {} does not exist in regex (only {} groups, including group 0)",
                 gi,
                 group_count
+            );
+        }
+        if let Some(mc) = self.min_confidence {
+            assert!(
+                (0..=10).contains(&mc),
+                "min_confidence must be in 0..=10, got {mc}"
             );
         }
     }
@@ -1020,6 +1039,7 @@ mod tests {
             offline_validation: None,
             uuid_format_secret: false,
             secret_group: None,
+            min_confidence: None,
             re: Regex::new(r"tok_[a-z0-9]{8}").unwrap(),
         }
     }
@@ -1084,6 +1104,33 @@ mod tests {
         let mut rule = dummy_rule(None);
         rule.value_suppressors_any = Some(SUPPRESSORS_WITH_EMPTY_ENTRY);
         rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "min_confidence must be in 0..=10")]
+    fn min_confidence_below_zero_panics() {
+        let mut rule = dummy_rule(None);
+        rule.min_confidence = Some(-1);
+        rule.assert_valid();
+    }
+
+    #[test]
+    #[should_panic(expected = "min_confidence must be in 0..=10")]
+    fn min_confidence_above_ten_panics() {
+        let mut rule = dummy_rule(None);
+        rule.min_confidence = Some(11);
+        rule.assert_valid();
+    }
+
+    #[test]
+    fn min_confidence_boundaries_are_valid() {
+        let mut lo = dummy_rule(None);
+        lo.min_confidence = Some(0);
+        lo.assert_valid();
+
+        let mut hi = dummy_rule(None);
+        hi.min_confidence = Some(10);
+        hi.assert_valid();
     }
 
     // ---- OfflineValidationSpec tests ----
