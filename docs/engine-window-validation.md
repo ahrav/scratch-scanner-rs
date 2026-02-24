@@ -23,6 +23,7 @@ Two entry styles are supported:
 - **Entropy validation**: Gate findings on Shannon entropy and optional min-entropy (NIST SP 800-90B) of extracted secret bytes
 - **Value suppression**: Discard findings whose extracted secret contains known placeholder/example patterns
 - **Emit-time policy checks**: Apply root safelist suppression and offline structural validation before recording findings
+- **Confidence thresholding**: Suppress candidates whose computed confidence score is below per-rule `min_confidence`
 
 ---
 
@@ -60,6 +61,8 @@ Input: Window [w.start..w.end) in buffer
 [Gate 13] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
 [Step 14] Compute additive confidence score from gate signals that fired
+  ↓
+[Gate 15] Apply per-rule `min_confidence` threshold
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -268,7 +271,7 @@ They apply uniformly in raw, UTF-16, and stream-decoded validation paths.
 
 ### 8. Emit-Time Safelist Suppression
 
-Emit-time safelist operates in two tiers:
+Emit-time safelist/offline filtering operates in three safelist tiers plus offline validation:
 
 **Tier 1 — Context-window safelist** (root findings only): Before recording a
 finding, emit paths run a safelist check only when the finding's
@@ -276,7 +279,7 @@ finding, emit paths run a safelist check only when the finding's
 `root_hint_start..root_hint_end`.
 
 - Step-root findings matching safelist patterns are suppressed immediately.
-- Suppressed findings increment `ScanScratch::safelist_suppressed`.
+- Suppressed findings increment `ScanScratch::safelist_suppressed` in instrumentation builds.
 - Findings with `step_id != STEP_ROOT` bypass this check.
 - Root-semantic UTF-16 findings carry a `Utf16Window` step as their own
   `step_id`, so they bypass safelist but still participate in offline
@@ -292,7 +295,7 @@ anchoring instead of `\b` word boundaries, preventing false suppression of
 composite secrets that contain placeholder words as hyphen- or dot-separated
 segments (e.g., `key-null-safety-9xK2mB`).
 
-- Suppressed findings increment `ScanScratch::secret_bytes_safelist_suppressed`.
+- Suppressed findings increment `ScanScratch::secret_bytes_safelist_suppressed` in instrumentation builds.
 - Context-anchored patterns and short substrings (e.g., "mock") that risk
   false suppression of real secrets are excluded from this tier.
 
@@ -307,7 +310,7 @@ gated per-rule by `RuleCompiled::uuid_format_secret()` so that rules whose
 capture group is exactly UUID-format (e.g., Heroku, Snyk API keys) bypass
 suppression.
 
-- Suppressed findings increment `ScanScratch::uuid_format_suppressed`.
+- Suppressed findings increment `ScanScratch::uuid_format_suppressed` in instrumentation builds.
 
 ### 9. Offline Structural Validation
 
@@ -321,7 +324,7 @@ emission time, before the finding consumes a `max_findings_per_chunk` slot.
 - Suppression requires both an [`Invalid`](OfflineVerdict::Invalid) verdict
   and the spec's `suppresses_on_invalid` flag.
 - `Valid` and `Indeterminate` verdicts always pass through.
-- Suppressed findings increment `ScanScratch::offline_suppressed`.
+- Suppressed findings increment `ScanScratch::offline_suppressed` in instrumentation builds.
 
 ---
 
@@ -603,9 +606,15 @@ Gates are applied in a specific order to minimize decode work:
     ↓
 [6] Apply assignment-shape check on decoded UTF-8
     ↓
-[7] Run regex on decoded UTF-8
+[7] Apply char-class gate on decoded UTF-8 (when configured)
     ↓
-[8] Post-match: secret extraction → entropy → value suppressors → local context
+[8] Run regex on decoded UTF-8
+    ↓
+[9] Post-match: secret extraction → entropy → value suppressors → local context
+    ↓
+[10] Emit-time policy: root safelist → secret-bytes safelist → UUID reject → offline validation
+    ↓
+[11] Compute confidence score and apply `min_confidence` threshold
 ```
 
 This ordering ensures:
@@ -637,7 +646,7 @@ pub(super) fn run_rule_on_raw_window_into(
 For externally-managed windows (already extracted from buffer). Used when:
 - Window buffer is managed by caller
 - Caller tracks window starting offset
-- Caller needs to know if any match passed gates
+- Caller needs to know if any match passed gates and cleared emit-time policy plus confidence threshold
 
 Uses output parameter (`found_any`) and stages accepted findings in
 `scratch.tmp_findings` with aligned sidecars (`tmp_drop_hint_end`, `tmp_norm_hash`).
@@ -691,6 +700,7 @@ variant-specific ordering:
 2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape -> char_class
 3. Regex: O(n x complexity)
 4. Post-match: secret extraction -> entropy -> value suppressors -> local context
+5. Emit-time: safelists/offline validation -> confidence score -> min_confidence threshold
 
 Early failures save expensive regex execution. Post-match gates run only on
 confirmed regex matches, so their cost scales with finding count, not window count.
@@ -730,4 +740,4 @@ Findings are written to scratch buffers (not directly to materialized results) b
 6. All early returns occur before findings are recorded
 7. Findings are appended or replaced in-place for dedupe preference (never removed or reordered during function execution)
 8. Entropy gates continue to next match (not early return)
-9. Root safelist suppression, secret-bytes safelist suppression, UUID-format quick-reject, offline structural validation, and cap checks are applied before finding insertion
+9. Root safelist suppression, secret-bytes safelist suppression, UUID-format quick-reject, offline structural validation, confidence threshold checks, and cap checks are applied before finding insertion

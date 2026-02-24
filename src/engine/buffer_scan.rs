@@ -178,7 +178,7 @@ impl Engine {
             let rule = &self.rules_hot[rid];
             // Resolve gate pool references once per (rule, variant) pair rather
             // than inside the per-window loop. See ResolvedGates for rationale.
-            let gates = self.resolve_gates(rule);
+            let gates = self.resolve_gates(rid as u32, rule);
 
             scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
             if scratch.windows.is_empty() {

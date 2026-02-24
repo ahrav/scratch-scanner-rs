@@ -17,18 +17,22 @@
 //! - Decoded offsets are monotonically increasing during a stream decode.
 //! - `pending_windows` is a timing wheel keyed by `hi` (G=1), so windows are
 //!   only processed once the decoded offset has reached the window end.
-//! - `scratch.slab` is append-only during a stream pass; on abort or fallback
-//!   it is truncated back to its pre-decode length.
+//! - `scratch.slab` grows during decode, and may be truncated within the stream
+//!   path when dropping bytes outside retained spans or when discarding output.
+//!   On abort it is truncated back to its pre-decode length.
 //! - Per-scan decode budgets (`max_total_decode_output_bytes`, per-transform
 //!   `max_decoded_bytes`) are enforced on every chunk.
+//! - `found_any` flips only for staged findings that survive emit-time policy
+//!   and `min_confidence`; suppressed/low-confidence matches keep it `false`.
 //!
 //! ## Fallback triggers
 //! Streaming will fall back to full decode when any of the following happen:
 //! - the per-rule window cap is exceeded (risking unbounded work),
 //! - a decoded window/span cannot be reconstructed from the ring,
-//! - decode budgets are exceeded or timing-wheel enqueue fails.
+//! - callback-side overflow/force-full signals are raised for pending windows,
+//! - timing-wheel enqueue fails.
 //!
-//! Decoder errors/truncation are handled as hard aborts for the stream path:
+//! Decoder errors/truncation (including decode-budget exhaustion) are handled as hard aborts for the stream path:
 //! staged stream output is discarded and this call returns without fallback.
 //!
 //! ## Gate behavior
@@ -586,7 +590,7 @@ impl Engine {
             };
 
             let rule = &self.rules_hot[win.rule_id as usize];
-            let gates = self.resolve_gates(rule);
+            let gates = self.resolve_gates(win.rule_id, rule);
             match win.variant {
                 Variant::Raw => {
                     self.run_rule_on_raw_window_into(
@@ -1596,7 +1600,7 @@ impl Engine {
                                 continue;
                             }
                             let rule = &self.rules_hot[rid];
-                            let gates = self.resolve_gates(rule);
+                            let gates = self.resolve_gates(rid as u32, rule);
 
                             scratch.hit_acc_pool.take_into(pair, &mut scratch.windows);
                             if scratch.windows.is_empty() {
@@ -1790,7 +1794,9 @@ impl Engine {
         //
         // All-or-nothing: staged findings are only promoted to `scratch.out`
         // now that the stream completed, dedupe passed, and the gate was
-        // satisfied. `mem::take` + put-back avoids double-borrowing `scratch`.
+        // satisfied. `run_rule_on_*_window_into` only stages findings that
+        // already passed emit-time policy and `min_confidence`.
+        // `mem::take` + put-back avoids double-borrowing `scratch`.
         let mut tmp_findings = std::mem::take(&mut scratch.tmp_findings);
         let mut tmp_drop_hint_end = std::mem::take(&mut scratch.tmp_drop_hint_end);
         let mut tmp_norm_hash = std::mem::take(&mut scratch.tmp_norm_hash);
@@ -1811,6 +1817,8 @@ impl Engine {
         //
         // Deferred because `IfNoFindingsInThisBuffer` transforms must see the
         // final `found_any` state before deciding whether to enqueue.
+        // `found_any` reflects emitted/staged findings only (post-policy and
+        // post-threshold), not raw regex hits.
         let found_any_in_buf = found_any;
         let mut enqueued = 0usize;
         for pending in scratch.pending_spans.drain(..) {
