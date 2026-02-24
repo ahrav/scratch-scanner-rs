@@ -173,7 +173,6 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut null_sink = false;
     let mut scan_binary = false;
     let mut persist_findings = false;
-    let mut cross_rule_dedupe = true;
     let mut verbose = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
@@ -253,14 +252,6 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
                     persist_findings = true;
                     continue;
                 }
-                "--cross-rule-dedupe" => {
-                    cross_rule_dedupe = true;
-                    continue;
-                }
-                "--no-cross-rule-dedupe" => {
-                    cross_rule_dedupe = false;
-                    continue;
-                }
                 "--verbose" => {
                     verbose = true;
                     continue;
@@ -301,7 +292,6 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             anchor_mode,
             scan_binary,
             persist_findings,
-            cross_rule_dedupe,
         }),
         event_format,
         verbose,
@@ -708,9 +698,6 @@ FILE TYPE OPTIONS:
     --scan-archives         Scan archives (undo --skip-archives) [default: scan]
     --scan-binary           Scan binary files instead of skipping [default: skip]
     --skip-binary           Skip binary files (undo --scan-binary) [default: skip]
-    --cross-rule-dedupe     Enable cross-rule winner dedupe (spans only count when offsets stay stable) [default: on]
-    --no-cross-rule-dedupe  Disable cross-rule winner dedupe
-
 OUTPUT OPTIONS:
     --anchors=manual|derived  Anchor mode (default: manual)
     --event-format=jsonl|text|json|sarif  Output format (default: jsonl)
@@ -1364,12 +1351,6 @@ mod tests {
     }
 
     #[test]
-    fn fs_no_cross_rule_dedupe_flag_parsed() {
-        let cfg = fs_config(&["--path=/d", "--no-cross-rule-dedupe"]);
-        assert!(!cfg.cross_rule_dedupe);
-    }
-
-    #[test]
     fn git_scan_binary_flag_parsed() {
         let cfg = git_config(&["--repo=/r", "--scan-binary"]);
         assert!(cfg.scan_binary);
@@ -1395,12 +1376,6 @@ mod tests {
         assert!(!cfg.scan_binary);
     }
 
-    #[test]
-    fn fs_last_flag_wins_cross_rule_dedupe() {
-        let cfg = fs_config(&["--path=/d", "--no-cross-rule-dedupe", "--cross-rule-dedupe"]);
-        assert!(cfg.cross_rule_dedupe);
-    }
-
     // -- Defaults: file-type flags start at standard behavior -----------------
 
     #[test]
@@ -1408,10 +1383,6 @@ mod tests {
         let fs = fs_config(&["--path=/d"]);
         assert!(!fs.skip_archives, "archives should be scanned by default");
         assert!(!fs.scan_binary, "binary should be skipped by default");
-        assert!(
-            fs.cross_rule_dedupe,
-            "cross-rule dedupe should default to enabled"
-        );
 
         let git = git_config(&["--repo=/r"]);
         assert!(!git.scan_binary, "binary should be skipped by default");

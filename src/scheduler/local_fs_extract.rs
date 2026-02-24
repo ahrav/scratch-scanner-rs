@@ -9,7 +9,7 @@ use std::fs::File;
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, dedupe_findings_cross_rule, emit_findings,
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
     emit_persistence_batch, FileTask, LocalScratch,
 };
 
@@ -100,17 +100,10 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
         .scan_scratch
         .drain_findings_into(&mut scratch.pending);
 
-    let before_mode_pass = scratch.pending.len();
-    if scratch.cross_rule_dedupe && before_mode_pass > 1 {
-        dedupe_findings_cross_rule(&mut scratch.pending, |lhs, rhs| {
-            engine.rule_name(lhs).cmp(engine.rule_name(rhs))
-        });
-    } else if scratch.dedupe_within_chunk && before_mode_pass > 1 {
-        dedupe_findings(&mut scratch.pending);
-    }
+    let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
     let scheduler_pruned = before_prefix
         .saturating_sub(after_prefix)
-        .saturating_add(before_mode_pass.saturating_sub(scratch.pending.len()));
+        .saturating_add(dedupe_removed);
     account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
     if !scratch.pending.is_empty() {
         emit_persistence_batch(

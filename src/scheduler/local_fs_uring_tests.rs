@@ -203,7 +203,6 @@ fn uring_finds_boundary_spanning_match() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(),
@@ -278,7 +277,6 @@ fn uring_open_stat_parity_with_blocking() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(),
@@ -346,7 +344,6 @@ fn blocking_mode_skips_open_stat_ops() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(),
@@ -398,7 +395,6 @@ fn uring_binary_skipped_counted() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: true,
         archive: ArchiveConfig {
@@ -452,7 +448,6 @@ fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: true,
         archive: ArchiveConfig {
@@ -481,7 +476,7 @@ fn uring_cross_rule_mode_uses_hash_aware_winner_pass() -> io::Result<()> {
     let file_path = dir.path().join("a.txt");
     std::fs::write(&file_path, b"SECRET")?;
 
-    let mut cfg = LocalFsUringConfig {
+    let cfg = LocalFsUringConfig {
         cpu_workers: 2,
         io_threads: 1,
         ring_entries: 64,
@@ -497,7 +492,6 @@ fn uring_cross_rule_mode_uses_hash_aware_winner_pass() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: false,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig {
@@ -506,22 +500,12 @@ fn uring_cross_rule_mode_uses_hash_aware_winner_pass() -> io::Result<()> {
         },
     };
 
-    let sink_off = Arc::new(VecEventSink::new());
-    let (_summary, _io_stats, off_metrics) = scan_local_fs_uring(
-        Arc::clone(&engine),
-        &[dir.path().to_path_buf()],
-        cfg.clone(),
-        sink_off,
-    )?;
-    assert_eq!(off_metrics.findings_emitted, 1);
-
-    cfg.cross_rule_dedupe = true;
-    let sink_on = Arc::new(VecEventSink::new());
-    let (_summary, _io_stats, on_metrics) =
-        scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink_on)?;
+    let sink = Arc::new(VecEventSink::new());
+    let (_summary, _io_stats, metrics) =
+        scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
     assert_eq!(
-        on_metrics.findings_emitted, 2,
-        "cross-rule mode must route through hash-aware helper and preserve distinct hashes"
+        metrics.findings_emitted, 2,
+        "distinct hashes must preserve both findings"
     );
 
     Ok(())
@@ -570,7 +554,7 @@ fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
     drop(tx);
 
     let sink = Arc::new(VecEventSink::new());
-    let stats = extract_worker_loop(rx, engine, sink.clone(), true, false);
+    let stats = extract_worker_loop(rx, engine, sink.clone());
 
     assert_eq!(stats.files_extracted, 1, "expected extraction from open fd");
     assert_eq!(stats.io_errors, 0);
@@ -621,7 +605,6 @@ fn uring_archive_sniffed_counted() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true by default
@@ -689,7 +672,6 @@ fn uring_sniff_detected_gzip_emits_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true
@@ -763,7 +745,6 @@ fn uring_extension_routed_archive_emits_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true
@@ -830,7 +811,6 @@ fn uring_sniff_detected_zip_emits_findings() -> io::Result<()> {
         max_file_size: None,
         seed: 123,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         pin_threads: false,
         skip_binary: false,
         archive: ArchiveConfig::default(), // enabled=true

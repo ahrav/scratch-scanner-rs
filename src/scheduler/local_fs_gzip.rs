@@ -16,7 +16,7 @@ use super::local_fs_archive_ctx::{
     ArchiveScanCtx, ARCHIVE_STREAM_READ_MAX,
 };
 use super::local_fs_owner::{
-    account_effective_dropped_findings, dedupe_findings, dedupe_findings_cross_rule, emit_findings,
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
     emit_persistence_batch, FileTask, LocalScratch,
 };
 
@@ -34,8 +34,6 @@ pub(super) fn process_gzip_file<E: ScanEngine>(
     let engine = &scratch.engine;
     let overlap = engine.required_overlap();
     let chunk_size = scratch.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
-    let dedupe = scratch.dedupe_within_chunk;
-    let cross_rule_dedupe = scratch.cross_rule_dedupe;
 
     let file = match File::open(&task.path) {
         Ok(f) => f,
@@ -206,17 +204,10 @@ pub(super) fn process_gzip_file<E: ScanEngine>(
             .scan_scratch
             .drain_findings_into(&mut scratch.pending);
 
-        let before_mode_pass = scratch.pending.len();
-        if cross_rule_dedupe && before_mode_pass > 1 {
-            dedupe_findings_cross_rule(&mut scratch.pending, |lhs, rhs| {
-                engine.rule_name(lhs).cmp(engine.rule_name(rhs))
-            });
-        } else if dedupe && before_mode_pass > 1 {
-            dedupe_findings(&mut scratch.pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_mode_pass.saturating_sub(scratch.pending.len()));
+            .saturating_add(dedupe_removed);
         account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
 
         metrics.findings_emitted = metrics

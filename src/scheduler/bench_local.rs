@@ -336,7 +336,6 @@ mod tests {
             seed: 12345,
             pin_threads: false,
             dedupe_within_chunk: true,
-            cross_rule_dedupe: true,
             archive: ArchiveConfig::default(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),

@@ -41,7 +41,6 @@ fn small_config_with_sink(sink: Arc<VecEventSink>) -> LocalConfig {
         seed: 12345,
         pin_threads: false,
         dedupe_within_chunk: true,
-        cross_rule_dedupe: true,
         archive: ArchiveConfig::default(),
         skip_binary: true,
         event_sink: sink,
@@ -461,7 +460,7 @@ fn archive_extension_scans_when_disabled() {
 }
 
 // ---------------------------------------------------------------
-// dedupe_findings unit tests
+// dedupe_findings_cross_rule unit tests
 // ---------------------------------------------------------------
 
 fn finding(rule: u16, start: u64, end: u64) -> FindingRec {
@@ -483,14 +482,14 @@ fn hashed(f: FindingRec) -> FindingWithHash<FindingRec> {
 #[test]
 fn dedupe_empty_vec() {
     let mut v: Vec<FindingWithHash<FindingRec>> = Vec::new();
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert!(v.is_empty());
 }
 
 #[test]
 fn dedupe_single_element() {
     let mut v = vec![hashed(finding(0, 10, 16))];
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].finding.root_hint_start, 10);
 }
@@ -504,7 +503,7 @@ fn dedupe_removes_exact_duplicates() {
         hashed(finding(1, 20, 28)), // dup
         hashed(finding(2, 50, 56)),
     ];
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(v.len(), 3);
 }
 
@@ -515,8 +514,12 @@ fn dedupe_preserves_different_rules_same_offsets() {
         hashed(finding(1, 10, 16)),
         hashed(finding(2, 10, 16)),
     ];
-    dedupe_findings(&mut v);
-    assert_eq!(v.len(), 3, "distinct rule_ids should all be kept");
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
+    assert_eq!(
+        v.len(),
+        1,
+        "cross-rule dedupe selects winner among different rules at same location+hash"
+    );
 }
 
 #[test]
@@ -526,7 +529,7 @@ fn dedupe_preserves_same_rule_different_offsets() {
         hashed(finding(0, 20, 26)),
         hashed(finding(0, 30, 36)),
     ];
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(v.len(), 3, "distinct offsets should all be kept");
 }
 
@@ -537,7 +540,7 @@ fn dedupe_works_for_finding_with_hash_carrier() {
         FindingWithHash::new(finding(0, 10, 16), [1; 32]), // dup
         FindingWithHash::new(finding(1, 20, 26), [2; 32]),
     ];
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(v.len(), 2);
     assert_eq!(v[0].finding.rule_id, RuleId(0));
     assert_eq!(v[1].finding.rule_id, RuleId(1));
@@ -714,7 +717,7 @@ fn dedupe_same_span_different_hash_preserves_both() {
         FindingWithHash::new(finding(0, 10, 16), [0xAA; 32]),
         FindingWithHash::new(finding(0, 10, 16), [0xBB; 32]),
     ];
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(
         v.len(),
         2,
@@ -728,7 +731,7 @@ fn dedupe_same_span_same_hash_collapses() {
         FindingWithHash::new(finding(0, 10, 16), [0xCC; 32]),
         FindingWithHash::new(finding(0, 10, 16), [0xCC; 32]),
     ];
-    dedupe_findings(&mut v);
+    dedupe_findings_cross_rule(&mut v, |_, _| std::cmp::Ordering::Equal);
     assert_eq!(
         v.len(),
         1,
@@ -929,6 +932,39 @@ fn cross_rule_dedupe_preserves_distinct_spans_when_dedupe_with_span_is_true() {
         v.len(),
         2,
         "span should remain part of key when dedupe_with_span=true"
+    );
+}
+
+#[test]
+fn cross_rule_dedupe_mixed_span_modes_form_separate_groups() {
+    let mut v = vec![
+        SpanModeFinding {
+            rule_id: 0,
+            root_hint_start: 100,
+            root_hint_end: 120,
+            span_start: 100,
+            span_end: 110,
+            dedupe_with_span: false,
+            confidence_score: 5,
+            norm_hash: [0x33; 32],
+        },
+        SpanModeFinding {
+            rule_id: 1,
+            root_hint_start: 100,
+            root_hint_end: 120,
+            span_start: 105,
+            span_end: 115,
+            dedupe_with_span: true,
+            confidence_score: 8,
+            norm_hash: [0x33; 32],
+        },
+    ];
+
+    dedupe_findings_cross_rule(&mut v, |_lhs, _rhs| std::cmp::Ordering::Equal);
+    assert_eq!(
+        v.len(),
+        2,
+        "mixed dedupe_with_span values should form separate groups"
     );
 }
 

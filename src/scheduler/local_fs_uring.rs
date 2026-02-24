@@ -41,7 +41,7 @@ use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::file_id_alloc::FileIdAllocator;
-use super::local_fs_owner::{account_effective_dropped_findings, dedupe_findings_cross_rule};
+use super::local_fs_owner::{account_effective_dropped_findings, apply_cross_rule_dedupe};
 use super::metrics::MetricsSnapshot;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
@@ -155,16 +155,6 @@ pub struct LocalFsUringConfig {
     /// Deduplicate findings within each chunk.
     pub dedupe_within_chunk: bool,
 
-    /// When `true`, run cross-rule winner dedupe after prefix pruning.
-    ///
-    /// Cross-rule dedupe respects each finding's `dedupe_with_span()` flag so
-    /// spans only participate when the engine can provide stable offsets.
-    ///
-    /// Mode interaction:
-    /// - `true`: cross-rule winner pass (always runs when >1 finding)
-    /// - `false`: same-rule-only dedupe path (gated by `dedupe_within_chunk`)
-    pub cross_rule_dedupe: bool,
-
     /// Pin worker and I/O threads to CPU cores (Linux only, no-op elsewhere).
     pub pin_threads: bool,
 
@@ -193,7 +183,6 @@ impl Default for LocalFsUringConfig {
             max_file_size: None,
             seed: 1,
             dedupe_within_chunk: true,
-            cross_rule_dedupe: true,
             pin_threads: super::affinity::default_pin_threads(),
             skip_binary: true,
             archive: ArchiveConfig::default(),
@@ -579,49 +568,11 @@ struct CpuScratch<E: ScanEngine> {
     event_sink: Arc<dyn EventSink>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
-    dedupe_within_chunk: bool,
-    cross_rule_dedupe: bool,
 }
 
 // ============================================================================
 // Deduplication Helpers
 // ============================================================================
-
-/// In-place dedupe of findings by (rule_id, root_hint, span).
-///
-/// # Note on `norm_hash` omission
-///
-/// The local_fs_owner path uses [`FindingWithHashRecord`] which includes
-/// `norm_hash` in the dedup key to avoid collapsing distinct secrets at the
-/// same location. This function uses the base [`FindingRecord`] trait which
-/// does not expose `norm_hash`. If the engine's `Finding` type carries a
-/// hash, two findings with identical `(rule_id, root_hint, span)` but
-/// different normalized secrets will be collapsed here. This is acceptable
-/// for within-chunk dedupe (same bytes produce same secrets), but callers
-/// should be aware of this limitation for engines with transform chains.
-fn dedupe_pending_in_place<F: FindingRecord>(p: &mut Vec<F>) {
-    if p.len() <= 1 {
-        return;
-    }
-
-    p.sort_unstable_by_key(|f| {
-        (
-            f.rule_id(),
-            f.root_hint_start(),
-            f.root_hint_end(),
-            f.span_start(),
-            f.span_end(),
-        )
-    });
-
-    p.dedup_by(|a, b| {
-        a.rule_id() == b.rule_id()
-            && a.root_hint_start() == b.root_hint_start()
-            && a.root_hint_end() == b.root_hint_end()
-            && a.span_start() == b.span_start()
-            && a.span_end() == b.span_end()
-    });
-}
 
 /// Emit findings as [`FindingEvent`]s through the event sink.
 ///
@@ -694,18 +645,13 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
                 .drain_findings_into(&mut ctx.scratch.pending);
 
             let before_mode_pass = ctx.scratch.pending.len();
-            if ctx.scratch.cross_rule_dedupe && before_mode_pass > 1 {
-                dedupe_findings_cross_rule(&mut ctx.scratch.pending, |lhs, rhs| {
-                    engine.rule_name(lhs).cmp(engine.rule_name(rhs))
-                });
-            } else if ctx.scratch.dedupe_within_chunk && before_mode_pass > 1 {
-                dedupe_pending_in_place(&mut ctx.scratch.pending);
-            }
+            let dedupe_removed =
+                apply_cross_rule_dedupe(&mut ctx.scratch.pending, &*ctx.scratch.engine);
 
             // Account for dropped findings: engine drops minus scheduler pruning.
             let scheduler_pruned = before_prefix
                 .saturating_sub(after_prefix)
-                .saturating_add(before_mode_pass.saturating_sub(ctx.scratch.pending.len()));
+                .saturating_add(dedupe_removed);
             account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
 
             emit_findings(
@@ -748,8 +694,6 @@ struct UringArchiveSink<'a, E: ScanEngine> {
     next_entry_index: u32,
     file_ids: Arc<FileIdAllocator>,
     file_id: FileId,
-    dedupe: bool,
-    cross_rule_dedupe: bool,
     bytes_scanned: u64,
     chunks_scanned: u64,
     findings_emitted: u64,
@@ -782,18 +726,10 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
         self.pending.clear();
         self.scratch.drain_findings_into(self.pending);
 
-        let before_mode_pass = self.pending.len();
-        if self.cross_rule_dedupe && before_mode_pass > 1 {
-            let engine = self.engine;
-            dedupe_findings_cross_rule(self.pending, |lhs, rhs| {
-                engine.rule_name(lhs).cmp(engine.rule_name(rhs))
-            });
-        } else if self.dedupe && before_mode_pass > 1 {
-            dedupe_pending_in_place(self.pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(self.pending, self.engine);
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_mode_pass.saturating_sub(self.pending.len()));
+            .saturating_add(dedupe_removed);
         let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
         self.findings_dropped = self.findings_dropped.saturating_add(effective_dropped);
 
@@ -835,8 +771,6 @@ fn archive_worker_loop<E: ScanEngine>(
     event_sink: Arc<dyn EventSink>,
     file_ids: Arc<FileIdAllocator>,
     cfg: ArchiveConfig,
-    dedupe: bool,
-    cross_rule_dedupe: bool,
 ) -> ArchiveWorkerStats {
     let overlap = engine.required_overlap();
     let chunk_size = 256 * 1024; // Match ARCHIVE_STREAM_READ_MAX ceiling.
@@ -878,8 +812,6 @@ fn archive_worker_loop<E: ScanEngine>(
             next_entry_index: 0,
             file_ids: Arc::clone(&file_ids),
             file_id: work.token.file_id,
-            dedupe,
-            cross_rule_dedupe,
             bytes_scanned: 0,
             chunks_scanned: 0,
             findings_emitted: 0,
@@ -978,8 +910,6 @@ fn extract_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ExtractWork>,
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
-    dedupe: bool,
-    cross_rule_dedupe: bool,
 ) -> ExtractWorkerStats {
     use crate::content_policy::extract::{
         extract_content, ExtractResult, EXTRACT_INPUT_CAP, EXTRACT_OUTPUT_CAP, JAR_ENTRY_CAP,
@@ -1034,17 +964,10 @@ fn extract_worker_loop<E: ScanEngine>(
         pending.clear();
         scratch.drain_findings_into(&mut pending);
 
-        let before_mode_pass = pending.len();
-        if cross_rule_dedupe && before_mode_pass > 1 {
-            dedupe_findings_cross_rule(&mut pending, |lhs, rhs| {
-                engine.rule_name(lhs).cmp(engine.rule_name(rhs))
-            });
-        } else if dedupe && before_mode_pass > 1 {
-            dedupe_pending_in_place(&mut pending);
-        }
+        let dedupe_removed = apply_cross_rule_dedupe(&mut pending, engine.as_ref());
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
-            .saturating_add(before_mode_pass.saturating_sub(pending.len()));
+            .saturating_add(dedupe_removed);
         let effective_dropped = engine_dropped.saturating_sub(scheduler_pruned as u64);
         total_dropped = total_dropped.saturating_add(effective_dropped);
 
@@ -2573,8 +2496,6 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
         {
             let engine = Arc::clone(&engine);
             let event_sink = Arc::clone(&event_sink);
-            let dedupe = cfg.dedupe_within_chunk;
-            let cross_rule_dedupe = cfg.cross_rule_dedupe;
             move |_wid| CpuScratch {
                 engine: Arc::clone(&engine),
                 event_sink: Arc::clone(&event_sink),
@@ -2582,8 +2503,6 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
                 // Match the local scan default: avoid steady-state allocs without
                 // relying on engine-specific tuning details.
                 pending: Vec::with_capacity(4096),
-                dedupe_within_chunk: dedupe,
-                cross_rule_dedupe,
             }
         },
         cpu_runner::<E>,
@@ -2617,22 +2536,12 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             let event_sink = Arc::clone(&event_sink);
             let file_ids = Arc::clone(&file_ids);
             let archive_cfg = cfg.archive.clone();
-            let dedupe = cfg.dedupe_within_chunk;
-            let cross_rule_dedupe = cfg.cross_rule_dedupe;
 
             archive_threads.push(
                 thread::Builder::new()
                     .name(format!("uring-archive-{wid}"))
                     .spawn(move || {
-                        archive_worker_loop(
-                            rx,
-                            engine,
-                            event_sink,
-                            file_ids,
-                            archive_cfg,
-                            dedupe,
-                            cross_rule_dedupe,
-                        )
+                        archive_worker_loop(rx, engine, event_sink, file_ids, archive_cfg)
                     })
                     .expect("failed to spawn archive worker thread"),
             );
@@ -2662,15 +2571,11 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
             let rx = erx.clone();
             let engine = Arc::clone(&engine);
             let event_sink = Arc::clone(&event_sink);
-            let dedupe = cfg.dedupe_within_chunk;
-            let cross_rule_dedupe = cfg.cross_rule_dedupe;
 
             extract_threads.push(
                 thread::Builder::new()
                     .name(format!("uring-extract-{wid}"))
-                    .spawn(move || {
-                        extract_worker_loop(rx, engine, event_sink, dedupe, cross_rule_dedupe)
-                    })
+                    .spawn(move || extract_worker_loop(rx, engine, event_sink))
                     .expect("failed to spawn extraction worker thread"),
             );
         }
