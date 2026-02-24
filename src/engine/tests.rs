@@ -3115,41 +3115,65 @@ fn offline_validation_mixed_rules_selective_suppression() {
 /// explicit `secret_group` override, no-group fallback, empty-group fallback,
 /// explicit group-0 override, and empty-configured-group fallback.
 #[rstest]
-#[case::prefers_group1(
-    &[b"KEY_" as &[u8]], None, r"KEY_([A-Za-z0-9]{8,16})",
-    b"prefix KEY_SecretValue1 suffix" as &[u8], b"SecretValue1" as &[u8],
-)]
+#[case::prefers_group1(0, None, r"KEY_([A-Za-z0-9]{8,16})", b"prefix KEY_SecretValue1 suffix" as &[u8], b"SecretValue1" as &[u8])]
 #[case::uses_configured_secret_group(
-    &[b"TOK"], Some(2), r"TOK([A-Z]+):([a-z0-9]{8,16})",
-    b"prefix TOKTYPE:secretval12 suffix", b"secretval12",
+    1,
+    Some(2),
+    r"TOK([A-Z]+):([a-z0-9]{8,16})",
+    b"prefix TOKTYPE:secretval12 suffix",
+    b"secretval12"
 )]
 #[case::falls_back_to_full_match_without_groups(
-    &[b"AKIA"], None, r"AKIA[A-Z0-9]{16}",
-    b"prefix AKIAIOSFODNN7REAL123 suffix", b"AKIAIOSFODNN7REAL123",
+    2,
+    None,
+    r"AKIA[A-Z0-9]{16}",
+    b"prefix AKIAIOSFODNN7REAL123 suffix",
+    b"AKIAIOSFODNN7REAL123"
 )]
 #[case::skips_empty_group1(
-    &[b"OPT"], None, r"OPT([A-Z]*)_[a-z0-9]{8}",
-    b"prefix OPT_abcd1234 suffix", b"OPT_abcd1234",
+    3,
+    None,
+    r"OPT([A-Z]*)_[a-z0-9]{8}",
+    b"prefix OPT_abcd1234 suffix",
+    b"OPT_abcd1234"
 )]
 #[case::explicit_group0_overrides_group1(
-    &[b"TOK_"], Some(0), r"TOK_([A-Za-z0-9]{8})_END",
-    b"prefix TOK_Secret12_END suffix", b"TOK_Secret12_END",
+    4,
+    Some(0),
+    r"TOK_([A-Za-z0-9]{8})_END",
+    b"prefix TOK_Secret12_END suffix",
+    b"TOK_Secret12_END"
 )]
 #[case::empty_configured_group_falls_back(
-    &[b"CFG_"], Some(2), r"CFG_([a-z0-9]{8})([A-Z]*)",
-    b"prefix CFG_secret12 suffix", b"secret12",
+    5,
+    Some(2),
+    r"CFG_([a-z0-9]{8})([A-Z]*)",
+    b"prefix CFG_secret12 suffix",
+    b"secret12"
 )]
 fn secret_extraction_span(
-    #[case] anchors: &'static [&'static [u8]],
+    #[case] anchor_idx: usize,
     #[case] secret_group: Option<u16>,
     #[case] pattern: &str,
     #[case] hay: &[u8],
     #[case] expected_secret: &[u8],
 ) {
+    const ANCHOR_SETS: &[&[&[u8]]] = &[
+        &[b"KEY_"], // 0: prefers_group1
+        &[b"TOK"],  // 1: uses_configured_secret_group
+        &[b"AKIA"], // 2: falls_back_to_full_match_without_groups
+        &[b"OPT"],  // 3: skips_empty_group1
+        &[b"TOK_"], // 4: explicit_group0_overrides_group1
+        &[b"CFG_"], // 5: empty_configured_group_falls_back
+    ];
     let rule = RuleSpec {
         radius: 16,
         secret_group,
-        ..base_rule("se-test", anchors, Regex::new(pattern).unwrap())
+        ..base_rule(
+            "se-test",
+            ANCHOR_SETS[anchor_idx],
+            Regex::new(pattern).unwrap(),
+        )
     };
     let eng = Engine::new_with_anchor_policy(
         vec![rule],
@@ -3505,104 +3529,6 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
     // The fix ensures root_span_hint uses w.clone() instead of span_in_buf.clone().
 }
 
-#[test]
-fn secret_extraction_explicit_group0_overrides_group1() {
-    // When secret_group is explicitly set to 0, it should use the full match
-    // even if group 1 exists and is non-empty. This is useful for rules where
-    // capture groups exist for other purposes (e.g., GUID repetition in URLs).
-    const ANCHORS: &[&[u8]] = &[b"TOK_"];
-    let rule = RuleSpec {
-        name: "explicit-group0",
-        anchors: ANCHORS,
-        radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: Some(0), // Explicitly use full match
-        min_confidence: None,
-        offline_validation: None,
-        // Pattern: TOK_<secret>_END where <secret> would normally be group 1
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8})_END").unwrap(),
-    };
-    let eng = Engine::new_with_anchor_policy(
-        vec![rule],
-        Vec::new(),
-        demo_tuning(),
-        AnchorPolicy::ManualOnly,
-    );
-
-    let hay = b"prefix TOK_Secret12_END suffix";
-    let hits = scan_chunk_findings(&eng, hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "explicit-group0"),
-        "expected finding for explicit-group0 rule"
-    );
-
-    let hit = hits.iter().find(|h| h.rule == "explicit-group0").unwrap();
-    let secret = &hay[hit.span.clone()];
-    // With secret_group: Some(0), should extract full match, not group 1
-    assert_eq!(
-        secret, b"TOK_Secret12_END",
-        "secret_group: Some(0) should extract full match, not group 1"
-    );
-}
-
-#[test]
-fn secret_extraction_empty_configured_group_falls_back() {
-    // When secret_group points to a group that matches empty, fall back to
-    // group 1 or full match (same as empty group 1 behavior).
-    const ANCHORS: &[&[u8]] = &[b"CFG_"];
-    let rule = RuleSpec {
-        name: "empty-configured-group",
-        anchors: ANCHORS,
-        radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: Some(2), // Points to group 2 which can be empty
-        min_confidence: None,
-        offline_validation: None,
-        // Pattern: CFG_<prefix>_<optional> - group 1 is prefix, group 2 is optional suffix
-        uuid_format_secret: false,
-        re: Regex::new(r"CFG_([a-z0-9]{8})([A-Z]*)").unwrap(),
-    };
-    let eng = Engine::new_with_anchor_policy(
-        vec![rule],
-        Vec::new(),
-        demo_tuning(),
-        AnchorPolicy::ManualOnly,
-    );
-
-    // Input where group 2 is empty (no uppercase letters after the prefix)
-    let hay = b"prefix CFG_secret12 suffix";
-    let hits = scan_chunk_findings(&eng, hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "empty-configured-group"),
-        "expected finding for empty-configured-group rule"
-    );
-
-    let hit = hits
-        .iter()
-        .find(|h| h.rule == "empty-configured-group")
-        .unwrap();
-    let secret = &hay[hit.span.clone()];
-    // Group 2 is empty, so should fall back to group 1
-    assert_eq!(
-        secret, b"secret12",
-        "when configured group is empty, should fall back to group 1"
-    );
-}
 
 #[test]
 fn anchor_policy_prefers_derived_over_manual() {
