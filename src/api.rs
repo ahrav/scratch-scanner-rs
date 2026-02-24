@@ -1021,7 +1021,7 @@ pub enum OfflineVerdict {
 pub mod confidence {
     /// Entropy gate passed — secret has sufficient randomness.
     pub const ENTROPY_PASS: i8 = 1;
-    /// Keyword gate matched — context contains expected key name.
+    /// Local keyword evidence — rule keyword found within 32 bytes of the match span.
     pub const KEYWORD_PRESENT: i8 = 2;
     /// Assignment-shape check passed — secret follows `key = value` pattern.
     pub const ASSIGNMENT_SHAPE: i8 = 2;

@@ -282,13 +282,6 @@ fn compute_confidence_score_cases() {
             0,
         ),
         (
-            "failed entropy contributes zero",
-            stub_evidence(Some(EntropyGateOutcome::Failed), false),
-            false,
-            false,
-            0,
-        ),
-        (
             "assignment shape only",
             stub_evidence(None, false),
             true,

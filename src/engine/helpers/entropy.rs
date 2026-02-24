@@ -404,7 +404,7 @@ mod tests {
         );
     }
 
-    /// entropy_gate_passes rejects skewed distribution via min-entropy.
+    /// entropy_gate_outcome rejects skewed distribution via min-entropy.
     #[test]
     fn entropy_gate_rejects_via_min_entropy() {
         let spec = EntropyCompiled {

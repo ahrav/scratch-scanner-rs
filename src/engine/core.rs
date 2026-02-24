@@ -2188,7 +2188,7 @@ pub fn bench_contains_all_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> b
     super::helpers::contains_all_memmem(hay, &needles.patterns)
 }
 
-/// Benchmark helper for `entropy_gate_passes`.
+/// Benchmark helper for the entropy gate (delegates to `entropy_gate_outcome` internally).
 #[cfg(feature = "bench")]
 pub struct BenchEntropyState {
     max_len: usize,
@@ -2228,7 +2228,7 @@ pub fn bench_build_entropy_state(max_len: usize) -> BenchEntropyState {
     BenchEntropyState::new(max_len)
 }
 
-/// Benchmark helper for `entropy_gate_passes` using reusable prebuilt state.
+/// Benchmark helper for the entropy gate using reusable prebuilt state.
 #[cfg(feature = "bench")]
 #[inline(always)]
 pub fn bench_entropy_gate_passes_with_state(

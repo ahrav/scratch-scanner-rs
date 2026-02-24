@@ -48,21 +48,23 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 7] Check entropy on extracted secret (Shannon + optional min-entropy)
   ↓
-[Gate 8] Apply value suppressors on extracted secret bytes (when configured)
+[Step 8] Probe for keyword evidence in local context (±32 bytes around full match)
   ↓
-[Gate 9] Apply local context checks (bounded, fail-open)
+[Gate 9] Apply value suppressors on extracted secret bytes (when configured)
   ↓
-[Gate 10] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
+[Gate 10] Apply local context checks (bounded, fail-open)
   ↓
-[Gate 11] Apply secret-bytes safelist suppression (all findings, including decoded)
+[Gate 11] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
   ↓
-[Gate 12] Apply UUID-format quick-reject (all findings, gated per-rule by uuid_format_secret())
+[Gate 12] Apply secret-bytes safelist suppression (all findings, including decoded)
   ↓
-[Gate 13] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+[Gate 13] Apply UUID-format quick-reject (all findings, gated per-rule by uuid_format_secret())
   ↓
-[Step 14] Compute additive confidence score from per-finding evidence outcomes
+[Gate 14] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
-[Gate 15] Apply per-rule `min_confidence` threshold
+[Step 15] Compute additive confidence score from per-finding evidence outcomes
+  ↓
+[Gate 16] Apply per-rule `min_confidence` threshold
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```

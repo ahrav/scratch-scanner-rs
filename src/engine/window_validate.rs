@@ -562,10 +562,8 @@ fn keyword_local_hit(
 ///
 /// # Output range
 /// Phase 1 scores are clamped to `0..=10`. The theoretical maximum is 10
-/// (entropy + keyword + assignment + offline), though no single rule currently
-/// reaches it because the highest-scoring rule (`generic-api-key`, which
-/// earns entropy + keyword + assignment = 5) lacks offline validation.
-/// Callers compare the result against
+/// (entropy + keyword + assignment + offline). No current rule earns all
+/// four signals simultaneously. Callers compare the result against
 /// `ResolvedGates::min_confidence` for threshold filtering.
 ///
 /// `#[inline(always)]` because the function is called on every finding
@@ -577,6 +575,10 @@ fn compute_confidence_score(
     rule: &RuleCompiled,
     outcome: &EmitPolicyOutcome,
 ) -> i8 {
+    debug_assert!(
+        !matches!(evidence.entropy_outcome, Some(EntropyGateOutcome::Failed)),
+        "Failed entropy outcome should never reach confidence scoring"
+    );
     let mut s: i8 = 0;
     if matches!(
         evidence.entropy_outcome,

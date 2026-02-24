@@ -83,7 +83,8 @@ flowchart TB
     UTF16Dec --> SecretExtract
 
     SecretExtract --> Entropy
-    Entropy --> ValueSuppressors
+    Entropy --> KeywordEvidence["keyword_local_hit()<br/>(±32 bytes around match)"]
+    KeywordEvidence --> ValueSuppressors
     ValueSuppressors --> LocalCtx
     LocalCtx --> Safelist
     Safelist --> SecretSafelist
