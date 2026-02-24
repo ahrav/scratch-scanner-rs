@@ -6571,6 +6571,88 @@ fn confidence_score_assignment_shape_gate() {
     );
 }
 
+fn stage1_generic_api_key_rule() -> RuleSpec {
+    // Stage 1 requires entropy-backed confidence: assignment shape (2) + keyword (2)
+    // tops out at 4, so min_confidence=5 forces an entropy contribution.
+    RuleSpec {
+        radius: 128,
+        keywords_any: Some(&[b"api_key", b"token"]),
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.5,
+            min_len: 16,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+        }),
+        min_confidence: Some(5),
+        secret_group: Some(1),
+        ..base_rule(
+            "generic-api-key",
+            &[b"api_key", b"token"],
+            Regex::new(r"(?i)(?:api_key|token)\s*=\s*([A-Za-z0-9_]{10,40})").unwrap(),
+        )
+    }
+}
+
+#[test]
+fn generic_api_key_stage1_requires_measured_entropy_to_emit() {
+    let engine = Engine::new_with_anchor_policy(
+        vec![stage1_generic_api_key_rule()],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(
+        engine.rule_min_confidence(0),
+        5,
+        "stage1 generic-api-key rule should require confidence >= 5"
+    );
+
+    let mut scratch = engine.new_scratch();
+
+    // Assignment + keyword + assignment-shape can only reach 4 when
+    // entropy is not measured (len < 16), so this should be filtered.
+    engine.scan_chunk_into(b"api_key=driver_probe suffix", FileId(0), 0, &mut scratch);
+    assert!(
+        scratch.findings().is_empty(),
+        "generic-api-key should reject assignment/keyword evidence without measured entropy"
+    );
+
+    engine.scan_chunk_into(
+        b"api_key=A1b2C3d4E5f6G7h8 suffix",
+        FileId(1),
+        0,
+        &mut scratch,
+    );
+    let recs = scratch.findings();
+    assert_eq!(recs.len(), 1, "measured-entropy token should emit");
+    assert_eq!(
+        recs[0].confidence_score,
+        confidence::ASSIGNMENT_SHAPE + confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS,
+        "stage1 generic-api-key score should include assignment+keyword+entropy signals"
+    );
+}
+
+#[test]
+fn generic_api_key_stage1_rejects_identifier_like_constant() {
+    let engine = Engine::new_with_anchor_policy(
+        vec![stage1_generic_api_key_rule()],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(
+        b"token=CONFIG_CONFIG_CONFIG suffix",
+        FileId(0),
+        0,
+        &mut scratch,
+    );
+    assert!(
+        scratch.findings().is_empty(),
+        "identifier-like constant should not survive stage1 generic-api-key thresholds"
+    );
+}
+
 #[test]
 fn keyword_entropy_auto_tier_requires_measured_entropy_evidence() {
     let rule = RuleSpec {
@@ -6751,11 +6833,10 @@ fn rule_min_confidence_offline_plus_keywords_entropy_uses_keyword_tier() {
 
 #[test]
 fn transform_finding_confidence_meets_offline_rule_threshold() {
-    // A rule with offline validation produces a min_confidence of OFFLINE_VALID (5).
+    // Offline validation is intentionally excluded from auto-derived min_confidence.
     // Transform-derived findings (non-root step) bypass offline validation, so
-    // they cannot earn the +5 offline signal. If the auto-derived threshold is
-    // set to OFFLINE_VALID, those transform findings would have a confidence_score
-    // below the threshold, causing downstream policy to incorrectly drop them.
+    // they cannot earn OFFLINE_VALID (+5). This regression test ensures the
+    // effective threshold remains compatible with valid transform findings.
     let rule = offline_crc_rule();
 
     let transforms = vec![TransformConfig {

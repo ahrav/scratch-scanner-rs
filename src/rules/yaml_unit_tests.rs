@@ -683,6 +683,30 @@ fn structured_prefix_rules_keep_value_suppressors_unset() {
 }
 
 #[test]
+fn generic_api_key_stage1_policy_requires_entropy_backed_confidence() {
+    // Keep default_rules.yaml aligned with Stage 1 semantics verified in engine tests.
+    let rule = builtin_rule_by_name("generic-api-key");
+    assert_eq!(
+        rule.min_confidence,
+        Some(5),
+        "generic-api-key should pin Stage 1 confidence floor to 5"
+    );
+
+    let entropy = rule
+        .entropy
+        .as_ref()
+        .expect("generic-api-key should keep entropy gate enabled");
+    assert_eq!(
+        entropy.min_bits_per_byte, 3.5,
+        "Stage 1 should keep existing Shannon entropy threshold"
+    );
+    assert_eq!(
+        entropy.min_entropy_bits_per_byte, None,
+        "Stage 1 should not enable min-entropy tightening yet"
+    );
+}
+
+#[test]
 fn suppressor_value_cases() {
     // Each entry: (rule_name, haystack, expect_hit, label).
     const CASES: &[(&str, &[u8], bool, &str)] = &[
@@ -734,6 +758,20 @@ fn suppressor_value_cases() {
             b"API_KEY=YOUR_EXAMPLE_1",
             false,
             "placeholder API key should be suppressed",
+        ),
+        // Linux-style identifier assignment should not survive Stage 1.
+        (
+            "generic-api-key",
+            b"api_key=driver_probe",
+            false,
+            "short identifier assignment should fail generic-api-key confidence floor",
+        ),
+        // Another identifier-like constant without entropy evidence.
+        (
+            "generic-api-key",
+            b"token=KERNEL_STACK_ID",
+            false,
+            "identifier-like constant should fail generic-api-key confidence floor",
         ),
         // Formerly: generic_api_key_allows_real_value
         (
