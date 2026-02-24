@@ -1,0 +1,81 @@
+{
+  "metrics_semantics": "position_pr_curve",
+  "metrics": {
+    "average_precision": 1.0,
+    "precision": 0.75,
+    "recall": 1.0,
+    "f1": 0.8571428571428571,
+    "f2": 0.9375,
+    "tp": 3,
+    "fp": 1,
+    "false_neg": 0,
+    "unlabeled": 0,
+    "baseline_ap": 0.75,
+    "precision_at_recall": [
+      {
+        "target": 0.8,
+        "value": 1.0
+      },
+      {
+        "target": 0.9,
+        "value": 1.0
+      },
+      {
+        "target": 0.95,
+        "value": 1.0
+      }
+    ],
+    "recall_at_precision": [
+      {
+        "target": 0.95,
+        "value": 1.0
+      }
+    ],
+    "ap_ci": {
+      "lower": 1.0,
+      "upper": 1.0
+    },
+    "per_rule": {
+      "aws-access-key": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "generic-api-key": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "generic-secret": {
+        "tp": 0,
+        "fp": 1,
+        "precision": 0.0
+      },
+      "hex-token": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      }
+    }
+  },
+  "provenance": {
+    "corpus_hash": "eb4f904740a66b0c9c1cce516958c002689e89f22535c93ea304ad77e01e8029",
+    "corpus_file_count": 2,
+    "corpus_total_bytes": 166
+  },
+  "pipeline_config": {
+    "cross_rule_dedup": false
+  },
+  "error_book": {
+    "false_positives": [
+      {
+        "rule": "generic-secret",
+        "count": 1,
+        "classification": "FALSE_POSITIVE",
+        "confidence": 4,
+        "path": "normhash.py"
+      }
+    ],
+    "false_negatives": []
+  }
+}
