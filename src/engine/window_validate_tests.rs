@@ -399,3 +399,36 @@ fn min_confidence_threshold_allows_finding_at_threshold() {
         "keyword gate should contribute KEYWORD_PRESENT and satisfy threshold"
     );
 }
+
+#[cfg(feature = "perf-stats")]
+#[test]
+fn confidence_suppressed_counter_increments_and_resets() {
+    // A rule with min_confidence=1 and no keyword/entropy gates: all findings
+    // score 0 and get suppressed, incrementing the counter.
+    let rule = min_conf_rule("counter-test", None, 1);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+
+    // First scan: one finding suppressed by confidence threshold.
+    engine.scan_chunk_into(b"prefix TOK_ABCDEFGH suffix", FileId(0), 0, &mut scratch);
+    assert_eq!(
+        scratch.confidence_suppressed(),
+        1,
+        "confidence_suppressed counter should increment on suppression"
+    );
+
+    // Second scan (new file): another suppressed finding. Verify the counter
+    // was reset (reads 1 again, not accumulated to 2).
+    engine.scan_chunk_into(b"prefix TOK_XYZWVUTS suffix", FileId(1), 0, &mut scratch);
+    assert_eq!(
+        scratch.confidence_suppressed(),
+        1,
+        "confidence_suppressed counter should reset between scans (reads 1, not 2)"
+    );
+}

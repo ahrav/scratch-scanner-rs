@@ -106,6 +106,14 @@ pub(super) struct ResolvedGates<'e> {
     pub(super) min_confidence: i8,
 }
 
+impl ResolvedGates<'_> {
+    /// Returns `true` when the confidence score meets the rule's threshold.
+    #[inline(always)]
+    fn passes_threshold(&self, score: i8) -> bool {
+        score >= self.min_confidence
+    }
+}
+
 impl Engine {
     /// Resolves all per-window gates for a rule into stack-local references.
     ///
@@ -115,8 +123,17 @@ impl Engine {
     /// rule-specific and do not vary by variant; the per-pair call frequency
     /// is an artifact of the loop structure, not a semantic requirement.
     /// See [`ResolvedGates`] for the optimization rationale.
+    ///
+    /// `rule_id` is required separately because `min_confidence` is stored in
+    /// `rules_cold` (not in `RuleCompiled`) and resolved via
+    /// [`rule_min_confidence`](Engine::rule_min_confidence).
     #[inline(always)]
     pub(super) fn resolve_gates(&self, rule_id: u32, rule: &RuleCompiled) -> ResolvedGates<'_> {
+        let min_confidence = self.rule_min_confidence(rule_id);
+        debug_assert!(
+            (0..=10).contains(&min_confidence),
+            "min_confidence {min_confidence} out of Phase 1 range for rule {rule_id}"
+        );
         ResolvedGates {
             confirm_all: self.confirm_all_gate(rule.confirm_all),
             keywords: self.keyword_gate(rule.keywords),
@@ -124,7 +141,7 @@ impl Engine {
             char_class: self.char_class_gate(rule.char_class),
             value_suppressors: self.value_suppressor_gate(rule.value_suppressors),
             local_context: self.local_context_gate(rule.local_context),
-            min_confidence: self.rule_min_confidence(rule_id),
+            min_confidence,
         }
     }
 }
@@ -671,7 +688,11 @@ impl Engine {
                                 return;
                             };
                             let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                            if confidence_score < gates.min_confidence {
+                            if !gates.passes_threshold(confidence_score) {
+                                crate::perf_stats::sat_add_usize(
+                                    &mut scratch.confidence_suppressed,
+                                    1,
+                                );
                                 return;
                             }
                             scratch.push_finding_with_drop_hint(
@@ -963,7 +984,8 @@ impl Engine {
                         return;
                     };
                     let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                    if confidence_score < gates.min_confidence {
+                    if !gates.passes_threshold(confidence_score) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
                         return;
                     }
                     scratch.push_finding_with_drop_hint(
@@ -1142,7 +1164,8 @@ impl Engine {
                         return;
                     };
                     let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                    if confidence_score < gates.min_confidence {
+                    if !gates.passes_threshold(confidence_score) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
                         return;
                     }
                     // Set found_any only for findings that are actually staged.
@@ -1172,7 +1195,7 @@ impl Engine {
     ///
     /// Staging variant of [`run_rule_on_utf16_window_aligned`]. Applies the
     /// same gate sequence (pre-decode raw gates, decode, post-decode gates,
-    /// regex, emit-time policy) but writes to `tmp_*` staging buffers instead
+    /// regex, emit-time policy, confidence threshold) but writes to `tmp_*` staging buffers instead
     /// of committing directly. See that method for the full gate ordering and
     /// safety justification for the `utf16_buf` raw-pointer reborrow.
     ///
@@ -1391,7 +1414,8 @@ impl Engine {
                         return;
                     };
                     let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                    if confidence_score < gates.min_confidence {
+                    if !gates.passes_threshold(confidence_score) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
                         return;
                     }
                     // Set found_any only for findings that are actually staged
