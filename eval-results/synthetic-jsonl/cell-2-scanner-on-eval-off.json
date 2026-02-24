@@ -1,0 +1,78 @@
+{
+  "metrics_semantics": "position_pr_curve",
+  "metrics": {
+    "average_precision": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "f2": 1.0,
+    "tp": 6,
+    "fp": 0,
+    "false_neg": 0,
+    "unlabeled": 0,
+    "baseline_ap": 1.0,
+    "precision_at_recall": [
+      {
+        "target": 0.8,
+        "value": 1.0
+      },
+      {
+        "target": 0.9,
+        "value": 1.0
+      },
+      {
+        "target": 0.95,
+        "value": 1.0
+      }
+    ],
+    "recall_at_precision": [
+      {
+        "target": 0.95,
+        "value": 1.0
+      }
+    ],
+    "ap_ci": {
+      "lower": 0.9999999999999999,
+      "upper": 1.0
+    },
+    "per_rule": {
+      "aws-access-key": {
+        "tp": 2,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "aws-extended": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "aws-prefix": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "generic-api-key": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "hex-token": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      }
+    }
+  },
+  "provenance": {
+    "corpus_hash": "7b1145eb135d7a3b8e9f1f53020559293b1a3b007100e87bcf03770515b32930",
+    "corpus_file_count": 3,
+    "corpus_total_bytes": 259
+  },
+  "pipeline_config": {
+    "cross_rule_dedup": false
+  },
+  "error_book": {
+    "false_positives": [],
+    "false_negatives": []
+  }
+}

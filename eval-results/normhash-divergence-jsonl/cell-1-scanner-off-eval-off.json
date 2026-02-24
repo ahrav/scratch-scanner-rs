@@ -1,0 +1,93 @@
+{
+  "metrics_semantics": "position_pr_curve",
+  "metrics": {
+    "average_precision": 0.9166666666666666,
+    "precision": 0.5,
+    "recall": 1.0,
+    "f1": 0.6666666666666666,
+    "f2": 0.8333333333333334,
+    "tp": 3,
+    "fp": 3,
+    "false_neg": 0,
+    "unlabeled": 0,
+    "baseline_ap": 0.5,
+    "precision_at_recall": [
+      {
+        "target": 0.8,
+        "value": 0.75
+      },
+      {
+        "target": 0.9,
+        "value": 0.75
+      },
+      {
+        "target": 0.95,
+        "value": 0.75
+      }
+    ],
+    "recall_at_precision": [
+      {
+        "target": 0.95,
+        "value": 0.6666666666666666
+      }
+    ],
+    "ap_ci": {
+      "lower": 0.7333333333333334,
+      "upper": 1.0
+    },
+    "per_rule": {
+      "aws-access-key": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "generic-api-key": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "generic-secret": {
+        "tp": 0,
+        "fp": 1,
+        "precision": 0.0
+      },
+      "github-pat": {
+        "tp": 0,
+        "fp": 2,
+        "precision": 0.0
+      },
+      "hex-token": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      }
+    }
+  },
+  "provenance": {
+    "corpus_hash": "eb4f904740a66b0c9c1cce516958c002689e89f22535c93ea304ad77e01e8029",
+    "corpus_file_count": 2,
+    "corpus_total_bytes": 166
+  },
+  "pipeline_config": {
+    "cross_rule_dedup": false
+  },
+  "error_book": {
+    "false_positives": [
+      {
+        "rule": "github-pat",
+        "count": 2,
+        "classification": "FALSE_POSITIVE",
+        "confidence": 6,
+        "path": "normhash.py"
+      },
+      {
+        "rule": "generic-secret",
+        "count": 1,
+        "classification": "FALSE_POSITIVE",
+        "confidence": 4,
+        "path": "normhash.py"
+      }
+    ],
+    "false_negatives": []
+  }
+}

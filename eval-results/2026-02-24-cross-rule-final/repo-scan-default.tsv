@@ -1,0 +1,7 @@
+repo	files	bytes	findings	errors	dropped_findings	elapsed_ms	throughput_mib_s
+linux	92129	1531964612	2465	0	0	12362	119.69
+RustyPixels	955	638773	0	0	0	327	3.42
+gitleaks	513	1186521	622	0	0	233	12.50
+trufflehog	3374	16496618	456	0	0	666	29.97
+kingfisher	720	24965940	3487	0	0	328	129.37
+tigerbeetle-fun	1116	23563074	128	0	0	332	120.39

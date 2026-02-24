@@ -74,3 +74,9 @@ proptest-regressions/
 tools/bench-compare/results/raw/
 tools/bench-compare/results/perf_raw/
 tools/bench-compare/results/*.csv
+
+# Eval experiment scratch artifacts (keep decision reports + summary tables/json)
+eval-results/**/repo-scans/
+eval-results/**/repo-scans-off/
+eval-results/**/linux-uring-parity/*.log
+eval-results/**/creddata-subset/*-table.txt

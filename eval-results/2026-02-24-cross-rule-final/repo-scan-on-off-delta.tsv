@@ -1,0 +1,7 @@
+repo	findings_off	findings_on	delta_findings	delta_findings_pct	throughput_off	throughput_on	delta_throughput_mib_s	delta_throughput_pct
+RustyPixels	0	0	0	0.00	1.86	3.42	1.56	83.87
+gitleaks	622	622	0	0.00	7.45	12.50	5.05	67.79
+kingfisher	3487	3487	0	0.00	104.13	129.37	25.24	24.24
+linux	2465	2465	0	0.00	108.47	119.69	11.22	10.34
+tigerbeetle-fun	128	128	0	0.00	98.51	120.39	21.88	22.21
+trufflehog	456	456	0	0.00	22.85	29.97	7.12	31.16
