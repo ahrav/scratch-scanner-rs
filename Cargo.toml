@@ -71,6 +71,7 @@ real-rules-harness = []  # Real-ruleset regression harness (simulation test)
 loom = "0.7"
 proptest = "1.10"
 criterion = "0.5"
+rstest = "0.24"
 tempfile = "3.10"
 itoa = "1"
 ryu = "1"

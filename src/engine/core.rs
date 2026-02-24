@@ -70,9 +70,10 @@ use super::helpers::{build_log2_table, u64_to_usize};
 #[cfg(feature = "bench")]
 use super::rule_repr::PackedPatternsBuilder;
 use super::rule_repr::{
-    add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, map_to_patterns, utf16be_bytes,
-    utf16le_bytes, CharClassCompiled, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled,
-    PackedPatterns, RuleCold, RuleCompiled, Target, TwoPhaseCompiled, Variant, NO_GATE,
+    add_pat_owned, add_pat_raw, auto_min_confidence, compile_confirm_all, compile_rule,
+    map_to_patterns, utf16be_bytes, utf16le_bytes, CharClassCompiled, ConfirmAllCompiled,
+    EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold, RuleCompiled, Target,
+    TwoPhaseCompiled, Variant, NO_GATE,
 };
 use super::safelist::SafelistFilter;
 use super::scratch::{RootSpanMapCtx, ScanScratch, DEDUP_RULE_ID_MAX};
@@ -469,8 +470,12 @@ impl Engine {
                 rule.char_class = char_class_gates.len() as u32;
                 char_class_gates.push(cc);
             }
+            let min_confidence = auto_min_confidence(spec);
             rules_compiled.push(rule);
-            rules_cold.push(RuleCold { name: spec.name });
+            rules_cold.push(RuleCold {
+                name: spec.name,
+                min_confidence,
+            });
         }
         debug_assert_eq!(rules_compiled.len(), rules_cold.len());
 
@@ -1978,6 +1983,21 @@ impl Engine {
             .get(rule_id as usize)
             .map(|r| r.name)
             .unwrap_or("<unknown-rule>")
+    }
+
+    /// Returns the effective per-rule minimum confidence threshold.
+    ///
+    /// The value is precomputed during engine construction and stored in
+    /// `rules_cold`, so scan-loop code does not need to recompute threshold
+    /// defaults from rule structure.
+    ///
+    /// Returns `0` if `rule_id` is out of bounds (the same fallback as "no
+    /// threshold configured").
+    pub fn rule_min_confidence(&self, rule_id: u32) -> i8 {
+        self.rules_cold
+            .get(rule_id as usize)
+            .map(|r| r.min_confidence)
+            .unwrap_or(0)
     }
 
     /// Allocates a fresh scratch state sized for this engine.

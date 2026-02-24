@@ -304,7 +304,7 @@ rules:
   offline_validation: null
   uuid_format_secret: false  # set true when the capture group is exactly UUID (8-4-4-4-12 hex)
   secret_group: null
-  min_confidence: null       # optional per-rule threshold metadata (0..=10, schema-only today)
+  min_confidence: null       # optional per-rule threshold (0..=10); auto-derived from gates when null
 ```
 
 Guidelines:
@@ -317,7 +317,8 @@ Guidelines:
    (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that regex and entropy cannot distinguish
    from real secrets. Patterns are case-sensitive and matched on extracted secret bytes.
 6. Set `secret_group` when the secret is not the full match.
-7. Set `min_confidence` to record a per-rule confidence threshold for future
-   filtering; this field is currently schema-only and not yet enforced at scan time.
+7. Set `min_confidence` to override the per-rule confidence threshold. When
+   omitted (`null`), the engine auto-derives defaults by gate strength:
+   offline validation => 5, keywords+entropy => 3, assignment-shape => 2, else 0.
 8. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
    may produce a compiled `confirm_all` gate from regex literal islands.

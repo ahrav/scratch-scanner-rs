@@ -18,7 +18,7 @@
 //!   │                          │
 //!   │                          ▼
 //!   │                     RuleCompiled   ── hot array iterated per buffer
-//!   │                     RuleCold       ── parallel cold array (name, etc.)
+//!   │                     RuleCold       ── parallel cold array (name, min confidence, etc.)
 //!   │
 //!   ├─ add_pat_raw/owned() ──► anchor map (AHashMap<Vec<u8>, Vec<Target>>)
 //!   │                              │
@@ -582,9 +582,47 @@ impl RuleCompiled {
 /// that scan-loop iteration touches only the compact hot fields needed for
 /// gating and regex evaluation. The cold array is indexed identically:
 /// `rules_hot[i]` and `rules_cold[i]` always describe the same rule.
+/// This holds reporting/policy metadata (`name`, `min_confidence`) that does
+/// not need to live in the cache-sensitive hot rule struct.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RuleCold {
     pub(super) name: &'static str,
+    pub(super) min_confidence: i8,
+}
+
+#[inline(always)]
+fn needs_assignment_shape_check(spec: &RuleSpec) -> bool {
+    spec.name == "generic-api-key"
+}
+
+/// Computes the effective minimum confidence threshold for a rule.
+///
+/// Priority order:
+/// 1. explicit `RuleSpec::min_confidence` override
+/// 2. offline validation gate present
+/// 3. keyword + entropy gates both present
+/// 4. assignment-shape check enabled
+/// 5. default to zero (no threshold filtering)
+///
+/// This chooses a single default floor (not an additive score). Offline
+/// validation wins over keyword+entropy because it is treated as the strongest
+/// standalone confidence signal in the default policy.
+pub(super) fn auto_min_confidence(spec: &RuleSpec) -> i8 {
+    use crate::api::confidence;
+
+    if let Some(v) = spec.min_confidence {
+        return v;
+    }
+    if spec.offline_validation.is_some() {
+        return confidence::OFFLINE_VALID;
+    }
+    if spec.keywords_any.is_some() && spec.entropy.is_some() {
+        return confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS;
+    }
+    if needs_assignment_shape_check(spec) {
+        return confidence::ASSIGNMENT_SHAPE;
+    }
+    0
 }
 
 // Compile-time size guards: RuleCompiled is iterated for every merged window
@@ -704,7 +742,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     // cheap textual gate that substantially reduces false positives for rules with
     // broad regexes. Currently hard-coded to `generic-api-key` because that rule's
     // regex is intentionally loose and benefits most from this structural filter.
-    let needs_assignment_shape_check = spec.name == "generic-api-key";
+    let needs_assignment_shape_check = needs_assignment_shape_check(spec);
 
     let rule = RuleCompiled {
         re: spec.re.clone(),
@@ -891,8 +929,9 @@ pub(super) fn utf16be_bytes(ascii: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{RuleSpec, ValidatorKind};
+    use crate::api::{confidence, EntropySpec, OfflineValidationSpec, RuleSpec, ValidatorKind};
     use regex::bytes::Regex;
+    use rstest::rstest;
 
     fn unpack_patterns(pats: &PackedPatterns) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -975,6 +1014,58 @@ mod tests {
 
         assert_eq!(rule.value_suppressors, NO_GATE);
         assert!(gates.value_suppressors.is_none());
+    }
+
+    #[rstest]
+    #[case::no_signals(None, false, false, false, false, 0)]
+    #[case::explicit_override(Some(7), false, false, false, false, 7)]
+    #[case::offline_default(None, true, false, false, false, confidence::OFFLINE_VALID)]
+    #[case::override_beats_offline(Some(3), true, false, false, false, 3)]
+    #[case::keywords_plus_entropy(None, false, true, true, false,
+        confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS)]
+    #[case::keywords_only(None, false, true, false, false, 0)]
+    #[case::entropy_only(None, false, false, true, false, 0)]
+    #[case::offline_beats_keywords_plus_entropy(
+        None,
+        true,
+        true,
+        true,
+        false,
+        confidence::OFFLINE_VALID
+    )]
+    #[case::assignment_shape(None, false, false, false, true, confidence::ASSIGNMENT_SHAPE)]
+    fn auto_min_confidence_priority_cascade(
+        #[case] min_confidence: Option<i8>,
+        #[case] has_offline: bool,
+        #[case] has_keywords: bool,
+        #[case] has_entropy: bool,
+        #[case] is_generic_api_key: bool,
+        #[case] expected: i8,
+    ) {
+        let mut spec = test_rule_spec(None);
+        spec.min_confidence = min_confidence;
+        if has_offline {
+            spec.offline_validation = Some(OfflineValidationSpec::Crc32Base62 {
+                prefix_skip: 4,
+                payload_len: 8,
+                checksum_len: 6,
+            });
+        }
+        if has_keywords {
+            spec.keywords_any = Some(&[b"key"]);
+        }
+        if has_entropy {
+            spec.entropy = Some(EntropySpec {
+                min_bits_per_byte: 2.0,
+                min_len: 4,
+                max_len: 32,
+                min_entropy_bits_per_byte: None,
+            });
+        }
+        if is_generic_api_key {
+            spec.name = "generic-api-key";
+        }
+        assert_eq!(auto_min_confidence(&spec), expected);
     }
 
     #[test]

@@ -702,12 +702,17 @@ pub struct RuleSpec {
 
     /// Optional per-rule minimum confidence threshold metadata.
     ///
-    /// This field is currently schema-level only: YAML parsing and
-    /// [`RuleSpec::assert_valid`] preserve/validate it, but scan-time filtering
-    /// by confidence is not yet wired into the engine hot path.
+    /// During engine build, the effective threshold is materialized into cold
+    /// rule metadata (`RuleCold.min_confidence`) and can be queried via
+    /// [`crate::Engine::rule_min_confidence`]. Scan-time matching does not
+    /// branch on this threshold; downstream policy can consume it out-of-band.
     ///
-    /// `None` means no per-rule override is specified. `Some(v)` stores the
-    /// configured threshold for downstream phases that consume it.
+    /// `Some(v)` is an explicit override. `None` selects an auto-default based
+    /// on compiled rule signals:
+    /// - offline validation gate present => `OFFLINE_VALID`
+    /// - keyword + entropy gates present => `KEYWORD_PRESENT + ENTROPY_PASS`
+    /// - assignment-shape check enabled (currently `generic-api-key`) => `ASSIGNMENT_SHAPE`
+    /// - otherwise => `0`
     ///
     /// # Valid range
     /// `v` must be in `0..=10` (Phase 1 confidence ceiling).

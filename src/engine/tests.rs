@@ -7488,6 +7488,126 @@ fn confidence_score_assignment_shape_gate() {
     );
 }
 
+fn min_conf_rule(name: &'static str) -> RuleSpec {
+    RuleSpec {
+        name,
+        anchors: &[b"TOK_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        min_confidence: None,
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+    }
+}
+
+#[test]
+fn rule_min_confidence_explicit_override_wins() {
+    let mut rule = offline_crc_rule();
+    rule.min_confidence = Some(7);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(engine.rule_min_confidence(0), 7);
+}
+
+#[test]
+fn rule_min_confidence_offline_default_is_five() {
+    let engine = Engine::new_with_anchor_policy(
+        vec![offline_crc_rule()],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(engine.rule_min_confidence(0), confidence::OFFLINE_VALID);
+}
+
+#[test]
+fn rule_min_confidence_keywords_plus_entropy_default_is_three() {
+    let mut rule = min_conf_rule("kw-ent");
+    rule.keywords_any = Some(&[b"password"]);
+    rule.entropy = Some(EntropySpec {
+        min_bits_per_byte: 2.0,
+        min_len: 4,
+        max_len: 32,
+        min_entropy_bits_per_byte: None,
+    });
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(
+        engine.rule_min_confidence(0),
+        confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS
+    );
+}
+
+#[test]
+fn rule_min_confidence_assignment_shape_default_is_two() {
+    let rule = min_conf_rule("generic-api-key");
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(engine.rule_min_confidence(0), confidence::ASSIGNMENT_SHAPE);
+}
+
+#[test]
+fn rule_min_confidence_plain_rule_default_is_zero() {
+    let engine = Engine::new_with_anchor_policy(
+        vec![min_conf_rule("plain-rule")],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(engine.rule_min_confidence(0), 0);
+}
+
+#[test]
+fn rule_min_confidence_returns_zero_for_out_of_bounds_rule_id() {
+    let engine = Engine::new_with_anchor_policy(
+        vec![min_conf_rule("plain-rule")],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(engine.rule_min_confidence(999), 0);
+}
+
+#[test]
+fn rule_min_confidence_offline_priority_beats_keywords_and_entropy() {
+    let mut rule = offline_crc_rule();
+    rule.keywords_any = Some(&[b"password"]);
+    rule.entropy = Some(EntropySpec {
+        min_bits_per_byte: 2.0,
+        min_len: 4,
+        max_len: 32,
+        min_entropy_bits_per_byte: None,
+    });
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+    assert_eq!(engine.rule_min_confidence(0), confidence::OFFLINE_VALID);
+}
+
 // ── UUID quick-reject integration tests ─────────────────────────────────
 
 #[test]
