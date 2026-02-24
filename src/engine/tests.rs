@@ -6459,14 +6459,17 @@ fn rule_min_confidence_explicit_override_wins() {
 }
 
 #[test]
-fn rule_min_confidence_offline_default_is_five() {
+fn rule_min_confidence_offline_only_defaults_to_zero() {
+    // Offline validation is excluded from auto-derivation because the
+    // signal is only available on root-semantic findings. A rule with
+    // only offline validation (no keyword/entropy gates) gets threshold 0.
     let engine = Engine::new_with_anchor_policy(
         vec![offline_crc_rule()],
         Vec::new(),
         demo_tuning(),
         AnchorPolicy::ManualOnly,
     );
-    assert_eq!(engine.rule_min_confidence(0), confidence::OFFLINE_VALID);
+    assert_eq!(engine.rule_min_confidence(0), 0);
 }
 
 #[test]
@@ -6526,7 +6529,10 @@ fn rule_min_confidence_returns_zero_for_out_of_bounds_rule_id() {
 }
 
 #[test]
-fn rule_min_confidence_offline_priority_beats_keywords_and_entropy() {
+fn rule_min_confidence_offline_plus_keywords_entropy_uses_keyword_tier() {
+    // Offline validation is excluded from auto-derivation, so a rule with
+    // offline + keywords + entropy falls through to the keyword+entropy
+    // tier (3), not the offline tier (5).
     let mut rule = offline_crc_rule();
     rule.keywords_any = Some(&[b"password"]);
     rule.entropy = Some(EntropySpec {
@@ -6541,7 +6547,74 @@ fn rule_min_confidence_offline_priority_beats_keywords_and_entropy() {
         demo_tuning(),
         AnchorPolicy::ManualOnly,
     );
-    assert_eq!(engine.rule_min_confidence(0), confidence::OFFLINE_VALID);
+    assert_eq!(
+        engine.rule_min_confidence(0),
+        confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS
+    );
+}
+
+#[test]
+fn transform_finding_confidence_meets_offline_rule_threshold() {
+    // A rule with offline validation produces a min_confidence of OFFLINE_VALID (5).
+    // Transform-derived findings (non-root step) bypass offline validation, so
+    // they cannot earn the +5 offline signal. If the auto-derived threshold is
+    // set to OFFLINE_VALID, those transform findings would have a confidence_score
+    // below the threshold, causing downstream policy to incorrectly drop them.
+    let rule = offline_crc_rule();
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 8,
+        max_spans_per_buffer: 8,
+        max_encoded_len: 1024,
+        max_decoded_bytes: 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        transforms,
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Build an invalid-CRC token and base64-encode it so the transform
+    // decodes it. The decoded finding is non-root and gets no offline signal.
+    let invalid_tok = build_invalid_crc_token();
+    let b64_encoded = base64_encode_bytes(&invalid_tok);
+
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"data ");
+    hay.extend_from_slice(&b64_encoded);
+    hay.extend_from_slice(b" end");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+
+    let threshold = engine.rule_min_confidence(0);
+    let transform_findings: Vec<_> = scratch
+        .findings()
+        .iter()
+        .filter(|r| r.step_id != STEP_ROOT)
+        .collect();
+
+    assert!(
+        !transform_findings.is_empty(),
+        "expected at least one transform-derived finding"
+    );
+
+    for f in &transform_findings {
+        assert!(
+            f.confidence_score >= threshold,
+            "transform finding confidence {} is below rule threshold {} — \
+             downstream policy would incorrectly drop this valid finding",
+            f.confidence_score,
+            threshold,
+        );
+    }
 }
 
 // ── UUID quick-reject integration tests ─────────────────────────────────

@@ -709,10 +709,13 @@ pub struct RuleSpec {
     ///
     /// `Some(v)` is an explicit override. `None` selects an auto-default based
     /// on compiled rule signals:
-    /// - offline validation gate present => `OFFLINE_VALID`
     /// - keyword + entropy gates present => `KEYWORD_PRESENT + ENTROPY_PASS`
     /// - assignment-shape check enabled (currently `generic-api-key`) => `ASSIGNMENT_SHAPE`
     /// - otherwise => `0`
+    ///
+    /// Offline validation is excluded from auto-derivation: the signal is only
+    /// scored on root-semantic findings, so transform-derived findings can never
+    /// earn it. Rules that want an offline-tier threshold should set `Some(5)`.
     ///
     /// # Valid range
     /// `v` must be in `0..=10` (Phase 1 confidence ceiling).

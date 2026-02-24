@@ -598,22 +598,23 @@ fn needs_assignment_shape_check(spec: &RuleSpec) -> bool {
 ///
 /// Priority order:
 /// 1. explicit `RuleSpec::min_confidence` override
-/// 2. offline validation gate present
-/// 3. keyword + entropy gates both present
-/// 4. assignment-shape check enabled
-/// 5. default to zero (no threshold filtering)
+/// 2. keyword + entropy gates both present
+/// 3. assignment-shape check enabled
+/// 4. default to zero (no threshold filtering)
 ///
-/// This chooses a single default floor (not an additive score). Offline
-/// validation wins over keyword+entropy because it is treated as the strongest
-/// standalone confidence signal in the default policy.
+/// This chooses a single default floor (not an additive score).
+///
+/// Offline validation is deliberately excluded from auto-derivation:
+/// the offline signal is only scored on root-semantic findings
+/// (`parent_step_id == STEP_ROOT`), so transform-derived findings can
+/// never earn it. A per-rule threshold of `OFFLINE_VALID` would
+/// silently block valid transform findings. Rules that want the
+/// offline tier can set `min_confidence` explicitly.
 pub(super) fn derive_min_confidence(spec: &RuleSpec) -> i8 {
     use crate::api::confidence;
 
     if let Some(v) = spec.min_confidence {
         return v;
-    }
-    if spec.offline_validation.is_some() {
-        return confidence::OFFLINE_VALID;
     }
     if spec.keywords_any.is_some() && spec.entropy.is_some() {
         return confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS;
