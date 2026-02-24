@@ -1020,19 +1020,19 @@ mod tests {
     #[rstest]
     #[case::no_signals(None, false, false, false, false, 0)]
     #[case::explicit_override(Some(7), false, false, false, false, 7)]
-    #[case::offline_default(None, true, false, false, false, confidence::OFFLINE_VALID)]
+    #[case::offline_alone_no_threshold(None, true, false, false, false, 0)]
     #[case::override_beats_offline(Some(3), true, false, false, false, 3)]
     #[case::keywords_plus_entropy(None, false, true, true, false,
         confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS)]
     #[case::keywords_only(None, false, true, false, false, 0)]
     #[case::entropy_only(None, false, false, true, false, 0)]
-    #[case::offline_beats_keywords_plus_entropy(
+    #[case::offline_ignored_keywords_plus_entropy(
         None,
         true,
         true,
         true,
         false,
-        confidence::OFFLINE_VALID
+        confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS
     )]
     #[case::assignment_shape(None, false, false, false, true, confidence::ASSIGNMENT_SHAPE)]
     fn derive_min_confidence_priority_cascade(

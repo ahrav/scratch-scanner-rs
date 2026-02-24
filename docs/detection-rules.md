@@ -319,6 +319,8 @@ Guidelines:
 6. Set `secret_group` when the secret is not the full match.
 7. Set `min_confidence` to override the per-rule confidence threshold. When
    omitted (`null`), the engine auto-derives defaults by gate strength:
-   offline validation => 5, keywords+entropy => 3, assignment-shape => 2, else 0.
+   keywords+entropy => 3, assignment-shape => 2, else 0. Offline validation
+   is excluded from auto-derivation because the signal only fires on
+   root-semantic findings; set `min_confidence: 5` explicitly if desired.
 8. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
    may produce a compiled `confirm_all` gate from regex literal islands.
