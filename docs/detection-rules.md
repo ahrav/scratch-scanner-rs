@@ -151,6 +151,7 @@ graph TB
         OfflineValidation["offline_validation: Option<OfflineValidationSpec>"]
         UuidFormatSecret["uuid_format_secret: bool"]
         SecretGroup["secret_group: Option<u16>"]
+        MinConfidence["min_confidence: Option<i8>"]
         Regex["re: Regex"]
     end
 
@@ -303,6 +304,7 @@ rules:
   offline_validation: null
   uuid_format_secret: false  # set true when the capture group is exactly UUID (8-4-4-4-12 hex)
   secret_group: null
+  min_confidence: null       # optional per-rule threshold metadata (0..=10, schema-only today)
 ```
 
 Guidelines:
@@ -315,5 +317,7 @@ Guidelines:
    (e.g., `EXAMPLE`, `DUMMY_TOKEN`) that regex and entropy cannot distinguish
    from real secrets. Patterns are case-sensitive and matched on extracted secret bytes.
 6. Set `secret_group` when the secret is not the full match.
-7. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
+7. Set `min_confidence` to record a per-rule confidence threshold for future
+   filtering; this field is currently schema-only and not yet enforced at scan time.
+8. Derived anchors are enabled by default (`AnchorPolicy::PreferDerived`) and
    may produce a compiled `confirm_all` gate from regex literal islands.

@@ -156,6 +156,7 @@ fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
                 char_class: None,
                 local_context: None,
                 secret_group: None,
+                min_confidence: None,
                 offline_validation: None,
                 uuid_format_secret: false,
                 re: regex::bytes::Regex::new(&format!(r"{prefix}[A-Z0-9]{{16}}")).unwrap(),
@@ -219,6 +220,7 @@ fn generate_grouped_rules(count: usize, group_size: usize) -> Vec<RuleSpec> {
                 char_class: None,
                 local_context: None,
                 secret_group: None,
+                min_confidence: None,
                 offline_validation: None,
                 uuid_format_secret: false,
                 re: regex::bytes::Regex::new(&format!(r"{full}[A-Z0-9]{{16}}")).unwrap(),
@@ -318,6 +320,7 @@ fn generate_realistic_rules(count: usize) -> Vec<RuleSpec> {
                 char_class: None,
                 local_context: None,
                 secret_group: None,
+                min_confidence: None,
                 offline_validation: None,
                 uuid_format_secret: false,
                 re: regex::bytes::Regex::new(&format!(r"{full_prefix}[A-Za-z0-9_-]{{20,40}}"))

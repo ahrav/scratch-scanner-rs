@@ -55,6 +55,7 @@ classDiagram
         +Option~OfflineValidationSpec~ offline_validation
         +bool uuid_format_secret
         +Option~u16~ secret_group
+        +Option~i8~ min_confidence
         +Regex re
     }
 

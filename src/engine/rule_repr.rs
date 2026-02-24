@@ -919,6 +919,7 @@ mod tests {
             char_class: None,
             local_context: None,
             secret_group: Some(1),
+            min_confidence: None,
             offline_validation: None,
             uuid_format_secret: false,
             re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),

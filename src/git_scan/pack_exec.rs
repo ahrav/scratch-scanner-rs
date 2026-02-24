@@ -5284,6 +5284,7 @@ run with --test-threads=1 to enable"
             char_class: None,
             local_context: None,
             secret_group: Some(1),
+            min_confidence: None,
             offline_validation: None,
             uuid_format_secret: false,
             re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
