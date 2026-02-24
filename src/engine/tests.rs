@@ -176,22 +176,9 @@ fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
 #[test]
 fn norm_hash_deterministic_for_raw_matches() {
     let rule = RuleSpec {
-        name: "tok",
-        anchors: &[b"TOK_"],
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Z0-9]{4})").unwrap(),
+        ..base_rule("tok", &[b"TOK_"], Regex::new(r"TOK_([A-Z0-9]{4})").unwrap())
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -227,22 +214,13 @@ fn norm_hash_deterministic_for_raw_matches() {
 #[test]
 fn norm_hash_uses_decoded_bytes_for_base64_transform() {
     let rule = RuleSpec {
-        name: "b64",
-        anchors: &[b"SECRET_"],
         radius: 24,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
+        ..base_rule(
+            "b64",
+            &[b"SECRET_"],
+            Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -276,16 +254,7 @@ fn norm_hash_uses_decoded_bytes_for_base64_transform() {
 #[test]
 fn local_context_gate_applies_in_base64_stream_decode() {
     let rule = RuleSpec {
-        name: "b64-local-context",
-        anchors: &[b"SECRET_"],
         radius: 24,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -294,10 +263,11 @@ fn local_context_gate_applies_in_base64_stream_decode() {
             key_names_any: None,
         }),
         secret_group: Some(0),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SECRET_[A-Z]{4}").unwrap(),
+        ..base_rule(
+            "b64-local-context",
+            &[b"SECRET_"],
+            Regex::new(r"SECRET_[A-Z]{4}").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -340,16 +310,6 @@ fn local_context_gate_applies_in_base64_stream_decode() {
 #[test]
 fn local_context_gate_filters_without_assignment_when_bounds_present() {
     let rule = RuleSpec {
-        name: "lc-assign",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -357,11 +317,11 @@ fn local_context_gate_filters_without_assignment_when_bounds_present() {
             require_quoted: false,
             key_names_any: None,
         }),
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+        ..base_rule(
+            "lc-assign",
+            &[b"TOK_"],
+            Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -389,16 +349,6 @@ fn local_context_gate_filters_without_assignment_when_bounds_present() {
 #[test]
 fn local_context_key_names_required_and_fail_open_when_out_of_range() {
     let rule = RuleSpec {
-        name: "lc-keyname",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -406,11 +356,11 @@ fn local_context_key_names_required_and_fail_open_when_out_of_range() {
             require_quoted: false,
             key_names_any: Some(&[b"key"]),
         }),
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+        ..base_rule(
+            "lc-keyname",
+            &[b"TOK_"],
+            Regex::new(r"TOK_[A-Z]{4}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -691,22 +641,11 @@ fn rules_hot_and_cold_have_equal_length() {
 #[test]
 fn zero_hit_url_plus_to_space_still_scans_transforms() {
     let rule = RuleSpec {
-        name: "url-plus-space",
-        anchors: &[b"TOK "],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK [A-Z]{4}").unwrap(),
+        ..base_rule(
+            "url-plus-space",
+            &[b"TOK "],
+            Regex::new(r"TOK [A-Z]{4}").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::UrlPercent,
@@ -757,22 +696,12 @@ fn base64_utf16_aws_key_is_detected() {
 #[test]
 fn base64_padding_in_root_hint() {
     let rule = RuleSpec {
-        name: "b64-padding",
-        anchors: &[b"SIM0_"],
         radius: 25,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SIM0_[A-Z0-9]{12}").unwrap(),
+        ..base_rule(
+            "b64-padding",
+            &[b"SIM0_"],
+            Regex::new(r"SIM0_[A-Z0-9]{12}").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -835,22 +764,9 @@ fn keyword_gate_filters_without_keyword() {
     const ANCHORS: &[&[u8]] = &[b"ANCH"];
     const KEYWORDS: &[&[u8]] = &[b"kw"];
     let rule = RuleSpec {
-        name: "keyword-gate",
-        anchors: ANCHORS,
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
         keywords_any: Some(KEYWORDS),
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("secret").unwrap(),
+        ..base_rule("keyword-gate", ANCHORS, Regex::new("secret").unwrap())
     };
     let eng = Engine::new_with_anchor_policy(
         vec![rule],
@@ -871,22 +787,8 @@ fn keyword_gate_filters_without_keyword() {
 #[test]
 fn derived_confirm_all_is_compiled() {
     let rule = RuleSpec {
-        name: "confirm-all",
-        anchors: &[],
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"foo\d+bar").unwrap(),
+        ..base_rule("confirm-all", &[], Regex::new(r"foo\d+bar").unwrap())
     };
 
     let eng = Engine::new_with_anchor_policy(
@@ -945,22 +847,13 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     const SUPPRESSORS: &[&[u8]] = &[b"EXAMPLE", b"DUMMY_TOKEN"];
     let rule = RuleSpec {
-        name: "value-suppressor-gate",
-        anchors: ANCHORS,
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(SUPPRESSORS),
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
+        ..base_rule(
+            "value-suppressor-gate",
+            ANCHORS,
+            Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
+        )
     };
 
     let eng = Engine::new_with_anchor_policy(
@@ -996,22 +889,13 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
 #[test]
 fn value_suppressor_filters_matching_secret_in_raw_path() {
     let rule = RuleSpec {
-        name: "value-suppressor-raw-filter",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-raw-filter",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1032,22 +916,13 @@ fn value_suppressor_filters_matching_secret_in_raw_path() {
 #[test]
 fn value_suppressor_passes_non_matching_secret_in_raw_path() {
     let rule = RuleSpec {
-        name: "value-suppressor-raw-pass",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-raw-pass",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1068,22 +943,13 @@ fn value_suppressor_passes_non_matching_secret_in_raw_path() {
 #[test]
 fn value_suppressor_any_match_filters_with_multiple_patterns() {
     let rule = RuleSpec {
-        name: "value-suppressor-raw-multi",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"DUMMY", b"EXAMPLE"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-raw-multi",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1108,22 +974,12 @@ fn value_suppressor_any_match_filters_with_multiple_patterns() {
 #[test]
 fn value_suppressor_absent_does_not_change_behavior() {
     let rule = RuleSpec {
-        name: "value-suppressor-none",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-none",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1144,22 +1000,11 @@ fn value_suppressor_absent_does_not_change_behavior() {
 #[test]
 fn safelist_emit_time_filter_suppresses_root_finding() {
     let rule = RuleSpec {
-        name: "safelist-root-filter",
-        anchors: &[b"token"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        ..base_rule(
+            "safelist-root-filter",
+            &[b"token"],
+            Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1208,23 +1053,12 @@ fn safelist_emit_time_filter_keeps_non_root_findings() {
     // for the root finding, but whose decoded value does NOT match the
     // secret-bytes safelist (a realistic-looking token).
     let rule = RuleSpec {
-        name: "safelist-mixed-root-non-root",
-        anchors: &[b"token"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        // Matches both the context placeholder and the decoded value.
-        uuid_format_secret: false,
-        re: Regex::new(r"(?:placeholder_token|prod_token_A1B2C3)").unwrap(),
+        ..base_rule(
+            "safelist-mixed-root-non-root",
+            &[b"token"],
+            Regex::new(r"(?:placeholder_token|prod_token_A1B2C3)").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -1280,22 +1114,12 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
     // nor the secret-bytes safelist, to verify UTF-16 root emissions bypass
     // the root-only context safelist path (they carry a Utf16Window step_id).
     let rule = RuleSpec {
-        name: "safelist-utf16-root-emission",
-        anchors: &[b"prod_token_A1B2C3"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"prod_token_A1B2C3").unwrap(),
+        ..base_rule(
+            "safelist-utf16-root-emission",
+            &[b"prod_token_A1B2C3"],
+            Regex::new(r"prod_token_A1B2C3").unwrap(),
+        )
     };
 
     let mut tuning = demo_tuning();
@@ -1328,22 +1152,12 @@ fn safelist_emit_time_filter_does_not_suppress_utf16_root_emission() {
 #[test]
 fn safelist_suppression_does_not_consume_findings_cap() {
     let rule = RuleSpec {
-        name: "safelist-cap-ordering",
-        anchors: &[b"token"],
         radius: 128,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        ..base_rule(
+            "safelist-cap-ordering",
+            &[b"token"],
+            Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        )
     };
 
     let mut tuning = demo_tuning();
@@ -1374,22 +1188,12 @@ fn safelist_suppression_does_not_consume_findings_cap() {
 #[test]
 fn max_findings_cap_applies_after_safelist_suppression() {
     let rule = RuleSpec {
-        name: "safelist-cap-emit-time-suppression",
-        anchors: &[b"token"],
         radius: 128,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        ..base_rule(
+            "safelist-cap-emit-time-suppression",
+            &[b"token"],
+            Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        )
     };
 
     let mut tuning = demo_tuning();
@@ -1436,22 +1240,11 @@ fn max_findings_cap_applies_after_safelist_suppression() {
 #[test]
 fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
     let rule = RuleSpec {
-        name: "safelist-noop-root",
-        anchors: &[b"prod_token_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
+        ..base_rule(
+            "safelist-noop-root",
+            &[b"prod_token_"],
+            Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1495,22 +1288,12 @@ fn safelist_emit_time_filter_noop_keeps_all_non_safelisted_roots() {
 #[test]
 fn safelist_emit_time_filter_drops_tail_root_finding() {
     let rule = RuleSpec {
-        name: "safelist-tail-drop",
-        anchors: &[b"token"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"(?:prod_token_[A-Z0-9]{6}|placeholder_token)").unwrap(),
+        ..base_rule(
+            "safelist-tail-drop",
+            &[b"token"],
+            Regex::new(r"(?:prod_token_[A-Z0-9]{6}|placeholder_token)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1546,58 +1329,25 @@ fn safelist_emit_time_filter_drops_tail_root_finding() {
 fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
     let rules = vec![
         RuleSpec {
-            name: "safelist-dup-a",
-            anchors: &[b"placeholder_token"],
-            radius: 32,
-            validator: ValidatorKind::None,
-            two_phase: None,
-            must_contain: None,
-            keywords_any: None,
-            value_suppressors_any: None,
-            entropy: None,
-            char_class: None,
-            local_context: None,
-            secret_group: None,
-            min_confidence: None,
-            offline_validation: None,
-            uuid_format_secret: false,
-            re: Regex::new(r"placeholder_token").unwrap(),
+            ..base_rule(
+                "safelist-dup-a",
+                &[b"placeholder_token"],
+                Regex::new(r"placeholder_token").unwrap(),
+            )
         },
         RuleSpec {
-            name: "safelist-dup-b",
-            anchors: &[b"placeholder_token"],
-            radius: 32,
-            validator: ValidatorKind::None,
-            two_phase: None,
-            must_contain: None,
-            keywords_any: None,
-            value_suppressors_any: None,
-            entropy: None,
-            char_class: None,
-            local_context: None,
-            secret_group: None,
-            min_confidence: None,
-            offline_validation: None,
-            uuid_format_secret: false,
-            re: Regex::new(r"placeholder_token").unwrap(),
+            ..base_rule(
+                "safelist-dup-b",
+                &[b"placeholder_token"],
+                Regex::new(r"placeholder_token").unwrap(),
+            )
         },
         RuleSpec {
-            name: "safelist-dup-keep",
-            anchors: &[b"prod_token_"],
-            radius: 32,
-            validator: ValidatorKind::None,
-            two_phase: None,
-            must_contain: None,
-            keywords_any: None,
-            value_suppressors_any: None,
-            entropy: None,
-            char_class: None,
-            local_context: None,
-            secret_group: None,
-            min_confidence: None,
-            offline_validation: None,
-            uuid_format_secret: false,
-            re: Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
+            ..base_rule(
+                "safelist-dup-keep",
+                &[b"prod_token_"],
+                Regex::new(r"prod_token_[A-Z0-9]{6}").unwrap(),
+            )
         },
     ];
 
@@ -1621,22 +1371,11 @@ fn safelist_emit_time_filter_suppresses_duplicate_root_spans_across_rules() {
 #[test]
 fn safelist_emit_time_filter_all_findings_suppressed() {
     let rule = RuleSpec {
-        name: "safelist-all-suppressed",
-        anchors: &[b"placeholder_token"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"placeholder_token").unwrap(),
+        ..base_rule(
+            "safelist-all-suppressed",
+            &[b"placeholder_token"],
+            Regex::new(r"placeholder_token").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1669,22 +1408,11 @@ fn safelist_emit_time_filter_all_findings_suppressed() {
 #[test]
 fn safelist_suppressed_counter_resets_between_scans() {
     let rule = RuleSpec {
-        name: "safelist-counter-reset",
-        anchors: &[b"token"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        ..base_rule(
+            "safelist-counter-reset",
+            &[b"token"],
+            Regex::new(r"(?:placeholder_token|prod_token_[A-Z0-9]{6})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1720,22 +1448,13 @@ fn secret_bytes_safelist_suppresses_placeholder_when_context_is_clean() {
     // pattern 5 (`[:=]\s*(?:changeme|...)`) does NOT fire. Only the
     // secret-bytes safelist pattern `(?i)\b(?:changeme|...)\b` suppresses this.
     let rule = RuleSpec {
-        name: "secret-bytes-clean-context",
-        anchors: &[b"header"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"header\s+(\S+)").unwrap(),
+        ..base_rule(
+            "secret-bytes-clean-context",
+            &[b"header"],
+            Regex::new(r"header\s+(\S+)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1759,22 +1478,12 @@ fn secret_bytes_safelist_suppresses_placeholder_when_context_is_clean() {
 #[test]
 fn secret_bytes_safelist_does_not_suppress_high_entropy_secret() {
     let rule = RuleSpec {
-        name: "secret-bytes-high-entropy",
-        anchors: &[b"token"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"token[:=]\s*(\S+)").unwrap(),
+        ..base_rule(
+            "secret-bytes-high-entropy",
+            &[b"token"],
+            Regex::new(r"token[:=]\s*(\S+)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1800,22 +1509,11 @@ fn secret_bytes_safelist_suppresses_decoded_placeholder() {
     // Base64-encoded "hunter2" in a decoded buffer should still be suppressed
     // by the secret-bytes safelist.
     let rule = RuleSpec {
-        name: "secret-bytes-decoded",
-        anchors: &[b"hunter2"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"hunter2").unwrap(),
+        ..base_rule(
+            "secret-bytes-decoded",
+            &[b"hunter2"],
+            Regex::new(r"hunter2").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -1857,22 +1555,13 @@ fn secret_bytes_safelist_counter_resets_between_scans() {
     // but the context "header changeme trailer" has no `[:=]\s*` prefix, so
     // context pattern 5 `(?i)[:=]\s*(?:null|changeme|todo|fixme)\b` does not fire.
     let rule = RuleSpec {
-        name: "secret-bytes-counter-reset",
-        anchors: &[b"header"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"header\s+(\S+)").unwrap(),
+        ..base_rule(
+            "secret-bytes-counter-reset",
+            &[b"header"],
+            Regex::new(r"header\s+(\S+)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -1911,22 +1600,13 @@ fn secret_bytes_safelist_suppressed_findings_dont_consume_cap() {
     // the context-tier safelist does NOT fire. Only the secret-bytes tier
     // suppresses "changeme".
     let rule = RuleSpec {
-        name: "secret-bytes-cap-ordering",
-        anchors: &[b"header"],
         radius: 128,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"header\s+(\S+)").unwrap(),
+        ..base_rule(
+            "secret-bytes-cap-ordering",
+            &[b"header"],
+            Regex::new(r"header\s+(\S+)").unwrap(),
+        )
     };
 
     let engine =
@@ -1965,22 +1645,13 @@ fn secret_bytes_suppression_does_not_block_child_transforms() {
     // The UrlPercent transform (IfNoFindingsInThisBuffer) should still run
     // and discover the real secret.
     let rule = RuleSpec {
-        name: "found-any-suppression",
-        anchors: &[b"SECRET_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SECRET_([A-Za-z0-9]+)").unwrap(),
+        ..base_rule(
+            "found-any-suppression",
+            &[b"SECRET_"],
+            Regex::new(r"SECRET_([A-Za-z0-9]+)").unwrap(),
+        )
     };
     let transforms = vec![
         TransformConfig {
@@ -2046,22 +1717,13 @@ fn secret_bytes_safelist_does_not_suppress_composite_secret_with_placeholder_seg
     // suppressed. Before the \b → ^...$ anchoring fix, the `\b(?:null|...)\b`
     // pattern would match "null" at the hyphen-delimited segment boundary.
     let rule = RuleSpec {
-        name: "secret-bytes-composite",
-        anchors: &[b"SECRET_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SECRET_([A-Za-z0-9._-]+)").unwrap(),
+        ..base_rule(
+            "secret-bytes-composite",
+            &[b"SECRET_"],
+            Regex::new(r"SECRET_([A-Za-z0-9._-]+)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2085,22 +1747,13 @@ fn secret_bytes_safelist_does_not_suppress_composite_secret_with_placeholder_seg
 #[test]
 fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
     let rule = RuleSpec {
-        name: "value-suppressor-b64-raw",
-        anchors: &[b"SECRET_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"ABCD"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
+        ..base_rule(
+            "value-suppressor-b64-raw",
+            &[b"SECRET_"],
+            Regex::new(r"SECRET_([A-Z]{4})").unwrap(),
+        )
     };
     let transforms = vec![TransformConfig {
         id: TransformId::Base64,
@@ -2143,22 +1796,14 @@ fn value_suppressor_applies_in_base64_stream_decode_raw_path() {
 #[test]
 fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
     let with_suppressor = RuleSpec {
-        name: "value-suppressor-b64-utf16",
-        anchors: &[b"TOK"],
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"TOK"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(0),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK").unwrap(),
+        ..base_rule(
+            "value-suppressor-b64-utf16",
+            &[b"TOK"],
+            Regex::new("TOK").unwrap(),
+        )
     };
     let without_suppressor = RuleSpec {
         value_suppressors_any: None,
@@ -2215,22 +1860,13 @@ fn value_suppressor_applies_in_base64_stream_decode_utf16_path() {
 #[test]
 fn value_suppressor_filters_in_chunked_scan_path() {
     let rule = RuleSpec {
-        name: "value-suppressor-chunked",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-chunked",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2258,22 +1894,13 @@ fn value_suppressor_filters_in_chunked_scan_path() {
 #[test]
 fn value_suppressor_is_case_sensitive() {
     let rule = RuleSpec {
-        name: "value-suppressor-case",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"example"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-case",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2297,22 +1924,12 @@ fn value_suppressor_is_case_sensitive() {
 fn value_suppressor_works_with_full_match_fallback() {
     // No capture groups → secret_group: None falls back to the full match.
     let rule = RuleSpec {
-        name: "value-suppressor-full-match",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"TOK_AAAABBBB"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        ..base_rule(
+            "value-suppressor-full-match",
+            &[b"TOK_"],
+            Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2342,22 +1959,13 @@ fn value_suppressor_works_with_full_match_fallback() {
 #[test]
 fn value_suppressor_single_byte_pattern() {
     let rule = RuleSpec {
-        name: "value-suppressor-single-byte",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"X"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "value-suppressor-single-byte",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2393,22 +2001,13 @@ fn value_suppressor_targets_secret_group_not_full_match() {
     // match. Here group 1 = the part after "KEY_", so suppressor "KEY_" should only match
     // if the captured group itself contains "KEY_".
     let rule = RuleSpec {
-        name: "vs-group-target",
-        anchors: &[b"KEY_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"KEY_"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "vs-group-target",
+            &[b"KEY_"],
+            Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2440,22 +2039,13 @@ fn value_suppressor_is_substring_match_not_exact() {
     // Verify that suppressor matching is substring-based: the suppressor pattern must be
     // found anywhere in the secret span, not requiring an exact match.
     let rule = RuleSpec {
-        name: "vs-substring",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"ABC"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "vs-substring",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2499,13 +2089,7 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
     // Rule with all three post-regex gates active: entropy, suppressor, and local context.
     // Each vector tests a different gate filtering independently.
     let rule = RuleSpec {
-        name: "vs-triple-gate",
-        anchors: &[b"KEY="],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"EXAMPLE"]),
         entropy: Some(EntropySpec {
             min_bits_per_byte: 3.0,
@@ -2513,7 +2097,6 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
             max_len: 32,
             min_entropy_bits_per_byte: None,
         }),
-        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -2522,10 +2105,11 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
             key_names_any: None,
         }),
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"KEY=([A-Za-z0-9]{8,16})").unwrap(),
+        ..base_rule(
+            "vs-triple-gate",
+            &[b"KEY="],
+            Regex::new(r"KEY=([A-Za-z0-9]{8,16})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2569,22 +2153,10 @@ fn value_suppressor_direct_utf16_window() {
     // Encode a secret directly as UTF-16BE bytes (not via base64) and verify
     // suppression works through the `run_rule_on_utf16_window_aligned` path.
     let rule = RuleSpec {
-        name: "vs-direct-utf16",
-        anchors: &[b"TOK"],
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"TOK"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(0),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK").unwrap(),
+        ..base_rule("vs-direct-utf16", &[b"TOK"], Regex::new("TOK").unwrap())
     };
 
     let mut tuning = demo_tuning();
@@ -2626,40 +2198,22 @@ fn value_suppressor_direct_utf16_window() {
 fn multiple_rules_different_suppressors_are_independent() {
     // Two rules with different suppressors: verify no cross-contamination.
     let rule_a = RuleSpec {
-        name: "rule-a",
-        anchors: &[b"AA_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"FOO"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"AA_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "rule-a",
+            &[b"AA_"],
+            Regex::new(r"AA_([A-Za-z0-9]{8})").unwrap(),
+        )
     };
     let rule_b = RuleSpec {
-        name: "rule-b",
-        anchors: &[b"BB_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"BAR"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"BB_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "rule-b",
+            &[b"BB_"],
+            Regex::new(r"BB_([A-Za-z0-9]{8})").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2701,22 +2255,13 @@ fn value_suppressor_with_explicit_secret_group_0() {
     // `secret_group: Some(0)` explicitly set. Verifies that the explicit group 0
     // path in `extract_secret_span_locs` behaves identically to the None fallback.
     let rule = RuleSpec {
-        name: "vs-explicit-group0",
-        anchors: &[b"TOK_"],
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
         value_suppressors_any: Some(&[b"TOK_AAAABBBB"]),
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: Some(0), // Explicit group 0 instead of None
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        secret_group: Some(0),
+        ..base_rule(
+            "vs-explicit-group0",
+            &[b"TOK_"],
+            Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -2747,27 +2292,18 @@ fn value_suppressor_with_explicit_secret_group_0() {
 fn entropy_gate_filters_low_entropy_matches() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule = RuleSpec {
-        name: "entropy-gate",
-        anchors: ANCHORS,
         radius: 8,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
         entropy: Some(EntropySpec {
             min_bits_per_byte: 3.0,
             min_len: 8,
             max_len: 32,
             min_entropy_bits_per_byte: None,
         }),
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
+        ..base_rule(
+            "entropy-gate",
+            ANCHORS,
+            Regex::new(r"TOK_[A-Za-z0-9]{8}").unwrap(),
+        )
     };
     let eng = Engine::new_with_anchor_policy(
         vec![rule],
@@ -2807,43 +2343,27 @@ fn entropy_gate_evaluated_on_extracted_secret() {
     // --- (a) Reject: full match high entropy, secret zero entropy ----------
     const ANCHORS_A: &[&[u8]] = &[b"pfx_"];
     let rule_reject = RuleSpec {
-        name: "ent-on-secret-reject",
-        anchors: ANCHORS_A,
         radius: 40,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
         entropy: entropy.clone(),
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"pfx_[a-z0-9]{8}:([X]{8})").unwrap(),
+        ..base_rule(
+            "ent-on-secret-reject",
+            ANCHORS_A,
+            Regex::new(r"pfx_[a-z0-9]{8}:([X]{8})").unwrap(),
+        )
     };
 
     // --- (b) Accept: full match low entropy, secret high entropy -----------
     const ANCHORS_B: &[&[u8]] = &[b"REP_"];
     let rule_accept = RuleSpec {
-        name: "ent-on-secret-accept",
-        anchors: ANCHORS_B,
         radius: 40,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
         entropy: entropy.clone(),
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"REP_[A]{20}_([a-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "ent-on-secret-accept",
+            ANCHORS_B,
+            Regex::new(r"REP_[A]{20}_([a-z0-9]{8})").unwrap(),
+        )
     };
 
     let eng = Engine::new_with_anchor_policy(
@@ -2878,40 +2398,15 @@ fn entropy_gate_evaluated_on_extracted_secret() {
 fn offline_validation_gate_pooled_round_trip() {
     const ANCHORS: &[&[u8]] = &[b"TOK_"];
     let rule_with = RuleSpec {
-        name: "with-ov",
-        anchors: ANCHORS,
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
         offline_validation: Some(OfflineValidationSpec::GithubFinegrainedPat),
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+        ..base_rule("with-ov", ANCHORS, Regex::new(r"TOK_[A-Z0-9]{4}").unwrap())
     };
     let rule_without = RuleSpec {
-        name: "without-ov",
-        anchors: ANCHORS,
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+        ..base_rule(
+            "without-ov",
+            ANCHORS,
+            Regex::new(r"TOK_[A-Z0-9]{4}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -3199,22 +2694,12 @@ fn secret_extraction_hash_consistency() {
     // Same secret value should produce the same hash regardless of how it's found.
     const ANCHORS: &[&[u8]] = &[b"SEC_"];
     let rule = RuleSpec {
-        name: "hash-consistency",
-        anchors: ANCHORS,
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SEC_([A-Za-z0-9]{12})").unwrap(),
+        ..base_rule(
+            "hash-consistency",
+            ANCHORS,
+            Regex::new(r"SEC_([A-Za-z0-9]{12})").unwrap(),
+        )
     };
     let eng = Engine::new_with_anchor_policy(
         vec![rule],
@@ -3256,22 +2741,11 @@ fn secret_extraction_utf16le_path() {
     // Secret extraction should work correctly through UTF-16LE decode path.
     const ANCHORS: &[&[u8]] = &[b"UTF_"];
     let rule = RuleSpec {
-        name: "utf16-extraction",
-        anchors: ANCHORS,
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"UTF_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "utf16-extraction",
+            ANCHORS,
+            Regex::new(r"UTF_([A-Za-z0-9]{8})").unwrap(),
+        )
     };
 
     let mut tuning = demo_tuning();
@@ -3321,16 +2795,6 @@ fn secret_extraction_utf16le_path() {
 fn local_context_gate_applies_in_utf16_path() {
     const ANCHORS: &[&[u8]] = &[b"UTF_"];
     let rule = RuleSpec {
-        name: "utf16-local-context",
-        anchors: ANCHORS,
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
             lookahead: 64,
@@ -3339,10 +2803,11 @@ fn local_context_gate_applies_in_utf16_path() {
             key_names_any: None,
         }),
         secret_group: Some(0),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"UTF_[A-Za-z0-9]{8}").unwrap(),
+        ..base_rule(
+            "utf16-local-context",
+            ANCHORS,
+            Regex::new(r"UTF_[A-Za-z0-9]{8}").unwrap(),
+        )
     };
 
     let mut tuning = demo_tuning();
@@ -3476,23 +2941,11 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
     // Create a rule where the secret is a substring of the full match.
     const ANCHORS: &[&[u8]] = &[b"PREFIX_"];
     let rule = RuleSpec {
-        name: "partial-secret-window",
-        anchors: ANCHORS,
-        radius: 32,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        // Pattern: PREFIX_<secret>_SUFFIX - group 1 is just the middle part.
-        uuid_format_secret: false,
-        re: Regex::new(r"PREFIX_([A-Za-z0-9]{8})_SUFFIX").unwrap(),
+        ..base_rule(
+            "partial-secret-window",
+            ANCHORS,
+            Regex::new(r"PREFIX_([A-Za-z0-9]{8})_SUFFIX").unwrap(),
+        )
     };
 
     let eng = Engine::new_with_anchor_policy(
@@ -3533,22 +2986,8 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
 fn anchor_policy_prefers_derived_over_manual() {
     const MANUAL: &[&[u8]] = &[b"bar"];
     let rule = RuleSpec {
-        name: "derived-prefers",
-        anchors: MANUAL,
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("foo").unwrap(),
+        ..base_rule("derived-prefers", MANUAL, Regex::new("foo").unwrap())
     };
 
     let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
@@ -3567,22 +3006,12 @@ fn anchor_policy_prefers_derived_over_manual() {
 fn anchor_policy_falls_back_to_manual_on_unfilterable() {
     const MANUAL: &[&[u8]] = &[b"Z"];
     let rule = RuleSpec {
-        name: "manual-fallback",
-        anchors: MANUAL,
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("[A-Za-z]{1,}").unwrap(),
+        ..base_rule(
+            "manual-fallback",
+            MANUAL,
+            Regex::new("[A-Za-z]{1,}").unwrap(),
+        )
     };
 
     let eng = Engine::new(vec![rule], Vec::new(), demo_tuning());
@@ -4740,22 +4169,8 @@ fn scan_file_sync_materializes_provenance_across_chunks() -> std::io::Result<()>
 fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
     const ANCHORS: &[&[u8]] = &[b"X"];
     let rules = vec![RuleSpec {
-        name: "toy-token",
-        anchors: ANCHORS,
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("X").unwrap(),
+        ..base_rule("toy-token", ANCHORS, Regex::new("X").unwrap())
     }];
     let engine = Arc::new(Engine::new(rules, Vec::new(), demo_tuning()));
     let mut runtime = ScannerRuntime::new(
@@ -4784,22 +4199,12 @@ fn scan_file_sync_drops_prefix_duplicates() -> std::io::Result<()> {
 #[test]
 fn utf16_overlap_accounts_for_scaled_radius() {
     let rule = RuleSpec {
-        name: "utf16-boundary",
-        anchors: &[b"tok_"],
         radius: 12,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
+        ..base_rule(
+            "utf16-boundary",
+            &[b"tok_"],
+            Regex::new(r"aaatok_[0-9]{8}bbbb").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -4849,22 +4254,12 @@ fn utf16_overlap_accounts_for_scaled_radius() {
 #[test]
 fn utf16le_anchor_odd_offset_near_start_is_detected() {
     let rule = RuleSpec {
-        name: "utf16-odd-start",
-        anchors: &[b"SIM2_"],
         radius: 25,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
+        ..base_rule(
+            "utf16-odd-start",
+            &[b"SIM2_"],
+            Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -4900,22 +4295,12 @@ fn utf16le_anchor_odd_offset_near_start_is_detected() {
 #[test]
 fn utf16be_mixed_parity_anchors_find_both() {
     let rule = RuleSpec {
-        name: "utf16be-mixed-parity",
-        anchors: &[b"SIM2_"],
         radius: 25,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
+        ..base_rule(
+            "utf16be-mixed-parity",
+            &[b"SIM2_"],
+            Regex::new(r"SIM2_[A-Z0-9]{12}").unwrap(),
+        )
     };
     let mut tuning = demo_tuning();
     tuning.scan_utf16_variants = true;
@@ -4974,22 +4359,12 @@ fn test_chunked_scan_dedup_secret_in_overlap_with_wide_window() {
     const ANCHORS: &[&[u8]] = &[b"KEY_"];
 
     let rule = RuleSpec {
-        name: "dedup-regression",
-        anchors: ANCHORS,
-        radius: 128, // Wide window radius to extend past chunk boundary
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"KEY_([A-Za-z0-9]{16})").unwrap(),
+        radius: 128,
+        ..base_rule(
+            "dedup-regression",
+            ANCHORS,
+            Regex::new(r"KEY_([A-Za-z0-9]{16})").unwrap(),
+        )
     };
 
     let eng = Engine::new_with_anchor_policy(
@@ -5059,22 +4434,13 @@ fn test_chunked_scan_trailing_context_not_dropped() {
     // Pattern with trailing delimiter context after the capture group.
     // The `;` is NOT part of the captured secret but IS part of the full match.
     let rule = RuleSpec {
-        name: "trailing-context-test",
-        anchors: ANCHORS,
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: Some(1), // Capture group 1 is the secret
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"KEY_([A-Z0-9]{8})(?:;|$)").unwrap(),
+        secret_group: Some(1),
+        ..base_rule(
+            "trailing-context-test",
+            ANCHORS,
+            Regex::new(r"KEY_([A-Z0-9]{8})(?:;|$)").unwrap(),
+        )
     };
 
     let eng = Engine::new_with_anchor_policy(
@@ -5432,22 +4798,8 @@ fn tiger_boundary_percent_triplet_split() {
 #[test]
 fn chunked_transform_root_hint_matches_reference() {
     let rule = RuleSpec {
-        name: "tok0",
-        anchors: &[b"TOK0_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
     };
 
     let transforms = vec![
@@ -5566,22 +4918,8 @@ fn chunked_transform_root_hint_matches_reference() {
 #[test]
 fn chunked_url_percent_prefix_trigger_kept() {
     let rule = RuleSpec {
-        name: "tok0",
-        anchors: &[b"TOK0_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
     };
 
     let transforms = vec![TransformConfig {
@@ -5626,22 +4964,8 @@ fn chunked_url_percent_prefix_trigger_kept() {
 #[test]
 fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
     let rule = RuleSpec {
-        name: "tok0",
-        anchors: &[b"TOK0_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
     };
 
     let transforms = vec![TransformConfig {
@@ -5714,22 +5038,8 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
 #[test]
 fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
     let rule = RuleSpec {
-        name: "tok0",
-        anchors: &[b"TOK0_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
     };
 
     let transforms = vec![TransformConfig {
@@ -5798,22 +5108,8 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
 #[test]
 fn nested_transform_dedupe_keeps_multiple_matches() {
     let rule = RuleSpec {
-        name: "tok0",
-        anchors: &[b"TOK0_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK0_[A-Z0-9]{8}").unwrap(),
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
     };
 
     let transforms = vec![
@@ -5924,22 +5220,12 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
     // so we place a UTF-16BE anchor so its final byte lands in a 1-byte tail
     // chunk. The gate must inspect tail+chunk to see the NULs and match.
     let rule = RuleSpec {
-        name: "utf16be-gate-boundary",
-        anchors: &[b"TOK"],
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK").unwrap(),
+        ..base_rule(
+            "utf16be-gate-boundary",
+            &[b"TOK"],
+            Regex::new("TOK").unwrap(),
+        )
     };
 
     let tc = TransformConfig {
@@ -5981,22 +5267,8 @@ fn base64_gate_utf16be_anchor_straddles_stream_boundary() {
 #[test]
 fn stream_window_recovers_after_ring_eviction() {
     let rule = RuleSpec {
-        name: "ring-evict-window",
-        anchors: &[b"TOK"],
         radius: 128,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK").unwrap(),
+        ..base_rule("ring-evict-window", &[b"TOK"], Regex::new("TOK").unwrap())
     };
 
     let tc = TransformConfig {
@@ -6036,22 +5308,12 @@ fn stream_window_recovers_after_ring_eviction() {
 #[test]
 fn stream_hit_cap_forces_full_fallback() {
     let rule = RuleSpec {
-        name: "stream-hit-cap-fallback",
-        anchors: &[b"TOK"],
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK").unwrap(),
+        ..base_rule(
+            "stream-hit-cap-fallback",
+            &[b"TOK"],
+            Regex::new("TOK").unwrap(),
+        )
     };
 
     let tc = TransformConfig {
@@ -6093,22 +5355,12 @@ fn stream_hit_cap_forces_full_fallback() {
 #[test]
 fn stream_nested_span_fallback_recovers() {
     let rule = RuleSpec {
-        name: "nested-span-fallback",
-        anchors: &[b"TOK"],
         radius: 0,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new("TOK").unwrap(),
+        ..base_rule(
+            "nested-span-fallback",
+            &[b"TOK"],
+            Regex::new("TOK").unwrap(),
+        )
     };
 
     let tc = TransformConfig {
@@ -6537,26 +5789,17 @@ fn build_invalid_crc_token() -> Vec<u8> {
 /// `secret_group` is `None` so the full match is the secret span.
 fn offline_crc_rule() -> RuleSpec {
     RuleSpec {
-        name: "offline-crc-test",
-        anchors: &[b"tok_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
         offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
             prefix_skip: 4,
             payload_len: 8,
             checksum_len: 6,
         }),
-        uuid_format_secret: false,
-        re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+        ..base_rule(
+            "offline-crc-test",
+            &[b"tok_"],
+            Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+        )
     }
 }
 
@@ -6635,22 +5878,12 @@ fn offline_validation_mixed_valid_invalid_and_no_gate() {
 
     // A rule without offline validation.
     let plain_rule = RuleSpec {
-        name: "plain-no-gate",
-        anchors: &[b"api_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"api_[A-Za-z0-9]{8}").unwrap(),
+        ..base_rule(
+            "plain-no-gate",
+            &[b"api_"],
+            Regex::new(r"api_[A-Za-z0-9]{8}").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -6874,25 +6107,16 @@ fn offline_invalid_does_not_consume_finding_cap_slot() {
 #[test]
 fn char_class_gate_rejects_all_lowercase() {
     let rule = RuleSpec {
-        name: "cc-reject",
-        anchors: &[b"tok_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
         char_class: Some(CharClassSpec {
             max_lower_pct: 50,
             min_window_len: 16,
         }),
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"tok_([a-z]{20})").unwrap(),
+        ..base_rule(
+            "cc-reject",
+            &[b"tok_"],
+            Regex::new(r"tok_([a-z]{20})").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -6915,25 +6139,16 @@ fn char_class_gate_rejects_all_lowercase() {
 #[test]
 fn char_class_gate_passes_mixed_case() {
     let rule = RuleSpec {
-        name: "cc-pass",
-        anchors: &[b"TOK_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
         char_class: Some(CharClassSpec {
             max_lower_pct: 50,
             min_window_len: 16,
         }),
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "cc-pass",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -6955,25 +6170,16 @@ fn char_class_gate_passes_mixed_case() {
 #[test]
 fn char_class_gate_fail_open_short_window() {
     let rule = RuleSpec {
-        name: "cc-failopen",
-        anchors: &[b"tok_"],
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
         char_class: Some(CharClassSpec {
             max_lower_pct: 50,
             min_window_len: 128, // Very high min_window_len
         }),
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"tok_([a-z]{8})").unwrap(),
+        ..base_rule(
+            "cc-failopen",
+            &[b"tok_"],
+            Regex::new(r"tok_([a-z]{8})").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -7029,22 +6235,12 @@ fn base64_encode_bytes(input: &[u8]) -> Vec<u8> {
 #[test]
 fn confidence_score_zero_when_no_gates() {
     let rule = RuleSpec {
-        name: "test-secret",
-        anchors: &[b"SECRET"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"SECRET[A-Z]{8}").unwrap(),
+        ..base_rule(
+            "test-secret",
+            &[b"SECRET"],
+            Regex::new(r"SECRET[A-Z]{8}").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -7063,27 +6259,19 @@ fn confidence_score_zero_when_no_gates() {
 #[test]
 fn confidence_score_entropy_gate() {
     let rule = RuleSpec {
-        name: "entropy-test",
-        anchors: &[b"TOK_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
         entropy: Some(EntropySpec {
             min_bits_per_byte: 3.0,
             min_len: 4,
             max_len: 32,
             min_entropy_bits_per_byte: None,
         }),
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            "entropy-test",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -7108,22 +6296,13 @@ fn confidence_score_entropy_gate() {
 #[test]
 fn confidence_score_keyword_gate() {
     let rule = RuleSpec {
-        name: "keyword-test",
-        anchors: &[b"TOK_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
         keywords_any: Some(&[b"password"]),
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        ..base_rule(
+            "keyword-test",
+            &[b"TOK_"],
+            Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -7175,31 +6354,24 @@ fn confidence_score_offline_valid() {
 fn confidence_score_multiple_gates_accumulate() {
     // Rule with entropy + keywords + offline CRC validation.
     let rule = RuleSpec {
-        name: "multi-gate-test",
-        anchors: &[b"tok_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
         keywords_any: Some(&[b"secret"]),
-        value_suppressors_any: None,
         entropy: Some(EntropySpec {
             min_bits_per_byte: 2.5,
             min_len: 4,
             max_len: 32,
             min_entropy_bits_per_byte: None,
         }),
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
         offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
             prefix_skip: 4,
             payload_len: 8,
             checksum_len: 6,
         }),
-        uuid_format_secret: false,
-        re: Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+        ..base_rule(
+            "multi-gate-test",
+            &[b"tok_"],
+            Regex::new(r"tok_[A-Za-z0-9]{14}").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -7234,22 +6406,12 @@ fn confidence_score_multiple_gates_accumulate() {
 fn confidence_score_assignment_shape_gate() {
     // name = "generic-api-key" enables the assignment-shape check.
     let rule = RuleSpec {
-        name: "generic-api-key",
-        anchors: &[b"gak_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"gak_[A-Z]{8}").unwrap(),
+        ..base_rule(
+            "generic-api-key",
+            &[b"gak_"],
+            Regex::new(r"gak_[A-Z]{8}").unwrap(),
+        )
     };
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -7273,22 +6435,13 @@ fn confidence_score_assignment_shape_gate() {
 
 fn min_conf_rule(name: &'static str) -> RuleSpec {
     RuleSpec {
-        name,
-        anchors: &[b"TOK_"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        ..base_rule(
+            name,
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+        )
     }
 }
 
@@ -7398,22 +6551,13 @@ fn uuid_quick_reject_suppresses_bare_uuid() {
     // Rule with uuid_format_secret=false, regex captures UUID-shaped value.
     // Extracted secret is a bare UUID → should be suppressed.
     let rule = RuleSpec {
-        name: "uuid-suppress-test",
-        anchors: &[b"header"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"header\s+(\S+)").unwrap(),
+        ..base_rule(
+            "uuid-suppress-test",
+            &[b"header"],
+            Regex::new(r"header\s+(\S+)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
@@ -7438,22 +6582,14 @@ fn uuid_quick_reject_suppresses_bare_uuid() {
 fn uuid_quick_reject_bypassed_when_rule_captures_uuid_secrets() {
     // Same setup but uuid_format_secret=true → finding should be preserved.
     let rule = RuleSpec {
-        name: "uuid-bypass-test",
-        anchors: &[b"header"],
         radius: 64,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
         secret_group: Some(1),
-        min_confidence: None,
-        offline_validation: None,
         uuid_format_secret: true,
-        re: Regex::new(r"header\s+(\S+)").unwrap(),
+        ..base_rule(
+            "uuid-bypass-test",
+            &[b"header"],
+            Regex::new(r"header\s+(\S+)").unwrap(),
+        )
     };
 
     let engine = Engine::new_with_anchor_policy(
