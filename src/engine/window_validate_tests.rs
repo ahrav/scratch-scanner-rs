@@ -221,18 +221,6 @@ fn char_class_gate_cases() {
 
 // ---- compute_confidence_score tests ----
 
-fn empty_gates() -> ResolvedGates<'static> {
-    ResolvedGates {
-        confirm_all: None,
-        keywords: None,
-        entropy: None,
-        char_class: None,
-        value_suppressors: None,
-        local_context: None,
-        min_confidence: 0,
-    }
-}
-
 fn stub_rule(needs_assignment_shape: bool) -> RuleCompiled {
     RuleCompiled {
         re: Regex::new("x").unwrap(),
@@ -258,70 +246,76 @@ fn stub_outcome(offline_verdict_valid: bool) -> EmitPolicyOutcome {
     }
 }
 
+fn stub_evidence(
+    entropy_outcome: Option<EntropyGateOutcome>,
+    keyword_local_hit: bool,
+) -> GateEvidence {
+    GateEvidence {
+        entropy_outcome,
+        keyword_local_hit,
+    }
+}
+
 #[test]
 fn compute_confidence_score_cases() {
-    let kw = KeywordsCompiled {
-        any: [
-            PackedPatterns {
-                bytes: Box::new([]),
-                offsets: Box::new([]),
-            },
-            PackedPatterns {
-                bytes: Box::new([]),
-                offsets: Box::new([]),
-            },
-            PackedPatterns {
-                bytes: Box::new([]),
-                offsets: Box::new([]),
-            },
-        ],
-    };
-    let entropy_gate = EntropyCompiled {
-        min_bits_per_byte: 3.0,
-        min_len: 4,
-        max_len: 256,
-        min_entropy_bits_per_byte: None,
-    };
-
-    // (label, gates-modifier, assignment_shape, offline_valid, expected)
-    let cases: Vec<(&str, bool, bool, bool, bool, i8)> = vec![
-        // (label, has_entropy, has_keywords, assignment_shape, offline_valid, expected)
+    let cases: Vec<(&str, GateEvidence, bool, bool, i8)> = vec![
+        ("no evidence", stub_evidence(None, false), false, false, 0),
         (
-            "no gates, no shape, no offline",
+            "measured entropy only",
+            stub_evidence(Some(EntropyGateOutcome::PassedMeasured), false),
             false,
             false,
+            confidence::ENTROPY_PASS,
+        ),
+        (
+            "keyword local only",
+            stub_evidence(None, true),
+            false,
+            false,
+            confidence::KEYWORD_PRESENT,
+        ),
+        (
+            "short-len bypass entropy contributes zero",
+            stub_evidence(Some(EntropyGateOutcome::BypassedShortLen), false),
             false,
             false,
             0,
         ),
-        ("entropy only", true, false, false, false, 1),
-        ("keywords only", false, true, false, false, 2),
-        ("entropy + keywords", true, true, false, false, 3),
-        ("assignment shape only", false, false, true, false, 2),
-        ("entropy + assignment shape", true, false, true, false, 3),
-        ("offline valid only", false, false, false, true, 5),
+        (
+            "failed entropy contributes zero",
+            stub_evidence(Some(EntropyGateOutcome::Failed), false),
+            false,
+            false,
+            0,
+        ),
+        (
+            "assignment shape only",
+            stub_evidence(None, false),
+            true,
+            false,
+            confidence::ASSIGNMENT_SHAPE,
+        ),
+        (
+            "offline valid only",
+            stub_evidence(None, false),
+            false,
+            true,
+            confidence::OFFLINE_VALID,
+        ),
         (
             "all signals",
-            true,
-            true,
+            stub_evidence(Some(EntropyGateOutcome::PassedMeasured), true),
             true,
             true,
             10, // 1 + 2 + 2 + 5
         ),
     ];
 
-    for (label, has_entropy, has_keywords, assignment_shape, offline_valid, expected) in &cases {
-        let mut gates = empty_gates();
-        if *has_entropy {
-            gates.entropy = Some(entropy_gate);
-        }
-        if *has_keywords {
-            gates.keywords = Some(&kw);
-        }
+    for (label, evidence, assignment_shape, offline_valid, expected) in &cases {
         let rule = stub_rule(*assignment_shape);
         let outcome = stub_outcome(*offline_valid);
 
-        let score = compute_confidence_score(&gates, &rule, &outcome);
+        let score = compute_confidence_score(evidence, &rule, &outcome);
         assert_eq!(score, *expected, "case: {label}");
     }
 }

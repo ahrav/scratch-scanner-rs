@@ -89,7 +89,7 @@ flowchart TB
     Safelist --> SecretSafelist
     SecretSafelist --> OfflineVal
     OfflineVal --> Cap
-    Cap --> ConfScore["compute_confidence_score()<br/>(additive 0–10 from gate signals)"]
+    Cap --> ConfScore["compute_confidence_score()<br/>(additive 0–10 from per-finding evidence)"]
     ConfScore --> FindingRec
 
     style Input fill:#e3f2fd
@@ -554,7 +554,7 @@ FindingRec {
     root_hint_end: 140,
     dedupe_with_span: true,  // Whether span participates in dedupe key
     step_id: StepId(0),      // Decode provenance chain
-    confidence_score: 7,     // Additive 0–10 score from gate signals
+    confidence_score: 7,     // Additive 0–10 score from per-finding evidence
 }
 ```
 

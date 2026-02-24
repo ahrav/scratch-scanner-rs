@@ -2243,7 +2243,8 @@ pub fn bench_entropy_gate_passes_with_state(
         max_len: state.max_len,
         min_entropy_bits_per_byte: None,
     };
-    super::helpers::entropy_gate_passes(&spec, bytes, &mut state.scratch, &state.log2_table)
+    super::helpers::entropy_gate_outcome(&spec, bytes, &mut state.scratch, &state.log2_table)
+        .allows_candidate()
 }
 
 /// Benchmark helper for `shannon_entropy_bits_per_byte` using reusable state.

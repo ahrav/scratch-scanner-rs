@@ -6,7 +6,7 @@
 
 use super::core::Engine;
 #[cfg(feature = "stdx-proptest")]
-use super::helpers::entropy_gate_passes;
+use super::helpers::entropy_gate_outcome;
 use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, extract_secret_span, hash128};
 #[cfg(all(test, feature = "stdx-proptest"))]
 use super::hit_pool::{HitAccPool, SpanU32};
@@ -3449,12 +3449,14 @@ fn scan_rules_reference(
                                     min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
                                 };
                                 let secret_bytes = &window[secret_start..secret_end];
-                                if !entropy_gate_passes(
+                                if !entropy_gate_outcome(
                                     &ent,
                                     secret_bytes,
                                     entropy_scratch,
                                     &engine.entropy_log2,
-                                ) {
+                                )
+                                .allows_candidate()
+                                {
                                     continue;
                                 }
                             }
@@ -3569,12 +3571,14 @@ fn scan_rules_reference(
                                         min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
                                     };
                                     let secret_bytes = &decoded[secret_start..secret_end];
-                                    if !entropy_gate_passes(
+                                    if !entropy_gate_outcome(
                                         &ent,
                                         secret_bytes,
                                         entropy_scratch,
                                         &engine.entropy_log2,
-                                    ) {
+                                    )
+                                    .allows_candidate()
+                                    {
                                         continue;
                                     }
                                 }
@@ -6385,7 +6389,7 @@ fn confidence_score_entropy_gate() {
     assert_eq!(
         recs[0].confidence_score,
         confidence::ENTROPY_PASS,
-        "entropy gate should add ENTROPY_PASS ({}) to score",
+        "measured entropy pass should add ENTROPY_PASS ({}) to score",
         confidence::ENTROPY_PASS,
     );
 }
@@ -6415,8 +6419,45 @@ fn confidence_score_keyword_gate() {
     assert_eq!(
         recs[0].confidence_score,
         confidence::KEYWORD_PRESENT,
-        "keyword gate should add KEYWORD_PRESENT ({}) to score",
+        "local keyword evidence should add KEYWORD_PRESENT ({}) to score",
         confidence::KEYWORD_PRESENT,
+    );
+}
+
+#[test]
+fn confidence_score_keyword_presence_without_local_evidence_is_zero() {
+    let rule = RuleSpec {
+        radius: 256,
+        keywords_any: Some(&[b"password"]),
+        ..base_rule(
+            "keyword-presence-not-evidence",
+            &[b"TOK_"],
+            Regex::new(r"TOK_[A-Z]{8}").unwrap(),
+        )
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut hay = Vec::new();
+    hay.extend_from_slice(b"password ");
+    hay.extend(std::iter::repeat_n(b'x', 96));
+    hay.extend_from_slice(b"TOK_ABCDEFGH suffix");
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(&hay, FileId(0), 0, &mut scratch);
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "presence-only keyword window should still emit"
+    );
+    assert_eq!(
+        recs[0].confidence_score, 0,
+        "keyword presence outside the local evidence window must not earn score"
     );
 }
 
@@ -6527,6 +6568,64 @@ fn confidence_score_assignment_shape_gate() {
         confidence::ASSIGNMENT_SHAPE,
         "assignment-shape gate should add ASSIGNMENT_SHAPE ({}) to score",
         confidence::ASSIGNMENT_SHAPE,
+    );
+}
+
+#[test]
+fn keyword_entropy_auto_tier_requires_measured_entropy_evidence() {
+    let rule = RuleSpec {
+        radius: 128,
+        keywords_any: Some(&[b"password"]),
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 2.0,
+            min_len: 16,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+        }),
+        secret_group: Some(1),
+        ..base_rule(
+            "kw-ent-evidence",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Za-z0-9]{8,24})").unwrap(),
+        )
+    };
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Entropy bypass (len < 16): contributes 0, so score stays at keyword-only (2)
+    // and fails the auto-derived keyword+entropy threshold (3).
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(b"password TOK_A1b2C3d4 suffix", FileId(0), 0, &mut scratch);
+    assert!(
+        scratch.findings().is_empty(),
+        "short-len entropy bypass should not satisfy kw+entropy auto-threshold"
+    );
+
+    // Measured entropy pass (len >= 16) + local keyword evidence => score 3 and emit.
+    engine.scan_chunk_into(
+        b"password TOK_A1b2C3d4E5f6G7h8 suffix",
+        FileId(1),
+        0,
+        &mut scratch,
+    );
+    let recs = scratch.findings();
+    assert_eq!(
+        recs.len(),
+        1,
+        "measured entropy + keyword evidence should emit"
+    );
+    assert_eq!(
+        recs[0].confidence_score,
+        confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS,
+        "auto-tier score should reflect measured entropy + local keyword evidence"
+    );
+    assert_eq!(
+        engine.rule_min_confidence(0),
+        confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS
     );
 }
 

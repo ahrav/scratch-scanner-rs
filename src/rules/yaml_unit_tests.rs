@@ -936,12 +936,14 @@ fn random_high_entropy_values_are_not_suppressed() {
         &|secret| format!("API_KEY={secret}"),
     );
 
-    // hashicorp-tf-password: 12-char alphanumeric, distinct >= 6.
+    // hashicorp-tf-password: 16-char alphanumeric, distinct >= 6.
+    // The rule auto-derives min_confidence=3 (keyword + measured entropy), so
+    // test secrets must be long enough for measured entropy (min_len=16).
     assert_random_high_entropy_not_suppressed(
         "hashicorp-tf-password",
         0xA5A5A5A5A5A5A5A5,
         6,
-        &|state| deterministic_secret(state, 12),
+        &|state| deterministic_secret(state, 16),
         &|secret| format!("password = \"{secret}\""),
     );
 
