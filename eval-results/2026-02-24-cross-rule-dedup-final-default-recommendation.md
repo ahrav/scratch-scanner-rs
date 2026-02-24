@@ -148,4 +148,3 @@ docker run --rm --privileged -v "$PWD":/work -w /work rust:1.90 bash -lc '
 - `eval-results/2026-02-24-cross-rule-final/repo-scan-off.tsv`
 - `eval-results/2026-02-24-cross-rule-final/repo-scan-on-off-delta.tsv`
 - `eval-results/2026-02-24-cross-rule-final/linux-uring-parity/2026-02-24-linux-uring-parity-summary.md`
-- `eval-results/2026-02-24-cross-rule-final/linux-uring-parity/uring-parity-tests-privileged.log`
