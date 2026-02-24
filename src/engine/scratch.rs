@@ -628,6 +628,10 @@ pub struct ScanScratch {
     /// Incremented only when both `perf-stats` and `debug_assertions` are
     /// enabled; accessor returns 0 otherwise.
     pub(super) offline_suppressed: usize,
+    /// Findings removed by the per-rule confidence-threshold check at emission time.
+    /// Incremented only when both `perf-stats` and `debug_assertions` are
+    /// enabled; accessor returns 0 otherwise.
+    pub(super) confidence_suppressed: usize,
     /// Set by `scan_chunk_into` after running the Vectorscan prefilter on the
     /// root buffer. Consumed (one-shot) by the first `scan_rules_on_buffer`
     /// call so that the root buffer skips redundant prefiltering. Transform
@@ -869,6 +873,7 @@ impl ScanScratch {
             secret_bytes_safelist_suppressed: 0,
             uuid_format_suppressed: 0,
             offline_suppressed: 0,
+            confidence_suppressed: 0,
             last_chunk_start: 0,
             last_chunk_len: 0,
             last_file_id: None,
@@ -957,6 +962,7 @@ impl ScanScratch {
         self.secret_bytes_safelist_suppressed = 0;
         self.uuid_format_suppressed = 0;
         self.offline_suppressed = 0;
+        self.confidence_suppressed = 0;
         self.work_q.clear();
         self.work_head = 0;
         self.slab.reset();
@@ -1521,6 +1527,22 @@ impl ScanScratch {
         #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
         {
             let _ = &self.offline_suppressed;
+            0
+        }
+    }
+
+    /// Returns the number of findings removed by the per-rule confidence
+    /// threshold.
+    ///
+    /// Always returns 0 when the `perf-stats` feature is disabled.
+    pub fn confidence_suppressed(&self) -> usize {
+        #[cfg(all(feature = "perf-stats", debug_assertions))]
+        {
+            self.confidence_suppressed
+        }
+        #[cfg(not(all(feature = "perf-stats", debug_assertions)))]
+        {
+            let _ = &self.confidence_suppressed;
             0
         }
     }

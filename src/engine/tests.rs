@@ -1712,6 +1712,103 @@ fn secret_bytes_suppression_does_not_block_child_transforms() {
 }
 
 #[test]
+fn confidence_suppression_does_not_block_child_transforms() {
+    // Mirrors `secret_bytes_suppression_does_not_block_child_transforms` but
+    // uses confidence-threshold suppression instead of safelist suppression.
+    //
+    // Two rules, both match in base64-decoded content:
+    //   Rule A ("conf-suppressed"): matches SECRET_*, min_confidence=5, no keyword gate
+    //     → scores 0 → suppressed. Must NOT set found_any.
+    //   Rule B ("conf-passthrough"): matches TOKEN_*, no min_confidence
+    //     → discovered in the URL-percent-decoded child buffer.
+    //
+    // The UrlPercent transform (IfNoFindingsInThisBuffer) should run because
+    // Rule A's suppressed finding never set found_any.
+    let rule_a = RuleSpec {
+        radius: 64,
+        secret_group: Some(1),
+        min_confidence: Some(5),
+        ..base_rule(
+            "conf-suppressed",
+            &[b"SECRET_"],
+            Regex::new(r"SECRET_([A-Za-z0-9]+)").unwrap(),
+        )
+    };
+    let rule_b = RuleSpec {
+        radius: 64,
+        secret_group: Some(1),
+        ..base_rule(
+            "conf-passthrough",
+            &[b"TOKEN_"],
+            Regex::new(r"TOKEN_([A-Za-z0-9]+)").unwrap(),
+        )
+    };
+    let transforms = vec![
+        TransformConfig {
+            id: TransformId::UrlPercent,
+            mode: TransformMode::IfNoFindingsInThisBuffer,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 8,
+            max_encoded_len: 4096,
+            max_decoded_bytes: 4096,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+        TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 8,
+            max_spans_per_buffer: 8,
+            max_encoded_len: 4096,
+            max_decoded_bytes: 4096,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        },
+    ];
+
+    let mut tuning = demo_tuning();
+    tuning.max_transform_depth = 3;
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_a, rule_b],
+        transforms,
+        tuning,
+        AnchorPolicy::ManualOnly,
+    );
+
+    // Base64-encode content with a confidence-suppressed match (Rule A) and a
+    // URL-encoded real secret for Rule B.
+    // Decoded base64: "key SECRET_PlainLow urldata %54%4F%4B%45%4E%5F%58%6B%39%70%51%6D end"
+    //   - "SECRET_PlainLow" → Rule A, scores 0, suppressed by min_confidence=5
+    //   - URL-decoded: "TOKEN_Xk9pQm" → Rule B, no threshold, emitted
+    let inner_plain = b"key SECRET_PlainLow urldata %54%4F%4B%45%4E%5F%58%6B%39%70%51%6D end";
+    let b64 = b64_encode(inner_plain);
+    let hay = format!("noise {b64}");
+    let hits = scan_chunk_findings(&engine, hay.as_bytes());
+
+    // Rule A's finding is suppressed by confidence threshold.
+    // Rule B's finding from the URL-decoded layer should be emitted via the
+    // IfNoFindingsInThisBuffer transform (transform_idx 0).
+    assert!(
+        hits.iter().any(|h| {
+            h.rule == "conf-passthrough"
+                && h.decode_steps
+                    .iter()
+                    .any(|s| matches!(s, DecodeStep::Transform { transform_idx, .. } if *transform_idx == 0))
+        }),
+        "URL-decoded real secret should be found — IfNoFindingsInThisBuffer \
+         must not be blocked by confidence-suppressed findings.\n\
+         Found {} findings: {:?}",
+        hits.len(),
+        hits.iter()
+            .map(|h| (&h.rule, &h.decode_steps))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn secret_bytes_safelist_does_not_suppress_composite_secret_with_placeholder_segment() {
     // Regression: composite secrets like "key-null-safety-9xK2mB" must not be
     // suppressed. Before the \b → ^...$ anchoring fix, the `\b(?:null|...)\b`

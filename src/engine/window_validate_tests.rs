@@ -1,4 +1,6 @@
 use super::*;
+use crate::api::{confidence, AnchorPolicy, FileId, RuleSpec, ValidatorKind};
+use crate::demo::demo_tuning;
 use crate::engine::rule_repr::NO_GATE;
 use regex::bytes::Regex;
 
@@ -227,6 +229,7 @@ fn empty_gates() -> ResolvedGates<'static> {
         char_class: None,
         value_suppressors: None,
         local_context: None,
+        min_confidence: 0,
     }
 }
 
@@ -321,4 +324,111 @@ fn compute_confidence_score_cases() {
         let score = compute_confidence_score(&gates, &rule, &outcome);
         assert_eq!(score, *expected, "case: {label}");
     }
+}
+
+fn min_conf_rule(
+    name: &'static str,
+    keywords_any: Option<&'static [&'static [u8]]>,
+    min_confidence: i8,
+) -> RuleSpec {
+    RuleSpec {
+        name,
+        anchors: &[b"TOK_"],
+        radius: 64,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: Some(1),
+        min_confidence: Some(min_confidence),
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"TOK_([A-Za-z0-9]{8})").unwrap(),
+    }
+}
+
+#[test]
+fn min_confidence_threshold_suppresses_low_score_finding() {
+    let rule = min_conf_rule("min-conf-drop", None, 1);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(b"prefix TOK_ABCDEFGH suffix", FileId(0), 0, &mut scratch);
+
+    assert!(
+        scratch.findings().is_empty(),
+        "score-0 finding should be suppressed by min_confidence=1"
+    );
+}
+
+#[test]
+fn min_confidence_threshold_allows_finding_at_threshold() {
+    let rule = min_conf_rule(
+        "min-conf-keep",
+        Some(&[b"password"]),
+        confidence::KEYWORD_PRESENT,
+    );
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+    engine.scan_chunk_into(b"password TOK_ABCDEFGH suffix", FileId(0), 0, &mut scratch);
+
+    let findings = scratch.findings();
+    assert_eq!(
+        findings.len(),
+        1,
+        "threshold-equal finding should be emitted"
+    );
+    assert_eq!(
+        findings[0].confidence_score,
+        confidence::KEYWORD_PRESENT,
+        "keyword gate should contribute KEYWORD_PRESENT and satisfy threshold"
+    );
+}
+
+#[cfg(feature = "perf-stats")]
+#[test]
+fn confidence_suppressed_counter_increments_and_resets() {
+    // A rule with min_confidence=1 and no keyword/entropy gates: all findings
+    // score 0 and get suppressed, incrementing the counter.
+    let rule = min_conf_rule("counter-test", None, 1);
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let mut scratch = engine.new_scratch();
+
+    // First scan: one finding suppressed by confidence threshold.
+    engine.scan_chunk_into(b"prefix TOK_ABCDEFGH suffix", FileId(0), 0, &mut scratch);
+    assert_eq!(
+        scratch.confidence_suppressed(),
+        1,
+        "confidence_suppressed counter should increment on suppression"
+    );
+
+    // Second scan (new file): another suppressed finding. Verify the counter
+    // was reset (reads 1 again, not accumulated to 2).
+    engine.scan_chunk_into(b"prefix TOK_XYZWVUTS suffix", FileId(1), 0, &mut scratch);
+    assert_eq!(
+        scratch.confidence_suppressed(),
+        1,
+        "confidence_suppressed counter should reset between scans (reads 1, not 2)"
+    );
 }

@@ -32,7 +32,8 @@
 //!     `uuid_format_secret()`.
 //! 13. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
 //! 14. Compute additive confidence score from gate signals that fired.
-//! 15. Record the finding with the extracted secret span.
+//! 15. Apply per-rule `min_confidence` threshold.
+//! 16. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -102,6 +103,15 @@ pub(super) struct ResolvedGates<'e> {
     pub(super) char_class: Option<CharClassCompiled>,
     pub(super) value_suppressors: Option<&'e PackedPatterns>,
     pub(super) local_context: Option<LocalContextSpec>,
+    pub(super) min_confidence: i8,
+}
+
+impl ResolvedGates<'_> {
+    /// Returns `true` when the confidence score meets the rule's threshold.
+    #[inline(always)]
+    fn passes_threshold(&self, score: i8) -> bool {
+        score >= self.min_confidence
+    }
 }
 
 impl Engine {
@@ -113,8 +123,17 @@ impl Engine {
     /// rule-specific and do not vary by variant; the per-pair call frequency
     /// is an artifact of the loop structure, not a semantic requirement.
     /// See [`ResolvedGates`] for the optimization rationale.
+    ///
+    /// `rule_id` is required separately because `min_confidence` is stored in
+    /// `rules_cold` (not in `RuleCompiled`) and resolved via
+    /// [`rule_min_confidence`](Engine::rule_min_confidence).
     #[inline(always)]
-    pub(super) fn resolve_gates(&self, rule: &RuleCompiled) -> ResolvedGates<'_> {
+    pub(super) fn resolve_gates(&self, rule_id: u32, rule: &RuleCompiled) -> ResolvedGates<'_> {
+        let min_confidence = self.rule_min_confidence(rule_id);
+        debug_assert!(
+            (0..=10).contains(&min_confidence),
+            "min_confidence {min_confidence} out of Phase 1 range for rule {rule_id}"
+        );
         ResolvedGates {
             confirm_all: self.confirm_all_gate(rule.confirm_all),
             keywords: self.keyword_gate(rule.keywords),
@@ -122,6 +141,7 @@ impl Engine {
             char_class: self.char_class_gate(rule.char_class),
             value_suppressors: self.value_suppressor_gate(rule.value_suppressors),
             local_context: self.local_context_gate(rule.local_context),
+            min_confidence,
         }
     }
 }
@@ -516,6 +536,8 @@ impl Engine {
     ///   or decoding fails.
     /// - Findings may be suppressed at emit-time by safelist policy, UUID-format
     ///   quick-reject, or offline structural validation.
+    /// - Surviving findings are still dropped when the computed additive
+    ///   confidence score is below the rule's `min_confidence` threshold.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_rule_on_window(
         &self,
@@ -666,6 +688,13 @@ impl Engine {
                                 return;
                             };
                             let confidence_score = compute_confidence_score(gates, rule, &outcome);
+                            if !gates.passes_threshold(confidence_score) {
+                                crate::perf_stats::sat_add_usize(
+                                    &mut scratch.confidence_suppressed,
+                                    1,
+                                );
+                                return;
+                            }
                             scratch.push_finding_with_drop_hint(
                                 FindingRec {
                                     file_id,
@@ -747,7 +776,8 @@ impl Engine {
     /// char_class gates run on **decoded** UTF-8 bytes (post-decode). The
     /// remaining gates (regex, entropy, value suppressor, local context,
     /// safelist, UUID reject, offline validation) operate on the decoded
-    /// representation.
+    /// representation. After emit-time policy passes, confidence is scored and
+    /// compared against `min_confidence` before emission.
     ///
     /// # Step ID distinction
     /// Context-window safelist suppression uses the emitted `utf16_step_id`
@@ -954,6 +984,10 @@ impl Engine {
                         return;
                     };
                     let confidence_score = compute_confidence_score(gates, rule, &outcome);
+                    if !gates.passes_threshold(confidence_score) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                        return;
+                    }
                     scratch.push_finding_with_drop_hint(
                         FindingRec {
                             file_id,
@@ -993,7 +1027,8 @@ impl Engine {
     ///   match start. Regex search starts near this position with a back-scan margin.
     ///
     /// # Effects
-    /// - Sets `found_any` when any match passes gates AND emit-time policy.
+    /// - Sets `found_any` when any match passes gates, emit-time policy,
+    ///   and the `min_confidence` threshold.
     ///   Suppressed findings do not set `found_any`, ensuring
     ///   `IfNoFindingsInThisBuffer` transforms can still run.
     /// - Findings may be suppressed by the context-window safelist when emitted
@@ -1128,12 +1163,15 @@ impl Engine {
                     ) else {
                         return;
                     };
-                    // Set found_any only after emit-time policy confirms
-                    // the finding will be emitted. Suppressed findings
-                    // (safelist, secret-bytes, offline validation) must not
-                    // prevent IfNoFindingsInThisBuffer transforms from running.
-                    *found_any = true;
                     let confidence_score = compute_confidence_score(gates, rule, &outcome);
+                    if !gates.passes_threshold(confidence_score) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                        return;
+                    }
+                    // Set found_any only for findings that are actually staged.
+                    // Suppressed findings (emit-time policy or confidence threshold)
+                    // must not prevent IfNoFindingsInThisBuffer transforms from running.
+                    *found_any = true;
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1157,7 +1195,7 @@ impl Engine {
     ///
     /// Staging variant of [`run_rule_on_utf16_window_aligned`]. Applies the
     /// same gate sequence (pre-decode raw gates, decode, post-decode gates,
-    /// regex, emit-time policy) but writes to `tmp_*` staging buffers instead
+    /// regex, emit-time policy, confidence threshold) but writes to `tmp_*` staging buffers instead
     /// of committing directly. See that method for the full gate ordering and
     /// safety justification for the `utf16_buf` raw-pointer reborrow.
     ///
@@ -1170,7 +1208,8 @@ impl Engine {
     ///   `base_offset` and overrides the default root span.
     ///
     /// # Effects
-    /// - Sets `found_any` when any match passes gates AND emit-time policy.
+    /// - Sets `found_any` when any match passes gates, emit-time policy,
+    ///   and the `min_confidence` threshold.
     ///   Suppressed findings do not set `found_any`, preserving
     ///   `IfNoFindingsInThisBuffer` transform semantics.
     /// - Context-window safelist suppression checks the emitted step
@@ -1374,10 +1413,14 @@ impl Engine {
                     ) else {
                         return;
                     };
-                    // Set found_any only after emit-time policy confirms
-                    // the finding will be emitted (see raw-path comment).
-                    *found_any = true;
                     let confidence_score = compute_confidence_score(gates, rule, &outcome);
+                    if !gates.passes_threshold(confidence_score) {
+                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                        return;
+                    }
+                    // Set found_any only for findings that are actually staged
+                    // (emit-time policy and confidence threshold both passed).
+                    *found_any = true;
                     scratch.tmp_findings.push(FindingRec {
                         file_id,
                         rule_id,
@@ -1469,7 +1512,9 @@ impl Engine {
     ///
     /// Returns `None` when the finding is suppressed. In that case suppression
     /// counters are incremented here (when `perf-stats` + `debug_assertions`
-    /// are enabled) so callers do not duplicate bookkeeping.
+    /// are enabled) so callers do not duplicate bookkeeping. Confidence
+    /// thresholding is intentionally handled by callers after
+    /// [`compute_confidence_score`].
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn apply_emit_time_policy(
