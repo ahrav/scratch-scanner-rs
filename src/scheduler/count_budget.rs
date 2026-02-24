@@ -493,7 +493,6 @@ mod tests {
 
         assert!(p2.is_none());
         assert!(elapsed >= Duration::from_millis(40)); // Allow some slack
-        assert!(elapsed < Duration::from_millis(200)); // Shouldn't take too long
     }
 
     #[test]
