@@ -587,29 +587,51 @@ impl RuleCompiled {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RuleCold {
     pub(super) name: &'static str,
+    /// Effective minimum confidence threshold for this rule.
+    ///
+    /// Precomputed by [`derive_min_confidence`] during engine construction.
+    /// At emission time, findings whose `confidence_score` is below this
+    /// value are suppressed. Stored here (not in `RuleCompiled`) because it
+    /// is only consulted at emit time, not in the hot per-window gate loop.
     pub(super) min_confidence: i8,
 }
 
+/// Returns whether this rule should use the assignment-shape precheck gate.
+///
+/// Currently hard-coded to `generic-api-key`, which matches `key = <token>`
+/// patterns in arbitrary contexts. The shape check rejects windows lacking
+/// a separator + token run, and enables `confidence::ASSIGNMENT_SHAPE` (+2)
+/// as a confidence signal.
 fn needs_assignment_shape_check(spec: &RuleSpec) -> bool {
     spec.name == "generic-api-key"
 }
 
 /// Computes the effective minimum confidence threshold for a rule.
 ///
-/// Priority order:
-/// 1. explicit `RuleSpec::min_confidence` override
-/// 2. keyword + entropy gates both present
-/// 3. assignment-shape check enabled
-/// 4. default to zero (no threshold filtering)
+/// # Priority cascade
 ///
-/// This chooses a single default floor (not an additive score).
+/// The first matching tier wins; later tiers are not consulted:
+/// 1. Explicit `RuleSpec::min_confidence` override (author intent).
+/// 2. Both keyword + entropy gates configured => `KEYWORD_PRESENT + ENTROPY_PASS` (3).
+/// 3. Assignment-shape check enabled => `ASSIGNMENT_SHAPE` (2).
+/// 4. Default => 0 (no threshold filtering).
 ///
-/// Offline validation is deliberately excluded from auto-derivation:
-/// the offline signal is only scored on root-semantic findings
-/// (`parent_step_id == STEP_ROOT`), so transform-derived findings can
-/// never earn it. A per-rule threshold of `OFFLINE_VALID` would
-/// silently block valid transform findings. Rules that want the
-/// offline tier can set `min_confidence` explicitly.
+/// This chooses a single default floor (not an additive score). The
+/// keyword+entropy tier requires both signals because that is the evidence
+/// combination the auto-derived threshold expects at emission time: a local
+/// keyword hit (+2) plus a measured entropy pass (+1) on the same finding.
+///
+/// # Why offline validation is excluded
+///
+/// Offline validation (`OFFLINE_VALID`, +5) is only scored on root-semantic
+/// findings (`parent_step_id == STEP_ROOT`), so transform-derived findings
+/// can never earn it. A per-rule threshold of `OFFLINE_VALID` would silently
+/// block all valid transform-derived findings. Rules that want an offline-tier
+/// threshold should set `min_confidence` explicitly.
+///
+/// # Returns
+///
+/// A value in `0..=10` (Phase 1 ceiling), stored in [`RuleCold::min_confidence`].
 pub(super) fn derive_min_confidence(spec: &RuleSpec) -> i8 {
     use crate::api::confidence;
 

@@ -48,21 +48,23 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 7] Check entropy on extracted secret (Shannon + optional min-entropy)
   ↓
-[Gate 8] Apply value suppressors on extracted secret bytes (when configured)
+[Step 8] Probe for keyword evidence in local context (±32 bytes around full match)
   ↓
-[Gate 9] Apply local context checks (bounded, fail-open)
+[Gate 9] Apply value suppressors on extracted secret bytes (when configured)
   ↓
-[Gate 10] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
+[Gate 10] Apply local context checks (bounded, fail-open)
   ↓
-[Gate 11] Apply secret-bytes safelist suppression (all findings, including decoded)
+[Gate 11] Apply root-context safelist suppression (emit-time, `step_id == STEP_ROOT` findings only)
   ↓
-[Gate 12] Apply UUID-format quick-reject (all findings, gated per-rule by uuid_format_secret())
+[Gate 12] Apply secret-bytes safelist suppression (all findings, including decoded)
   ↓
-[Gate 13] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
+[Gate 13] Apply UUID-format quick-reject (all findings, gated per-rule by uuid_format_secret())
   ↓
-[Step 14] Compute additive confidence score from gate signals that fired
+[Gate 14] Apply offline structural validation (CRC, charset, etc.) for root-semantic findings
   ↓
-[Gate 15] Apply per-rule `min_confidence` threshold
+[Step 15] Compute additive confidence score from per-finding evidence outcomes
+  ↓
+[Gate 16] Apply per-rule `min_confidence` threshold
   ↓
 Output: FindingRec with spans in appropriate coordinate space
 ```
@@ -409,7 +411,7 @@ let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
 
 ---
 
-## Entropy Checking: entropy_gate_passes Implementation
+## Entropy Checking: entropy_gate_outcome Implementation
 
 Entropy gating filters matches based on two complementary metrics computed from
 the extracted secret bytes, eliminating tokens unlikely to be credentials:
@@ -433,9 +435,12 @@ let (secret_start, secret_end) = extract_secret_span_locs_raw(
 );
 let secret_bytes = &window[secret_start..secret_end];
 
-let entropy_ok = post_match_entropy_passes(
+let entropy_outcome = post_match_entropy_outcome(
     entropy, secret_bytes, scratch, &self.entropy_log2,
 );
+if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
+    return;
+}
 ```
 
 ### Parameters
@@ -450,8 +455,8 @@ let entropy_ok = post_match_entropy_passes(
 - Evaluates entropy on the **extracted secret** bytes, not the full regex match or window
 - Shannon entropy is checked first (rejects ~80-90% of non-secrets)
 - Min-entropy is checked second when `min_entropy_bits_per_byte` is set
-- Matches shorter than configured minimum length automatically pass (entropy is noisy on tiny samples)
-- On failure, **continues to next match** (not an early return) via `continue`
+- Matches shorter than configured minimum length return `BypassedShortLen` (pass-through for detection, zero confidence contribution)
+- On measured failure (`Failed`), the callback returns early for that match and continues scanning other matches
 
 ### Rationale
 
@@ -534,7 +539,10 @@ scratch.push_finding_with_drop_hint(
 | `root_hint_end` | `u64` | Full match end (file offset for deduplication) |
 | `step_id` | `StepId` | Decode chain reference (enables span mapping) |
 | `dedupe_with_span` | `bool` | Whether `span_start`/`span_end` participate in dedupe |
-| `confidence_score` | `i8` | Additive 0–10 score computed from gate signals that fired |
+| `confidence_score` | `i8` | Additive 0–10 score computed from per-finding evidence (measured entropy pass, local keyword hit, assignment-shape signal, offline-valid signal) |
+
+Keyword evidence is evaluated on a clamped local slice around the full regex
+match: `match_start.saturating_sub(32) .. min(match_end + 32, hay.len())`.
 
 ### Capacity Management
 
@@ -700,7 +708,7 @@ variant-specific ordering:
 2. UTF-16: confirm_all -> keywords -> decode -> must_contain -> assignment-shape -> char_class
 3. Regex: O(n x complexity)
 4. Post-match: secret extraction -> entropy -> value suppressors -> local context
-5. Emit-time: safelists/offline validation -> confidence score -> min_confidence threshold
+5. Emit-time: safelists/offline validation -> evidence-based confidence score -> min_confidence threshold
 
 Early failures save expensive regex execution. Post-match gates run only on
 confirmed regex matches, so their cost scales with finding count, not window count.

@@ -22,18 +22,22 @@
 //!    UTF-8 buffer for UTF-16 variants (i.e., after this step).
 //! 5. Run regex with reusable capture locations to access capture groups.
 //! 6. Extract the secret span using capture group priority (see [`extract_secret_span_locs_raw`]).
-//! 7. Apply entropy gates on the *extracted secret*.
-//! 8. Apply value suppressors (when configured) on the extracted secret bytes.
-//! 9. Apply local context checks (when configured) on the secret span.
-//! 10. Apply root-context safelist suppression for root emit paths.
-//! 11. Apply secret-bytes safelist suppression (all findings, including decoded).
-//! 12. Apply UUID-format quick-reject: suppress findings whose extracted value is
+//! 7. Apply entropy gate on the *extracted secret*. `Failed` vetoes the finding;
+//!    the outcome is captured in [`GateEvidence`] for confidence scoring.
+//! 8. Probe for keyword evidence in local context (±`KEYWORD_EVIDENCE_RADIUS` bytes
+//!    around the full match). Result stored in [`GateEvidence`].
+//! 9. Apply value suppressors (when configured) on the extracted secret bytes.
+//! 10. Apply local context checks (when configured) on the secret span.
+//! 11. Apply root-context safelist suppression for root emit paths.
+//! 12. Apply secret-bytes safelist suppression (all findings, including decoded).
+//! 13. Apply UUID-format quick-reject: suppress findings whose extracted value is
 //!     a bare UUID (8-4-4-4-12 hex), unless the rule opts out via
 //!     `uuid_format_secret()`.
-//! 13. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
-//! 14. Compute additive confidence score from gate signals that fired.
-//! 15. Apply per-rule `min_confidence` threshold.
-//! 16. Record the finding with the extracted secret span.
+//! 14. Apply offline structural validation (CRC, charset, etc.) for root-semantic findings.
+//! 15. Compute additive confidence score from [`GateEvidence`], rule flags, and
+//!     emit-policy outcome (see `compute_confidence_score`).
+//! 16. Apply per-rule `min_confidence` threshold — suppress findings below floor.
+//! 17. Record the finding with the extracted secret span.
 //!
 //! # Secret Extraction
 //! The finding's `span_start`/`span_end` reflect the *secret* portion of the match,
@@ -55,6 +59,10 @@
 //! - UTF-16 findings attach a `DecodeStep::Utf16Window` so callers can map
 //!   decoded spans back to parent byte offsets.
 //! - Capture locations are reused per rule to avoid per-match allocations in hot paths.
+//! - Evidence collection (steps 7–8) is separated from scoring (step 15) so that
+//!   suppress-only gates (steps 9–14) can veto a finding without computing a
+//!   score, and all four emission sites share a single scoring function via
+//!   [`GateEvidence`].
 //!
 //! # Entry Points
 //! - `run_rule_on_window`: engine hot path that writes findings directly into
@@ -76,7 +84,8 @@ use std::ops::Range;
 use super::core::Engine;
 use super::helpers::{
     contains_all_memmem, contains_any_memmem, decode_utf16be_to_buf, decode_utf16le_to_buf,
-    entropy_gate_passes, extract_secret_span_locs_raw, map_utf16_decoded_offset,
+    entropy_gate_outcome, extract_secret_span_locs_raw, map_utf16_decoded_offset,
+    EntropyGateOutcome,
 };
 use super::rule_repr::{
     CharClassCompiled, ConfirmAllCompiled, EntropyCompiled, KeywordsCompiled, PackedPatterns,
@@ -157,6 +166,15 @@ impl Engine {
 /// adding negligible cost relative to typical 4–16 KiB window sizes. Doubling
 /// this showed no additional matches in benchmarks.
 const BACK_SCAN_MARGIN: usize = 64;
+/// Bytes of context on each side of the full regex match scanned for keyword
+/// evidence in confidence scoring.
+///
+/// The search window is `match_start - RADIUS .. match_end + RADIUS` (clamped
+/// to buffer bounds). A hit within this radius awards `confidence::KEYWORD_PRESENT`
+/// (+2). The value 32 is a pragmatic trade-off: large enough to catch
+/// `key = <secret>` patterns where the key name sits before the match, but small
+/// enough to avoid awarding score for unrelated keywords elsewhere in the buffer.
+const KEYWORD_EVIDENCE_RADIUS: usize = 32;
 
 /// Sidecar data computed by [`Engine::apply_emit_time_policy`] when a finding
 /// survives safelist suppression and offline validation.
@@ -182,6 +200,32 @@ struct EmitPolicyOutcome {
     /// Used by confidence scoring — `true` contributes [`confidence::OFFLINE_VALID`]
     /// to the finding's additive score.
     offline_verdict_valid: bool,
+}
+
+/// Per-finding evidence bundle consumed by [`compute_confidence_score`].
+///
+/// Constructed after entropy gating and keyword probing at each emission site,
+/// then passed — together with [`RuleCompiled`] flags and [`EmitPolicyOutcome`]
+/// — into confidence scoring. Only signals that require per-finding evaluation
+/// are stored here; rule-level signals (e.g., assignment-shape) and emit-time
+/// signals (e.g., offline validation) live in their respective structs.
+///
+/// # Design rationale
+///
+/// Separating evidence collection from scoring keeps the four structurally
+/// identical emission sites (raw, UTF-16 direct, raw-into, UTF-16-into) in
+/// sync: each builds a `GateEvidence`, and all share a single scoring function.
+#[derive(Clone, Copy, Debug)]
+struct GateEvidence {
+    /// Entropy-gate decision for this finding's extracted secret bytes.
+    ///
+    /// `None` when no entropy gate is configured for the rule. `Some(Failed)`
+    /// causes an early return before this struct is ever constructed, so in
+    /// practice only `Some(PassedMeasured)` and `Some(BypassedShortLen)` appear.
+    entropy_outcome: Option<EntropyGateOutcome>,
+    /// Whether any rule keyword appears within [`KEYWORD_EVIDENCE_RADIUS`] bytes
+    /// of the full regex match in the current buffer.
+    keyword_local_hit: bool,
 }
 
 /// Iterate capture matches without allocating by reusing `CaptureLocations`.
@@ -447,54 +491,102 @@ fn local_context_passes(
     true
 }
 
-/// Evaluates all entropy-family gates on extracted secret bytes.
+/// Evaluates entropy-family gates on extracted secret bytes.
 ///
-/// Returns `true` if the candidate passes (entropy is high enough or no gate configured).
-/// Exists to DRY up the `if let Some / else true` unwrap-and-default pattern that
-/// would otherwise be duplicated in each match callback (raw, UTF-16 direct, and
-/// both `*_into` staging paths).
+/// Returns `None` when no entropy gate is configured for this rule; otherwise
+/// delegates to [`entropy_gate_outcome`] and returns the canonical decision.
+///
+/// Callers use the returned outcome in two ways:
+/// 1. Hard-gate: `Some(Failed)` causes immediate discard of the finding.
+/// 2. Evidence: the outcome is stored in [`GateEvidence::entropy_outcome`]
+///    for confidence scoring.
 #[inline]
-fn post_match_entropy_passes(
+fn post_match_entropy_outcome(
     entropy: Option<EntropyCompiled>,
     secret_bytes: &[u8],
     scratch: &mut ScanScratch,
     entropy_log2: &[f32],
-) -> bool {
-    let Some(ent) = entropy else { return true };
-    entropy_gate_passes(
+) -> Option<EntropyGateOutcome> {
+    let ent = entropy?;
+    Some(entropy_gate_outcome(
         &ent,
         secret_bytes,
         scratch.ensure_entropy_scratch(),
         entropy_log2,
-    )
+    ))
+}
+
+/// Returns true when any rule keyword appears in local context around the match.
+///
+/// Scans ±[`KEYWORD_EVIDENCE_RADIUS`] bytes around the full regex match
+/// (`match_start..match_end`) using the rule's compiled keyword patterns.
+/// Locality matters: a keyword on the same line as the secret is strong
+/// evidence, but a keyword 500 bytes away is not. The bounded window avoids
+/// false confidence boosts from unrelated context.
+///
+/// Returns `false` when no keywords are configured (`keywords` is `None`),
+/// which means the rule does not participate in keyword evidence.
+#[inline]
+fn keyword_local_hit(
+    hay: &[u8],
+    match_start: usize,
+    match_end: usize,
+    keywords: Option<&PackedPatterns>,
+) -> bool {
+    let Some(keywords) = keywords else {
+        return false;
+    };
+    let local_start = match_start.saturating_sub(KEYWORD_EVIDENCE_RADIUS);
+    let local_end = match_end
+        .saturating_add(KEYWORD_EVIDENCE_RADIUS)
+        .min(hay.len());
+    contains_any_memmem(&hay[local_start..local_end], keywords)
 }
 
 /// Computes an additive confidence score for a finding based on which
-/// optional gates were present (and therefore passed) at emission time.
+/// per-finding evidence signals were observed at emission time.
 ///
-/// Each gate contributes a fixed weight defined in [`confidence`]:
-/// - Entropy gate present → `ENTROPY_PASS` (+1)
-/// - Keyword gate present → `KEYWORD_PRESENT` (+2)
+/// Each signal contributes a fixed weight defined in [`confidence`]:
+/// - Measured entropy passed → `ENTROPY_PASS` (+1)
+/// - Local keyword evidence hit → `KEYWORD_PRESENT` (+2)
 /// - Assignment-shape check enabled → `ASSIGNMENT_SHAPE` (+2)
 /// - Offline structural validation passed → `OFFLINE_VALID` (+5)
 ///
 /// Suppress-only gates (must-contain, value-suppressors, safelists) contribute
 /// zero because they only filter — they never add positive signal.
 ///
+/// # Inputs
+/// - `evidence`: per-finding entropy and keyword signals (see [`GateEvidence`]).
+/// - `rule`: consulted for rule-level flags (`needs_assignment_shape_check`).
+/// - `outcome`: consulted for the offline validation verdict.
+///
+/// # Output range
+/// Phase 1 scores are clamped to `0..=10`. The theoretical maximum is 10
+/// (entropy + keyword + assignment + offline). No current rule earns all
+/// four signals simultaneously. Callers compare the result against
+/// `ResolvedGates::min_confidence` for threshold filtering.
+///
 /// `#[inline(always)]` because the function is called on every finding
 /// emission and the body is a short chain of branch-and-add operations
 /// that benefits from inlining into each call-site.
 #[inline(always)]
 fn compute_confidence_score(
-    gates: &ResolvedGates<'_>,
+    evidence: &GateEvidence,
     rule: &RuleCompiled,
     outcome: &EmitPolicyOutcome,
 ) -> i8 {
+    debug_assert!(
+        !matches!(evidence.entropy_outcome, Some(EntropyGateOutcome::Failed)),
+        "Failed entropy outcome should never reach confidence scoring"
+    );
     let mut s: i8 = 0;
-    if gates.entropy.is_some() {
+    if matches!(
+        evidence.entropy_outcome,
+        Some(EntropyGateOutcome::PassedMeasured)
+    ) {
         s = s.saturating_add(confidence::ENTROPY_PASS);
     }
-    if gates.keywords.is_some() {
+    if evidence.keyword_local_hit {
         s = s.saturating_add(confidence::KEYWORD_PRESENT);
     }
     if rule.needs_assignment_shape_check() {
@@ -503,8 +595,8 @@ fn compute_confidence_score(
     if outcome.offline_verdict_valid {
         s = s.saturating_add(confidence::OFFLINE_VALID);
     }
-    debug_assert!(s >= 0, "Phase 1 score must be non-negative: {s}");
-    debug_assert!(s <= 10, "Phase 1 score exceeds max: {s}");
+    debug_assert!(s >= 0, "confidence score must be non-negative: {s}");
+    debug_assert!(s <= 10, "confidence score exceeds max: {s}");
     s.clamp(0, 10)
 }
 
@@ -526,7 +618,8 @@ impl Engine {
     /// - For UTF-16 variants, spans are in decoded UTF-8 byte space and the
     ///   parent raw span is recorded via `DecodeStep::Utf16Window`.
     /// - `root_hint`, when provided, is expected to be in the same coordinate
-    ///   space as `buf`/`w` and is used as the finding root span.
+    ///   space as `buf`/`w` and is used as a fallback root span when no
+    ///   root-span mapping context is active.
     /// - `anchor_hint` is the byte offset (in `buf` coordinates) where Vectorscan
     ///   reported the match start. Regex search starts near this position with
     ///   a back-scan margin for correctness.
@@ -604,6 +697,8 @@ impl Engine {
                 let search_window = &window[search_start..];
 
                 let entropy = gates.entropy;
+                let keyword_evidence_patterns =
+                    gates.keywords.map(|kws| &kws.any[Variant::Raw.idx()]);
                 let value_suppressors = gates.value_suppressors;
                 let secret_group_raw = rule.secret_group_raw();
                 let has_secret_group_override = rule.has_secret_group_override();
@@ -631,87 +726,93 @@ impl Engine {
                     let secret_end = search_start + secret_end;
                     let secret_bytes = &window[secret_start..secret_end];
 
-                    let entropy_ok = post_match_entropy_passes(
+                    let entropy_outcome = post_match_entropy_outcome(
                         entropy,
                         secret_bytes,
                         scratch,
                         &self.entropy_log2,
                     );
+                    if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
+                        return;
+                    }
+                    let evidence = GateEvidence {
+                        entropy_outcome,
+                        keyword_local_hit: keyword_local_hit(
+                            window,
+                            match_start,
+                            match_end,
+                            keyword_evidence_patterns,
+                        ),
+                    };
 
-                    if entropy_ok {
-                        // Value suppressor gate: discard findings whose extracted
-                        // secret contains a known placeholder/example pattern.
-                        if let Some(vs) = value_suppressors {
-                            if contains_any_memmem(secret_bytes, vs) {
-                                return;
-                            }
+                    // Value suppressor gate: discard findings whose extracted
+                    // secret contains a known placeholder/example pattern.
+                    if let Some(vs) = value_suppressors {
+                        if contains_any_memmem(secret_bytes, vs) {
+                            return;
                         }
+                    }
 
-                        let context_ok = if let Some(ctx) = gates.local_context {
-                            local_context_passes(window, secret_start, secret_end, ctx)
+                    let context_ok = if let Some(ctx) = gates.local_context {
+                        local_context_passes(window, secret_start, secret_end, ctx)
+                    } else {
+                        true
+                    };
+
+                    if context_ok {
+                        let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
+                        let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
+                        // Root hint uses the FULL MATCH span (group 0), not the secret or
+                        // window span. `drop_prefix_findings()` compares `root_hint_end`
+                        // against the chunk overlap boundary:
+                        // - Prefilter window span → too wide → false duplicates.
+                        // - Secret span → too narrow → misses findings whose trailing
+                        //   context (e.g., `;` delimiter) extends into the next chunk.
+                        // - Full match span → correct extent of the regex match.
+                        let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                            ctx.map_span(match_span_in_buf.clone())
                         } else {
-                            true
+                            root_hint.clone().unwrap_or(match_span_in_buf)
                         };
-
-                        if context_ok {
-                            let span_in_buf = (w.start + secret_start)..(w.start + secret_end);
-                            let match_span_in_buf = (w.start + match_start)..(w.start + match_end);
-                            // Root hint uses the FULL MATCH span (group 0), not the secret or
-                            // window span. `drop_prefix_findings()` compares `root_hint_end`
-                            // against the chunk overlap boundary:
-                            // - Prefilter window span → too wide → false duplicates.
-                            // - Secret span → too narrow → misses findings whose trailing
-                            //   context (e.g., `;` delimiter) extends into the next chunk.
-                            // - Full match span → correct extent of the regex match.
-                            let root_span_hint =
-                                if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                                    ctx.map_span(match_span_in_buf.clone())
-                                } else {
-                                    root_hint.clone().unwrap_or(match_span_in_buf)
-                                };
-                            let root_hint_start = base_offset + root_span_hint.start as u64;
-                            let root_hint_end = base_offset + root_span_hint.end as u64;
-                            let Some(outcome) = self.apply_emit_time_policy(
-                                rule,
-                                secret_bytes,
-                                step_id,
-                                step_id,
-                                buf,
-                                base_offset,
-                                base_offset,
-                                &root_span_hint,
+                        let root_hint_start = base_offset + root_span_hint.start as u64;
+                        let root_hint_end = base_offset + root_span_hint.end as u64;
+                        let Some(outcome) = self.apply_emit_time_policy(
+                            rule,
+                            secret_bytes,
+                            step_id,
+                            step_id,
+                            buf,
+                            base_offset,
+                            base_offset,
+                            &root_span_hint,
+                            root_hint_start,
+                            root_hint_end,
+                            &mut last_safelist_decision,
+                            scratch,
+                        ) else {
+                            return;
+                        };
+                        let confidence_score = compute_confidence_score(&evidence, rule, &outcome);
+                        if !gates.passes_threshold(confidence_score) {
+                            crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                            return;
+                        }
+                        scratch.push_finding_with_drop_hint(
+                            FindingRec {
+                                file_id,
+                                rule_id,
+                                span_start: span_in_buf.start as u32,
+                                span_end: span_in_buf.end as u32,
                                 root_hint_start,
                                 root_hint_end,
-                                &mut last_safelist_decision,
-                                scratch,
-                            ) else {
-                                return;
-                            };
-                            let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                            if !gates.passes_threshold(confidence_score) {
-                                crate::perf_stats::sat_add_usize(
-                                    &mut scratch.confidence_suppressed,
-                                    1,
-                                );
-                                return;
-                            }
-                            scratch.push_finding_with_drop_hint(
-                                FindingRec {
-                                    file_id,
-                                    rule_id,
-                                    span_start: span_in_buf.start as u32,
-                                    span_end: span_in_buf.end as u32,
-                                    root_hint_start,
-                                    root_hint_end,
-                                    dedupe_with_span: outcome.dedupe_with_span,
-                                    step_id,
-                                    confidence_score,
-                                },
-                                outcome.norm_hash,
-                                outcome.drop_hint_end,
-                                outcome.dedupe_with_span,
-                            );
-                        }
+                                dedupe_with_span: outcome.dedupe_with_span,
+                                step_id,
+                                confidence_score,
+                            },
+                            outcome.norm_hash,
+                            outcome.drop_hint_end,
+                            outcome.dedupe_with_span,
+                        );
                     }
                 });
                 scratch.capture_locs[rule_id as usize] = Some(locs);
@@ -909,6 +1010,7 @@ impl Engine {
         );
 
         let entropy = gates.entropy;
+        let keyword_evidence_patterns = gates.keywords.map(|kws| &kws.any[Variant::Raw.idx()]);
         let value_suppressors = gates.value_suppressors;
         let secret_group_raw = rule.secret_group_raw();
         let has_secret_group_override = rule.has_secret_group_override();
@@ -925,86 +1027,96 @@ impl Engine {
                 extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
             let secret_bytes = &decoded[secret_start..secret_end];
 
-            let entropy_ok =
-                post_match_entropy_passes(entropy, secret_bytes, scratch, &self.entropy_log2);
+            let entropy_outcome =
+                post_match_entropy_outcome(entropy, secret_bytes, scratch, &self.entropy_log2);
+            if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
+                return;
+            }
+            let evidence = GateEvidence {
+                entropy_outcome,
+                keyword_local_hit: keyword_local_hit(
+                    decoded,
+                    span.start,
+                    span.end,
+                    keyword_evidence_patterns,
+                ),
+            };
 
-            if entropy_ok {
-                // Value suppressor gate (see raw-path comment for rationale).
-                if let Some(vs) = value_suppressors {
-                    if contains_any_memmem(secret_bytes, vs) {
-                        return;
-                    }
+            // Value suppressor gate (see raw-path comment for rationale).
+            if let Some(vs) = value_suppressors {
+                if contains_any_memmem(secret_bytes, vs) {
+                    return;
                 }
+            }
 
-                let context_ok = if let Some(ctx) = gates.local_context {
-                    local_context_passes(decoded, secret_start, secret_end, ctx)
+            let context_ok = if let Some(ctx) = gates.local_context {
+                local_context_passes(decoded, secret_start, secret_end, ctx)
+            } else {
+                true
+            };
+
+            if context_ok {
+                // Map decoded UTF-8 match span back to raw UTF-16 byte offsets.
+                let match_raw_start = map_utf16_decoded_offset(
+                    raw_win,
+                    span.start,
+                    matches!(variant, Variant::Utf16Le),
+                );
+                let match_raw_end = map_utf16_decoded_offset(
+                    raw_win,
+                    span.end,
+                    matches!(variant, Variant::Utf16Le),
+                );
+                let mapped_span =
+                    (decode_range.start + match_raw_start)..(decode_range.start + match_raw_end);
+                // Apply root_span_map_ctx for transform-derived findings (same as Raw variant)
+                // to ensure each UTF-16 match gets a distinct root hint for deduplication.
+                let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                    ctx.map_span(mapped_span.clone())
                 } else {
-                    true
+                    root_hint.clone().unwrap_or(mapped_span)
                 };
-
-                if context_ok {
-                    // Map decoded UTF-8 match span back to raw UTF-16 byte offsets.
-                    let match_raw_start = map_utf16_decoded_offset(
-                        raw_win,
-                        span.start,
-                        matches!(variant, Variant::Utf16Le),
-                    );
-                    let match_raw_end = map_utf16_decoded_offset(
-                        raw_win,
-                        span.end,
-                        matches!(variant, Variant::Utf16Le),
-                    );
-                    let mapped_span = (decode_range.start + match_raw_start)
-                        ..(decode_range.start + match_raw_end);
-                    // Apply root_span_map_ctx for transform-derived findings (same as Raw variant)
-                    // to ensure each UTF-16 match gets a distinct root hint for deduplication.
-                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        ctx.map_span(mapped_span.clone())
-                    } else {
-                        root_hint.clone().unwrap_or(mapped_span)
-                    };
-                    let root_hint_start = base_offset + root_span_hint.start as u64;
-                    let root_hint_end = base_offset + root_span_hint.end as u64;
-                    // Use the parent step_id (not utf16_step_id) for offline validation:
-                    // root UTF-16 findings have parent == STEP_ROOT.
-                    let Some(outcome) = self.apply_emit_time_policy(
-                        rule,
-                        secret_bytes,
-                        utf16_step_id,
-                        step_id,
-                        buf,
-                        base_offset,
-                        base_offset,
-                        &root_span_hint,
+                let root_hint_start = base_offset + root_span_hint.start as u64;
+                let root_hint_end = base_offset + root_span_hint.end as u64;
+                // Use the parent step_id (not utf16_step_id) for offline validation:
+                // root UTF-16 findings have parent == STEP_ROOT.
+                let Some(outcome) = self.apply_emit_time_policy(
+                    rule,
+                    secret_bytes,
+                    utf16_step_id,
+                    step_id,
+                    buf,
+                    base_offset,
+                    base_offset,
+                    &root_span_hint,
+                    root_hint_start,
+                    root_hint_end,
+                    &mut last_safelist_decision,
+                    scratch,
+                ) else {
+                    return;
+                };
+                let confidence_score = compute_confidence_score(&evidence, rule, &outcome);
+                if !gates.passes_threshold(confidence_score) {
+                    crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                    return;
+                }
+                scratch.push_finding_with_drop_hint(
+                    FindingRec {
+                        file_id,
+                        rule_id,
+                        span_start: secret_start as u32,
+                        span_end: secret_end as u32,
                         root_hint_start,
                         root_hint_end,
-                        &mut last_safelist_decision,
-                        scratch,
-                    ) else {
-                        return;
-                    };
-                    let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                    if !gates.passes_threshold(confidence_score) {
-                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
-                        return;
-                    }
-                    scratch.push_finding_with_drop_hint(
-                        FindingRec {
-                            file_id,
-                            rule_id,
-                            span_start: secret_start as u32,
-                            span_end: secret_end as u32,
-                            root_hint_start,
-                            root_hint_end,
-                            dedupe_with_span: outcome.dedupe_with_span,
-                            step_id: utf16_step_id,
-                            confidence_score,
-                        },
-                        outcome.norm_hash,
-                        outcome.drop_hint_end,
-                        outcome.dedupe_with_span,
-                    );
-                }
+                        dedupe_with_span: outcome.dedupe_with_span,
+                        step_id: utf16_step_id,
+                        confidence_score,
+                    },
+                    outcome.norm_hash,
+                    outcome.drop_hint_end,
+                    outcome.dedupe_with_span,
+                );
             }
         });
         scratch.capture_locs[rule_id as usize] = Some(locs);
@@ -1022,7 +1134,8 @@ impl Engine {
     /// - `window_start` is the decoded-stream offset for `window[0]`.
     /// - Span offsets in findings are expressed in decoded-stream byte space.
     /// - `root_hint`, when present, is in the same coordinate space as
-    ///   `base_offset` and overrides the default root span.
+    ///   `base_offset` and is used as a fallback root span when no root-span
+    ///   mapping context is active.
     /// - `anchor_hint` is the decoded-stream offset where Vectorscan reported the
     ///   match start. Regex search starts near this position with a back-scan margin.
     ///
@@ -1094,6 +1207,7 @@ impl Engine {
         let search_window = &window[search_start..];
 
         let entropy = gates.entropy;
+        let keyword_evidence_patterns = gates.keywords.map(|kws| &kws.any[Variant::Raw.idx()]);
         let value_suppressors = gates.value_suppressors;
         let secret_group_raw = rule.secret_group_raw();
         let has_secret_group_override = rule.has_secret_group_override();
@@ -1115,77 +1229,87 @@ impl Engine {
             let secret_end = search_start + secret_end;
             let secret_bytes = &window[secret_start..secret_end];
 
-            let entropy_ok =
-                post_match_entropy_passes(entropy, secret_bytes, scratch, &self.entropy_log2);
+            let entropy_outcome =
+                post_match_entropy_outcome(entropy, secret_bytes, scratch, &self.entropy_log2);
+            if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
+                return;
+            }
+            let evidence = GateEvidence {
+                entropy_outcome,
+                keyword_local_hit: keyword_local_hit(
+                    window,
+                    match_start,
+                    match_end,
+                    keyword_evidence_patterns,
+                ),
+            };
 
-            if entropy_ok {
-                // Value suppressor gate (see raw-path comment for rationale).
-                if let Some(vs) = value_suppressors {
-                    if contains_any_memmem(secret_bytes, vs) {
-                        return;
-                    }
+            // Value suppressor gate (see raw-path comment for rationale).
+            if let Some(vs) = value_suppressors {
+                if contains_any_memmem(secret_bytes, vs) {
+                    return;
                 }
+            }
 
-                let context_ok = if let Some(ctx) = gates.local_context {
-                    local_context_passes(window, secret_start, secret_end, ctx)
+            let context_ok = if let Some(ctx) = gates.local_context {
+                local_context_passes(window, secret_start, secret_end, ctx)
+            } else {
+                true
+            };
+
+            if context_ok {
+                let span_start = window_start.saturating_add(secret_start as u64) as usize;
+                let span_end = window_start.saturating_add(secret_end as u64) as usize;
+                let span_in_buf = span_start..span_end;
+                // Use FULL MATCH span for root_span_hint (see Raw variant comment for rationale).
+                let match_hint_start = window_start.saturating_add(match_start as u64) as usize;
+                let match_hint_end = window_start.saturating_add(match_end as u64) as usize;
+                let match_span_in_buf = match_hint_start..match_hint_end;
+                let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                    ctx.map_span(match_span_in_buf.clone())
                 } else {
-                    true
+                    root_hint.clone().unwrap_or(match_span_in_buf)
                 };
-
-                if context_ok {
-                    let span_start = window_start.saturating_add(secret_start as u64) as usize;
-                    let span_end = window_start.saturating_add(secret_end as u64) as usize;
-                    let span_in_buf = span_start..span_end;
-                    // Use FULL MATCH span for root_span_hint (see Raw variant comment for rationale).
-                    let match_hint_start = window_start.saturating_add(match_start as u64) as usize;
-                    let match_hint_end = window_start.saturating_add(match_end as u64) as usize;
-                    let match_span_in_buf = match_hint_start..match_hint_end;
-                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        ctx.map_span(match_span_in_buf.clone())
-                    } else {
-                        root_hint.clone().unwrap_or(match_span_in_buf)
-                    };
-                    let root_hint_start = base_offset + root_span_hint.start as u64;
-                    let root_hint_end = base_offset + root_span_hint.end as u64;
-                    let Some(outcome) = self.apply_emit_time_policy(
-                        rule,
-                        secret_bytes,
-                        step_id,
-                        step_id,
-                        window,
-                        base_offset,
-                        base_offset.saturating_add(window_start),
-                        &root_span_hint,
-                        root_hint_start,
-                        root_hint_end,
-                        &mut last_safelist_decision,
-                        scratch,
-                    ) else {
-                        return;
-                    };
-                    let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                    if !gates.passes_threshold(confidence_score) {
-                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
-                        return;
-                    }
-                    // Set found_any only for findings that are actually staged.
-                    // Suppressed findings (emit-time policy or confidence threshold)
-                    // must not prevent IfNoFindingsInThisBuffer transforms from running.
-                    *found_any = true;
-                    scratch.tmp_findings.push(FindingRec {
-                        file_id,
-                        rule_id,
-                        span_start: span_in_buf.start as u32,
-                        span_end: span_in_buf.end as u32,
-                        root_hint_start,
-                        root_hint_end,
-                        dedupe_with_span: outcome.dedupe_with_span,
-                        step_id,
-                        confidence_score,
-                    });
-                    scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
-                    scratch.tmp_norm_hash.push(outcome.norm_hash);
+                let root_hint_start = base_offset + root_span_hint.start as u64;
+                let root_hint_end = base_offset + root_span_hint.end as u64;
+                let Some(outcome) = self.apply_emit_time_policy(
+                    rule,
+                    secret_bytes,
+                    step_id,
+                    step_id,
+                    window,
+                    base_offset,
+                    base_offset.saturating_add(window_start),
+                    &root_span_hint,
+                    root_hint_start,
+                    root_hint_end,
+                    &mut last_safelist_decision,
+                    scratch,
+                ) else {
+                    return;
+                };
+                let confidence_score = compute_confidence_score(&evidence, rule, &outcome);
+                if !gates.passes_threshold(confidence_score) {
+                    crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                    return;
                 }
+                // Set found_any only for findings that are actually staged.
+                // Suppressed findings (emit-time policy or confidence threshold)
+                // must not prevent IfNoFindingsInThisBuffer transforms from running.
+                *found_any = true;
+                scratch.tmp_findings.push(FindingRec {
+                    file_id,
+                    rule_id,
+                    span_start: span_in_buf.start as u32,
+                    span_end: span_in_buf.end as u32,
+                    root_hint_start,
+                    root_hint_end,
+                    dedupe_with_span: outcome.dedupe_with_span,
+                    step_id,
+                    confidence_score,
+                });
+                scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
+                scratch.tmp_norm_hash.push(outcome.norm_hash);
             }
         });
         scratch.capture_locs[rule_id as usize] = Some(locs);
@@ -1205,7 +1329,8 @@ impl Engine {
     /// - An attached [`DecodeStep::Utf16Window`] records the raw UTF-16 parent
     ///   span in decoded-stream byte offsets.
     /// - `root_hint`, when present, is in the same coordinate space as
-    ///   `base_offset` and overrides the default root span.
+    ///   `base_offset` and is used as a fallback root span when no root-span
+    ///   mapping context is active.
     ///
     /// # Effects
     /// - Sets `found_any` when any match passes gates, emit-time policy,
@@ -1338,6 +1463,7 @@ impl Engine {
         );
 
         let entropy = gates.entropy;
+        let keyword_evidence_patterns = gates.keywords.map(|kws| &kws.any[Variant::Raw.idx()]);
         let value_suppressors = gates.value_suppressors;
         let secret_group_raw = rule.secret_group_raw();
         let has_secret_group_override = rule.has_secret_group_override();
@@ -1354,87 +1480,97 @@ impl Engine {
                 extract_secret_span_locs_raw(locs, secret_group_raw, has_secret_group_override);
             let secret_bytes = &decoded[secret_start..secret_end];
 
-            let entropy_ok =
-                post_match_entropy_passes(entropy, secret_bytes, scratch, &self.entropy_log2);
+            let entropy_outcome =
+                post_match_entropy_outcome(entropy, secret_bytes, scratch, &self.entropy_log2);
+            if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
+                return;
+            }
+            let evidence = GateEvidence {
+                entropy_outcome,
+                keyword_local_hit: keyword_local_hit(
+                    decoded,
+                    span.start,
+                    span.end,
+                    keyword_evidence_patterns,
+                ),
+            };
 
-            if entropy_ok {
-                // Value suppressor gate (see raw-path comment for rationale).
-                if let Some(vs) = value_suppressors {
-                    if contains_any_memmem(secret_bytes, vs) {
-                        return;
-                    }
+            // Value suppressor gate (see raw-path comment for rationale).
+            if let Some(vs) = value_suppressors {
+                if contains_any_memmem(secret_bytes, vs) {
+                    return;
                 }
+            }
 
-                let context_ok = if let Some(ctx) = gates.local_context {
-                    local_context_passes(decoded, secret_start, secret_end, ctx)
+            let context_ok = if let Some(ctx) = gates.local_context {
+                local_context_passes(decoded, secret_start, secret_end, ctx)
+            } else {
+                true
+            };
+
+            if context_ok {
+                // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
+                // lift into decoded-stream coordinates and (when available) map
+                // through the transform root-span context.
+                let match_raw_start = map_utf16_decoded_offset(
+                    raw_win,
+                    span.start,
+                    matches!(variant, Variant::Utf16Le),
+                );
+                let match_raw_end = map_utf16_decoded_offset(
+                    raw_win,
+                    span.end,
+                    matches!(variant, Variant::Utf16Le),
+                );
+                let match_stream_start = window_start as usize + match_raw_start;
+                let match_stream_end = window_start as usize + match_raw_end;
+                let mapped_span = match_stream_start..match_stream_end;
+                let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
+                    ctx.map_span(mapped_span.clone())
                 } else {
-                    true
+                    root_hint.clone().unwrap_or(mapped_span)
                 };
-
-                if context_ok {
-                    // Map decoded UTF-8 match span back to raw UTF-16 offsets, then
-                    // lift into decoded-stream coordinates and (when available) map
-                    // through the transform root-span context.
-                    let match_raw_start = map_utf16_decoded_offset(
-                        raw_win,
-                        span.start,
-                        matches!(variant, Variant::Utf16Le),
-                    );
-                    let match_raw_end = map_utf16_decoded_offset(
-                        raw_win,
-                        span.end,
-                        matches!(variant, Variant::Utf16Le),
-                    );
-                    let match_stream_start = window_start as usize + match_raw_start;
-                    let match_stream_end = window_start as usize + match_raw_end;
-                    let mapped_span = match_stream_start..match_stream_end;
-                    let root_span_hint = if let Some(ctx) = scratch.root_span_map_ctx.as_ref() {
-                        ctx.map_span(mapped_span.clone())
-                    } else {
-                        root_hint.clone().unwrap_or(mapped_span)
-                    };
-                    let root_hint_start = base_offset + root_span_hint.start as u64;
-                    let root_hint_end = base_offset + root_span_hint.end as u64;
-                    // Use the parent step_id (not utf16_step_id) for offline validation:
-                    // root UTF-16 findings have parent == STEP_ROOT.
-                    let Some(outcome) = self.apply_emit_time_policy(
-                        rule,
-                        secret_bytes,
-                        utf16_step_id,
-                        step_id,
-                        raw_win,
-                        base_offset,
-                        base_offset.saturating_add(window_start),
-                        &root_span_hint,
-                        root_hint_start,
-                        root_hint_end,
-                        &mut last_safelist_decision,
-                        scratch,
-                    ) else {
-                        return;
-                    };
-                    let confidence_score = compute_confidence_score(gates, rule, &outcome);
-                    if !gates.passes_threshold(confidence_score) {
-                        crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
-                        return;
-                    }
-                    // Set found_any only for findings that are actually staged
-                    // (emit-time policy and confidence threshold both passed).
-                    *found_any = true;
-                    scratch.tmp_findings.push(FindingRec {
-                        file_id,
-                        rule_id,
-                        span_start: secret_start as u32,
-                        span_end: secret_end as u32,
-                        root_hint_start,
-                        root_hint_end,
-                        dedupe_with_span: outcome.dedupe_with_span,
-                        step_id: utf16_step_id,
-                        confidence_score,
-                    });
-                    scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
-                    scratch.tmp_norm_hash.push(outcome.norm_hash);
+                let root_hint_start = base_offset + root_span_hint.start as u64;
+                let root_hint_end = base_offset + root_span_hint.end as u64;
+                // Use the parent step_id (not utf16_step_id) for offline validation:
+                // root UTF-16 findings have parent == STEP_ROOT.
+                let Some(outcome) = self.apply_emit_time_policy(
+                    rule,
+                    secret_bytes,
+                    utf16_step_id,
+                    step_id,
+                    raw_win,
+                    base_offset,
+                    base_offset.saturating_add(window_start),
+                    &root_span_hint,
+                    root_hint_start,
+                    root_hint_end,
+                    &mut last_safelist_decision,
+                    scratch,
+                ) else {
+                    return;
+                };
+                let confidence_score = compute_confidence_score(&evidence, rule, &outcome);
+                if !gates.passes_threshold(confidence_score) {
+                    crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                    return;
                 }
+                // Set found_any only for findings that are actually staged
+                // (emit-time policy and confidence threshold both passed).
+                *found_any = true;
+                scratch.tmp_findings.push(FindingRec {
+                    file_id,
+                    rule_id,
+                    span_start: secret_start as u32,
+                    span_end: secret_end as u32,
+                    root_hint_start,
+                    root_hint_end,
+                    dedupe_with_span: outcome.dedupe_with_span,
+                    step_id: utf16_step_id,
+                    confidence_score,
+                });
+                scratch.tmp_drop_hint_end.push(outcome.drop_hint_end);
+                scratch.tmp_norm_hash.push(outcome.norm_hash);
             }
         });
         scratch.capture_locs[rule_id as usize] = Some(locs);

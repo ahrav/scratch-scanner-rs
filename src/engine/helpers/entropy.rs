@@ -1,4 +1,31 @@
 //! Entropy gating helpers for Shannon and min-entropy checks.
+//!
+//! This module implements the entropy-family gate used to discard low-randomness
+//! regex matches early in the detection pipeline. Two complementary metrics are
+//! supported:
+//!
+//! - **Shannon entropy** (always): measures average information per byte. Rejects
+//!   ~80-90% of non-secret matches (repeated characters, prose fragments).
+//! - **Min-entropy** (optional, per NIST SP 800-90B): `H_inf = log2(n) - log2(max_count)`.
+//!   Catches skewed distributions where one byte dominates even though Shannon
+//!   looks moderate.
+//!
+//! # Role in the confidence model
+//!
+//! The entropy gate serves a dual purpose:
+//! 1. **Hard gate**: findings with `EntropyGateOutcome::Failed` are discarded
+//!    unconditionally (they never reach the emission pipeline).
+//! 2. **Evidence signal**: findings with `EntropyGateOutcome::PassedMeasured`
+//!    contribute `confidence::ENTROPY_PASS` (+1) to the additive confidence
+//!    score. Findings that bypass the gate due to short length (`BypassedShortLen`)
+//!    contribute 0 — they are not penalized, but they do not earn positive evidence.
+//!
+//! # Performance
+//!
+//! The histogram is computed in a single branchless pass over the input bytes.
+//! A pre-built `log2` lookup table avoids per-bin floating-point calls
+//! during the Shannon summation over all 256 histogram bins.
+//! Scratch memory (`EntropyScratch`) is reused across checks to avoid allocation.
 
 use crate::engine::rule_repr::EntropyCompiled;
 use crate::engine::scratch::EntropyScratch;
@@ -40,10 +67,38 @@ pub(crate) struct EntropyMetrics {
     pub(crate) max_bin_count: u32,
     /// Precomputed `log2(n)` where `n` is the input length.
     ///
-    /// Cached here so that `entropy_gate_passes` can reuse the value for the
+    /// Cached here so that [`entropy_gate_outcome`] can reuse the value for the
     /// min-entropy calculation without a second table lookup after the
     /// `scratch.reset()` / `bzero` barrier that prevents CSE.
     pub(crate) log2_n: f32,
+}
+
+/// Canonical decision outcome for an entropy gate evaluation.
+///
+/// Consumed by the confidence-scoring pipeline in `window_validate.rs`:
+/// - `Failed` vetoes the finding (hard gate, never emitted).
+/// - `PassedMeasured` awards `confidence::ENTROPY_PASS` (+1).
+/// - `BypassedShortLen` awards 0 (fail-open, no evidence either way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntropyGateOutcome {
+    /// Candidate failed measured entropy validation. The finding is
+    /// unconditionally discarded — it never reaches confidence scoring.
+    Failed,
+    /// Candidate length is below `min_len`, so entropy is bypassed (fail-open).
+    /// No positive evidence is contributed to the confidence score.
+    BypassedShortLen,
+    /// Candidate met all measured entropy checks (Shannon and optional min-entropy).
+    /// Contributes `confidence::ENTROPY_PASS` to the finding's confidence score.
+    PassedMeasured,
+}
+
+impl EntropyGateOutcome {
+    /// Returns true when the candidate should proceed through detection flow.
+    #[inline(always)]
+    #[allow(dead_code)] // Used by bench/test-only call sites.
+    pub(crate) fn allows_candidate(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
 }
 
 /// Computes Shannon entropy and max-bin-count in a single fused pass.
@@ -129,7 +184,7 @@ pub(crate) fn shannon_entropy_bits_per_byte(
     compute_entropy_metrics(bytes, scratch, log2_table).shannon_bpb
 }
 
-/// Returns true when the entropy gate allows a buffer to proceed.
+/// Returns the canonical entropy gate outcome for this candidate.
 ///
 /// # Behavior
 /// - Buffers shorter than `spec.min_len` always pass (entropy is noisy).
@@ -139,41 +194,44 @@ pub(crate) fn shannon_entropy_bits_per_byte(
 ///   distributions where one byte dominates even though Shannon looks moderate.
 ///
 /// # Preconditions
-/// - `spec.min_len <= spec.max_len` and `spec.min_bits_per_byte` is in [0.0, 8.0].
+/// - `spec.min_len >= 1`.
+/// - `spec.min_len <= spec.max_len`.
+/// - `spec.min_bits_per_byte` is in [0.0, 8.0].
 #[inline]
-pub(crate) fn entropy_gate_passes(
+pub(crate) fn entropy_gate_outcome(
     spec: &EntropyCompiled,
     bytes: &[u8],
     scratch: &mut EntropyScratch,
     log2_table: &[f32],
-) -> bool {
+) -> EntropyGateOutcome {
     let len = bytes.len();
     if len < spec.min_len {
         // For tiny samples entropy is noisy; let them pass rather than
         // discarding true positives.
-        return true;
+        return EntropyGateOutcome::BypassedShortLen;
     }
     let capped = len.min(spec.max_len);
     let metrics = compute_entropy_metrics(&bytes[..capped], scratch, log2_table);
 
     // Shannon (always checked).
     if metrics.shannon_bpb < spec.min_bits_per_byte {
-        return false;
+        return EntropyGateOutcome::Failed;
     }
 
     // Min-entropy (optional, per NIST SP 800-90B).
     if let Some(me_min) = spec.min_entropy_bits_per_byte {
-        // max_bin_count == 0 only for empty input, guarded by min_len >= 1.
+        // max_bin_count == 0 only for empty input, which cannot reach this
+        // branch when specs are validated (`min_len >= 1`).
         if metrics.max_bin_count == 0 {
-            return false;
+            return EntropyGateOutcome::Failed;
         }
         let me = metrics.log2_n - log2_lookup(log2_table, metrics.max_bin_count as usize);
         if me < me_min {
-            return false;
+            return EntropyGateOutcome::Failed;
         }
     }
 
-    true
+    EntropyGateOutcome::PassedMeasured
 }
 
 #[cfg(test)]
@@ -276,7 +334,7 @@ mod tests {
         assert!((me - 0.0).abs() < f32::EPSILON);
     }
 
-    /// entropy_gate_passes with min_entropy_bits_per_byte = None behaves like Shannon-only.
+    /// With min_entropy_bits_per_byte = None, outcome follows Shannon-only behavior.
     #[test]
     fn entropy_gate_none_min_entropy_is_shannon_only() {
         let spec = EntropyCompiled {
@@ -289,10 +347,64 @@ mod tests {
         let input: Vec<u8> = (0..=255).collect();
         let table = build_log2_table(input.len());
         let mut scratch = EntropyScratch::new();
-        assert!(entropy_gate_passes(&spec, &input, &mut scratch, &table));
+        assert!(
+            entropy_gate_outcome(&spec, &input, &mut scratch, &table).allows_candidate(),
+            "high-entropy input should pass Shannon-only gate"
+        );
     }
 
-    /// entropy_gate_passes rejects skewed distribution via min-entropy.
+    #[test]
+    fn entropy_outcome_failed_when_measured_entropy_below_threshold() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 7.0,
+            min_len: 8,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+        };
+        let input = b"AAAAAAAA";
+        let table = build_log2_table(64);
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&spec, input, &mut scratch, &table),
+            EntropyGateOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn entropy_outcome_bypassed_for_short_input() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 8.0,
+            min_len: 10,
+            max_len: 64,
+            min_entropy_bits_per_byte: Some(8.0),
+        };
+        let input = b"short";
+        let table = build_log2_table(64);
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&spec, input, &mut scratch, &table),
+            EntropyGateOutcome::BypassedShortLen
+        );
+    }
+
+    #[test]
+    fn entropy_outcome_passed_when_measured_entropy_meets_threshold() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+        };
+        let input = b"A1b2C3d4";
+        let table = build_log2_table(64);
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&spec, input, &mut scratch, &table),
+            EntropyGateOutcome::PassedMeasured
+        );
+    }
+
+    /// entropy_gate_outcome rejects skewed distribution via min-entropy.
     #[test]
     fn entropy_gate_rejects_via_min_entropy() {
         let spec = EntropyCompiled {
@@ -309,7 +421,10 @@ mod tests {
         let table = build_log2_table(input.len());
         let mut scratch = EntropyScratch::new();
         // Shannon passes (> 1.0) but min-entropy (~0.98) fails the 2.0 gate.
-        assert!(!entropy_gate_passes(&spec, &input, &mut scratch, &table));
+        assert_eq!(
+            entropy_gate_outcome(&spec, &input, &mut scratch, &table),
+            EntropyGateOutcome::Failed
+        );
     }
 
     /// Boundary: input at exactly min_len - 1 always passes (bypass).
@@ -324,7 +439,10 @@ mod tests {
         let input = [0u8; 9]; // Below min_len
         let table = build_log2_table(256);
         let mut scratch = EntropyScratch::new();
-        assert!(entropy_gate_passes(&spec, &input, &mut scratch, &table));
+        assert_eq!(
+            entropy_gate_outcome(&spec, &input, &mut scratch, &table),
+            EntropyGateOutcome::BypassedShortLen
+        );
     }
 
     /// Boundary: input at exactly max_len + 1 is capped to max_len.
@@ -342,7 +460,10 @@ mod tests {
         let table = build_log2_table(20);
         let mut scratch = EntropyScratch::new();
         // Capped to first 10 bytes (all unique) -> max entropy -> passes.
-        assert!(entropy_gate_passes(&spec, &input, &mut scratch, &table));
+        assert_eq!(
+            entropy_gate_outcome(&spec, &input, &mut scratch, &table),
+            EntropyGateOutcome::PassedMeasured
+        );
     }
 
     /// Short hex tokens (n=17, k=16) without min-entropy pass the gate.
@@ -367,7 +488,7 @@ mod tests {
         // 2.0 bpb min-entropy gate but must pass Shannon-only.
         let token = b"66609066:7d494d16";
         assert!(
-            entropy_gate_passes(&spec, token, &mut scratch, &table),
+            entropy_gate_outcome(&spec, token, &mut scratch, &table).allows_candidate(),
             "short hex token with repeated nibble should pass without min-entropy gate"
         );
     }

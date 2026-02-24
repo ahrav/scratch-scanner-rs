@@ -303,7 +303,8 @@ pub struct Finding {
     /// Best-effort hint into the original/root buffer.
     /// - For raw findings in root: exact match span.
     /// - For derived buffers: outermost container span in root (or best available).
-    /// - For UTF-16 window findings in root: the decoded window span in root.
+    /// - For UTF-16 window findings in root: full-match span mapped back into
+    ///   root raw-byte offsets.
     ///
     /// For file-backed scans this is an absolute byte offset within the file.
     pub root_span_hint: Range<usize>,
@@ -350,15 +351,22 @@ pub struct FindingRec {
     /// Decode-step chain id for reconstructing provenance.
     /// Valid only while the originating `ScanScratch` arena is alive and not reset.
     pub step_id: StepId,
-    /// Additive confidence score accumulated from gate signals.
+    /// Additive confidence score computed from per-finding evidence signals.
     ///
-    /// Phase 1 signals: entropy (+1), keyword (+2), assignment shape (+2),
-    /// offline validation valid (+5). Score 0 means no confirming gates fired.
+    /// Computed by `compute_confidence_score` in `window_validate.rs` from
+    /// evidence collected at the emission site:
+    /// - Entropy passed (+1) — measured on extracted secret bytes.
+    /// - Local keyword hit (+2) — keyword found near the match span.
+    /// - Assignment shape (+2) — rule-level flag for `key = value` patterns.
+    /// - Offline validation valid (+5) — CRC/charset check passed.
     ///
-    /// Accumulated via `saturating_add`; no overflow panic.  Phase 1 range
-    /// 0–10 is well within `i8` bounds.  Does **not**
-    /// participate in dedup keys — two findings at the same span with
-    /// different scores still deduplicate normally.
+    /// Score 0 means no confirming gates fired (or all bypassed).
+    ///
+    /// Accumulated via `saturating_add`; no overflow panic. Phase 1 range
+    /// 0–10 is well within `i8` bounds. Does **not** participate in dedup
+    /// keys — two findings at the same span with different scores still
+    /// deduplicate normally. Findings below the rule's `min_confidence`
+    /// threshold are suppressed before being written to the output buffer.
     pub confidence_score: i8,
 }
 
@@ -634,10 +642,11 @@ pub struct RuleSpec {
 
     /// Optional entropy gate evaluated on each regex match.
     ///
-    /// This is a *post-regex* filter applied to the match bytes. It is useful for
-    /// secret-like tokens that should be high-entropy; low-entropy matches are
-    /// likely false positives. Entropy is bounded by min/max length to keep cost
-    /// predictable and avoid noisy small-sample statistics.
+    /// This is a *post-regex* filter applied to the extracted secret bytes
+    /// (not the full match, which may include key names or delimiters). It is
+    /// useful for secret-like tokens that should be high-entropy; low-entropy
+    /// matches are likely false positives. Entropy is bounded by min/max length
+    /// to keep cost predictable and avoid noisy small-sample statistics.
     pub entropy: Option<EntropySpec>,
 
     /// Optional character-class distribution gate evaluated before regex.
@@ -676,13 +685,13 @@ pub struct RuleSpec {
     ///
     /// When set, the engine extracts the secret value from the specified capture
     /// group rather than using the default heuristic. The default behavior (when
-    /// `None`) is to prefer capture group 1 if it exists and is non-empty, falling
+    /// `None`) is to use the first non-empty capture in groups 1..N, falling
     /// back to the full match span.
     ///
     /// # Fallback Behavior
     /// If the specified group did not participate in the match or captured an empty
-    /// span, the engine falls back to the default behavior: prefer capture group 1
-    /// if non-empty, otherwise use the full match (group 0).
+    /// span, the engine falls back to the default behavior: use the first non-empty
+    /// capture in groups 1..N, otherwise use the full match (group 0).
     ///
     /// # Gitleaks Compatibility
     /// Gitleaks rules conventionally place the secret in capture group 1. Setting
@@ -711,6 +720,7 @@ pub struct RuleSpec {
     /// `Some(v)` is an explicit override. `None` selects an auto-default based
     /// on compiled rule signals:
     /// - keyword + entropy gates present => `KEYWORD_PRESENT + ENTROPY_PASS`
+    ///   (local keyword evidence + measured entropy pass on a finding)
     /// - assignment-shape check enabled (currently `generic-api-key`) => `ASSIGNMENT_SHAPE`
     /// - otherwise => `0`
     ///
@@ -990,10 +1000,11 @@ pub enum OfflineVerdict {
 
 /// Score constants for the additive confidence model.
 ///
-/// Each confirming gate that fires adds its weight to the finding's
-/// [`confidence_score`](FindingRec::confidence_score). Suppress-only gates
-/// (must-contain, value suppressors, safelists) contribute 0 — they remove
-/// false positives but don't add positive evidence.
+/// Evidence is collected **per finding** (not per rule) at each emission site
+/// in `window_validate.rs`. The scoring function (`compute_confidence_score`)
+/// sums the applicable weights into a single `i8` stored on [`FindingRec`].
+/// Suppress-only gates (must-contain, value suppressors, safelists) contribute
+/// 0 — they remove false positives but don't add positive evidence.
 ///
 /// # Calibration
 ///
@@ -1010,7 +1021,7 @@ pub enum OfflineVerdict {
 pub mod confidence {
     /// Entropy gate passed — secret has sufficient randomness.
     pub const ENTROPY_PASS: i8 = 1;
-    /// Keyword gate matched — context contains expected key name.
+    /// Local keyword evidence — rule keyword found within 32 bytes of the match span.
     pub const KEYWORD_PRESENT: i8 = 2;
     /// Assignment-shape check passed — secret follows `key = value` pattern.
     pub const ASSIGNMENT_SHAPE: i8 = 2;
