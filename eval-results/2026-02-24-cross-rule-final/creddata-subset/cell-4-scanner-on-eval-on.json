@@ -1,0 +1,208 @@
+{
+  "metrics_semantics": "position_pr_curve",
+  "metrics": {
+    "average_precision": 0.012928064842958461,
+    "precision": 0.4666666666666667,
+    "recall": 0.029787234042553193,
+    "f1": 0.056,
+    "f2": 0.03664921465968587,
+    "tp": 7,
+    "fp": 8,
+    "false_neg": 228,
+    "unlabeled": 9,
+    "baseline_ap": 0.4666666666666667,
+    "precision_at_recall": [
+      {
+        "target": 0.8,
+        "value": null
+      },
+      {
+        "target": 0.9,
+        "value": null
+      },
+      {
+        "target": 0.95,
+        "value": null
+      }
+    ],
+    "recall_at_precision": [
+      {
+        "target": 0.95,
+        "value": null
+      }
+    ],
+    "ap_ci": {
+      "lower": 0.011631205673758865,
+      "upper": 0.013900709219858157
+    },
+    "per_rule": {
+      "generic-api-key": {
+        "tp": 0,
+        "fp": 5,
+        "precision": 0.0
+      },
+      "hashicorp-tf-password": {
+        "tp": 4,
+        "fp": 3,
+        "precision": 0.5714285714285714
+      },
+      "jwt": {
+        "tp": 2,
+        "fp": 0,
+        "precision": 1.0
+      },
+      "private-key": {
+        "tp": 1,
+        "fp": 0,
+        "precision": 1.0
+      }
+    }
+  },
+  "provenance": {
+    "corpus_hash": "61005862c2b6bd1fb98b2e88e3ba9fa5fab433c7626c9b6178d75f7cc267c7f0",
+    "corpus_file_count": 7707,
+    "corpus_total_bytes": 778101172
+  },
+  "pipeline_config": {
+    "cross_rule_dedup": true
+  },
+  "error_book": {
+    "false_positives": [
+      {
+        "rule": "generic-api-key",
+        "count": 5,
+        "classification": "FALSE_POSITIVE",
+        "confidence": 5,
+        "path": "data/597acaac/src/build/6dcf9aa0.php"
+      },
+      {
+        "rule": "hashicorp-tf-password",
+        "count": 3,
+        "classification": "FALSE_POSITIVE",
+        "confidence": 3,
+        "path": "data/4a099ada/vendor/03d780df.md"
+      }
+    ],
+    "false_negatives": [
+      {
+        "rule": "API:Token",
+        "count": 99,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/4a099ada/docs/doc/2294854e.html"
+      },
+      {
+        "rule": "Password",
+        "count": 55,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/106c7cd2/test/api/80a89e46.php"
+      },
+      {
+        "rule": "Key",
+        "count": 13,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/106c7cd2/_/166d9d33.travis"
+      },
+      {
+        "rule": "UUID",
+        "count": 11,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/597acaac/docs/396fcfa2.md"
+      },
+      {
+        "rule": "API:Password",
+        "count": 8,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/680ef0c1/test/client/0402e6b2.go"
+      },
+      {
+        "rule": "Token",
+        "count": 8,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/680ef0c1/test/1914ca3b.go"
+      },
+      {
+        "rule": "Auth:Token",
+        "count": 6,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/4a099ada/rest/vendor/088d3691.go"
+      },
+      {
+        "rule": "UUID:Token:Auth",
+        "count": 6,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/4a099ada/rest/vendor/4c24badc.md"
+      },
+      {
+        "rule": "Password:Key",
+        "count": 4,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/b6263275/src/f31843d1.properties"
+      },
+      {
+        "rule": "Secret",
+        "count": 4,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/106c7cd2/_/166d9d33.travis"
+      },
+      {
+        "rule": "Token:UUID",
+        "count": 4,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/4a099ada/rest/vendor/4c24badc.md"
+      },
+      {
+        "rule": "Key:Secret",
+        "count": 3,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/597acaac/test/conf/fa8d6f0f.php"
+      },
+      {
+        "rule": "URL Credentials",
+        "count": 3,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/6e2ed0e4/docker/117efb4c.yaml"
+      },
+      {
+        "rule": "Auth",
+        "count": 1,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/4a099ada/rest/client/vendor/0adefa1d.go"
+      },
+      {
+        "rule": "Google API Key:Key",
+        "count": 1,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/f129be24/test/513331b8.har"
+      },
+      {
+        "rule": "Key:Password",
+        "count": 1,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/b6263275/src/f31843d1.properties"
+      },
+      {
+        "rule": "Nonce",
+        "count": 1,
+        "classification": "FALSE_NEGATIVE",
+        "confidence": 0,
+        "path": "data/f129be24/test/sys/ec6652b0.js"
+      }
+    ]
+  }
+}
