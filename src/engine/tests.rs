@@ -3529,7 +3529,6 @@ fn root_span_hint_uses_full_window_for_partial_secret() {
     // The fix ensures root_span_hint uses w.clone() instead of span_in_buf.clone().
 }
 
-
 #[test]
 fn anchor_policy_prefers_derived_over_manual() {
     const MANUAL: &[&[u8]] = &[b"bar"];
