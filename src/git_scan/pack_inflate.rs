@@ -731,17 +731,31 @@ fn interpret_delta_body(
     mut emit_chunk: impl FnMut(&[u8]) -> Result<(), DeltaError>,
 ) -> Result<(), DeltaError> {
     let mut out_len = 0usize;
+
+    // Delta copy instructions encode size in ≤ 3 bytes (max 0x00FF_FFFF).
+    // out_len ≤ result_size at every iteration, so out_len + size cannot
+    // overflow usize as long as result_size has this much headroom.
+    debug_assert!(
+        result_size <= usize::MAX - 0x00FF_FFFF,
+        "result_size too close to usize::MAX for unchecked arithmetic"
+    );
+
     while pos < delta.len() {
         let cmd = delta[pos];
         pos += 1;
 
         if (cmd & 0x80) != 0 {
             let (off, size) = decode_copy_params(delta, &mut pos, cmd)?;
-            let end = off.checked_add(size).ok_or(DeltaError::CopyOutOfRange)?;
+            // off is ≤ 32 bits (4 encoded bytes) and size is ≤ 24 bits (3 encoded bytes).
+            // Their sum fits in 33 bits — cannot overflow usize on 64-bit targets.
+            debug_assert!(off <= 0xFFFF_FFFF && size <= 0x00FF_FFFF);
+            let end = off + size;
             if end > base.len() {
                 return Err(DeltaError::CopyOutOfRange);
             }
-            let out_end = out_len.checked_add(size).ok_or(DeltaError::OutputOverrun)?;
+            // out_len ≤ result_size (loop invariant) and size ≤ 0x00FF_FFFF (encoding bound).
+            // Function-entry debug_assert ensures result_size has sufficient headroom.
+            let out_end = out_len + size;
             if out_end > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
@@ -754,7 +768,9 @@ fn interpret_delta_body(
             if delta.len() - pos < size {
                 return Err(DeltaError::Truncated);
             }
-            let out_end = out_len.checked_add(size).ok_or(DeltaError::OutputOverrun)?;
+            // out_len ≤ result_size (loop invariant) and size ≤ 127 (cmd byte, bit 7 clear).
+            // Function-entry debug_assert ensures result_size has sufficient headroom.
+            let out_end = out_len + size;
             if out_end > result_size {
                 return Err(DeltaError::OutputOverrun);
             }
