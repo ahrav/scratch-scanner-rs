@@ -3110,40 +3110,46 @@ fn offline_validation_mixed_rules_selective_suppression() {
 // These tests verify the capture-group-based secret extraction logic implemented
 // in `extract_secret_span`. The feature allows rules to specify which capture group
 // contains the actual secret (vs. surrounding context like prefixes/delimiters).
-//
-// Test coverage:
-// - `secret_extraction_prefers_group1_over_full_match`: Default gitleaks convention
-// - `secret_extraction_uses_configured_secret_group`: Explicit `secret_group` override
-// - `secret_extraction_falls_back_to_full_match_without_groups`: No capture groups
-// - `secret_extraction_skips_empty_group1`: Empty optional groups fallback
-// - `secret_extraction_hash_consistency`: Same secret → same hash (dedup correctness)
-// - `secret_extraction_utf16le_path`: Works through UTF-16 decode path
-// - `secret_extraction_explicit_group0_overrides_group1`: Some(0) forces full match
-// - `secret_extraction_empty_configured_group_falls_back`: Empty configured group fallback
 
-#[test]
-fn secret_extraction_prefers_group1_over_full_match() {
-    // Rule with capture group 1 should extract from group 1, not full match.
-    // The engine stores the extracted secret span in the finding's `span` field.
-    const ANCHORS: &[&[u8]] = &[b"KEY_"];
+/// Parametrized secret extraction tests covering default group-1 convention,
+/// explicit `secret_group` override, no-group fallback, empty-group fallback,
+/// explicit group-0 override, and empty-configured-group fallback.
+#[rstest]
+#[case::prefers_group1(
+    &[b"KEY_" as &[u8]], None, r"KEY_([A-Za-z0-9]{8,16})",
+    b"prefix KEY_SecretValue1 suffix" as &[u8], b"SecretValue1" as &[u8],
+)]
+#[case::uses_configured_secret_group(
+    &[b"TOK"], Some(2), r"TOK([A-Z]+):([a-z0-9]{8,16})",
+    b"prefix TOKTYPE:secretval12 suffix", b"secretval12",
+)]
+#[case::falls_back_to_full_match_without_groups(
+    &[b"AKIA"], None, r"AKIA[A-Z0-9]{16}",
+    b"prefix AKIAIOSFODNN7REAL123 suffix", b"AKIAIOSFODNN7REAL123",
+)]
+#[case::skips_empty_group1(
+    &[b"OPT"], None, r"OPT([A-Z]*)_[a-z0-9]{8}",
+    b"prefix OPT_abcd1234 suffix", b"OPT_abcd1234",
+)]
+#[case::explicit_group0_overrides_group1(
+    &[b"TOK_"], Some(0), r"TOK_([A-Za-z0-9]{8})_END",
+    b"prefix TOK_Secret12_END suffix", b"TOK_Secret12_END",
+)]
+#[case::empty_configured_group_falls_back(
+    &[b"CFG_"], Some(2), r"CFG_([a-z0-9]{8})([A-Z]*)",
+    b"prefix CFG_secret12 suffix", b"secret12",
+)]
+fn secret_extraction_span(
+    #[case] anchors: &'static [&'static [u8]],
+    #[case] secret_group: Option<u16>,
+    #[case] pattern: &str,
+    #[case] hay: &[u8],
+    #[case] expected_secret: &[u8],
+) {
     let rule = RuleSpec {
-        name: "group1-extraction",
-        anchors: ANCHORS,
         radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        // Pattern: KEY_<secret> where <secret> is captured in group 1
-        uuid_format_secret: false,
-        re: Regex::new(r"KEY_([A-Za-z0-9]{8,16})").unwrap(),
+        secret_group,
+        ..base_rule("se-test", anchors, Regex::new(pattern).unwrap())
     };
     let eng = Engine::new_with_anchor_policy(
         vec![rule],
@@ -3151,167 +3157,16 @@ fn secret_extraction_prefers_group1_over_full_match() {
         demo_tuning(),
         AnchorPolicy::ManualOnly,
     );
-
-    let hay = b"prefix KEY_SecretValue1 suffix";
     let hits = scan_chunk_findings(&eng, hay);
     assert!(
-        hits.iter().any(|h| h.rule == "group1-extraction"),
-        "expected finding for group1-extraction rule"
+        hits.iter().any(|h| h.rule == "se-test"),
+        "expected finding for secret extraction rule"
     );
-
-    // The span should be just the captured group 1, not the full "KEY_SecretValue1"
-    let hit = hits.iter().find(|h| h.rule == "group1-extraction").unwrap();
-    let secret = &hay[hit.span.clone()];
+    let hit = hits.iter().find(|h| h.rule == "se-test").unwrap();
     assert_eq!(
-        secret, b"SecretValue1",
-        "span should be capture group 1 (secret only)"
-    );
-}
-
-#[test]
-fn secret_extraction_uses_configured_secret_group() {
-    // When secret_group is set, it should override the default group 1 behavior.
-    const ANCHORS: &[&[u8]] = &[b"TOK"];
-    let rule = RuleSpec {
-        name: "secret-group-override",
-        anchors: ANCHORS,
-        radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: Some(2), // Use group 2 instead of group 1
-        min_confidence: None,
-        offline_validation: None,
-        // Pattern: TOK<prefix>:<secret> where prefix is group 1, secret is group 2
-        uuid_format_secret: false,
-        re: Regex::new(r"TOK([A-Z]+):([a-z0-9]{8,16})").unwrap(),
-    };
-    let eng = Engine::new_with_anchor_policy(
-        vec![rule],
-        Vec::new(),
-        demo_tuning(),
-        AnchorPolicy::ManualOnly,
-    );
-
-    let hay = b"prefix TOKTYPE:secretval12 suffix";
-    let hits = scan_chunk_findings(&eng, hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "secret-group-override"),
-        "expected finding for secret-group-override rule"
-    );
-
-    let hit = hits
-        .iter()
-        .find(|h| h.rule == "secret-group-override")
-        .unwrap();
-    let secret = &hay[hit.span.clone()];
-    assert_eq!(
-        secret, b"secretval12",
-        "span should be capture group 2 (configured secret_group)"
-    );
-}
-
-#[test]
-fn secret_extraction_falls_back_to_full_match_without_groups() {
-    // When there are no capture groups, fall back to full match.
-    const ANCHORS: &[&[u8]] = &[b"AKIA"];
-    let rule = RuleSpec {
-        name: "no-groups-fallback",
-        anchors: ANCHORS,
-        radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        // Pattern with no capture groups
-        uuid_format_secret: false,
-        re: Regex::new(r"AKIA[A-Z0-9]{16}").unwrap(),
-    };
-    let eng = Engine::new_with_anchor_policy(
-        vec![rule],
-        Vec::new(),
-        demo_tuning(),
-        AnchorPolicy::ManualOnly,
-    );
-
-    let hay = b"prefix AKIAIOSFODNN7REAL123 suffix";
-    let hits = scan_chunk_findings(&eng, hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "no-groups-fallback"),
-        "expected finding for no-groups-fallback rule"
-    );
-
-    let hit = hits
-        .iter()
-        .find(|h| h.rule == "no-groups-fallback")
-        .unwrap();
-    // Without capture groups, span should be full match
-    let matched = &hay[hit.span.clone()];
-    assert_eq!(
-        matched, b"AKIAIOSFODNN7REAL123",
-        "without capture groups, span should be full match"
-    );
-}
-
-#[test]
-fn secret_extraction_skips_empty_group1() {
-    // When group 1 is empty (matches zero chars), fall back to full match.
-    const ANCHORS: &[&[u8]] = &[b"OPT"];
-    let rule = RuleSpec {
-        name: "empty-group1-fallback",
-        anchors: ANCHORS,
-        radius: 16,
-        validator: ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        // Group 1 can be empty (optional prefix), group 0 is the full match
-        uuid_format_secret: false,
-        re: Regex::new(r"OPT([A-Z]*)_[a-z0-9]{8}").unwrap(),
-    };
-    let eng = Engine::new_with_anchor_policy(
-        vec![rule],
-        Vec::new(),
-        demo_tuning(),
-        AnchorPolicy::ManualOnly,
-    );
-
-    // Input where group 1 is empty (no uppercase letters after OPT)
-    let hay = b"prefix OPT_abcd1234 suffix";
-    let hits = scan_chunk_findings(&eng, hay);
-    assert!(
-        hits.iter().any(|h| h.rule == "empty-group1-fallback"),
-        "expected finding for empty-group1-fallback rule"
-    );
-
-    let hit = hits
-        .iter()
-        .find(|h| h.rule == "empty-group1-fallback")
-        .unwrap();
-    // Since group 1 is empty, span should be full match fallback
-    let matched = &hay[hit.span.clone()];
-    assert_eq!(
-        matched, b"OPT_abcd1234",
-        "when group 1 is empty, span should be full match"
+        &hay[hit.span.clone()],
+        expected_secret,
+        "extracted secret mismatch"
     );
 }
 
