@@ -367,26 +367,23 @@ fn io_worker_loop<B: RemoteBackend>(
 ```rust
 fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
     // 1. Scan chunk: engine.scan_chunk_into()
-    // 2. Drop findings in prefix (overlap)
-    // 3. Optionally dedupe within chunk
-    // 4. Emit findings as ScanEvent::Finding through EventSink
-    // 5. Return buffer to pool (on drop)
-}
-
-fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
-    // Sort by (rule_id, root_hint, span)
-    // Dedup by these fields
-}
-
-fn emit_findings(
-    engine: &MockEngine,
-    event_sink: &dyn EventSink,
-    display: &[u8],
-    recs: &[FindingRec],
-) {
-    // Emits FindingEvent with SourceKind::Fs, object path, offsets, and rule metadata
+    // 2. Record pending finding counts before/after prefix drop
+    // 3. If dedupe_within_chunk:
+    //    a. Drain via EngineScratch trait into FindingWithHash carriers
+    //    b. apply_cross_rule_dedupe() using (root_hint, optional span, norm_hash)
+    //    c. emit_findings() via shared local_fs_owner helper
+    // 4. Else drain raw findings and emit via the same shared helper
+    // 5. account_effective_dropped_findings() for scheduler-side pruning
+    // 6. Return buffer to pool (on drop)
 }
 ```
+
+Remote now reuses the same within-chunk cross-rule dedupe path as local FS
+backends by calling `local_fs_owner::apply_cross_rule_dedupe` and
+`local_fs_owner::emit_findings`. The mock engine's trait-based drain provides
+`FindingWithHash<FindingRec>` carriers with deterministic zero hashes, which
+preserves shared dedupe semantics in tests without introducing backend-specific
+dedupe logic.
 
 ---
 

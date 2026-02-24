@@ -41,14 +41,18 @@
 //! - Error classification: Retryable vs Permanent
 
 use super::count_budget::{CountBudget, CountPermit};
+use super::engine_trait::{EngineScratch as _, FindingWithHash};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
+use super::local_fs_owner::{
+    account_effective_dropped_findings, apply_cross_rule_dedupe,
+    emit_findings as shared_emit_findings,
+};
 use super::metrics::MetricsSnapshot;
 use super::rng::XorShift64;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::perf_stats;
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
-use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
-use crate::unified::SourceKind;
+use crate::unified::events::EventSink;
 
 use crossbeam_channel as chan;
 
@@ -141,7 +145,11 @@ pub struct RemoteConfig {
     /// Seed for deterministic retry jitter.
     pub seed: u64,
 
-    /// If true, deduplicate findings within each chunk.
+    /// If true, deduplicate findings within each chunk using the shared
+    /// `apply_cross_rule_dedupe` helper (same tie-breaker as the local file-system
+    /// path) so we emit at most one finding per span/hash pair before emitting
+    /// events. When false, the raw findings path is used to avoid the hash-wrapper
+    /// overhead.
     pub dedupe_within_chunk: bool,
 
     /// Pin worker and I/O threads to CPU cores (Linux only, no-op elsewhere).
@@ -403,6 +411,7 @@ struct CpuScratch {
 
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
+    pending_hashed: Vec<FindingWithHash<FindingRec>>,
 
     dedupe_within_chunk: bool,
 }
@@ -410,78 +419,6 @@ struct CpuScratch {
 // ============================================================================
 // CPU Worker Logic
 // ============================================================================
-
-/// In-place dedupe of findings by `(rule_id, root_hint, span)`.
-///
-/// `FindingRec` (mock engine stub) does not carry `norm_hash`, so this
-/// dedup key is a strict subset of the production path in `local_fs_owner`.
-/// See the note on `dedupe_pending_in_place` in `local_fs_uring.rs` for
-/// implications when porting to real engine findings.
-fn dedupe_pending_in_place(p: &mut Vec<FindingRec>) {
-    if p.len() <= 1 {
-        return;
-    }
-
-    p.sort_unstable_by(|a, b| {
-        (
-            a.rule_id,
-            a.root_hint_start,
-            a.root_hint_end,
-            a.span_start,
-            a.span_end,
-        )
-            .cmp(&(
-                b.rule_id,
-                b.root_hint_start,
-                b.root_hint_end,
-                b.span_start,
-                b.span_end,
-            ))
-    });
-
-    p.dedup_by(|a, b| {
-        a.rule_id == b.rule_id
-            && a.root_hint_start == b.root_hint_start
-            && a.root_hint_end == b.root_hint_end
-            && a.span_start == b.span_start
-            && a.span_end == b.span_end
-    });
-}
-
-/// Emit findings as structured events.
-///
-/// NOTE: Uses `SourceKind::Fs` because this module currently uses `MockEngine`
-/// for testing. When wired to a real remote backend, a new `SourceKind`
-/// variant (e.g., `Remote`) would need to be added and used here.
-fn emit_findings(
-    engine: &MockEngine,
-    event_sink: &dyn EventSink,
-    display: &[u8],
-    recs: &[FindingRec],
-) {
-    if recs.is_empty() {
-        return;
-    }
-
-    for rec in recs {
-        event_sink.emit(ScanEvent::Finding(FindingEvent {
-            source: SourceKind::Fs,
-            object_path: display,
-            start: rec.root_hint_start,
-            end: rec.root_hint_end,
-            rule_id: rec.rule_id.0 as u32,
-            rule_name: engine.rule_name(rec.rule_id),
-            commit_id: None,
-            change_kind: None,
-            // Remote scheduler receives pre-serialized findings without
-            // gate context — confidence_score is hardcoded to 0
-            // (indistinguishable from "zero gates fired").
-            // TODO: propagate confidence_score from the remote scan
-            // response when gate evaluation is available.
-            confidence_score: 0,
-        }));
-    }
-}
 
 /// Executes a single scan-chunk task on a CPU worker thread.
 fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
@@ -493,31 +430,53 @@ fn cpu_runner(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch>) {
             len,
             buf,
         } => {
-            let engine = &ctx.scratch.engine;
+            let engine = ctx.scratch.engine.as_ref();
             let data = &buf.as_slice()[..(len as usize)];
 
             engine.scan_chunk_into(data, token.file_id, base_offset, &mut ctx.scratch.scratch);
+            let engine_dropped = ctx.scratch.scratch.dropped_findings();
 
             // Drop findings fully contained in the prefix
             let new_bytes_start = base_offset + prefix_len as u64;
+            let before_prefix = ctx.scratch.scratch.pending_findings_len();
             ctx.scratch.scratch.drop_prefix_findings(new_bytes_start);
+            let after_prefix = ctx.scratch.scratch.pending_findings_len();
 
-            // Clear pending before draining new findings
-            ctx.scratch.pending.clear();
-            ctx.scratch
-                .scratch
-                .drain_findings_into(&mut ctx.scratch.pending);
+            let dedupe_removed = if ctx.scratch.dedupe_within_chunk {
+                ctx.scratch.pending_hashed.clear();
+                <ScanScratch as super::engine_trait::EngineScratch>::drain_findings_into(
+                    &mut ctx.scratch.scratch,
+                    &mut ctx.scratch.pending_hashed,
+                );
 
-            if ctx.scratch.dedupe_within_chunk && ctx.scratch.pending.len() > 1 {
-                dedupe_pending_in_place(&mut ctx.scratch.pending);
-            }
+                let dedupe_removed =
+                    apply_cross_rule_dedupe(&mut ctx.scratch.pending_hashed, &*ctx.scratch.engine);
+                shared_emit_findings(
+                    engine,
+                    &*ctx.scratch.event_sink,
+                    &token.display,
+                    &ctx.scratch.pending_hashed,
+                );
+                dedupe_removed
+            } else {
+                // Keep the no-dedupe path on raw findings to avoid hash-wrapper overhead.
+                ctx.scratch.pending.clear();
+                ctx.scratch
+                    .scratch
+                    .drain_findings_into(&mut ctx.scratch.pending);
+                shared_emit_findings(
+                    engine,
+                    &*ctx.scratch.event_sink,
+                    &token.display,
+                    &ctx.scratch.pending,
+                );
+                0
+            };
 
-            emit_findings(
-                engine,
-                &*ctx.scratch.event_sink,
-                &token.display,
-                &ctx.scratch.pending,
-            );
+            let scheduler_pruned = before_prefix
+                .saturating_sub(after_prefix)
+                .saturating_add(dedupe_removed);
+            account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
 
             // Metrics: count payload bytes only
             let payload = (len as u64).saturating_sub(prefix_len as u64);
@@ -876,6 +835,7 @@ pub fn scan_remote<B: RemoteBackend>(
                 event_sink: Arc::clone(&event_sink),
                 scratch: engine.new_scratch(),
                 pending: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
+                pending_hashed: Vec::with_capacity(engine.tuning.max_findings_per_chunk),
                 dedupe_within_chunk: dedupe,
             }
         },

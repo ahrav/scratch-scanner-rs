@@ -284,6 +284,41 @@ fn remote_pipeline_processes_multiple_objects() {
 }
 
 #[test]
+fn remote_pipeline_uses_cross_rule_dedupe_winner_selection() {
+    let engine = Arc::new(MockEngine::new(
+        vec![
+            MockRule {
+                name: "zeta".to_string(),
+                pattern: b"SECRET".to_vec(),
+            },
+            MockRule {
+                name: "alpha".to_string(),
+                pattern: b"SECRET".to_vec(),
+            },
+        ],
+        16,
+    ));
+
+    let backend = Arc::new(MockBackend {
+        objs: vec![MockObj {
+            key: b"dedupe-obj".to_vec(),
+            data: b"hello SECRET world".to_vec(),
+        }],
+    });
+    let sink = Arc::new(VecEventSink::new());
+
+    let (_report, _metrics) = scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
+
+    let out = sink.take();
+    let out_str = String::from_utf8_lossy(&out);
+
+    // Both rules match the same bytes. Cross-rule dedupe should keep exactly
+    // one finding and tie-break to the lexicographically smaller rule name.
+    assert_eq!(out_str.matches("alpha").count(), 1, "output: {}", out_str);
+    assert_eq!(out_str.matches("zeta").count(), 0, "output: {}", out_str);
+}
+
+#[test]
 fn remote_pipeline_retries_transient_failures() {
     let engine = Arc::new(test_engine(16));
 
