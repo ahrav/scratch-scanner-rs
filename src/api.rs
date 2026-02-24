@@ -704,8 +704,9 @@ pub struct RuleSpec {
     ///
     /// During engine build, the effective threshold is materialized into cold
     /// rule metadata (`RuleCold.min_confidence`) and can be queried via
-    /// [`crate::Engine::rule_min_confidence`]. Scan-time matching does not
-    /// branch on this threshold; downstream policy can consume it out-of-band.
+    /// [`crate::Engine::rule_min_confidence`]. At scan time, findings whose
+    /// computed confidence score falls below this threshold are suppressed at
+    /// all four emission sites in `window_validate.rs`.
     ///
     /// `Some(v)` is an explicit override. `None` selects an auto-default based
     /// on compiled rule signals:
