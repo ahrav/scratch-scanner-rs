@@ -55,6 +55,7 @@ use memchr::memmem;
 #[cfg(feature = "stdx-proptest")]
 use proptest::prelude::*;
 use regex::bytes::Regex;
+use rstest::rstest;
 use std::collections::HashSet;
 #[cfg(feature = "stdx-proptest")]
 use std::ops::Range;
@@ -460,6 +461,29 @@ fn unpack_patterns(pats: &PackedPatterns) -> Vec<Vec<u8>> {
     out
 }
 
+/// Shared base `RuleSpec` with default field values. Tests override only the
+/// fields that matter via struct-update syntax (`..base_rule(…)`).
+fn base_rule(name: &'static str, anchors: &'static [&'static [u8]], re: Regex) -> RuleSpec {
+    RuleSpec {
+        name,
+        anchors,
+        radius: 32,
+        validator: ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: None,
+        min_confidence: None,
+        offline_validation: None,
+        uuid_format_secret: false,
+        re,
+    }
+}
+
 // Tiny base64 encoder for tests (standard alphabet, with '=' padding).
 fn b64_encode(input: &[u8]) -> String {
     const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -787,44 +811,23 @@ fn base64_padding_in_root_hint() {
     );
 }
 
-#[test]
-fn base64_span_trims_trailing_space_when_allowed() {
-    let hay = b"AAAA   ";
+#[rstest]
+#[case::trims_trailing_space(b"AAAA   " as &[u8], 2, 32, 8, true, vec![0..4])]
+#[case::includes_leading_space(b"  AAAA" as &[u8], 2, 32, 8, true, vec![0..6])]
+#[case::disallows_space(b"AA AA" as &[u8], 1, 32, 8, false, vec![0..2, 3..5])]
+#[case::respects_min_chars(b"A \tA" as &[u8], 3, 32, 8, true, vec![])]
+#[case::respects_max_len(b"AAAAAAAAAA" as &[u8], 1, 4, 8, false, vec![0..4, 4..8, 8..10])]
+fn base64_span_behavior(
+    #[case] hay: &[u8],
+    #[case] min_chars: usize,
+    #[case] max_len: usize,
+    #[case] max_spans: usize,
+    #[case] allow_space: bool,
+    #[case] expected: Vec<std::ops::Range<usize>>,
+) {
     let mut spans = Vec::new();
-    find_base64_spans_into(hay, 2, 32, 8, true, &mut spans);
-    assert_eq!(spans, vec![0..4]);
-}
-
-#[test]
-fn base64_span_includes_leading_space_when_allowed() {
-    let hay = b"  AAAA";
-    let mut spans = Vec::new();
-    find_base64_spans_into(hay, 2, 32, 8, true, &mut spans);
-    assert_eq!(spans, vec![0..6]);
-}
-
-#[test]
-fn base64_span_disallows_space_when_flag_false() {
-    let hay = b"AA AA";
-    let mut spans = Vec::new();
-    find_base64_spans_into(hay, 1, 32, 8, false, &mut spans);
-    assert_eq!(spans, vec![0..2, 3..5]);
-}
-
-#[test]
-fn base64_span_respects_min_chars() {
-    let hay = b"A \tA";
-    let mut spans = Vec::new();
-    find_base64_spans_into(hay, 3, 32, 8, true, &mut spans);
-    assert!(spans.is_empty());
-}
-
-#[test]
-fn base64_span_respects_max_len() {
-    let hay = b"AAAAAAAAAA";
-    let mut spans = Vec::new();
-    find_base64_spans_into(hay, 1, 4, 8, false, &mut spans);
-    assert_eq!(spans, vec![0..4, 4..8, 8..10]);
+    find_base64_spans_into(hay, min_chars, max_len, max_spans, allow_space, &mut spans);
+    assert_eq!(spans, expected);
 }
 
 #[test]
