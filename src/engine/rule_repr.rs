@@ -590,7 +590,6 @@ pub(super) struct RuleCold {
     pub(super) min_confidence: i8,
 }
 
-#[inline(always)]
 fn needs_assignment_shape_check(spec: &RuleSpec) -> bool {
     spec.name == "generic-api-key"
 }
@@ -607,7 +606,7 @@ fn needs_assignment_shape_check(spec: &RuleSpec) -> bool {
 /// This chooses a single default floor (not an additive score). Offline
 /// validation wins over keyword+entropy because it is treated as the strongest
 /// standalone confidence signal in the default policy.
-pub(super) fn auto_min_confidence(spec: &RuleSpec) -> i8 {
+pub(super) fn derive_min_confidence(spec: &RuleSpec) -> i8 {
     use crate::api::confidence;
 
     if let Some(v) = spec.min_confidence {
@@ -632,6 +631,7 @@ pub(super) fn auto_min_confidence(spec: &RuleSpec) -> i8 {
 // struct within a single cache line pair.
 const _: () = assert!(std::mem::size_of::<u32>() == 4);
 const _: () = assert!(std::mem::size_of::<RuleCompiled>() <= 88);
+const _: () = assert!(std::mem::size_of::<RuleCold>() <= 24);
 
 // --------------------------
 // Compile helpers
@@ -1034,7 +1034,7 @@ mod tests {
         confidence::OFFLINE_VALID
     )]
     #[case::assignment_shape(None, false, false, false, true, confidence::ASSIGNMENT_SHAPE)]
-    fn auto_min_confidence_priority_cascade(
+    fn derive_min_confidence_priority_cascade(
         #[case] min_confidence: Option<i8>,
         #[case] has_offline: bool,
         #[case] has_keywords: bool,
@@ -1065,7 +1065,7 @@ mod tests {
         if is_generic_api_key {
             spec.name = "generic-api-key";
         }
-        assert_eq!(auto_min_confidence(&spec), expected);
+        assert_eq!(derive_min_confidence(&spec), expected);
     }
 
     #[test]

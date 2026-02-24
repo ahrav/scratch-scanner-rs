@@ -70,7 +70,7 @@ use super::helpers::{build_log2_table, u64_to_usize};
 #[cfg(feature = "bench")]
 use super::rule_repr::PackedPatternsBuilder;
 use super::rule_repr::{
-    add_pat_owned, add_pat_raw, auto_min_confidence, compile_confirm_all, compile_rule,
+    add_pat_owned, add_pat_raw, compile_confirm_all, compile_rule, derive_min_confidence,
     map_to_patterns, utf16be_bytes, utf16le_bytes, CharClassCompiled, ConfirmAllCompiled,
     EntropyCompiled, KeywordsCompiled, PackedPatterns, RuleCold, RuleCompiled, Target,
     TwoPhaseCompiled, Variant, NO_GATE,
@@ -470,7 +470,7 @@ impl Engine {
                 rule.char_class = char_class_gates.len() as u32;
                 char_class_gates.push(cc);
             }
-            let min_confidence = auto_min_confidence(spec);
+            let min_confidence = derive_min_confidence(spec);
             rules_compiled.push(rule);
             rules_cold.push(RuleCold {
                 name: spec.name,

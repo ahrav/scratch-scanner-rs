@@ -1014,15 +1014,10 @@ pub mod confidence {
     pub const OFFLINE_VALID: i8 = 5;
 }
 
-/// Compile-time guard: Phase 1 weights must sum to at most 10 (the documented ceiling).
-/// Any value ≤ 10 trivially fits in `i8`, so a separate `i8::MAX` check is unnecessary.
-const _: () = assert!(
-    (confidence::ENTROPY_PASS as i16
-        + confidence::KEYWORD_PRESENT as i16
-        + confidence::ASSIGNMENT_SHAPE as i16
-        + confidence::OFFLINE_VALID as i16)
-        <= 10
-);
+// Compile-time guard: every auto-derived tier must fit the Phase 1 ceiling (0..=10).
+const _: () = assert!(confidence::OFFLINE_VALID <= 10);
+const _: () = assert!((confidence::KEYWORD_PRESENT + confidence::ENTROPY_PASS) <= 10);
+const _: () = assert!(confidence::ASSIGNMENT_SHAPE <= 10);
 
 #[cfg(test)]
 mod tests {
