@@ -44,7 +44,8 @@
 //! reset() → enter_archive()
 //!   ├─ begin_entry() / begin_entry_scan()
 //!   │   ├─ charge_compressed_in()   (raw bytes consumed)
-//!   │   ├─ charge_decompressed_out() (payload bytes emitted)
+//!   │   ├─ charge_decompressed_out() (payload bytes delivered to sink)
+//!   │   ├─ charge_discarded_out()    (payload bytes read but dropped)
 //!   │   └─ end_entry(scanned)
 //!   ├─ … (repeat per entry)
 //!   └─ exit_archive()
@@ -334,13 +335,16 @@ impl<'a, S, Z: ZipSource> ArchiveScanCtx<'a, S, Z> {
 
 /// Map a [`BudgetHit`] to the top-level [`ArchiveEnd`] outcome for the
 /// current archive.
+///
+/// `SkipEntry` is promoted to `ArchiveEnd::Partial` because the archive scan is
+/// already in progress; only the current entry is being cut short.
 #[inline(always)]
 fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
     match hit {
         BudgetHit::SkipArchive(r) => ArchiveEnd::Skipped(r),
         BudgetHit::PartialArchive(r) => ArchiveEnd::Partial(r),
         BudgetHit::StopRoot(r) => ArchiveEnd::Partial(r),
-        BudgetHit::SkipEntry(_) => ArchiveEnd::Partial(PartialReason::EntryOutputBudgetExceeded),
+        BudgetHit::SkipEntry(r) => ArchiveEnd::Partial(r.to_partial()),
     }
 }
 
@@ -356,9 +360,11 @@ fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -> &[u8] {
     out
 }
 
-/// Charge `bytes` against the decompressed-output budget as *discarded*
-/// (read but not delivered to the sink). Returns `Err` if a budget limit
-/// is hit.
+/// Charge discarded decompressed bytes (read but not delivered to the sink).
+///
+/// Mirrors [`ArchiveBudgets::charge_discarded_out`]: bypasses the per-entry
+/// output-byte cap, but still enforces archive/root output caps and ratio caps
+/// (including per-entry ratio while an entry scope is open).
 #[inline(always)]
 fn charge_discarded_bytes(budgets: &mut ArchiveBudgets, bytes: u64) -> Result<(), PartialReason> {
     if bytes == 0 {
@@ -631,9 +637,10 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
 /// Scan a tar stream (plain or gzip-wrapped) as sequential entries.
 ///
-/// `ratio_active` controls whether inflation-ratio accounting is enforced
-/// for entry payload reads (set `true` when the tar stream is wrapped in
-/// gzip — the ratio tracks compressed-to-decompressed amplification).
+/// `ratio_active` controls whether probe-based ratio pre-clamping is applied
+/// before each payload read (set `true` when the tar stream is wrapped in
+/// gzip). Ratio enforcement still occurs in budget charge paths whenever
+/// compressed-byte accounting is present.
 ///
 /// Nesting starts at depth 1 (the root archive). Nested archives
 /// discovered inside tar entries are recursed via an internal helper
@@ -1038,8 +1045,6 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                             }
                         }
 
-                        budgets.end_entry(true);
-
                         let stop_reason = match nested_outcome.0 {
                             ArchiveEnd::Partial(r) => Some(r),
                             ArchiveEnd::Skipped(r) => Some(util::budget_hit_to_partial(
@@ -1072,6 +1077,8 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                                 stop_archive = true;
                             }
                         }
+
+                        budgets.end_entry(true);
 
                         if let Some(r) = entry_partial_reason {
                             scan.stats.record_entry_partial(r, entry_display, false);
@@ -1202,7 +1209,6 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
         }
 
         scan.sink.on_entry_end()?;
-        budgets.end_entry(offset > 0);
 
         if remaining > 0 {
             if let Err(r) =
@@ -1214,6 +1220,8 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                 outcome = ArchiveEnd::Partial(r);
             }
         }
+
+        budgets.end_entry(offset > 0);
 
         if let Some(r) = entry_partial_reason {
             scan.stats.record_entry_partial(r, entry_display, false);

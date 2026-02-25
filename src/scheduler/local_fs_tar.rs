@@ -379,8 +379,6 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                             }
                         }
 
-                        budgets.end_entry(true);
-
                         let stop_reason = match nested_outcome.0 {
                             ArchiveEnd::Partial(r) => Some(r),
                             ArchiveEnd::Skipped(r) => Some(map_archive_skip_to_partial(r)),
@@ -410,6 +408,8 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 stop_archive = true;
                             }
                         }
+
+                        budgets.end_entry(true);
 
                         if let Some(r) = entry_partial_reason {
                             scan.metrics

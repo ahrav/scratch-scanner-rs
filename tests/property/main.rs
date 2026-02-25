@@ -2,6 +2,7 @@
 //!
 //! Run with: `cargo test --test property`
 
+mod archive_entry_ratio;
 mod archive_path_canonicalization;
 mod archive_sliding_window;
 mod binary_classification;

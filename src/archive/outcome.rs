@@ -2,12 +2,11 @@
 //!
 //! Every archive encounter produces one of three outcomes:
 //!
-//! 1. **Skipped** — the entire archive (or a single entry) was rejected before
-//!    any content bytes were decompressed.  Tracked by [`ArchiveSkipReason`] and
-//!    [`EntrySkipReason`].
-//! 2. **Partial** — decompression started but a budget / integrity limit was hit
-//!    mid-stream; bytes already produced were still scanned.  Tracked by
-//!    [`PartialReason`].
+//! 1. **Skipped** — policy/format gating prevented scanning an archive or entry
+//!    to completion. Tracked by [`ArchiveSkipReason`] and [`EntrySkipReason`].
+//! 2. **Partial** — scanning stopped before completion after the archive was
+//!    accepted (budget/integrity/path limits). Any bytes already produced were
+//!    still scanned. Tracked by [`PartialReason`].
 //! 3. **Scanned** — the archive (or entry) was fully decompressed and scanned.
 //!
 //! [`ArchiveStats`] aggregates per-reason counters and a bounded sample buffer
@@ -52,7 +51,7 @@ pub enum ArchiveSkipReason {
     ArchiveOutputBudgetExceeded = 7,
     /// Root decompressed output exceeded `max_total_uncompressed_bytes_per_root`.
     RootOutputBudgetExceeded = 8,
-    /// Inflation ratio exceeded `max_inflation_ratio` (best-effort).
+    /// Archive-level inflation ratio exceeded `max_inflation_ratio`.
     InflationRatioExceeded = 9,
     /// Nested archive requires random access but spill/materialization is not available.
     NeedsRandomAccessNoSpill = 10,
@@ -114,10 +113,12 @@ pub enum EntrySkipReason {
     IoError = 7,
     /// Unsupported entry feature (e.g., data descriptor without streaming support).
     UnsupportedFeature = 8,
+    /// Entry-level inflation ratio exceeded `max_inflation_ratio`.
+    EntryInflationRatioExceeded = 9,
 }
 
 impl EntrySkipReason {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
 
     #[inline(always)]
     pub const fn as_usize(self) -> usize {
@@ -135,6 +136,29 @@ impl EntrySkipReason {
             Self::CorruptEntry => "corrupt_entry",
             Self::IoError => "io_error",
             Self::UnsupportedFeature => "unsupported_feature",
+            Self::EntryInflationRatioExceeded => "entry_inflation_ratio_exceeded",
+        }
+    }
+
+    /// Convert to the corresponding [`PartialReason`] for telemetry recording.
+    ///
+    /// `EntryInflationRatioExceeded` maps to `PartialReason::InflationRatioExceeded`.
+    /// All other variants map to `PartialReason::EntryOutputBudgetExceeded`.
+    ///
+    /// The match is exhaustive so that adding a new `EntrySkipReason` variant
+    /// produces a compile error, forcing an explicit mapping decision.
+    pub const fn to_partial(self) -> PartialReason {
+        match self {
+            Self::EntryOutputBudgetExceeded => PartialReason::EntryOutputBudgetExceeded,
+            Self::EntryInflationRatioExceeded => PartialReason::InflationRatioExceeded,
+            Self::NonRegular
+            | Self::MalformedPath
+            | Self::EncryptedEntry
+            | Self::UnsupportedCompression
+            | Self::CorruptPayload
+            | Self::CorruptEntry
+            | Self::IoError
+            | Self::UnsupportedFeature => PartialReason::EntryOutputBudgetExceeded,
         }
     }
 }
@@ -153,7 +177,8 @@ pub enum PartialReason {
     ArchiveOutputBudgetExceeded = 3,
     /// Per-root output budget hit.
     RootOutputBudgetExceeded = 4,
-    /// Inflation ratio exceeded (best-effort).
+    /// Scanning stopped due to inflation ratio (archive-level or promoted
+    /// entry-level ratio hit).
     InflationRatioExceeded = 5,
     /// gzip stream corrupted mid-stream (bytes already produced were scanned).
     GzipCorrupt = 6,
@@ -223,6 +248,7 @@ const ENTRY_SKIP_REASONS: [EntrySkipReason; EntrySkipReason::COUNT] = [
     EntrySkipReason::CorruptEntry,
     EntrySkipReason::IoError,
     EntrySkipReason::UnsupportedFeature,
+    EntrySkipReason::EntryInflationRatioExceeded,
 ];
 
 const PARTIAL_REASONS: [PartialReason; PartialReason::COUNT] = [
@@ -631,7 +657,7 @@ mod tests {
         );
         assert_eq!(
             EntrySkipReason::COUNT,
-            EntrySkipReason::UnsupportedFeature as usize + 1
+            EntrySkipReason::EntryInflationRatioExceeded as usize + 1
         );
         assert_eq!(
             PartialReason::COUNT,

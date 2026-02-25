@@ -118,8 +118,8 @@ pub(super) enum ArchiveEnd {
 /// Map an archive-level skip reason to the corresponding partial-scan reason.
 ///
 /// Used when a nested archive is skipped mid-stream, promoting the skip into
-/// a partial outcome for the parent entry/archive. Unmapped variants fall
-/// through to `MalformedZip` as a conservative default.
+/// a partial outcome for the parent entry/archive. Variants without a direct
+/// `PartialReason` counterpart map to `MalformedZip` as a conservative fallback.
 #[inline(always)]
 pub(super) fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
     match reason {
@@ -132,7 +132,13 @@ pub(super) fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialR
         ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
         ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
         ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-        _ => PartialReason::MalformedZip,
+        ArchiveSkipReason::Disabled
+        | ArchiveSkipReason::UnsupportedFormat
+        | ArchiveSkipReason::EncryptedArchive
+        | ArchiveSkipReason::DepthExceeded
+        | ArchiveSkipReason::NeedsRandomAccessNoSpill
+        | ArchiveSkipReason::IoError
+        | ArchiveSkipReason::Corrupt => PartialReason::MalformedZip,
     }
 }
 
@@ -140,13 +146,14 @@ pub(super) fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialR
 ///
 /// Every budget violation carries a reason; this collapses the four `BudgetHit`
 /// variants into a flat `PartialReason` for recording in metrics and diagnostics.
+/// `SkipEntry` is promoted to an entry-level partial reason.
 #[inline(always)]
 pub(super) fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
     match hit {
         BudgetHit::PartialArchive(r) => r,
         BudgetHit::StopRoot(r) => r,
         BudgetHit::SkipArchive(r) => map_archive_skip_to_partial(r),
-        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
+        BudgetHit::SkipEntry(r) => r.to_partial(),
     }
 }
 
@@ -159,7 +166,7 @@ pub(super) fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
         BudgetHit::SkipArchive(r) => ArchiveEnd::Skipped(r),
         BudgetHit::PartialArchive(r) => ArchiveEnd::Partial(r),
         BudgetHit::StopRoot(r) => ArchiveEnd::Partial(r),
-        BudgetHit::SkipEntry(_) => ArchiveEnd::Partial(PartialReason::EntryOutputBudgetExceeded),
+        BudgetHit::SkipEntry(r) => ArchiveEnd::Partial(r.to_partial()),
     }
 }
 
@@ -187,7 +194,7 @@ pub(super) struct ArchiveScanCtx<'a, E: ScanEngine> {
     pub(super) pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
     /// Reusable persistence batch buffer.
     pub(super) persist_batch: &'a mut Vec<FsFindingRecord>,
-    /// Shared budget tracker — enforces archive, entry, and root output caps.
+    /// Shared budget tracker — enforces output caps and inflation-ratio gates.
     pub(super) budgets: &'a mut ArchiveBudgets,
     pub(super) canon: &'a mut EntryPathCanonicalizer,
     /// Per-depth virtual path builders. Head is consumed at this depth.
@@ -322,9 +329,13 @@ pub(super) struct ChunkScanResult {
 
 /// Charge decompressed bytes that were read but not scanned (entry truncation).
 ///
-/// Discarded bytes still count against archive and root output budgets because
-/// the decompressor already produced them. Returns `Err` with the triggering
-/// [`PartialReason`] if charging the discard pushes a budget over its limit.
+/// Discarded bytes still count against archive/root output budgets and, when
+/// an entry is open, against the per-entry inflation ratio because the
+/// decompressor already produced them. Per-entry output-byte caps are
+/// intentionally bypassed for this discarded path.
+///
+/// Returns `Err` with the triggering [`PartialReason`] if charging the discard
+/// pushes a budget over its limit.
 #[inline(always)]
 pub(super) fn charge_discarded_bytes(
     budgets: &mut ArchiveBudgets,
@@ -342,11 +353,12 @@ pub(super) fn charge_discarded_bytes(
 /// Apply decompressed-output budgeting for a read of `n` bytes.
 ///
 /// Returns `(allowed, clamped)` where:
-/// - `allowed` is the prefix length to scan/emits.
+/// - `allowed` is the prefix length to scan/emit.
 /// - `clamped` signals the caller must stop after this iteration.
 ///
 /// If the decoder produced more bytes than allowed, the extra bytes are charged
-/// as discarded output so archive/root caps remain accurate.
+/// as discarded output so archive/root counters and entry-ratio accounting stay
+/// consistent.
 #[inline(always)]
 pub(super) fn apply_entry_budget_clamp(
     budgets: &mut ArchiveBudgets,
