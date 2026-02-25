@@ -879,7 +879,9 @@ impl RuleSpec {
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
 /// - If `digit_penalty` is enabled and the evaluated entropy slice (after
 ///   `max_len` capping) is all ASCII digits, Shannon is adjusted by
-///   `-1.2 / log2(len)` before thresholding.
+///   `-DIGIT_ONLY_PENALTY_NUMERATOR / log2(len)` before thresholding
+///   (see [`engine::helpers::entropy::DIGIT_ONLY_PENALTY_NUMERATOR`]).
+///   The penalty can push effective Shannon below zero.
 /// - For `len == 1`, the digit penalty is skipped (`log2(1) == 0`).
 /// - Shannon entropy is checked first. If an optional min-entropy threshold
 ///   (`min_entropy_bits_per_byte`) is configured, it is checked second to
@@ -908,10 +910,14 @@ pub struct EntropySpec {
     /// When `true`, apply a digit-only penalty before the Shannon check.
     ///
     /// If the evaluated (possibly capped) entropy slice is composed entirely
-    /// of ASCII digits, subtract `1.2 / log2(len)` from Shannon entropy.
-    /// The adjustment is skipped for `len == 1`. This targets common false
+    /// of ASCII digits, subtract `DIGIT_ONLY_PENALTY_NUMERATOR / log2(len)`
+    /// (see [`engine::helpers::entropy`]) from Shannon entropy. The
+    /// adjustment is skipped for `len == 1`. This targets common false
     /// positives such as phone numbers, timestamps, and numeric IDs that can
-    /// clear a 3.0 bits/byte hex threshold.
+    /// clear a 3.0 bits/byte Shannon threshold.
+    ///
+    /// The penalty can push effective Shannon below zero, meaning candidates
+    /// may be rejected even with `min_bits_per_byte: 0.0`.
     pub digit_penalty: bool,
 }
 
@@ -1387,12 +1393,12 @@ pub struct Tuning {
     /// findings beyond this limit are silently dropped.
     pub max_findings_per_chunk: usize,
 
-    /// Whether to scan UTF-16 anchor variants (LE and BE).
+    /// Whether to scan UTF-16 anchor variants (LE and BE) at runtime.
     ///
-    /// When `false`, only raw (ASCII) anchors are compiled into the
-    /// Vectorscan pattern database. Disabling this saves pattern-database
-    /// memory and avoids false hits on binary content that happens to
-    /// contain NUL bytes.
+    /// When `false`, UTF-16 scanning paths are skipped even if UTF-16
+    /// anchor patterns were compiled into the pattern database. This
+    /// avoids false hits on binary content that happens to contain NUL
+    /// bytes.
     pub scan_utf16_variants: bool,
 }
 

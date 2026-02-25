@@ -313,6 +313,31 @@ mod tests {
     }
 
     #[test]
+    fn policy_hash_is_sensitive_to_digit_penalty() {
+        let mut r1 = rule("a", "a", &[b"a"]);
+        let mut r2 = rule("a", "a", &[b"a"]);
+        r1.entropy = Some(crate::api::EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+            digit_penalty: false,
+        });
+        r2.entropy = Some(crate::api::EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+            digit_penalty: true,
+        });
+        let tuning = demo_tuning();
+
+        let h1 = policy_hash(&[r1], &transforms(), &tuning, MergeDiffMode::AllParents);
+        let h2 = policy_hash(&[r2], &transforms(), &tuning, MergeDiffMode::AllParents);
+        assert_ne!(h1, h2, "changing digit_penalty must change the policy hash");
+    }
+
+    #[test]
     fn policy_hash_is_order_invariant_for_rules() {
         let r1 = rule("a", "a", &[b"a"]);
         let r2 = rule("b", "b", &[b"b"]);

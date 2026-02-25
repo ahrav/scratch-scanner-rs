@@ -256,6 +256,16 @@ fn assert_rules_equal(original_rules: &[RuleSpec], parsed_rules: &[RuleSpec]) {
                     "entropy max_len mismatch for {}",
                     orig.name
                 );
+                assert_eq!(
+                    oe.digit_penalty, pe.digit_penalty,
+                    "entropy digit_penalty mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    oe.min_entropy_bits_per_byte, pe.min_entropy_bits_per_byte,
+                    "entropy min_entropy_bits_per_byte mismatch for {}",
+                    orig.name
+                );
             }
             (None, None) => {}
             _ => panic!("entropy presence mismatch for {}", orig.name),

@@ -46,7 +46,7 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 6] Extract secret span from capture groups
   ↓
-[Gate 7] Check entropy on extracted secret (Shannon + optional min-entropy)
+[Gate 7] Check entropy on extracted secret (Shannon + optional digit penalty + optional min-entropy)
   ↓
 [Step 8] Probe for keyword evidence in local context (±32 bytes around full match)
   ↓

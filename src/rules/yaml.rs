@@ -203,8 +203,9 @@ pub(crate) struct YamlRule {
 ///
 /// `digit_penalty` is an opt-in false-positive reducer for hex-like rules:
 /// when enabled, all-digit candidates in the evaluated entropy slice (after
-/// `max_len` capping) are penalized by `1.2 / log2(len)` before Shannon
-/// threshold comparison (`len == 1` is left unpenalized).
+/// `max_len` capping) are penalized by `DIGIT_ONLY_PENALTY_NUMERATOR /
+/// log2(len)` before Shannon threshold comparison (`len == 1` is left
+/// unpenalized). See [`engine::helpers::entropy::DIGIT_ONLY_PENALTY_NUMERATOR`].
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
@@ -223,9 +224,10 @@ pub(crate) struct YamlEntropy {
     #[serde(default)]
     pub min_entropy_bits_per_byte: Option<f32>,
     /// When `true`, all-digit candidates in the evaluated entropy slice
-    /// are penalized by `1.2 / log2(len)` before the Shannon threshold
-    /// comparison. Targets false positives from numeric-only strings in
-    /// hex-like rules (e.g. version numbers, timestamps).
+    /// are penalized by `DIGIT_ONLY_PENALTY_NUMERATOR / log2(len)` before
+    /// the Shannon threshold comparison. Targets false positives from
+    /// numeric-only strings in hex-like rules (e.g. version numbers,
+    /// timestamps).
     #[serde(default)]
     pub digit_penalty: bool,
 }

@@ -6970,3 +6970,57 @@ fn uuid_quick_reject_bypassed_when_rule_captures_uuid_secrets() {
         "UUID-format secret should be kept when uuid_format_secret=true"
     );
 }
+
+#[test]
+fn digit_penalty_rejects_all_digit_secret() {
+    // An all-digit string like "1234567890123456" has Shannon ~3.32 bpb,
+    // which clears a 3.0 bpb threshold without penalty.  With
+    // digit_penalty enabled the effective Shannon drops below 3.0 and the
+    // finding should be rejected.
+    let rule_penalty = RuleSpec {
+        radius: 64,
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+            digit_penalty: true,
+        }),
+        secret_group: Some(1),
+        ..base_rule(
+            "digit-penalty-on",
+            &[b"NUM_"],
+            Regex::new(r"NUM_([0-9]{16})").unwrap(),
+        )
+    };
+
+    let rule_no_penalty = RuleSpec {
+        entropy: Some(EntropySpec {
+            digit_penalty: false,
+            ..rule_penalty.entropy.clone().unwrap()
+        }),
+        ..base_rule(
+            "digit-penalty-off",
+            &[b"NUM_"],
+            Regex::new(r"NUM_([0-9]{16})").unwrap(),
+        )
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_penalty, rule_no_penalty],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hits = scan_chunk_findings(&engine, b"prefix NUM_1234567890123456 suffix");
+
+    assert!(
+        !hits.iter().any(|h| h.rule == "digit-penalty-on"),
+        "digit_penalty should reject all-digit secret that barely clears Shannon"
+    );
+    assert!(
+        hits.iter().any(|h| h.rule == "digit-penalty-off"),
+        "without digit_penalty the same all-digit secret should pass Shannon"
+    );
+}

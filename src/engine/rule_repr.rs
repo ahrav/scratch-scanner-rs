@@ -429,9 +429,10 @@ pub(super) struct EntropyCompiled {
     pub(super) min_bits_per_byte: f32,
     /// Applies a detect-secrets style penalty to all-digit candidates.
     ///
-    /// When enabled, `1.2 / log2(len)` is subtracted from Shannon entropy for
-    /// entropy slices composed entirely of ASCII digits, using the capped
-    /// entropy window length (`len == 1` is skipped).
+    /// When enabled, `DIGIT_ONLY_PENALTY_NUMERATOR / log2(len)` is subtracted
+    /// from Shannon entropy for entropy slices composed entirely of ASCII
+    /// digits, using the capped entropy window length (`len == 1` is skipped).
+    /// See [`super::helpers::entropy::DIGIT_ONLY_PENALTY_NUMERATOR`].
     pub(super) digit_penalty: bool,
     /// Minimum candidate length in bytes for the entropy check to apply.
     pub(super) min_len: usize,

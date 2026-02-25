@@ -10,7 +10,8 @@
 //!   Catches skewed distributions where one byte dominates even though Shannon
 //!   looks moderate.
 //! - **Digit-only penalty** (optional): for all-ASCII-digit slices, subtract
-//!   `1.2 / log2(len)` from Shannon before thresholding (detect-secrets style).
+//!   `DIGIT_ONLY_PENALTY_NUMERATOR / log2(len)` from Shannon before
+//!   thresholding (detect-secrets style).
 //!
 //! # Role in the confidence model
 //!
@@ -33,7 +34,8 @@
 //!    and tracks the all-digits flag, then a 256-bin scan derives Shannon
 //!    entropy and max-bin-count.
 //! 3. **Digit penalty** (if enabled) -- for all-digit slices, subtract
-//!    `1.2 / log2(capped_len)` from Shannon before thresholding.
+//!    `DIGIT_ONLY_PENALTY_NUMERATOR / log2(capped_len)` from Shannon before
+//!    thresholding.
 //! 4. **Shannon check** -- compare effective Shannon against `min_bits_per_byte`.
 //! 5. **Min-entropy check** (if configured) -- compare `H_inf` against
 //!    `min_entropy_bits_per_byte`. Checked second because Shannon already
@@ -250,8 +252,10 @@ pub(crate) fn shannon_entropy_bits_per_byte(
 /// - Buffers shorter than `spec.min_len` always pass (entropy is noisy).
 /// - Longer buffers are capped at `spec.max_len` for the computation.
 /// - If `spec.digit_penalty` is enabled, all-digit bytes in the capped slice
-///   use `effective_shannon = shannon - (1.2 / log2(capped_len))`.
+///   use `effective_shannon = shannon - (DIGIT_ONLY_PENALTY_NUMERATOR / log2(capped_len))`.
 ///   (`capped_len == 1` skips the penalty to avoid division by zero.)
+///   The penalty can push effective Shannon below zero, rejecting candidates
+///   even with `min_bits_per_byte: 0.0`.
 /// - Shannon entropy is always checked first.
 /// - Min-entropy (optional, per NIST SP 800-90B) is checked second: it catches
 ///   distributions where one byte dominates even though Shannon looks moderate.
@@ -277,7 +281,7 @@ pub(crate) fn entropy_gate_outcome(
     let metrics = compute_entropy_metrics(&bytes[..capped], scratch, log2_table);
 
     // detect-secrets style penalty for digit-only strings in the capped slice:
-    // effective_shannon = shannon - (1.2 / log2(capped_len)); skip when len==1.
+    // effective_shannon = shannon - (DIGIT_ONLY_PENALTY_NUMERATOR / log2(capped_len)); skip when len==1.
     let effective_shannon =
         if spec.digit_penalty && metrics.all_ascii_digits && metrics.log2_n > 0.0 {
             metrics.shannon_bpb - (DIGIT_ONLY_PENALTY_NUMERATOR / metrics.log2_n)
