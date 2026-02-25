@@ -120,10 +120,16 @@ pub struct ArchiveBudgets {
 /// Using a sentinel instead of a separate `bool` eliminates 7 bytes of padding
 /// and keeps the struct compact with `#[repr(C)]`.
 ///
-/// `u64::MAX` is safe as a sentinel because `entry_decompressed_out` is bounded
-/// by `max_uncompressed_bytes_per_entry`, which is clamped to at most
-/// `ENTRY_NOT_OPEN - 1` in [`ArchiveBudgets::new`].  Saturating addition in the
-/// charge path therefore cannot reach the sentinel value.
+/// `u64::MAX` is safe as a sentinel because:
+///   - `max_uncompressed_bytes_per_entry` is clamped to at most `ENTRY_NOT_OPEN - 1`
+///     in [`ArchiveBudgets::new`].
+///   - The charge paths (`charge_decompressed_out`, `charge_discarded_out`) apply a
+///     runtime cap that clamps `entry_decompressed_out` to `ENTRY_NOT_OPEN - 1`
+///     after every saturating addition.
+///
+/// Note: `entry_compressed_in` tracks input bytes for the current entry and is
+/// only meaningful while an entry is open (`entry_decompressed_out != ENTRY_NOT_OPEN`).
+/// It is reset to 0 by `end_entry()`.
 const ENTRY_NOT_OPEN: u64 = u64::MAX;
 
 /// Returns `true` when an entry is currently open (being scanned).
@@ -347,6 +353,7 @@ impl ArchiveBudgets {
         if scanned {
             f.entries_scanned = f.entries_scanned.saturating_add(1);
         }
+        f.entry_compressed_in = 0;
         f.entry_decompressed_out = ENTRY_NOT_OPEN;
     }
 
@@ -455,10 +462,10 @@ impl ArchiveBudgets {
             let f = self.cur_mut();
             if entry_is_open(f) {
                 f.entry_decompressed_out = f.entry_decompressed_out.saturating_add(allowed);
-                debug_assert_ne!(
-                    f.entry_decompressed_out, ENTRY_NOT_OPEN,
-                    "BUG: entry byte counter saturated to sentinel"
-                );
+                // Prevent counter from reaching the ENTRY_NOT_OPEN sentinel.
+                if f.entry_decompressed_out == ENTRY_NOT_OPEN {
+                    f.entry_decompressed_out = ENTRY_NOT_OPEN - 1;
+                }
             }
             f.decompressed_out = f.decompressed_out.saturating_add(allowed);
             self.root_decompressed_out = self.root_decompressed_out.saturating_add(allowed);
@@ -471,11 +478,12 @@ impl ArchiveBudgets {
         // Identify which cap was the binding constraint.
         //
         // Priority order (first match wins):
-        //   1. entry   — per-entry output cap
-        //   2. archive — per-archive output cap
-        //   3. root    — root-level (cross-archive) output cap
-        //   4. ratio   — inflation ratio cap
-        //   5. fallback — defensive (should be unreachable when caps are finite)
+        //   1. entry       — per-entry output cap
+        //   2. entry ratio — per-entry inflation ratio cap
+        //   3. archive     — per-archive output cap
+        //   4. root        — root-level (cross-archive) output cap
+        //   5. ratio       — archive-level inflation ratio cap
+        //   6. fallback    — defensive (should be unreachable when caps are finite)
         //
         // `progressed` distinguishes "we scanned nothing from this archive"
         // (→ SkipArchive, the archive is treated as if it was never opened)
@@ -574,10 +582,10 @@ impl ArchiveBudgets {
             let f = self.cur_mut();
             if entry_is_open(f) {
                 f.entry_decompressed_out = f.entry_decompressed_out.saturating_add(allowed);
-                debug_assert_ne!(
-                    f.entry_decompressed_out, ENTRY_NOT_OPEN,
-                    "BUG: entry byte counter saturated to sentinel"
-                );
+                // Prevent counter from reaching the ENTRY_NOT_OPEN sentinel.
+                if f.entry_decompressed_out == ENTRY_NOT_OPEN {
+                    f.entry_decompressed_out = ENTRY_NOT_OPEN - 1;
+                }
             }
             f.decompressed_out = f.decompressed_out.saturating_add(allowed);
             self.root_decompressed_out = self.root_decompressed_out.saturating_add(allowed);
