@@ -6584,7 +6584,7 @@ fn stage1_generic_api_key_rule() -> RuleSpec {
             min_entropy_bits_per_byte: None,
         }),
         min_confidence: Some(5),
-        secret_group: Some(1),
+        secret_group: None,
         ..base_rule(
             "generic-api-key",
             &[b"api_key", b"token"],
