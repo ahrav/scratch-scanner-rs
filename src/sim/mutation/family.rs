@@ -1,9 +1,26 @@
 //! Token family definitions and deterministic valid-token generators.
 //!
-//! Each `TokenFamily` variant knows how to generate a structurally valid token
-//! for a specific secret format and which mutation operators are applicable.
-//! Format details are verified against `engine/offline_validate.rs` and
-//! `default_rules.yaml` (see plan for references).
+//! A "token family" is an archetype of a real-world secret format (AWS access
+//! key, GitHub PAT, JWT, etc.). Each family encapsulates three pieces of
+//! knowledge needed to build mutation-based counterexample tests:
+//!
+//! 1. **Generation** ([`TokenFamily::gen_valid`]) -- produce a structurally
+//!    valid token from a deterministic seed. The generated token must pass the
+//!    corresponding `engine/offline_validate.rs` validator (prefix, charset,
+//!    length, checksum) so that it registers as a true positive in the absence
+//!    of mutations.
+//!
+//! 2. **Allowed operators** ([`TokenFamily::allowed_ops`]) -- declare which
+//!    mutation operator kinds are meaningful for this format. For example,
+//!    `ChecksumCorrupt` only applies to families that carry a CRC.
+//!
+//! 3. **Expectation oracle** ([`TokenFamily::expectation`]) -- given a
+//!    canonical token and a sequence of mutations, predict whether the
+//!    detection engine must match, must not match, or may match. This is the
+//!    ground-truth oracle that test harnesses assert against.
+//!
+//! Format details (prefix, body length, checksum algorithm and scope) are kept
+//! in sync with `engine/offline_validate.rs` and `default_rules.yaml`.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,28 +31,49 @@ use super::op::{MutOp, MutOpKind};
 use super::plan::Outcome;
 use crate::sim::rng::SimRng;
 
-/// AWS base-32 alphabet: A-Z (0–25) then 2-7 (26–31).
+/// AWS base-32 alphabet (RFC 4648 section 6): `A`--`Z` map to 0--25, `2`--`7`
+/// map to 26--31. Used for the 16-character body of AWS access key IDs.
 const AWS_BASE32_CHARS: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 /// Token family describing a specific secret format.
+///
+/// Each variant models one class of real-world credential. The set is not
+/// exhaustive -- it covers the format archetypes that exercise distinct code
+/// paths in the detection engine: fixed-prefix with base-32 body, CRC-bearing
+/// tokens (two different checksum scopes), structured multi-segment tokens
+/// (JWT), and opaque encoded blobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenFamily {
-    /// AKIA + 16 chars from [A-Z2-7] = 20 bytes total.
+    /// AWS access key ID: literal `AKIA` prefix + 16 base-32 characters = 20
+    /// bytes total. No checksum; validation relies on prefix + charset + length.
     AwsAccessKey,
-    /// github_pat_ + 76 body + 6 CRC = 93 bytes total.
+    /// GitHub fine-grained PAT: `github_pat_` (11 bytes) + 76 base-62 body +
+    /// 6 base-62 CRC-32 characters = 93 bytes. The CRC is computed over the
+    /// first 87 bytes (prefix **included**).
     GithubFinegrainedPat,
-    /// ghp_ + 30 body + 6 CRC = 40 bytes total.
+    /// GitHub classic PAT: `ghp_` (4 bytes) + 30 base-62 body + 6 base-62
+    /// CRC-32 characters = 40 bytes. The CRC is computed over the payload only
+    /// (bytes 4--33, prefix **excluded**).
     GithubClassicPat,
-    /// eyJ<b64url header>.eyJ<b64url payload>.<b64url sig>
+    /// JWT-like token: three dot-separated base64url segments
+    /// (`header.payload.signature`). Header and payload start with `eyJ`
+    /// (the base64url prefix for any JSON object starting with `{"`).
     JwtLike,
-    /// base64_encode_std(24–48 random bytes)
+    /// Opaque base64-encoded blob: `base64(24--48 random bytes)`. Variable
+    /// length; no structural prefix or checksum.
     Base64Blob,
-    /// percent_encode_all(16–32 random bytes)
+    /// Opaque percent-encoded blob: every byte encoded as `%XX` from 16--32
+    /// random source bytes. Variable length; no structural prefix or checksum.
     UrlEncodedBlob,
 }
 
 impl TokenFamily {
-    /// Generate a deterministically valid token for this family.
+    /// Generate a structurally valid token for this family.
+    ///
+    /// The returned token satisfies all format constraints (prefix, charset,
+    /// length, checksum) and is therefore expected to be detected by the engine
+    /// in the absence of any mutations. Output is fully deterministic: the same
+    /// `rng` state always produces the same byte sequence.
     pub fn gen_valid(&self, rng: &mut SimRng) -> Vec<u8> {
         match self {
             TokenFamily::AwsAccessKey => gen_aws_access_key(rng),
@@ -47,7 +85,11 @@ impl TokenFamily {
         }
     }
 
-    /// Which mutation operator kinds are valid for this family.
+    /// Mutation operator kinds that produce meaningful test cases for this family.
+    ///
+    /// Families without a checksum exclude `ChecksumCorrupt` (it would be a
+    /// no-op on the detection path). Blob families exclude `PrefixMangle`
+    /// because they have no structural prefix to corrupt.
     pub fn allowed_ops(&self) -> &'static [MutOpKind] {
         use MutOpKind::*;
         match self {
@@ -82,10 +124,26 @@ impl TokenFamily {
         }
     }
 
-    /// Expected detection result after applying the given mutations.
+    /// Predict the detection outcome after applying the given mutations.
     ///
-    /// Receives the canonical (pre-mutation) token so variable-length families
-    /// can reason about length-dependent operators like Truncate.
+    /// Returns a three-valued [`Outcome`]:
+    /// - `MustMatch` -- no mutation alters a property the engine checks, so
+    ///   the engine **must** still detect this token.
+    /// - `MustNotMatch` -- at least one mutation provably breaks a hard
+    ///   constraint (length, charset, prefix, or checksum), so the engine
+    ///   **must not** detect this token.
+    /// - `MayMatch` -- the mutation may or may not defeat detection depending
+    ///   on engine heuristics (e.g. entropy thresholds), so the test harness
+    ///   should accept either outcome.
+    ///
+    /// The scan is first-match: the method returns as soon as any single
+    /// operator produces a definitive `MustNotMatch` or `MayMatch` result.
+    /// Operators that are no-ops at their given parameters (e.g. `Truncate`
+    /// with `len >= canonical.len()`) fall through without affecting the
+    /// outcome.
+    ///
+    /// Receives the canonical (pre-mutation) token so that length-dependent
+    /// operators like `Truncate` can compare against the original size.
     pub fn expectation(&self, canonical: &[u8], ops: &[MutOp]) -> Outcome {
         if ops.is_empty() {
             return Outcome::MustMatch;
@@ -103,6 +161,8 @@ impl TokenFamily {
                 }
                 MutOp::PrefixMangle { .. } => return Outcome::MustNotMatch,
                 MutOp::ChecksumCorrupt => {
+                    // Only CRC-bearing families have a checksum the engine verifies;
+                    // for others the corruption lands on an arbitrary byte.
                     return match self {
                         TokenFamily::GithubFinegrainedPat | TokenFamily::GithubClassicPat => {
                             Outcome::MustNotMatch
@@ -129,7 +189,11 @@ impl TokenFamily {
 // Per-family generators
 // ---------------------------------------------------------------------------
 
-/// AKIA + 16 random chars from [A-Z2-7].
+/// Generate an AWS access key ID: `AKIA` prefix + 16 random base-32 characters.
+///
+/// The `AKIA` prefix identifies a long-term credential (as opposed to `ASIA`
+/// for temporary STS tokens). The 16-character body uses the RFC 4648 base-32
+/// alphabet that AWS employs for key IDs.
 fn gen_aws_access_key(rng: &mut SimRng) -> Vec<u8> {
     let mut out = Vec::with_capacity(20);
     out.extend_from_slice(b"AKIA");
@@ -140,7 +204,12 @@ fn gen_aws_access_key(rng: &mut SimRng) -> Vec<u8> {
     out
 }
 
-/// github_pat_ + 76 random base-62 chars + CRC-32 of first 87 bytes as 6 base-62 chars.
+/// Generate a GitHub fine-grained PAT.
+///
+/// Layout: `github_pat_` (11 bytes) + 76 random base-62 body + 6 base-62 CRC
+/// = 93 bytes total. The CRC-32 is computed over the **entire** first 87 bytes
+/// (prefix + body), which differs from the classic PAT format where the prefix
+/// is excluded from the checksum scope.
 fn gen_github_fine_grained_pat(rng: &mut SimRng) -> Vec<u8> {
     let mut out = Vec::with_capacity(93);
     out.extend_from_slice(b"github_pat_");
@@ -159,7 +228,13 @@ fn gen_github_fine_grained_pat(rng: &mut SimRng) -> Vec<u8> {
     out
 }
 
-/// ghp_ + 30 random base-62 chars + CRC-32 of payload (bytes 4–33) as 6 base-62 chars.
+/// Generate a GitHub classic PAT.
+///
+/// Layout: `ghp_` (4 bytes) + 30 random base-62 body + 6 base-62 CRC = 40
+/// bytes total. The CRC-32 is computed over the **payload only** (bytes
+/// 4--33), excluding the `ghp_` prefix. This difference in checksum scope
+/// versus the fine-grained format is why both variants exist as separate
+/// families.
 fn gen_github_classic_pat(rng: &mut SimRng) -> Vec<u8> {
     let mut out = Vec::with_capacity(40);
     out.extend_from_slice(b"ghp_");
@@ -178,7 +253,12 @@ fn gen_github_classic_pat(rng: &mut SimRng) -> Vec<u8> {
     out
 }
 
-/// JWT: header.payload.signature (three base64url-encoded segments).
+/// Generate a JWT-like token with three dot-separated base64url segments.
+///
+/// The header is fixed (`{"alg":"HS256"}`), producing the characteristic `eyJ`
+/// prefix after base64url encoding. The payload contains a `sub` claim with 8
+/// random alphanumeric characters. The signature is 32 random bytes. None of
+/// the segments carry padding (`=`), per RFC 7515 section 2.
 fn gen_jwt_like(rng: &mut SimRng) -> Vec<u8> {
     // Fixed header: {"alg":"HS256"}
     let header = base64url_encode_nopad(b"{\"alg\":\"HS256\"}");
@@ -216,7 +296,10 @@ fn gen_jwt_like(rng: &mut SimRng) -> Vec<u8> {
     out
 }
 
-/// base64(24–48 random bytes).
+/// Generate a base64-encoded blob of 24--48 random bytes.
+///
+/// The variable source length exercises the engine's entropy and length
+/// heuristics across a range of output sizes (32--64 base64 characters).
 fn gen_base64_blob(rng: &mut SimRng) -> Vec<u8> {
     let len = rng.gen_range(24, 49) as usize;
     let mut raw = vec![0u8; len];
@@ -226,7 +309,10 @@ fn gen_base64_blob(rng: &mut SimRng) -> Vec<u8> {
     base64_encode_std(&raw)
 }
 
-/// percent_encode_all(16–32 random bytes).
+/// Generate a percent-encoded blob of 16--32 random bytes.
+///
+/// Output length is 3x the source length (every byte becomes `%XX`), yielding
+/// 48--96 characters.
 fn gen_url_encoded_blob(rng: &mut SimRng) -> Vec<u8> {
     let len = rng.gen_range(16, 33) as usize;
     let mut raw = vec![0u8; len];

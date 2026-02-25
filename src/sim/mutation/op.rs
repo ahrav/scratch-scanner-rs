@@ -1,45 +1,77 @@
 //! Mutation operators for deterministic near-miss counterexample generation.
 //!
-//! Operators are applied left-to-right via `apply_ops`. Out-of-range parameters
-//! are clamped deterministically rather than causing panics.
+//! Each operator is a small, composable perturbation that pushes a valid token
+//! across (or near) a detection boundary. By combining operators in sequence,
+//! the test harness can systematically probe every rejection path in the engine:
+//! wrong length, wrong charset, corrupted prefix, bad checksum, low entropy,
+//! extra encoding layers, and trailing garbage.
+//!
+//! Operators are applied left-to-right via [`apply_ops`]. The pipeline is
+//! **order-dependent** -- `Truncate` then `Extend` yields a different result
+//! than `Extend` then `Truncate`. Out-of-range parameters (e.g. positions
+//! beyond the token length) are clamped deterministically rather than causing
+//! panics, so randomly generated operator parameters never produce undefined
+//! behavior.
 
 use serde::{Deserialize, Serialize};
 
 use super::encode::SecretRepr;
 
 /// Maximum nesting depth for `Encode { repr: Nested { depth } }`.
+///
+/// Each base64 layer expands by ~4/3x and each percent layer by 3x; at
+/// depth 4 the compounded expansion is ~16x, easily reaching kilobytes
+/// from a short input. Clamping here prevents accidental multi-megabyte
+/// allocations when the depth field is generated randomly.
 pub const MAX_NESTED_DEPTH: u8 = 4;
 
-/// Maximum output size (1 MiB) — safety net against exponential blowup.
+/// Maximum output size (1 MiB) -- safety net against exponential blowup.
+///
+/// If any single operator would push the output past this limit, `apply_ops`
+/// stops the pipeline and returns the last in-bounds result. This guards
+/// against pathological chains of `Encode` operators.
 pub const MAX_OUTPUT_BYTES: usize = 1 << 20;
 
-/// A concrete mutation operation with parameters.
+/// A concrete mutation operation with fully specified parameters.
+///
+/// Each variant targets a different detection-engine gate. The test harness
+/// generates these randomly (constrained by [`TokenFamily::allowed_ops`]) and
+/// uses [`TokenFamily::expectation`] to predict the detection outcome.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MutOp {
-    Truncate {
-        len: usize,
-    },
+    /// Cut the token to `len` bytes. Tests the engine's minimum-length gate.
+    /// If `len >= input.len()`, the token is left unchanged (no-op).
+    Truncate { len: usize },
+    /// Replace bytes at `positions` with `replacement`, injecting characters
+    /// outside the token's valid alphabet. Tests charset validation.
+    /// Out-of-bounds positions are silently skipped.
     CharsetViolate {
         positions: Vec<usize>,
         replacement: u8,
     },
-    PrefixMangle {
-        replacement: Vec<u8>,
-    },
+    /// Overwrite the leading bytes with `replacement`, destroying the
+    /// structural prefix (e.g. `AKIA`, `ghp_`). If `replacement` is longer
+    /// than the input, only `input.len()` bytes are overwritten.
+    PrefixMangle { replacement: Vec<u8> },
+    /// XOR the last byte with `0xFF`, corrupting any trailing checksum.
+    /// For CRC-bearing families this breaks the checksum; for other families
+    /// the corrupted byte may or may not affect detection.
     ChecksumCorrupt,
-    EntropyReduce {
-        repeat_byte: u8,
-        count: usize,
-    },
-    Encode {
-        repr: SecretRepr,
-    },
-    Extend {
-        suffix: Vec<u8>,
-    },
+    /// Overwrite the first `count` bytes with `repeat_byte`, reducing Shannon
+    /// entropy. Tests the engine's minimum-entropy threshold. `count` is
+    /// clamped to `input.len()`.
+    EntropyReduce { repeat_byte: u8, count: usize },
+    /// Wrap the entire token in an additional encoding layer. Tests whether
+    /// the engine can see through double/triple encoding. Nested depths are
+    /// clamped to [`MAX_NESTED_DEPTH`].
+    Encode { repr: SecretRepr },
+    /// Append `suffix` bytes after the token, adding trailing garbage that
+    /// may or may not confuse boundary detection.
+    Extend { suffix: Vec<u8> },
 }
 
-/// Fieldless mirror of `MutOp` for `allowed_ops()` filtering.
+/// Fieldless mirror of [`MutOp`] used by [`TokenFamily::allowed_ops`] to
+/// declare which operator categories are valid for a given token format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutOpKind {
     Truncate,
@@ -52,6 +84,11 @@ pub enum MutOpKind {
 }
 
 /// Apply mutation operators left-to-right, returning the final bytes.
+///
+/// An empty `ops` slice returns a copy of `input` unchanged. If any single
+/// operator would produce output exceeding [`MAX_OUTPUT_BYTES`], the pipeline
+/// halts early and returns the last in-bounds state. This makes the function
+/// safe to call with arbitrarily deep randomly-generated operator chains.
 pub fn apply_ops(input: &[u8], ops: &[MutOp]) -> Vec<u8> {
     let mut cur = input.to_vec();
     for op in ops {
@@ -64,6 +101,8 @@ pub fn apply_ops(input: &[u8], ops: &[MutOp]) -> Vec<u8> {
     cur
 }
 
+/// Apply a single mutation operator. All out-of-range parameters are clamped
+/// rather than panicking, so callers need not pre-validate operator fields.
 fn apply_single(input: &[u8], op: &MutOp) -> Vec<u8> {
     match op {
         MutOp::Truncate { len } => {

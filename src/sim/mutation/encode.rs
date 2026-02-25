@@ -1,19 +1,42 @@
 //! Shared encoding functions for deterministic mutation testing.
 //!
-//! These functions were extracted from `sim_scanner::generator` so that both
-//! property tests and sim-harness tests can consume them through a single
-//! module. All functions are pure, deterministic, and allocation-aware.
+//! Real-world secrets are often stored behind one or more encoding layers
+//! (base64, percent-encoding, UTF-16, or combinations thereof). This module
+//! provides a minimal, self-contained set of encoders that produce bit-identical
+//! output for any given input, so that test cases built on top of them are fully
+//! reproducible from a single seed.
+//!
+//! All functions are **pure** (no internal state or I/O), **deterministic**
+//! (same input always yields the same output byte-for-byte), and
+//! **allocation-aware** (capacity is pre-computed via `Vec::with_capacity` to
+//! avoid redundant reallocations in hot loops).
+//!
+//! These encoders intentionally avoid pulling in external base64/percent-encoding
+//! crates. Using our own implementations guarantees output stability across
+//! dependency updates and keeps the test oracle self-contained.
 
 use serde::{Deserialize, Serialize};
 
-/// Classification of how a secret is represented in the file.
+/// Encoding layer applied to a secret before it appears in a file.
+///
+/// The detection engine must see through these layers to find the underlying
+/// token. Each variant corresponds to a transform the engine is expected to
+/// reverse during scanning. `Nested` models the real-world pattern of
+/// double- or triple-encoded credentials (e.g. base64-inside-percent-encoding).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SecretRepr {
+    /// No encoding -- the raw token bytes appear verbatim.
     Raw,
+    /// Standard base-64 with `=` padding (RFC 4648 section 4).
     Base64,
+    /// Every byte percent-encoded as `%XX` with uppercase hex.
     UrlPercent,
+    /// ASCII widened to UTF-16 little-endian (zero high byte, value low byte).
     Utf16Le,
+    /// ASCII widened to UTF-16 big-endian (zero high byte first).
     Utf16Be,
+    /// Alternating base64 and percent-encoding layers, applied `depth` times.
+    /// Depth 0 is equivalent to `Raw`.
     Nested { depth: u8 },
 }
 
@@ -32,7 +55,11 @@ pub const BASE62_CHARS: &[u8; 62] =
 
 /// Encode a `u32` as a base-62 string into a caller-provided buffer.
 ///
-/// Writes exactly `buf.len()` characters, zero-padding from the left.
+/// Writes exactly `buf.len()` characters, zero-padding from the left with `'0'`
+/// (the base-62 digit for zero). If `val` is too large to fit in `buf.len()`
+/// digits, the high-order digits are silently lost -- callers must ensure the
+/// buffer is wide enough for the value range they use (6 chars suffice for any
+/// `u32`, since 62^6 > 2^32).
 pub fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
     for slot in buf.iter_mut().rev() {
         *slot = BASE62_CHARS[(val % 62) as usize];
@@ -40,7 +67,10 @@ pub fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
     }
 }
 
-/// Encode the raw token into the requested representation.
+/// Dispatch raw token bytes through the encoding layer described by `repr`.
+///
+/// This is the top-level entry point used by mutation operators and the
+/// scenario generator to wrap a token in its target encoding.
 pub fn encode_secret(raw: &[u8], repr: &SecretRepr) -> Vec<u8> {
     match repr {
         SecretRepr::Raw => raw.to_vec(),
@@ -52,7 +82,11 @@ pub fn encode_secret(raw: &[u8], repr: &SecretRepr) -> Vec<u8> {
     }
 }
 
-/// Base64-encode with the standard alphabet and `=` padding.
+/// Base64-encode with the standard alphabet and `=` padding (RFC 4648 section 4).
+///
+/// Processes input in 3-byte groups, each producing 4 output characters.
+/// A 1-byte remainder yields 2 characters plus `==`; a 2-byte remainder
+/// yields 3 characters plus `=`. Empty input produces empty output.
 pub fn base64_encode_std(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
@@ -83,7 +117,12 @@ pub fn base64_encode_std(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Percent-encode every byte using uppercase hex.
+/// Percent-encode **every** byte as `%XX` using uppercase hex digits.
+///
+/// Unlike standard URL percent-encoding, which leaves unreserved characters
+/// (alphanumerics, `-._~`) unencoded, this function encodes all bytes
+/// unconditionally. This worst-case encoding is needed to exercise the
+/// detection engine's percent-decoding path on every byte position.
 pub fn percent_encode_all(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len().saturating_mul(3));
     for &b in input {
@@ -94,7 +133,16 @@ pub fn percent_encode_all(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Apply alternating base64 and URL-percent layers `depth` times.
+/// Apply alternating base64 and percent-encoding layers `depth` times.
+///
+/// The layering pattern (even layers = base64, odd layers = percent) mimics
+/// credentials that have been encoded multiple times by different systems
+/// (e.g. a base64 token stored in a URL query parameter that is itself
+/// percent-encoded).
+///
+/// **Growth warning:** Each base64 layer expands size by ~4/3x and each
+/// percent layer by 3x. Callers should bound `depth` to avoid runaway
+/// allocation; see [`op::MAX_NESTED_DEPTH`](super::op::MAX_NESTED_DEPTH).
 ///
 /// Depth 0 returns the raw bytes unchanged.
 pub fn encode_nested(raw: &[u8], depth: u8) -> Vec<u8> {
@@ -112,7 +160,12 @@ pub fn encode_nested(raw: &[u8], depth: u8) -> Vec<u8> {
     cur
 }
 
-/// Widen ASCII bytes into UTF-16 code units (not a general Unicode encoder).
+/// Widen ASCII bytes into UTF-16 code units.
+///
+/// Each input byte is zero-extended to a 16-bit code unit. This is only correct
+/// for code points in the ASCII range (0x00-0x7F); it is **not** a general
+/// Unicode encoder. That limitation is fine here because all generated tokens
+/// consist exclusively of ASCII characters.
 pub fn encode_utf16(bytes: &[u8], be: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
     for &b in bytes {
@@ -148,7 +201,9 @@ pub fn base64url_encode_nopad(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Convert a nibble (0–15) to an uppercase hex ASCII byte.
+/// Convert a nibble (0--15) to an uppercase hex ASCII byte (`'0'`--`'F'`).
+///
+/// Panics in debug builds if `n >= 16`.
 pub fn hex_nibble(n: u8) -> u8 {
     debug_assert!(n < 16);
     match n {
