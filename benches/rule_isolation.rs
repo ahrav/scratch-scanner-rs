@@ -1,17 +1,89 @@
 //! Rule Isolation Benchmark
 //!
-//! This benchmark identifies which individual rules cause the most throughput damage.
-//! It tests the full engine with specific rules disabled to measure their impact.
+//! Identifies which individual rules cause the most throughput damage by A/B
+//! testing engines with and without specific rules.
 //!
-//! Run with: cargo bench --bench rule_isolation
+//! # Problem Statement
+//!
+//! Not all rules are equal in cost. A single "broad" rule—one with many common
+//! anchors (e.g., "api", "key", "token")—can dominate scan time because every
+//! anchor hit triggers a radius extraction and regex evaluation. This benchmark
+//! quantifies per-rule cost so we can decide whether to tighten, restructure,
+//! or accept a given rule's overhead.
+//!
+//! # Methodology
+//!
+//! Each benchmark group builds multiple `Engine` instances that differ by
+//! exactly one rule (or one dimension of a rule), then measures throughput on
+//! the same input. The difference in throughput isolates that rule's cost.
+//!
+//! Two data classes are used:
+//! - **Clean ASCII**: Random lowercase letters with no anchor matches.
+//!   Measures Vectorscan's raw scan speed with zero post-match work.
+//! - **Realistic code**: Repeating code snippets rich in common keywords
+//!   (api, key, token, secret, password). Produces many anchor hits to stress
+//!   the full scan pipeline: anchor match → radius extraction → regex → gates.
+//!
+//! # Benchmark Groups
+//!
+//! - **generic_api_key_impact**: Four engine configurations (baseline impossible
+//!   rules, well-anchored rules only, generic-api-key only, mixed) × two data
+//!   types = eight measurements. Isolates the generic-api-key rule's overhead.
+//!
+//! - **full_gitleaks_engine**: The production rule set from `demo_engine` on
+//!   both data types. Provides an absolute reference point.
+//!
+//! - **anchor_density**: A single generic-api-key-style rule with 2, 4, 8, or
+//!   14 common anchors. Shows how throughput degrades as anchor hit rate rises.
+//!
+//! # Interpreting Results
+//!
+//! - Compare "good_rules_only" vs "good_plus_generic" to see the marginal cost
+//!   of adding generic-api-key to an otherwise efficient rule set.
+//! - Compare "generic_api_key_only_clean" vs "_realistic" to see the
+//!   amplification effect of anchor density on a broad rule.
+//! - Use anchor_density results to set upper bounds on how many common anchors
+//!   a single rule should carry.
+//!
+//! # Running
+//!
+//! ```bash
+//! cargo bench --bench rule_isolation
+//! cargo bench --bench rule_isolation -- generic_api_key_impact   # one group
+//! cargo bench --bench rule_isolation -- anchor_density            # one group
+//! ```
+//!
+//! # Relationship to `rule_scaling`
+//!
+//! `rule_scaling` measures how throughput changes as the *number* of rules
+//! grows. This benchmark varies *which* rules are active (and sometimes isolates
+//! a single rule), focusing on per-rule quality rather than quantity.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use regex::bytes::Regex;
 use scanner_rs::{AnchorMode, AnchorPolicy, Engine, EntropySpec, RuleSpec, Tuning, ValidatorKind};
 
-const BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+/// Buffer size for all isolation benchmarks.
+///
+/// 4 MiB is large enough to amortize per-scan overhead and measure steady-state
+/// throughput, but small enough that even slow configurations complete quickly.
+const BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
-/// Generate realistic code-like content that will trigger common anchors.
+/// Generate realistic code-like content saturated with common anchor keywords.
+///
+/// Returns a buffer of repeating code snippets that mimic real source files:
+/// JavaScript, Python, env files, and YAML configs. Each snippet contains one
+/// or more of the broad anchors used by generic-api-key ("api", "key", "token",
+/// "secret", "password", "access", "auth", "credential").
+///
+/// # Why this matters
+///
+/// On clean data, broad anchors never fire and the rule is nearly free. On real
+/// code, these keywords appear every few lines. This generator produces the
+/// high-density case that stresses the full scan pipeline, making it the
+/// complement to `gen_clean_ascii`.
+///
+/// The snippets are cycled round-robin to fill `size` bytes, then truncated.
 fn gen_realistic_code(size: usize) -> Vec<u8> {
     let code_snippets = [
         b"const apiKey = process.env.API_KEY;\n".as_slice(),
@@ -46,22 +118,34 @@ fn gen_realistic_code(size: usize) -> Vec<u8> {
     data
 }
 
-/// Generate clean ASCII that won't match anchors.
+/// Generate pseudo-random lowercase ASCII text with 80-character lines.
+///
+/// Produces "clean" data with no secret-like keywords—anchors will not fire.
+/// This isolates Vectorscan's raw multi-pattern scan cost from post-match
+/// validation overhead. The xorshift PRNG ensures deterministic output
+/// for reproducible benchmarks.
 fn gen_clean_ascii(size: usize, seed: u64) -> Vec<u8> {
     let mut state = seed;
     let mut buf = vec![0u8; size];
     for b in buf.iter_mut() {
+        // xorshift64: fast, deterministic, good enough for test data
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         *b = b'a' + ((state & 0xFF) % 26) as u8;
     }
+    // Insert newlines every 80 chars for realistic line structure
     for i in (80..buf.len()).step_by(80) {
         buf[i] = b'\n';
     }
     buf
 }
 
+/// Compile a byte-mode regex with a 32 MiB DFA size limit.
+///
+/// The elevated limit (default is 10 MiB) accommodates the generic-api-key
+/// pattern which produces a large alternation automaton. Panics on invalid
+/// patterns since benchmark rule definitions are compile-time constants.
 fn build_regex(pattern: &str) -> Regex {
     regex::bytes::RegexBuilder::new(pattern)
         .size_limit(32 * 1024 * 1024)
@@ -69,7 +153,20 @@ fn build_regex(pattern: &str) -> Regex {
         .expect("invalid regex")
 }
 
-/// The problematic generic-api-key rule.
+/// Construct the generic-api-key rule—the primary subject of this benchmark.
+///
+/// This rule is expensive because of three compounding factors:
+///
+/// 1. **Broad anchors**: 20 common keywords (api, key, token, secret, ...) that
+///    appear frequently in real code. Each hit triggers radius extraction.
+/// 2. **Large radius** (256 bytes): Every anchor hit extracts a 512-byte window
+///    for regex evaluation, increasing memory traffic.
+/// 3. **Complex regex**: Case-insensitive alternation with many branches and
+///    flexible whitespace/delimiter matching, making regex evaluation slow per
+///    candidate.
+///
+/// Together these mean: many anchor hits × large extraction × slow regex = the
+/// rule that typically dominates scan time in production.
 fn generic_api_key_rule() -> RuleSpec {
     RuleSpec {
         name: "generic-api-key",
@@ -127,6 +224,7 @@ fn generic_api_key_rule() -> RuleSpec {
             min_len: 16,
             max_len: 256,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         char_class: None,
         local_context: None,
@@ -140,7 +238,12 @@ fn generic_api_key_rule() -> RuleSpec {
     }
 }
 
-/// Create a minimal rule that won't match anything (baseline).
+/// Create a rule whose anchor never appears in ASCII data (measurement baseline).
+///
+/// Uses a 4-byte high-ASCII anchor (`\xFF\xFE\xFD\xFC`) that cannot occur in
+/// any of the benchmark's test buffers. This lets us measure the cost of having
+/// rules *registered* in the Vectorscan automaton without any post-match work,
+/// isolating automaton overhead from rule evaluation overhead.
 fn impossible_rule(name: &'static str) -> RuleSpec {
     RuleSpec {
         name,
@@ -162,7 +265,12 @@ fn impossible_rule(name: &'static str) -> RuleSpec {
     }
 }
 
-/// A simple, well-anchored rule (GitHub PAT).
+/// A well-anchored rule representing the ideal case: GitHub Personal Access Token.
+///
+/// "Well-anchored" means the anchor (`ghp_`) is specific enough that it rarely
+/// appears outside actual secrets. In realistic code the hit rate is near zero,
+/// so this rule adds almost no post-match cost. Used as a control alongside
+/// `generic_api_key_rule` to measure the gap between good and bad anchor design.
 fn github_pat_rule() -> RuleSpec {
     RuleSpec {
         name: "github-pat",
@@ -178,6 +286,7 @@ fn github_pat_rule() -> RuleSpec {
             min_len: 16,
             max_len: 256,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         char_class: None,
         local_context: None,
@@ -189,7 +298,12 @@ fn github_pat_rule() -> RuleSpec {
     }
 }
 
-/// AWS access key rule (well-anchored).
+/// Another well-anchored rule: AWS access key IDs.
+///
+/// AWS keys always start with a 4-character service prefix (AKIA, AGPA, etc.)
+/// that is rare in non-secret text. Multiple anchors are used here (one per
+/// service type), but all are highly specific—demonstrating that anchor *count*
+/// alone does not make a rule expensive; anchor *frequency in real data* does.
 fn aws_rule() -> RuleSpec {
     RuleSpec {
         name: "aws-access-key",
@@ -211,7 +325,30 @@ fn aws_rule() -> RuleSpec {
     }
 }
 
-/// Benchmark comparing engines with and without generic-api-key.
+/// Measure the throughput impact of adding generic-api-key to an engine.
+///
+/// # Experimental design
+///
+/// Four engine configurations (three padded to 10 rules, one isolated):
+///
+/// | Config               | Rule composition                        |
+/// |----------------------|-----------------------------------------|
+/// | `baseline`           | 10 impossible rules (no anchor hits)    |
+/// | `good_rules_only`    | 2 well-anchored + 8 impossible          |
+/// | `generic_only`       | 1 generic-api-key (the subject rule)    |
+/// | `good_plus_generic`  | 2 well-anchored + generic + 7 impossible|
+///
+/// Each is run on both clean and realistic data (8 total measurements).
+///
+/// # What to look for
+///
+/// - `baseline` vs `good_rules_only` on clean data: should be nearly identical
+///   (specific anchors don't fire). On realistic data, may differ if GitHub/AWS
+///   anchors appear in the snippets.
+/// - `good_rules_only` vs `good_plus_generic`: the marginal cost of the broad
+///   rule. A large gap means generic-api-key dominates overall scan time.
+/// - `generic_only` on clean vs realistic: shows the amplification factor of
+///   anchor density on a single rule's cost.
 fn bench_generic_api_key_impact(c: &mut Criterion) {
     let mut group = c.benchmark_group("generic_api_key_impact");
     group.throughput(Throughput::Bytes(BUFFER_SIZE as u64));
@@ -224,7 +361,8 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
         ..scanner_rs::demo_tuning()
     };
 
-    // Engine with just impossible rules (baseline)
+    // Baseline: 10 rules registered in the automaton but never matching.
+    // Measures the floor cost of having rules compiled into Vectorscan.
     let baseline_rules: Vec<RuleSpec> = (0..10)
         .map(|i| {
             let name: &'static str = Box::leak(format!("impossible_{}", i).into_boxed_str());
@@ -239,7 +377,8 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
     );
     let mut baseline_scratch = baseline_engine.new_scratch();
 
-    // Engine with 10 well-anchored rules (no generic-api-key)
+    // Well-anchored rules: specific prefixes that rarely fire in test data.
+    // Pads to 10 rules with impossible fillers to keep rule count constant.
     let good_rules = vec![
         github_pat_rule(),
         aws_rule(),
@@ -260,7 +399,7 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
     );
     let mut good_scratch = good_engine.new_scratch();
 
-    // Engine with generic-api-key ONLY
+    // Single broad rule in isolation—shows its standalone cost.
     let generic_only = vec![generic_api_key_rule()];
     let generic_engine = Engine::new_with_anchor_policy(
         generic_only,
@@ -270,7 +409,8 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
     );
     let mut generic_scratch = generic_engine.new_scratch();
 
-    // Engine with good rules + generic-api-key
+    // Mixed: well-anchored rules plus the broad rule. The throughput delta
+    // between this and good_rules_only is the marginal cost of generic-api-key.
     let mixed_rules = vec![
         github_pat_rule(),
         aws_rule(),
@@ -291,7 +431,7 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
     );
     let mut mixed_scratch = mixed_engine.new_scratch();
 
-    // Benchmark on clean data (few anchor hits)
+    // -- Clean data: zero anchor hits expected, measures automaton overhead --
     group.bench_function("baseline_10_impossible_clean", |b| {
         b.iter(|| {
             let hits = baseline_engine.scan_chunk(black_box(&clean_data), &mut baseline_scratch);
@@ -320,7 +460,7 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
         })
     });
 
-    // Benchmark on realistic data (many anchor hits)
+    // -- Realistic data: high anchor density, stresses the full scan pipeline --
     group.bench_function("baseline_10_impossible_realistic", |b| {
         b.iter(|| {
             let hits =
@@ -353,7 +493,12 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
     group.finish();
 }
 
-/// Test the full gitleaks engine.
+/// Measure throughput of the full production rule set as an absolute reference.
+///
+/// Uses `demo_engine_with_anchor_mode(Manual)` which loads all ~220 gitleaks
+/// rules with their hand-specified anchors. This provides the "real world"
+/// throughput number that the isolation benchmarks above help explain: if the
+/// full engine is slow, the per-rule benchmarks show which rule(s) are to blame.
 fn bench_full_gitleaks_engine(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_gitleaks_engine");
     group.throughput(Throughput::Bytes(BUFFER_SIZE as u64));
@@ -361,7 +506,6 @@ fn bench_full_gitleaks_engine(c: &mut Criterion) {
     let clean_data = gen_clean_ascii(BUFFER_SIZE, 0x1234);
     let realistic_data = gen_realistic_code(BUFFER_SIZE);
 
-    // Full gitleaks engine with manual anchors
     let full_engine = scanner_rs::demo_engine_with_anchor_mode(AnchorMode::Manual);
     let mut full_scratch = full_engine.new_scratch();
 
@@ -382,14 +526,37 @@ fn bench_full_gitleaks_engine(c: &mut Criterion) {
     group.finish();
 }
 
-/// Test anchor density impact - how many times do common anchors appear?
+/// Measure how throughput degrades as a single rule gains more broad anchors.
+///
+/// Holds everything constant (one rule, same regex, same data) and varies only
+/// the number of common anchors from 2 to 14. This answers the question: "If I
+/// add `AUTH` as an anchor to my rule, how much throughput do I lose?"
+///
+/// # Design
+///
+/// The 14 anchors are drawn from the generic-api-key rule's actual anchor list,
+/// ordered roughly by frequency in real code. Each test point uses the first N
+/// anchors, so the 8-anchor case is a strict subset of the 14-anchor case.
+///
+/// Only realistic data is tested because clean data produces zero anchor hits
+/// regardless of anchor count, making the measurements identical.
+///
+/// # Expected shape
+///
+/// Throughput should decrease monotonically with anchor count, but the curve
+/// shape reveals whether the cost is:
+/// - **Linear**: Each anchor adds a fixed cost (ideal for budgeting)
+/// - **Super-linear**: Anchors interact (e.g., overlapping radii cause
+///   redundant regex evaluations)
+/// - **Sub-linear**: Diminishing marginal cost (anchor hit regions overlap)
 fn bench_anchor_density(c: &mut Criterion) {
     let mut group = c.benchmark_group("anchor_density");
     group.throughput(Throughput::Bytes(BUFFER_SIZE as u64));
 
     let realistic_data = gen_realistic_code(BUFFER_SIZE);
 
-    // Count anchor hits in realistic data
+    // The common keywords from generic-api-key, in both cases.
+    // Ordered roughly by expected frequency in real code.
     let common_anchors = [
         "api", "API", "key", "KEY", "token", "TOKEN", "secret", "SECRET", "password", "PASSWORD",
         "access", "ACCESS", "auth", "AUTH",
@@ -400,7 +567,7 @@ fn bench_anchor_density(c: &mut Criterion) {
         ..scanner_rs::demo_tuning()
     };
 
-    // Test with increasing numbers of common anchors
+    // Progressively add anchors to observe marginal cost per anchor
     for anchor_count in [2, 4, 8, 14] {
         let anchors: Vec<&'static [u8]> = common_anchors[..anchor_count]
             .iter()
@@ -422,6 +589,7 @@ fn bench_anchor_density(c: &mut Criterion) {
                 min_len: 16,
                 max_len: 256,
                 min_entropy_bits_per_byte: None,
+                digit_penalty: false,
             }),
             char_class: None,
             local_context: None,

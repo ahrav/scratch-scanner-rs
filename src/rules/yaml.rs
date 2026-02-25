@@ -21,7 +21,8 @@
 //!    which mirror the on-disk schema using owned `String` / `Vec` types.
 //! 2. **Compile regex** — the pattern string is compiled into a
 //!    `regex::bytes::Regex` via [`super::build_regex`], which retries with
-//!    progressively larger DFA size limits on `CompiledTooBig` errors. This
+//!    progressively larger compile-size limits (both compiled regex and DFA
+//!    cache) on `CompiledTooBig` errors. This
 //!    step runs *outside* the interning lock to avoid holding the mutex
 //!    during potentially expensive compilation.
 //! 3. **Intern and assemble** — string/byte fields are interned into the
@@ -76,9 +77,9 @@ use super::RulesError;
 /// for prose rather than a real secret. Rules below it target passwords or
 /// low-entropy strings where the same gate would cause false negatives.
 ///
-/// 3.0 bits/byte was chosen empirically: it separates the ~6 low-entropy
-/// rules (e.g. `nuget-config-password` at 1.0, `asana-client-id` at 2.5)
-/// from the bulk of token-oriented rules.
+/// 3.0 bits/byte was chosen empirically: it separates low-entropy rules
+/// (e.g. `nuget-config-password` at 1.0, `asana-client-id` at 2.5)
+/// from token-oriented rules.
 pub(crate) const AUTO_CHAR_CLASS_ENTROPY_THRESHOLD: f32 = 3.0;
 
 /// Default max-lowercase-percentage for auto-enabled `char_class` gates.
@@ -130,30 +131,58 @@ pub(crate) struct YamlRulesFile {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlRule {
+    /// Unique rule identifier used for diagnostics and finding attribution.
     pub name: String,
+    /// Pattern compiled into a [`regex::bytes::Regex`] during parsing.
     pub regex: String,
+    /// Literal byte strings fed to the Vectorscan pre-filter; at least one
+    /// must appear in the input for a scan window to be opened.
     pub anchors: Vec<String>,
+    /// Byte radius around each anchor hit that defines the scan window.
     pub radius: usize,
+    /// Cheap byte-substring gate applied before the regex. When set, the
+    /// window must contain this literal or it is skipped entirely.
     #[serde(default)]
     pub must_contain: Option<String>,
+    /// Local keyword gate (any-of). At least one keyword must appear in the
+    /// scan window for the regex to run. Evaluated on raw window bytes,
+    /// including auto-generated UTF-16LE/BE variants.
     #[serde(default)]
     pub keywords_any: Option<Vec<String>>,
+    /// Post-match suppressor gate (any-of). If any literal appears inside
+    /// the extracted secret bytes, the finding is silently dropped. Useful
+    /// for filtering known placeholders like `EXAMPLE` or `DUMMY_TOKEN`.
     #[serde(default)]
     pub value_suppressors_any: Option<Vec<String>>,
+    /// Shannon/min-entropy gate on the extracted secret. See [`YamlEntropy`].
     #[serde(default)]
     pub entropy: Option<YamlEntropy>,
+    /// Character-class distribution pre-filter. See [`YamlCharClass`].
+    /// When absent and entropy threshold >= 3.0 bits/byte, the parser
+    /// auto-enables a default gate.
     #[serde(default)]
     pub char_class: Option<YamlCharClass>,
+    /// Two-phase confirm-then-expand configuration. See [`YamlTwoPhase`].
     #[serde(default)]
     pub two_phase: Option<YamlTwoPhase>,
+    /// Post-extraction structural context check. See [`YamlLocalContext`].
     #[serde(default)]
     pub local_context: Option<YamlLocalContext>,
+    /// Offline structural validation (checksums, format checks).
+    /// See [`YamlOfflineValidation`].
     #[serde(default)]
     pub offline_validation: Option<YamlOfflineValidation>,
+    /// Capture group index for secret extraction. `None` uses the default
+    /// heuristic (first non-empty capture in groups 1..N, else full match).
     #[serde(default)]
     pub secret_group: Option<u16>,
+    /// When `true`, bypass the UUID-format quick-reject in the safelist.
+    /// Required for providers that issue API keys in 8-4-4-4-12 hex format.
     #[serde(default)]
     pub uuid_format_secret: bool,
+    /// Per-rule minimum confidence floor. Findings scoring below this are
+    /// suppressed. `None` selects an auto-default derived from the rule's
+    /// compiled gate configuration. Valid range: `0..=10`.
     #[serde(default)]
     pub min_confidence: Option<i8>,
 }
@@ -171,14 +200,36 @@ pub(crate) struct YamlRule {
 /// probability of the single most frequent byte, catching skewed
 /// distributions where one byte value dominates even though the Shannon
 /// entropy across all byte values looks moderate.
+///
+/// `digit_penalty` is an opt-in false-positive reducer for hex-like rules:
+/// when enabled, all-digit candidates in the evaluated entropy slice (after
+/// `max_len` capping) are penalized by `DIGIT_ONLY_PENALTY_NUMERATOR /
+/// log2(len)` before Shannon threshold comparison (`len == 1` is left
+/// unpenalized). See [`engine::helpers::entropy::DIGIT_ONLY_PENALTY_NUMERATOR`].
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
+    /// Shannon entropy threshold in bits/byte. Secrets below this are
+    /// rejected as likely false positives. Valid range: `[0.0, 8.0]`.
     pub min_bits_per_byte: f32,
+    /// Secrets shorter than this length bypass the entropy check entirely
+    /// because Shannon entropy is unreliable on small samples.
     pub min_len: usize,
+    /// Maximum bytes evaluated for entropy. Longer secrets are capped to
+    /// bound compute cost without rejecting the entire candidate.
     pub max_len: usize,
+    /// Optional stricter gate based on NIST SP 800-90B min-entropy.
+    /// Catches byte distributions skewed toward a single dominant value
+    /// that Shannon entropy alone may miss. `None` disables this gate.
     #[serde(default)]
     pub min_entropy_bits_per_byte: Option<f32>,
+    /// When `true`, all-digit candidates in the evaluated entropy slice
+    /// are penalized by `DIGIT_ONLY_PENALTY_NUMERATOR / log2(len)` before
+    /// the Shannon threshold comparison. Targets false positives from
+    /// numeric-only strings in hex-like rules (e.g. version numbers,
+    /// timestamps).
+    #[serde(default)]
+    pub digit_penalty: bool,
 }
 
 /// Character-class pre-filter gate parameters for a rule.
@@ -195,7 +246,11 @@ pub(crate) struct YamlEntropy {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlCharClass {
+    /// Maximum percentage of lowercase ASCII bytes (`a`-`z`) allowed in
+    /// the scan window. Windows exceeding this are rejected. Range: 0-100.
     pub max_lower_pct: u8,
+    /// Minimum window length (bytes) for the gate to apply. Shorter
+    /// windows pass unconditionally because the percentage is too noisy.
     pub min_window_len: u16,
 }
 
@@ -213,8 +268,13 @@ pub(crate) struct YamlCharClass {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlTwoPhase {
+    /// Narrow window radius (bytes) for the cheap Phase 1 literal scan.
     pub seed_radius: usize,
+    /// Expanded window radius (bytes) for Phase 2 regex evaluation.
+    /// Must be >= `seed_radius`.
     pub full_radius: usize,
+    /// Confirming literals (any-of). At least one must appear in the
+    /// seed window or the candidate is dropped before Phase 2.
     pub confirm_any: Vec<String>,
 }
 
@@ -229,12 +289,19 @@ pub(crate) struct YamlTwoPhase {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlLocalContext {
+    /// Bytes to examine before the start of the secret span.
     pub lookbehind: usize,
+    /// Bytes to examine after the end of the secret span.
     pub lookahead: usize,
+    /// Require an assignment separator (`=`, `:`, or `>`) on the same line
+    /// preceding the secret. Catches unanchored regex matches in prose.
     #[serde(default)]
     pub require_same_line_assignment: bool,
+    /// Require the secret to be wrapped in matching quotes (`"`, `'`, or `` ` ``).
     #[serde(default)]
     pub require_quoted: bool,
+    /// Key names (any-of) that must appear on the same line as the match.
+    /// When `None`, no key-name check is performed.
     #[serde(default)]
     pub key_names_any: Option<Vec<String>>,
 }
@@ -263,12 +330,18 @@ pub(crate) struct YamlLocalContext {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlOfflineValidation {
+    /// Validation algorithm selector. Renamed from `type` in YAML to
+    /// avoid the Rust keyword. See the struct-level table for valid values.
     #[serde(rename = "type")]
     pub kind: String,
+    /// Bytes to skip before the payload region. Required for `crc32_base62`.
     #[serde(default)]
     pub prefix_skip: Option<u8>,
+    /// Length of the payload region in bytes. Required for `crc32_base62`.
     #[serde(default)]
     pub payload_len: Option<u8>,
+    /// Length of the base-62-encoded CRC-32 checksum. Required for
+    /// `crc32_base62`; must be <= 6 (max digits for a `u32` in base 62).
     #[serde(default)]
     pub checksum_len: Option<u8>,
 }
@@ -303,8 +376,14 @@ pub(crate) struct YamlOfflineValidation {
 /// `parse_yaml_rules` calls for the lifetime of the process.
 #[derive(Default)]
 struct RuleAtomPool {
+    /// Rule names: owned `String` key -> leaked `&'static str`.
     strings: HashMap<String, &'static str>,
+    /// Individual byte atoms (anchors, keywords, must_contain literals):
+    /// owned `Vec<u8>` key -> leaked `&'static [u8]`.
     bytes: HashMap<Vec<u8>, &'static [u8]>,
+    /// Composite byte-slice arrays (anchor lists, keyword lists):
+    /// owned `Vec<Vec<u8>>` key -> leaked `&'static [&'static [u8]]`.
+    /// Inner slices are also interned via `bytes` for cross-rule sharing.
     bytes_slices: HashMap<Vec<Vec<u8>>, &'static [&'static [u8]]>,
 }
 
@@ -450,7 +529,7 @@ fn yaml_offline_to_spec(
 ///
 /// 1. Compile the regex pattern (outside the interning lock).
 /// 2. Intern string/byte fields under the global atom pool lock.
-/// 3. Map numeric spec fields (`entropy`, `char_class`) directly.
+/// 3. Map gate config fields (`entropy`, `char_class`) directly.
 /// 4. Apply implicit defaults — auto-enable `char_class` when entropy
 ///    threshold >= [`AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`] and no explicit
 ///    gate is provided.
@@ -541,6 +620,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             min_len: e.min_len,
             max_len: e.max_len,
             min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
+            digit_penalty: e.digit_penalty,
         });
 
         let char_class = char_class.map(|cc| CharClassSpec {
@@ -551,7 +631,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
         // Auto-enable char_class for high-entropy rules that don't explicitly
         // set it. Rules with entropy threshold >= 3.0 bits/byte are scanning
         // for secrets (API keys, tokens), not passwords or low-entropy strings.
-        // Excludes ~6 low-entropy password rules (e.g. nuget-config-password
+        // Excludes low-entropy password-like rules (e.g. nuget-config-password
         // at 1.0).
         //
         // Note: `char_class: null` in YAML deserializes to `None` (same as

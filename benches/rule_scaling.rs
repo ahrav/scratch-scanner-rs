@@ -15,8 +15,9 @@
 //! 1. **Cost per rule**: How much throughput do we lose per additional rule?
 //!    Helps decide whether to add new detection rules or optimize existing ones.
 //!
-//! 2. **UTF-16 impact**: UTF-16 variants double pattern count (LE + BE). When is
-//!    this cost justified vs. scanning only UTF-8?
+//! 2. **UTF-16 impact**: UTF-16 variants add LE and BE copies of every anchor
+//!    (tripling the prefilter pattern count). When is this cost justified
+//!    vs. scanning only UTF-8?
 //!
 //! 3. **Inflection points**: At what rule counts does Vectorscan's automaton
 //!    become less efficient (state explosion, cache pressure)?
@@ -74,6 +75,8 @@ use scanner_rs::{demo_tuning, AnchorPolicy, Engine, EntropySpec, RuleSpec, Tunin
 ///
 /// 4 MiB is large enough to amortize per-scan overhead and measure steady-state
 /// throughput, but small enough that even slow configurations complete quickly.
+/// All benchmark functions share this constant so that throughput numbers are
+/// directly comparable across groups.
 const BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 // ============================================================================
@@ -82,9 +85,10 @@ const BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Generate pseudo-random lowercase ASCII text with 80-character lines.
 ///
-/// This represents "clean" data with no secrets—the worst case for Vectorscan
-/// because it must scan the entire buffer without finding any anchors. The
-/// xorshift PRNG ensures deterministic output for reproducible benchmarks.
+/// This represents "clean" data with no secrets—the best case for Vectorscan
+/// because zero anchor callbacks fire. This isolates Vectorscan's raw
+/// scanning speed from post-match validation overhead. The xorshift PRNG
+/// ensures deterministic output for reproducible benchmarks.
 ///
 /// # Why lowercase only?
 ///
@@ -111,6 +115,12 @@ fn gen_clean_ascii(size: usize, seed: u64) -> Vec<u8> {
 // ============================================================================
 // Rule Generators
 // ============================================================================
+//
+// All generators use `Box::leak` to convert owned Strings into `&'static` references.
+// This is intentional: `RuleSpec` requires `'static` lifetimes for its anchor and
+// name slices (the production path uses compile-time constants), and benchmarks
+// run once then exit, so the leaked memory is reclaimed by the OS at process exit.
+// Do not use this pattern in library code.
 
 /// Generate N rules with unique, non-overlapping 4-character anchors (AAAA-ZZZZ).
 ///
@@ -129,10 +139,16 @@ fn gen_clean_ascii(size: usize, seed: u64) -> Vec<u8> {
 /// - 4 chars: Good balance—specific enough to filter well, short enough to
 ///   stress Vectorscan's state machine with many patterns
 /// - 8+ chars: Unrealistic; most real anchors (AKIA, ghp_, etc.) are 3-8 chars
+///
+/// # Wrapping behavior
+///
+/// If `count` exceeds 456,976 (26^4), anchors wrap around and collide.
+/// This is acceptable for benchmark purposes since the tested range
+/// (up to 250 rules) is well within the unique address space.
 fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
     (0..count)
         .map(|i| {
-            // Create a unique 4-byte prefix for each rule
+            // Base-26 encode `i` into a 4-character uppercase string.
             let prefix = format!(
                 "{}{}{}{}",
                 (b'A' + ((i / (26 * 26 * 26)) % 26) as u8) as char,
@@ -185,8 +201,14 @@ fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
 /// # Anchor structure
 ///
 /// - Group prefix: 2 chars based on group number (AA, AB, AC, ...)
-/// - Rule suffix: 2 chars based on rule index within group
+/// - Rule suffix: 2 chars based on global rule index (not per-group index)
 /// - Full anchor: 4 chars (e.g., "AAAB" = group 0, rule 1)
+///
+/// # Note
+///
+/// When `count` is not evenly divisible by `group_size`, the last group is smaller.
+/// This is fine for benchmarking purposes since the automaton sees the same total
+/// number of patterns regardless.
 fn generate_grouped_rules(count: usize, group_size: usize) -> Vec<RuleSpec> {
     (0..count)
         .map(|i| {
@@ -295,13 +317,15 @@ fn generate_realistic_rules(count: usize) -> Vec<RuleSpec> {
                 Box::leak(full_prefix.clone().into_bytes().into_boxed_slice());
             let anchors: &'static [&'static [u8]] = Box::leak(Box::new([anchor]));
 
-            // Some rules have entropy requirements
+            // Every third rule gets an entropy gate, simulating production rules
+            // that require high-entropy secret values (e.g., AWS keys, API tokens).
             let entropy = if i % 3 == 0 {
                 Some(EntropySpec {
                     min_bits_per_byte: 3.5,
                     min_len: 16,
                     max_len: 256,
                     min_entropy_bits_per_byte: None,
+                    digit_penalty: false,
                 })
             } else {
                 None
@@ -376,14 +400,22 @@ fn print_engine_diagnostics(name: &str, engine: &Engine, rule_count: usize) {
 /// Use this to understand how rules are classified before running timing
 /// benchmarks. Helps answer: "Why is my engine slow?"—often the answer is
 /// too many residue/unfilterable rules or unexpected UTF-16 DB creation.
+///
+/// Compares three engine configurations:
+/// 1. The full gitleaks rule set with derived anchors
+/// 2. 100 realistic rules with UTF-16 scanning enabled
+/// 3. 100 realistic rules with UTF-16 scanning disabled
+///
+/// Output goes to stderr so it does not interfere with criterion's JSON output.
 fn bench_diagnostics(c: &mut Criterion) {
     let mut group = c.benchmark_group("diagnostics");
-    group.sample_size(10); // Minimal samples—this is for printing, not timing
+    // Minimal samples—this group exists for its diagnostic side effects (eprintln),
+    // not for timing precision.
+    group.sample_size(10);
 
-    // Enable UTF-16 to see its impact on DB composition
     let tuning = Tuning {
         max_transform_depth: 0,
-        scan_utf16_variants: true, // Enable to see UTF-16 impact
+        scan_utf16_variants: true,
         ..demo_tuning()
     };
 
@@ -451,14 +483,16 @@ fn bench_rule_scaling(c: &mut Criterion) {
 
     let ascii = gen_clean_ascii(BUFFER_SIZE, 0x1234);
 
-    // Disable UTF-16 and transforms to measure pure anchor scaling
+    // Disable UTF-16 and transforms to isolate Vectorscan automaton scaling
+    // from orthogonal costs (transform decoding, secondary DB scan).
     let tuning = Tuning {
         max_transform_depth: 0,
         scan_utf16_variants: false,
         ..demo_tuning()
     };
 
-    // Progression from trivial (1) to gitleaks-scale (200+)
+    // Progression from trivial (1 rule) to beyond-gitleaks scale (250 rules).
+    // The gitleaks rule set has ~200 rules, so this range brackets production.
     let rule_counts = [1, 5, 10, 25, 50, 100, 150, 200, 250];
 
     for &count in &rule_counts {
@@ -515,7 +549,8 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
 
     let count = 100;
 
-    // Baseline: 100 rules with completely distinct prefixes (worst case)
+    // Baseline: 100 rules with completely distinct prefixes.
+    // No prefix sharing possible—worst case for automaton state count.
     let unique_rules = generate_unique_rules(count);
     let unique_engine = Engine::new_with_anchor_policy(
         unique_rules,
@@ -532,7 +567,7 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
         })
     });
 
-    // Grouped rules (10 groups of 10)
+    // 10 groups of 10: moderate prefix sharing (2-char shared prefix per group)
     let grouped_rules = generate_grouped_rules(count, 10);
     let grouped_engine = Engine::new_with_anchor_policy(
         grouped_rules,
@@ -549,7 +584,7 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
         })
     });
 
-    // Grouped rules (5 groups of 20)
+    // 5 groups of 20: more aggressive prefix sharing (fewer unique prefixes)
     let grouped_rules_5x20 = generate_grouped_rules(count, 20);
     let grouped_engine_5x20 = Engine::new_with_anchor_policy(
         grouped_rules_5x20,
@@ -566,7 +601,8 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
         })
     });
 
-    // Realistic diverse prefixes
+    // Production-like prefix diversity (AKIA, ghp_, xoxb, etc.) — the natural
+    // grouping that emerges from real cloud-provider secret formats.
     let realistic_rules = generate_realistic_rules(count);
     let realistic_engine = Engine::new_with_anchor_policy(
         realistic_rules,
@@ -599,7 +635,8 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
 /// # Trade-off
 ///
 /// - **Benefit**: Detect secrets in UTF-16 files without preprocessing
-/// - **Cost**: Roughly 2x pattern count, larger automaton, more cache pressure
+/// - **Cost**: ~3x total prefilter pattern count (raw + LE + BE), larger
+///   automaton, more cache pressure
 ///
 /// # Test methodology
 ///
@@ -621,7 +658,8 @@ fn bench_utf16_impact(c: &mut Criterion) {
 
     let rules = generate_realistic_rules(100);
 
-    // Baseline: UTF-8 only (single Vectorscan database)
+    // Baseline: `scan_utf16_variants = false` — the prefilter DB still contains
+    // UTF-16 patterns, but the separate UTF-16 anchor DB scan is skipped at runtime.
     let tuning_no_utf16 = Tuning {
         max_transform_depth: 0,
         scan_utf16_variants: false,
@@ -642,7 +680,8 @@ fn bench_utf16_impact(c: &mut Criterion) {
         })
     });
 
-    // UTF-16 enabled
+    // UTF-16 enabled — the engine compiles a second Vectorscan database with
+    // LE and BE variants of every anchor, then scans both databases per chunk.
     let tuning_utf16 = Tuning {
         max_transform_depth: 0,
         scan_utf16_variants: true,
@@ -669,6 +708,11 @@ fn bench_utf16_impact(c: &mut Criterion) {
 // ============================================================================
 // Criterion Groups
 // ============================================================================
+//
+// Two groups so that diagnostics (fast, side-effect–driven) can be run
+// independently from timing benchmarks (slower, throughput-driven).
+// Use `cargo bench --bench rule_scaling -- diagnostics` or `-- scaling`
+// to select one group.
 
 criterion_group!(diagnostic_benches, bench_diagnostics,);
 

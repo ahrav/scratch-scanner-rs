@@ -29,7 +29,7 @@ struct RuleCase {
     must_contain: Option<String>,
     keywords_any: Option<Vec<String>>,
     value_suppressors_any: Option<Vec<String>>,
-    entropy: Option<(u16, usize, usize)>,
+    entropy: Option<(u16, usize, usize, bool)>,
     char_class: Option<(u8, u16)>,
     two_phase: Option<(usize, usize, Vec<String>)>,
     local_context: Option<LocalContextCase>,
@@ -56,11 +56,12 @@ impl RuleCase {
             entropy: self
                 .entropy
                 .as_ref()
-                .map(|(bits_x10, min_len, max_len)| YamlEntropy {
+                .map(|(bits_x10, min_len, max_len, digit_penalty)| YamlEntropy {
                     min_bits_per_byte: *bits_x10 as f32 / 10.0,
                     min_len: *min_len,
                     max_len: *max_len,
                     min_entropy_bits_per_byte: None,
+                    digit_penalty: *digit_penalty,
                 }),
             two_phase: self
                 .two_phase
@@ -108,13 +109,15 @@ fn arb_opt_token_vec(max_len: usize) -> impl Strategy<Value = Option<Vec<String>
     ]
 }
 
-fn arb_entropy() -> impl Strategy<Value = Option<(u16, usize, usize)>> {
+fn arb_entropy() -> impl Strategy<Value = Option<(u16, usize, usize, bool)>> {
     prop_oneof![
         Just(None),
-        (0u16..=80, 0usize..=96, 0usize..=96).prop_map(|(bits_x10, a, b)| {
-            let (min_len, max_len) = if a <= b { (a, b) } else { (b, a) };
-            Some((bits_x10, min_len, max_len))
-        }),
+        (0u16..=80, 0usize..=96, 0usize..=96, any::<bool>()).prop_map(
+            |(bits_x10, a, b, digit_penalty)| {
+                let (min_len, max_len) = if a <= b { (a, b) } else { (b, a) };
+                Some((bits_x10, min_len, max_len, digit_penalty))
+            }
+        ),
     ]
 }
 
@@ -268,10 +271,14 @@ proptest! {
         prop_assert_eq!(parsed_suppressors, case.value_suppressors_any.clone());
 
         match (&case.entropy, &rule.entropy) {
-            (Some((bits_x10, min_len, max_len)), Some(entropy)) => {
+            (Some((bits_x10, min_len, max_len, digit_penalty)), Some(entropy)) => {
                 prop_assert!((entropy.min_bits_per_byte - (*bits_x10 as f32 / 10.0)).abs() <= 1e-6);
                 prop_assert_eq!(entropy.min_len, *min_len);
                 prop_assert_eq!(entropy.max_len, *max_len);
+                prop_assert_eq!(
+                    entropy.digit_penalty, *digit_penalty,
+                    "digit_penalty should round-trip through YAML"
+                );
             }
             (None, None) => {}
             _ => panic!("entropy presence mismatch"),
@@ -282,7 +289,7 @@ proptest! {
         let expect_auto_enable = case.char_class.is_none()
             && case
                 .entropy
-                .is_some_and(|(bits_x10, _, _)| bits_x10 as f32 / 10.0 >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD);
+                .is_some_and(|(bits_x10, _, _, _)| bits_x10 as f32 / 10.0 >= AUTO_CHAR_CLASS_ENTROPY_THRESHOLD);
         match (&case.char_class, &rule.char_class) {
             (Some((max_lower_pct, min_window_len)), Some(cc)) => {
                 prop_assert_eq!(cc.max_lower_pct, *max_lower_pct);

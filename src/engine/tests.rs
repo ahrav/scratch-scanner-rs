@@ -2193,6 +2193,7 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
             min_len: 8,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
@@ -2395,6 +2396,7 @@ fn entropy_gate_filters_low_entropy_matches() {
             min_len: 8,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         ..base_rule(
             "entropy-gate",
@@ -2435,6 +2437,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         min_len: 4,
         max_len: 64,
         min_entropy_bits_per_byte: None,
+        digit_penalty: false,
     });
 
     // --- (a) Reject: full match high entropy, secret zero entropy ----------
@@ -3444,6 +3447,7 @@ fn scan_rules_reference(
                             if let Some(spec) = rule.entropy.as_ref() {
                                 let ent = EntropyCompiled {
                                     min_bits_per_byte: spec.min_bits_per_byte,
+                                    digit_penalty: spec.digit_penalty,
                                     min_len: spec.min_len,
                                     max_len: spec.max_len,
                                     min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
@@ -3566,6 +3570,7 @@ fn scan_rules_reference(
                                 if let Some(spec) = rule.entropy.as_ref() {
                                     let ent = EntropyCompiled {
                                         min_bits_per_byte: spec.min_bits_per_byte,
+                                        digit_penalty: spec.digit_penalty,
                                         min_len: spec.min_len,
                                         max_len: spec.max_len,
                                         min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
@@ -6366,6 +6371,7 @@ fn confidence_score_entropy_gate() {
             min_len: 4,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         secret_group: Some(1),
         ..base_rule(
@@ -6499,6 +6505,7 @@ fn confidence_score_multiple_gates_accumulate() {
             min_len: 4,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
             prefix_skip: 4,
@@ -6582,6 +6589,7 @@ fn stage1_generic_api_key_rule() -> RuleSpec {
             min_len: 16,
             max_len: 64,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         min_confidence: Some(5),
         secret_group: None,
@@ -6663,6 +6671,7 @@ fn keyword_entropy_auto_tier_requires_measured_entropy_evidence() {
             min_len: 16,
             max_len: 64,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         secret_group: Some(1),
         ..base_rule(
@@ -6759,6 +6768,7 @@ fn rule_min_confidence_keywords_plus_entropy_default_is_three() {
         min_len: 4,
         max_len: 32,
         min_entropy_bits_per_byte: None,
+        digit_penalty: false,
     });
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -6818,6 +6828,7 @@ fn rule_min_confidence_offline_plus_keywords_entropy_uses_keyword_tier() {
         min_len: 4,
         max_len: 32,
         min_entropy_bits_per_byte: None,
+        digit_penalty: false,
     });
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -6957,5 +6968,107 @@ fn uuid_quick_reject_bypassed_when_rule_captures_uuid_secrets() {
         scratch.findings().len(),
         1,
         "UUID-format secret should be kept when uuid_format_secret=true"
+    );
+}
+
+#[test]
+fn digit_penalty_rejects_all_digit_secret() {
+    // An all-digit string like "1234567890123456" has Shannon ~3.32 bpb,
+    // which clears a 3.0 bpb threshold without penalty.  With
+    // digit_penalty enabled the effective Shannon drops below 3.0 and the
+    // finding should be rejected.
+    let rule_penalty = RuleSpec {
+        radius: 64,
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+            digit_penalty: true,
+        }),
+        secret_group: Some(1),
+        ..base_rule(
+            "digit-penalty-on",
+            &[b"NUM_"],
+            Regex::new(r"NUM_([0-9]{16})").unwrap(),
+        )
+    };
+
+    let rule_no_penalty = RuleSpec {
+        entropy: Some(EntropySpec {
+            digit_penalty: false,
+            ..rule_penalty.entropy.clone().unwrap()
+        }),
+        ..base_rule(
+            "digit-penalty-off",
+            &[b"NUM_"],
+            Regex::new(r"NUM_([0-9]{16})").unwrap(),
+        )
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule_penalty, rule_no_penalty],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    let hits = scan_chunk_findings(&engine, b"prefix NUM_1234567890123456 suffix");
+
+    assert!(
+        !hits.iter().any(|h| h.rule == "digit-penalty-on"),
+        "digit_penalty should reject all-digit secret that barely clears Shannon"
+    );
+    assert!(
+        hits.iter().any(|h| h.rule == "digit-penalty-off"),
+        "without digit_penalty the same all-digit secret should pass Shannon"
+    );
+}
+
+/// Integration test: full `Engine::scan_chunk → window_validate → entropy_gate_outcome`
+/// pipeline with `digit_penalty: true`.
+///
+/// An all-digit secret clears 3.0 bpb Shannon on its own but the penalty
+/// pushes effective entropy below the threshold → rejected.  A mixed hex
+/// secret of the same length is unaffected by the penalty → accepted.
+#[test]
+fn digit_penalty_integration_mixed_vs_all_digit() {
+    let rule = RuleSpec {
+        radius: 64,
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 32,
+            min_entropy_bits_per_byte: None,
+            digit_penalty: true,
+        }),
+        secret_group: Some(1),
+        ..base_rule(
+            "dp-hex",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Fa-f0-9]{10})").unwrap(),
+        )
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // All-digit secret: Shannon ~3.32 bpb clears 3.0 without penalty, but
+    // the digit-only penalty pushes it below → should be rejected.
+    let all_digit = scan_chunk_findings(&engine, b"prefix TOK_0123456789 suffix");
+    assert!(
+        all_digit.is_empty(),
+        "digit_penalty should reject all-digit secret in full pipeline"
+    );
+
+    // Mixed hex secret: penalty does not apply → should pass entropy gate.
+    let mixed_hex = scan_chunk_findings(&engine, b"prefix TOK_0a1b2c3d4e suffix");
+    assert!(
+        !mixed_hex.is_empty(),
+        "mixed hex secret should pass entropy gate despite digit_penalty being enabled"
     );
 }

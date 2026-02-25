@@ -342,6 +342,9 @@ classDiagram
   full `u16` capture-group semantics.
 - `Engine.required_overlap()` is computed as:
   `max_window_diameter_bytes + (max_prefilter_width - 1)`.
+- `EntropySpec` includes a `digit_penalty` flag. When enabled per rule, the
+  entropy gate applies the detect-secrets digit-only adjustment
+  (`-1.2 / log2(len)`) before Shannon threshold comparison.
 - `StepId` and `FindingRec.step_id` are only valid while the originating
   `ScanScratch` step arena is alive and not reset.
 

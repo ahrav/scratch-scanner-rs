@@ -18,6 +18,7 @@ The values below are from the current repository snapshot:
 - `two_phase` enabled: `2` rules (`private-key`, `vault-service-token-legacy`)
 - `entropy` enabled: `218` rules
 - `min_entropy_bits_per_byte` enabled: `97` rules (Tier 0: 43 hex, Tier 1: 48 keyword+alphanum, Tier 2: 6 prefix-structured)
+- `digit_penalty` enabled: `10` rules (`adobe-client-id`, `cisco-meraki-api-key`, `cloudflare-global-api-key`, `discord-api-token`, `facebook-secret`, `finicity-api-token`, `kucoin-access-token`, `linear-client-secret`, `sendbird-access-token`, `sentry-access-token`)
 - `local_context` enabled: `1` rule (`generic-api-key`)
 - `value_suppressors_any` enabled: `15` rules (`adafruit-api-key`, `adobe-client-id`, `algolia-api-key`, `atlassian-api-token`, `confluent-access-token`, `confluent-secret-key`, `curl-auth-header`, `curl-auth-user`, `discord-api-token`, `discord-client-secret`, `generic-api-key`, `hashicorp-tf-password`, `heroku-api-key`, `linear-client-secret`, `zendesk-secret-key`)
 - `secret_group` enabled: `2` rules (`microsoft-teams-webhook`, `sonar-api-token`)
@@ -176,6 +177,7 @@ graph TB
         MinLen["min_len: usize"]
         MaxLen["max_len: usize"]
         MinEntropyBpb["min_entropy_bits_per_byte: Option&lt;f32&gt;"]
+        DigitPenalty["digit_penalty: bool"]
     end
 
     subgraph CharClassSpec["CharClassSpec (optional)"]
@@ -296,6 +298,7 @@ rules:
     min_len: 16                     # skip gate if secret < min_len bytes
     max_len: 256                    # cap measurement at max_len bytes
     min_entropy_bits_per_byte: null  # min-entropy floor (null = disabled)
+    digit_penalty: false            # subtract 1.2/log2(len) for all-digit entropy slices
   char_class: null                  # auto-enabled when entropy.min_bits_per_byte >= 3.0
   #   max_lower_pct: 95            # override: max % lowercase ASCII before rejection
   #   min_window_len: 32           # override: skip gate for short windows

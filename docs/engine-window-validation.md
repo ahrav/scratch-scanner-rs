@@ -46,7 +46,7 @@ Input: Window [w.start..w.end) in buffer
   ↓
 [Gate 6] Extract secret span from capture groups
   ↓
-[Gate 7] Check entropy on extracted secret (Shannon + optional min-entropy)
+[Gate 7] Check entropy on extracted secret (Shannon + optional digit penalty + optional min-entropy)
   ↓
 [Step 8] Probe for keyword evidence in local context (±32 bytes around full match)
   ↓
@@ -445,7 +445,7 @@ if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
 
 ### Parameters
 
-- `entropy`: Optional `EntropyCompiled` with Shannon threshold, min-entropy threshold, and length bounds
+- `entropy`: Optional `EntropyCompiled` with Shannon threshold, optional digit-only penalty flag, min-entropy threshold, and length bounds
 - `secret_bytes`: The extracted secret bytes to evaluate
 - `scratch`: Mutable scan scratch (provides entropy histogram scratch space)
 - `entropy_log2`: Pre-computed log2 lookup table for efficiency
@@ -453,6 +453,7 @@ if matches!(entropy_outcome, Some(EntropyGateOutcome::Failed)) {
 ### Behavior
 
 - Evaluates entropy on the **extracted secret** bytes, not the full regex match or window
+- If `digit_penalty` is enabled and the evaluated entropy slice is all ASCII digits, subtracts `1.2 / log2(len)` from Shannon before threshold comparison
 - Shannon entropy is checked first (rejects ~80-90% of non-secrets)
 - Min-entropy is checked second when `min_entropy_bits_per_byte` is set
 - Matches shorter than configured minimum length return `BypassedShortLen` (pass-through for detection, zero confidence contribution)
