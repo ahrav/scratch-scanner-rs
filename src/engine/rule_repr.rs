@@ -73,14 +73,22 @@ use regex::bytes::Regex;
 // Anchor variants
 // --------------------------
 
-/// Anchor variant used during matching and window scaling.
+/// Encoding variant that determines byte layout for anchors, keywords, and gate patterns.
 ///
-/// Raw anchors match input bytes directly. UTF-16 variants match byte-encoded
-/// UTF-16LE/BE anchors and double window radii via `scale()` so windows are
-/// sized in bytes, not code units.
+/// Every anchor, keyword, and gate literal is compiled into three encoding
+/// variants (Raw, UTF-16LE, UTF-16BE) so the scan loop can gate on raw bytes
+/// without runtime encoding conversion. The variant also controls window
+/// scaling: UTF-16 encodes each ASCII character as two bytes, so window radii
+/// must double to cover the same number of logical characters.
+///
+/// The three variants form a closed set and are used as array indices throughout
+/// the compiled rule representation (e.g., `[PackedPatterns; 3]` arrays in
+/// [`TwoPhaseCompiled`], [`KeywordsCompiled`], and [`ConfirmAllCompiled`]).
 ///
 /// # Invariants
-/// - `idx()` ordering is stable and used for packed tables and array slots.
+/// - `idx()` ordering is stable: Raw=0, Utf16Le=1, Utf16Be=2.
+/// - This ordering is used for packed tables, array slots, and the low bits
+///   of [`Target`].
 /// - `scale()` returns 1 for raw and 2 for UTF-16 variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Variant {
@@ -90,7 +98,10 @@ pub(super) enum Variant {
 }
 
 impl Variant {
-    /// Stable index into per-variant arrays: Raw=0, Utf16Le=1, Utf16Be=2.
+    /// Stable index into per-variant `[_; 3]` arrays: Raw=0, Utf16Le=1, Utf16Be=2.
+    ///
+    /// Used to select the correct encoding slot in compiled gate structures
+    /// (e.g., `TwoPhaseCompiled::confirm[v.idx()]`).
     pub(super) fn idx(self) -> usize {
         match self {
             Variant::Raw => 0,
@@ -99,7 +110,11 @@ impl Variant {
         }
     }
 
-    /// Convert the packed table index back to a variant.
+    /// Convert a packed table index back to a variant, returning `None` for
+    /// out-of-range values.
+    ///
+    /// Inverse of [`idx`](Self::idx). Used when decoding variant tags from
+    /// packed representations like [`Target`].
     pub(super) fn from_idx(idx: u8) -> Option<Self> {
         match idx {
             0 => Some(Variant::Raw),
@@ -110,6 +125,10 @@ impl Variant {
     }
 
     /// Scale a character radius into a byte radius for this variant.
+    ///
+    /// Returns 1 for `Raw` (1 byte per character) and 2 for UTF-16 variants
+    /// (2 bytes per code unit for ASCII). Multiply a character-count radius by
+    /// this factor to get the equivalent byte-count radius.
     pub(super) fn scale(self) -> usize {
         match self {
             Variant::Raw => 1,
@@ -148,6 +167,9 @@ impl Target {
     const VARIANT_SHIFT: u32 = 2;
 
     /// Pack a (rule_id, variant) into a single `u32`.
+    ///
+    /// # Panics
+    /// Panics if `rule_id` exceeds 30 bits (~1 billion rules).
     pub(super) fn new(rule_id: u32, variant: Variant) -> Self {
         assert!(rule_id <= (u32::MAX >> Self::VARIANT_SHIFT));
         Self((rule_id << Self::VARIANT_SHIFT) | variant.idx() as u32)
@@ -207,8 +229,17 @@ pub(super) struct PackedPatterns {
 // Compile-time size guard: 2 × Box<[T]> = 2 × 16 = 32 bytes.
 const _: () = assert!(std::mem::size_of::<PackedPatterns>() == 32);
 
-/// Builder for [`PackedPatterns`] that accumulates patterns using `Vec`
-/// internally, then freezes into boxed slices.
+/// Mutable builder for [`PackedPatterns`].
+///
+/// Accumulates patterns into growable `Vec` storage, then freezes into
+/// immutable boxed slices via [`build`](Self::build). The typical lifecycle is:
+///
+/// 1. Create with [`with_capacity`](Self::with_capacity) sized from the rule spec.
+/// 2. Append patterns via `push_raw`, `push_utf16le`, or `push_utf16be`.
+/// 3. Freeze via `build()` -- consumes the builder and returns a `PackedPatterns`.
+///
+/// After `build()`, the resulting `PackedPatterns` is immutable and uses
+/// `Box<[T]>` storage (no excess capacity).
 ///
 /// # Invariants maintained during building
 /// - `offsets[0] == 0` (established at construction).
@@ -220,7 +251,11 @@ pub(super) struct PackedPatternsBuilder {
 }
 
 impl PackedPatternsBuilder {
-    /// Create a builder with capacities sized for fast filling.
+    /// Create a builder pre-allocated for the expected number of patterns
+    /// and total byte count.
+    ///
+    /// `patterns` is the number of patterns to be added (determines offset
+    /// vector capacity). `bytes` is the total byte count across all patterns.
     pub(super) fn with_capacity(patterns: usize, bytes: usize) -> Self {
         let mut offsets = Vec::with_capacity(patterns.saturating_add(1));
         offsets.push(0);
@@ -237,7 +272,8 @@ impl PackedPatternsBuilder {
         self.offsets.push(self.bytes.len() as u32);
     }
 
-    /// Append an ASCII pattern expanded to UTF-16LE code units.
+    /// Append an ASCII pattern expanded to UTF-16LE code units (each byte
+    /// becomes `[byte, 0x00]`).
     pub(super) fn push_utf16le(&mut self, pat: &[u8]) {
         for &b in pat {
             self.bytes.push(b);
@@ -247,7 +283,8 @@ impl PackedPatternsBuilder {
         self.offsets.push(self.bytes.len() as u32);
     }
 
-    /// Append an ASCII pattern expanded to UTF-16BE code units.
+    /// Append an ASCII pattern expanded to UTF-16BE code units (each byte
+    /// becomes `[0x00, byte]`).
     pub(super) fn push_utf16be(&mut self, pat: &[u8]) {
         for &b in pat {
             self.bytes.push(0);
@@ -257,7 +294,10 @@ impl PackedPatternsBuilder {
         self.offsets.push(self.bytes.len() as u32);
     }
 
-    /// Freeze into an immutable `PackedPatterns`.
+    /// Consume the builder and freeze into an immutable [`PackedPatterns`].
+    ///
+    /// After this call, the returned `PackedPatterns` uses `Box<[T]>` storage
+    /// with no excess capacity. The builder cannot be reused.
     pub(super) fn build(self) -> PackedPatterns {
         debug_assert_eq!(
             *self.offsets.last().unwrap() as usize,
@@ -365,11 +405,19 @@ pub(super) struct ConfirmAllCompiled {
 /// Entropy gate parameters compiled into a rule.
 ///
 /// Copied from the validated [`crate::api::EntropySpec`] at compile time to
-/// avoid repeated lookups through the rule spec during scanning. See
-/// `EntropySpec` for the entropy algorithm description.
+/// avoid repeated lookups through the rule spec during scanning. Evaluated
+/// *after* the regex matches, on the extracted secret bytes (not the full
+/// match or the window). This is the primary false-positive filter for
+/// token-like rules: low-entropy matches (repeated characters, sequential
+/// digits) are rejected before emission.
+///
+/// The gate computes Shannon entropy and optionally min-entropy (NIST
+/// SP 800-90B) over the extracted secret, capped to `max_len` bytes.
+/// See [`EntropySpec`](crate::api::EntropySpec) for the full algorithm.
 ///
 /// # Invariants
 /// - Values are validated by `RuleSpec::assert_valid`.
+/// - `min_len <= max_len`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct EntropyCompiled {
     /// Minimum Shannon entropy threshold in bits per byte.
@@ -407,16 +455,29 @@ const _: () = assert!(core::mem::size_of::<EntropyCompiled>() <= 32);
 /// Compiled character-class distribution gate.
 ///
 /// Copied from the validated [`crate::api::CharClassSpec`] at compile time.
-/// Used by the window-validation hot path to reject windows dominated by
-/// lowercase ASCII before running the regex.
+/// Evaluated in [`window_validate`](super::window_validate) *before* the regex
+/// runs (after confirm-all and keyword gates). Windows whose lowercase ASCII
+/// percentage exceeds `max_lower_pct` are rejected without regex evaluation,
+/// cheaply eliminating prose-dominated windows that cannot be secrets.
+///
+/// The gate is skipped for windows shorter than `min_window_len` to avoid
+/// noisy statistics on small samples.
 ///
 /// # Invariants
 /// - Values are validated by `RuleSpec::assert_valid`.
+/// - `max_lower_pct` is in `0..=100`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CharClassCompiled {
-    /// Maximum percentage of lowercase ASCII bytes allowed (0–100).
+    /// Maximum percentage of lowercase ASCII bytes (`a`..`z`) allowed (0--100).
+    ///
+    /// Windows exceeding this threshold are rejected. A typical value for
+    /// high-entropy secret rules is 95, which allows mixed-case tokens but
+    /// rejects natural-language prose.
     pub(super) max_lower_pct: u8,
-    /// Minimum window length for the gate to apply.
+    /// Minimum window length (in bytes) for the gate to apply.
+    ///
+    /// Windows shorter than this skip the character-class check entirely,
+    /// avoiding unreliable percentage calculations on small byte counts.
     pub(super) min_window_len: u16,
 }
 
@@ -432,13 +493,16 @@ pub(super) const NO_GATE: u32 = u32::MAX;
 // -- Packed rule metadata bit layout --
 //
 // `RuleCompiled::rule_meta` packs several per-rule flags into a single `u32`
-// to avoid padding and keep the hot struct compact. The layout is:
+// to avoid padding and keep the hot struct compact. Bit-packing rather than
+// separate `bool` + `Option<u16>` fields saves 6+ bytes of padding per rule,
+// which matters when the hot array is iterated for every merged window.
 //
+// Layout:
 //   bits  0..=15  secret_group value (meaningful only when bit 17 is set)
 //   bit   16      needs_assignment_shape_check
 //   bit   17      has_secret_group_override (distinguishes None from Some(u16::MAX))
 //   bit   18      uuid_format_secret
-//   bits 19..=31  reserved (zero)
+//   bits 19..=31  reserved (must be zero)
 
 const RULE_META_SECRET_GROUP_MASK: u32 = 0xFFFF;
 const RULE_META_NEEDS_ASSIGNMENT_SHAPE: u32 = 1 << 16;
@@ -585,16 +649,25 @@ impl RuleCompiled {
     }
 }
 
-/// Cold rule metadata used outside the validation hot path.
+/// Cold rule metadata consulted only at finding-emission time.
 ///
-/// Kept in a parallel array with [`RuleCompiled`] (`Engine::rules_hot`) so
-/// that scan-loop iteration touches only the compact hot fields needed for
-/// gating and regex evaluation. The cold array is indexed identically:
-/// `rules_hot[i]` and `rules_cold[i]` always describe the same rule.
-/// This holds reporting/policy metadata (`name`, `min_confidence`) that does
-/// not need to live in the cache-sensitive hot rule struct.
+/// Stored in `Engine::rules_cold`, a parallel array indexed identically with
+/// `Engine::rules_hot` (i.e., `rules_hot[i]` and `rules_cold[i]` always
+/// describe the same rule). Separating cold metadata from [`RuleCompiled`]
+/// keeps the hot array compact: the scan loop iterates `rules_hot` for every
+/// merged window, but only reads `rules_cold` when a finding survives all
+/// gates and is about to be emitted.
+///
+/// # Why separate from `RuleCompiled`?
+///
+/// `RuleCompiled` is sized for cache-line-friendly iteration (<=88 bytes).
+/// Adding reporting fields like `name` (a pointer + length) and
+/// `min_confidence` (policy metadata) would inflate the hot struct and waste
+/// cache capacity on data that is only read once per emitted finding, not
+/// once per candidate window.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RuleCold {
+    /// Human-readable rule name used in finding reports.
     pub(super) name: &'static str,
     /// Effective minimum confidence threshold for this rule.
     ///
@@ -607,10 +680,13 @@ pub(super) struct RuleCold {
 
 /// Returns whether this rule should use the assignment-shape precheck gate.
 ///
-/// Currently hard-coded to `generic-api-key`, which matches `key = <token>`
-/// patterns in arbitrary contexts. The shape check rejects windows lacking
-/// a separator + token run, and enables `confidence::ASSIGNMENT_SHAPE` (+2)
-/// as a confidence signal.
+/// The assignment-shape gate is a cheap textual filter that runs *before*
+/// the regex, rejecting windows that lack a `key = value`-like structure.
+/// Currently hard-coded to `generic-api-key`, which matches token patterns
+/// in arbitrary contexts and benefits most from structural filtering. The
+/// gate both (a) reduces false positives by discarding prose windows and
+/// (b) enables `confidence::ASSIGNMENT_SHAPE` (+2) as a positive confidence
+/// signal when the shape is found.
 fn needs_assignment_shape_check(spec: &RuleSpec) -> bool {
     spec.name == "generic-api-key"
 }
@@ -669,16 +745,23 @@ const _: () = assert!(std::mem::size_of::<RuleCold>() <= 24);
 // Compile helpers
 // --------------------------
 
-/// Compiled gates returned alongside `RuleCompiled` for pooling into `Engine`.
+/// Compiled gates returned alongside [`RuleCompiled`] by [`compile_rule`].
 ///
-/// Each `Some` variant is a heavyweight gate object that the caller pools into
-/// a type-specific `Vec` on `Engine`, then patches the corresponding `u32`
-/// index on [`RuleCompiled`]. `None` fields result in the [`NO_GATE`] sentinel
-/// remaining in the rule (no pool entry allocated).
+/// This is a transient bag: the caller (`Engine::new`) pools each `Some`
+/// variant into the corresponding type-specific `Vec` on `Engine`, obtains
+/// a `u32` pool index, and patches that index onto `RuleCompiled`. `None`
+/// fields leave the [`NO_GATE`] sentinel in place (no pool entry allocated).
 ///
-/// `confirm_all` is intentionally absent here: its literals are derived from
-/// regex analysis *after* compilation, so the caller builds it separately via
-/// [`compile_confirm_all`] and adds it to `Engine::confirm_all_gates`.
+/// After pooling, this struct is dropped -- it exists only to transfer
+/// ownership of gate objects from the per-rule compilation step to the
+/// engine-wide gate pools.
+///
+/// # Absent field: `confirm_all`
+///
+/// `confirm_all` is intentionally absent here. Its literals are derived from
+/// regex analysis *after* `compile_rule` returns (via the anchor derivation
+/// pass), so the caller builds it separately with [`compile_confirm_all`]
+/// and pools it in a second pass.
 pub(super) struct CompiledGates {
     pub(super) two_phase: Option<TwoPhaseCompiled>,
     pub(super) keywords: Option<KeywordsCompiled>,
@@ -689,14 +772,18 @@ pub(super) struct CompiledGates {
     pub(super) offline_validation: Option<OfflineValidationSpec>,
 }
 
-/// Compile a validated rule spec into the runtime representation.
+/// Compile a validated [`RuleSpec`] into the runtime representation.
 ///
-/// Returns the compact `RuleCompiled` (with [`NO_GATE`] sentinel indices) and
-/// the compiled gate objects. The caller is responsible for pooling gates into
-/// `Engine` vectors and patching the indices on `RuleCompiled`.
+/// Returns a compact [`RuleCompiled`] with all gate indices set to
+/// [`NO_GATE`], plus a [`CompiledGates`] bag holding the heavyweight gate
+/// objects. The caller (`Engine::new`) is responsible for:
 ///
-/// `confirm_all` is intentionally left as `NO_GATE` and should be filled by
-/// the caller after confirm-all literals are derived.
+/// 1. Pooling each `Some` gate from `CompiledGates` into the corresponding
+///    type-specific `Vec` on `Engine`.
+/// 2. Patching the resulting `u32` pool index back onto `RuleCompiled`.
+/// 3. Building `confirm_all` separately via [`compile_confirm_all`] (its
+///    literals are derived from regex analysis, which happens after this
+///    function returns).
 ///
 /// # Gate encoding rules
 ///
@@ -708,6 +795,9 @@ pub(super) struct CompiledGates {
 ///   bytes.
 /// - **Entropy, char-class, local-context, offline-validation**: copied
 ///   verbatim from the spec (small `Copy` types or enums).
+///
+/// # Panics
+/// Panics if `spec.re` cannot be cloned (regex compilation failure upstream).
 pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     let two_phase = spec.two_phase.as_ref().map(|tp| {
         let count = tp.confirm_any.len();
@@ -813,18 +903,22 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
     (rule, gates)
 }
 
-/// Compile the derived "confirm all" gate from mandatory literal islands.
+/// Compile derived mandatory literal islands into a [`ConfirmAllCompiled`] gate.
+///
+/// Called by `Engine::new` *after* [`compile_rule`], because the mandatory
+/// literals are produced by the regex analysis / anchor derivation pass that
+/// runs between the two stages.
 ///
 /// Returns `None` if `confirm_all` is empty (no mandatory literals derived).
 ///
 /// The longest literal becomes the `primary` selector -- checked first via a
-/// single memmem search for early rejection. The remaining literals are packed
-/// into AND-gated tables (all must match) for the fast memmem pass.
+/// single `memmem` search for early rejection (longest needles are least
+/// likely to appear by chance in non-matching windows). The remaining literals
+/// are packed into AND-gated tables (all must match) for the secondary pass.
 ///
-/// Sorting is longest-first with ties broken lexicographically. This makes
-/// the primary literal maximally selective (longer needles are less likely to
-/// appear by chance), and the tiebreaker ensures deterministic selection
-/// across compilations.
+/// Sorting is longest-first with ties broken lexicographically. The tiebreaker
+/// ensures deterministic primary selection across compilations when multiple
+/// literals share the same length.
 pub(super) fn compile_confirm_all(mut confirm_all: Vec<Vec<u8>>) -> Option<ConfirmAllCompiled> {
     if confirm_all.is_empty() {
         return None;
@@ -863,8 +957,12 @@ pub(super) fn compile_confirm_all(mut confirm_all: Vec<Vec<u8>>) -> Option<Confi
 /// the Vectorscan prefilter DB, with a fanout list of [`Target`] entries that
 /// records every (rule, variant) combination that needs to be notified on a hit.
 ///
+/// If the pattern already exists in the map, the target is appended to its
+/// fanout list. Otherwise, the pattern is cloned into the map as a new entry.
+///
 /// Use [`add_pat_owned`] when the caller already has an owned `Vec<u8>` (e.g.,
-/// UTF-16-expanded patterns) to avoid an extra allocation.
+/// UTF-16-expanded patterns produced by [`utf16le_bytes`] / [`utf16be_bytes`])
+/// to avoid the clone.
 pub(super) fn add_pat_raw(map: &mut AHashMap<Vec<u8>, Vec<Target>>, pat: &[u8], target: Target) {
     if let Some(existing) = map.get_mut(pat) {
         existing.push(target);
@@ -890,20 +988,28 @@ pub(super) fn add_pat_owned(
     }
 }
 
-/// Flatten a pattern→targets map into packed arrays used by the scan loop.
+/// Flatten the anchor dedup map into packed arrays consumed by the prefilter pipeline.
 ///
-/// Returns `(patterns, flat_targets, offsets)` where:
-/// - `patterns[i]` is the `i`-th anchor pattern (sorted lexicographically),
-/// - `flat_targets[offsets[i]..offsets[i+1]]` are the targets for pattern `i`,
-/// - `offsets` has length `patterns.len() + 1` (prefix-sum layout).
+/// Consumes the dedup map built by [`add_pat_raw`] / [`add_pat_owned`] and
+/// produces three parallel arrays:
+///
+/// - `patterns[i]`: the `i`-th unique anchor pattern (sorted lexicographically).
+/// - `flat_targets[offsets[i]..offsets[i+1]]`: the [`Target`] entries for
+///   pattern `i`, recording every (rule, variant) pair that needs notification.
+/// - `offsets`: prefix-sum index with length `patterns.len() + 1`.
+///
+/// The patterns vector is fed to Vectorscan's multi-pattern compiler. Because
+/// Vectorscan assigns pattern ids positionally (pattern 0 gets id 0, etc.),
+/// the lexicographic sort is essential: it guarantees the same anchor bytes
+/// always receive the same id, regardless of `AHashMap` iteration order.
+/// Each pattern's target list is also sorted by packed [`Target`] value to
+/// ensure deterministic fanout across compilations.
 ///
 /// # Why deterministic ordering matters
 ///
-/// Patterns are sorted by bytes and each pattern's target list is sorted by
-/// packed `Target` value. This guarantees stable pattern-id assignment across
-/// compilations, which is critical because Vectorscan pattern ids are
-/// positional — the same pattern must always get the same id for the
-/// prefilter callback to route hits to the correct rule/variant accumulator.
+/// Without stable pattern-id assignment, a Vectorscan hit callback would route
+/// to a wrong (rule, variant) accumulator whenever `AHashMap` reorders entries
+/// between compilations. The sort-by-bytes guarantee closes this gap.
 pub(super) fn map_to_patterns(
     map: AHashMap<Vec<u8>, Vec<Target>>,
 ) -> (Vec<Vec<u8>>, Vec<Target>, Vec<u32>) {
@@ -933,10 +1039,14 @@ pub(super) fn map_to_patterns(
     (patterns, flat, offsets)
 }
 
-/// Convert ASCII bytes to UTF-16LE encoding (one byte → one code unit).
+/// Convert ASCII bytes to UTF-16LE encoding (each byte `b` becomes `[b, 0x00]`).
 ///
-/// Input is assumed to be ASCII (bytes 0x00–0x7F). Non-ASCII input produces
-/// technically invalid UTF-16 but is still useful for byte-level literal matching.
+/// This is an ASCII-only expansion used for literal gating, not a
+/// general-purpose UTF-16 encoder. Input is assumed to be ASCII (0x00--0x7F);
+/// non-ASCII input produces technically invalid UTF-16 but is still useful
+/// for byte-level literal matching in the prefilter and gate pipelines.
+///
+/// The output length is always `2 * ascii.len()`.
 pub(super) fn utf16le_bytes(ascii: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ascii.len() * 2);
     for &b in ascii {
@@ -946,10 +1056,14 @@ pub(super) fn utf16le_bytes(ascii: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Convert ASCII bytes to UTF-16BE encoding (one byte → one code unit).
+/// Convert ASCII bytes to UTF-16BE encoding (each byte `b` becomes `[0x00, b]`).
 ///
-/// Input is assumed to be ASCII (bytes 0x00–0x7F). Non-ASCII input produces
-/// technically invalid UTF-16 but is still useful for byte-level literal matching.
+/// This is an ASCII-only expansion used for literal gating, not a
+/// general-purpose UTF-16 encoder. Input is assumed to be ASCII (0x00--0x7F);
+/// non-ASCII input produces technically invalid UTF-16 but is still useful
+/// for byte-level literal matching in the prefilter and gate pipelines.
+///
+/// The output length is always `2 * ascii.len()`.
 pub(super) fn utf16be_bytes(ascii: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ascii.len() * 2);
     for &b in ascii {

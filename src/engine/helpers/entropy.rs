@@ -22,6 +22,21 @@
 //!    score. Findings that bypass the gate due to short length (`BypassedShortLen`)
 //!    contribute 0 — they are not penalized, but they do not earn positive evidence.
 //!
+//! # Gate evaluation sequence
+//!
+//! [`entropy_gate_outcome`] evaluates checks in a specific order to fail fast:
+//!
+//! 1. **Length check** -- `len < min_len` returns `BypassedShortLen` immediately.
+//!    Short samples have noisy entropy; failing open avoids false negatives.
+//! 2. **Histogram + metrics** -- a single fused pass computes Shannon entropy,
+//!    max bin count, and the all-digits flag over `bytes[..min(len, max_len)]`.
+//! 3. **Digit penalty** (if enabled) -- for all-digit slices, subtract
+//!    `1.2 / log2(capped_len)` from Shannon before thresholding.
+//! 4. **Shannon check** -- compare effective Shannon against `min_bits_per_byte`.
+//! 5. **Min-entropy check** (if configured) -- compare `H_inf` against
+//!    `min_entropy_bits_per_byte`. Checked second because Shannon already
+//!    rejects most low-randomness inputs at lower cost.
+//!
 //! # Performance
 //!
 //! The histogram is computed in a single branchless pass over the input bytes.
@@ -32,14 +47,25 @@
 use crate::engine::rule_repr::EntropyCompiled;
 use crate::engine::scratch::EntropyScratch;
 
-/// detect-secrets digit-only penalty coefficient.
+/// Numerator of the detect-secrets digit-only penalty: `penalty = 1.2 / log2(len)`.
+///
+/// Derived from detect-secrets' heuristic for all-digit strings, which tend to
+/// have inflated Shannon entropy because the 10-symbol alphabet is dense relative
+/// to its byte representation. The penalty scales inversely with length so that
+/// shorter digit sequences (where false-positive risk is highest) receive a
+/// stronger downward adjustment.
 const DIGIT_ONLY_PENALTY_NUMERATOR: f32 = 1.2;
 
-/// Precomputes log2 values for entropy calculations.
+/// Builds the `log2(i)` lookup table used by entropy calculations.
 ///
-/// The table is sized to the maximum entropy window length across rules and
-/// can be shared across entropy checks to avoid repeated `log2` calls.
-/// Index 0 is unused; index 1 is log2(1) = 0.
+/// Built once per [`Engine`](super::core::Engine) at construction time, sized to
+/// `max(entropy_gate.max_len)` across all compiled rules. The table is stored on
+/// the `Engine` and passed by reference into every entropy check, eliminating
+/// per-window `f32::log2` calls on the hot path.
+///
+/// Index 0 is unused (log2(0) is undefined); index 1 is `log2(1) = 0.0`.
+/// Values beyond the table length fall back to a runtime `log2` call via
+/// [`log2_lookup`].
 pub(crate) fn build_log2_table(max: usize) -> Vec<f32> {
     let len = max.saturating_add(1).max(2);
     let mut t = vec![0.0f32; len];
@@ -49,6 +75,10 @@ pub(crate) fn build_log2_table(max: usize) -> Vec<f32> {
     t
 }
 
+/// Returns `log2(n)` from the precomputed table, falling back to a runtime
+/// `f32::log2` call for values beyond the table bounds. The fallback is
+/// cold-path only: table sizing in [`build_log2_table`] guarantees all
+/// in-spec entropy windows hit the table.
 #[inline]
 fn log2_lookup(table: &[f32], n: usize) -> f32 {
     if n < table.len() {
@@ -60,8 +90,10 @@ fn log2_lookup(table: &[f32], n: usize) -> f32 {
 
 /// Raw metric values from the entropy-family gate.
 ///
-/// Computed in a single fused pass over the 256-bin histogram. Shannon entropy
-/// uses all bins; min-entropy only needs `max_bin_count`.
+/// All fields are computed in a single fused pass over the 256-bin histogram
+/// inside [`compute_entropy_metrics`]. Shannon entropy uses all bins;
+/// min-entropy only needs `max_bin_count`; the digit-penalty flag is
+/// piggybacked onto the histogram loop to avoid a second scan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EntropyMetrics {
     /// Shannon entropy in bits per byte.
@@ -133,7 +165,8 @@ pub(crate) fn compute_entropy_metrics(
     }
 
     // Branchless histogram: unconditionally increment the bin for each byte.
-    // No "first touch" tracking — the reset zeroes all 256 bins via memset.
+    // No "first touch" tracking -- the reset zeroes all 256 bins via memset.
+    // The digit-flag check is fused here to avoid a second pass over the input.
     let mut all_ascii_digits = true;
     for &b in bytes {
         // SAFETY: b is u8, so b as usize is in 0..256; counts has exactly 256 entries.
@@ -197,12 +230,26 @@ pub(crate) fn shannon_entropy_bits_per_byte(
 
 /// Returns the canonical entropy gate outcome for this candidate.
 ///
+/// This is the single entry point for entropy-based filtering in the detection
+/// pipeline. It is called from `window_validate.rs` after a regex match
+/// extracts the secret span, and its outcome feeds both the hard-gate discard
+/// logic and the additive confidence score.
+///
+/// # Evaluation order
+///
+/// Checks are ordered to fail fast on the cheapest test first:
+///
+/// 1. Length bypass (`< min_len`) -- O(1), no histogram work.
+/// 2. Shannon threshold -- rejects the vast majority of low-randomness input.
+/// 3. Min-entropy threshold (optional) -- only reached by inputs that pass
+///    Shannon, catching the narrower class of skewed-but-moderate distributions.
+///
 /// # Behavior
 /// - Buffers shorter than `spec.min_len` always pass (entropy is noisy).
 /// - Longer buffers are capped at `spec.max_len` for the computation.
 /// - If `spec.digit_penalty` is enabled, all-digit bytes in the capped slice
 ///   use `effective_shannon = shannon - (1.2 / log2(capped_len))`.
-///   (`capped_len == 1` skips the penalty.)
+///   (`capped_len == 1` skips the penalty to avoid division by zero.)
 /// - Shannon entropy is always checked first.
 /// - Min-entropy (optional, per NIST SP 800-90B) is checked second: it catches
 ///   distributions where one byte dominates even though Shannon looks moderate.
@@ -260,6 +307,8 @@ pub(crate) fn entropy_gate_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Shannon entropy (standalone) ----
 
     // Sidekiq secrets are `[a-f0-9]{8}:[a-f0-9]{8}` (17 bytes). The embedded
     // colon and short length make Shannon entropy noisy — random hex pairs can
@@ -356,6 +405,8 @@ mod tests {
         let me = (1f32).log2() - (1f32).log2();
         assert!((me - 0.0).abs() < f32::EPSILON);
     }
+
+    // ---- entropy_gate_outcome integration ----
 
     /// With min_entropy_bits_per_byte = None, outcome follows Shannon-only behavior.
     #[test]
@@ -523,6 +574,8 @@ mod tests {
             "short hex token with repeated nibble should pass without min-entropy gate"
         );
     }
+
+    // ---- digit-only penalty (detect-secrets style) ----
 
     #[test]
     fn digit_penalty_is_opt_in() {

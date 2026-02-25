@@ -73,6 +73,15 @@ impl Default for StepId {
 }
 
 /// Identifies a supported transform used for derived-buffer scanning.
+///
+/// Each variant corresponds to a single encoding scheme the engine can
+/// reverse during recursive decode passes. The engine iterates over enabled
+/// transforms in order, detects candidate encoded spans in the current
+/// buffer, decodes them into child buffers, and re-scans those children for
+/// additional findings.
+///
+/// New transforms must also be added to [`TransformId::ALL`] and given a
+/// [`cli_name`](TransformId::cli_name) mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransformId {
     /// URL percent decoding (optionally treating `+` as space).
@@ -82,6 +91,9 @@ pub enum TransformId {
 }
 
 /// Controls when a transform is applied during scanning.
+///
+/// Used as the `mode` field of [`TransformConfig`]. The engine evaluates
+/// this predicate per buffer before attempting span detection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransformMode {
     /// Never apply this transform.
@@ -105,6 +117,10 @@ pub enum TransformMode {
 }
 
 /// Gate policy for expensive transform decoding.
+///
+/// Configured via the `gate` field of [`TransformConfig`]. The gate runs
+/// *after* a span is decoded but *before* the decoded buffer is enqueued
+/// for recursive scanning, allowing early discard of unproductive decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {
     /// No gate; decode all candidate spans (subject to caps).
@@ -244,6 +260,11 @@ impl Base64DecodeStats {
 }
 
 /// UTF-16 endianness used when validating UTF-16 anchor hits.
+///
+/// The engine derives UTF-16LE and UTF-16BE variants of every ASCII anchor
+/// and scans for both when the buffer contains NUL bytes (a simple heuristic
+/// for potential UTF-16 content). This enum tags which endianness produced a
+/// hit so downstream decode steps can replay the conversion faithfully.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Utf16Endianness {
     /// Little-endian UTF-16.
@@ -253,6 +274,11 @@ pub enum Utf16Endianness {
 }
 
 /// A single decode step in the provenance chain for a finding.
+///
+/// Findings discovered in decoded (child) buffers carry a chain of
+/// `DecodeStep` values that describe how to reach the child representation
+/// from the root buffer. Consumers replay the chain to recover the original
+/// encoded bytes for display or re-extraction.
 ///
 /// # Invariants
 /// - `parent_span` is a byte range in the parent representation (half-open).
@@ -370,8 +396,11 @@ pub struct FindingRec {
     pub confidence_score: i8,
 }
 
-/// Compile-time guard: `FindingRec` must fit in 48 bytes to keep the
-/// per-finding arena slot cache-friendly and avoid padding waste.
+/// Compile-time guard: `FindingRec` must fit in 48 bytes (three cache-line
+/// halves on typical x86-64 hardware). Keeping the record compact ensures
+/// that per-finding arena slots are cache-friendly and avoids wasting
+/// padding bytes. If new fields push the size beyond 48 bytes, consider
+/// moving cold data into a side table.
 const _: () = assert!(std::mem::size_of::<FindingRec>() <= 48);
 
 /// Two-phase rule specification: confirm in a smaller seed window, then expand.
@@ -412,6 +441,12 @@ impl TwoPhaseSpec {
 
 /// Fast-path validator used to confirm common token-like rules directly at
 /// anchor hits, bypassing window accumulation and regex evaluation.
+///
+/// When the engine encounters an anchor hit for a rule with a non-`None`
+/// validator, it runs the validator first. If the validator confirms the
+/// match, the finding is emitted immediately without building a window or
+/// running the regex. If the validator rejects, the engine falls back to
+/// the normal window + regex path.
 ///
 /// Validators assume the anchor match is **match-start aligned** in the raw
 /// representation (i.e., `anchor_start` is the regex match start). If this
@@ -479,9 +514,11 @@ impl ValidatorKind {
     }
 }
 
-/// Post-match delimiter requirement for token-like rules.
+/// Post-match delimiter requirement for fast-path [`ValidatorKind`] checks.
 ///
-/// Delimiter checks operate on raw bytes, not Unicode scalars.
+/// After the validator confirms the tail character class, it optionally
+/// checks the byte immediately following the tail. Delimiter checks operate
+/// on raw bytes, not Unicode scalars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DelimAfter {
     /// No delimiter requirement; the match may be followed by any byte or end.
@@ -491,9 +528,14 @@ pub enum DelimAfter {
     GitleaksTokenTerminator,
 }
 
-/// Tail character class for validator checks.
+/// Tail character class for fast-path [`ValidatorKind`] checks.
 ///
-/// All charsets are ASCII byte classes applied to raw bytes.
+/// Each variant defines the set of ASCII bytes accepted in the tail
+/// portion of a token. The validator scans bytes greedily from the anchor
+/// end and stops at the first byte outside the class.
+///
+/// All charsets are strict ASCII byte classes; non-ASCII bytes always
+/// terminate the tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TailCharset {
     /// `[A-Z0-9]`
@@ -519,19 +561,54 @@ pub const LOCAL_CONTEXT_MAX_LOOKAROUND: usize = 1024;
 
 /// Local context gate configuration for post-regex validation.
 ///
-/// These checks are intentionally bounded and allocation-free so they can run
-/// in the hot path after a regex match but before emitting a finding.
+/// Examines bytes immediately surrounding a confirmed regex match to decide
+/// whether the finding looks like a real secret in use (as opposed to prose,
+/// documentation, or dead code). Each enabled sub-gate runs in sequence and
+/// any failure short-circuits to suppression.
+///
+/// # Evaluation order
+///
+/// 1. **Quoting** (`require_quoted`) -- checked first. If the secret span
+///    falls outside the window, the check is skipped (fail-open).
+/// 2. **Line bounds** -- computed once from `lookbehind` / `lookahead`. If
+///    no newlines are found within those bounds the window is too small to
+///    determine context, so the remaining line-based checks are skipped
+///    (fail-open).
+/// 3. **Assignment separator** (`require_same_line_assignment`) -- the line
+///    slice *before* the secret must contain `=`, `:`, or `=>`.
+/// 4. **Key names** (`key_names_any`) -- at least one key literal must
+///    appear in the line slice *before* the secret.
+///
+/// Checks 3 and 4 are independent -- both must pass if both are enabled.
+///
+/// # Fail-open philosophy
+///
+/// When lookbehind/lookahead do not cover enough context (e.g., the match
+/// is near the start of a chunk), the gate fails open rather than
+/// suppressing a potentially real finding.
+///
+/// # Performance
+///
+/// All checks are bounded by [`LOCAL_CONTEXT_MAX_LOOKAROUND`] and
+/// allocation-free; they use `memchr` / `memmem` on small byte windows.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalContextSpec {
-    /// Lookbehind bytes before the secret span.
+    /// Maximum bytes before the secret span to include when searching for
+    /// assignment separators, key names, and line boundaries.
     pub lookbehind: usize,
-    /// Lookahead bytes after the secret span.
+    /// Maximum bytes after the secret span to include when determining the
+    /// logical line end (used for quoting checks).
     pub lookahead: usize,
-    /// Require an assignment separator on the same line before the secret.
+    /// Require an assignment separator (`=`, `:`, or `=>`) on the same
+    /// line before the secret. Fail-open when line bounds cannot be
+    /// determined.
     pub require_same_line_assignment: bool,
-    /// Require the secret to be wrapped in matching quotes.
+    /// Require the secret to be wrapped in matching quotes (`"..."` or
+    /// `'...'`). Fail-open when the secret span is outside the window.
     pub require_quoted: bool,
-    /// Optional key names that must appear on the same line (any-of).
+    /// Optional key names that must appear on the same line before the
+    /// secret (any-of match). When `Some`, at least one literal must be
+    /// found; when `None`, this sub-gate is inactive.
     pub key_names_any: Option<&'static [&'static [u8]]>,
 }
 
@@ -1238,48 +1315,82 @@ mod tests {
 
 /// Engine tuning knobs for performance and DoS protection.
 ///
+/// Every cap here exists to bound worst-case CPU or memory cost. When a cap
+/// is exceeded, work is dropped (not queued) -- the engine favors bounded
+/// latency over completeness.
+///
 /// # Trade-offs
-/// - Window coalescing limits bound CPU cost but may widen validation windows.
-/// - Decode/work-item caps can skip derived buffers when exceeded.
-/// - `max_findings_per_chunk` is enforced at finding insertion time.
+///
+/// - **Window coalescing** (`merge_gap`, `max_windows_per_rule_variant`,
+///   `pressure_gap_start`) limits per-chunk regex work at the cost of wider
+///   validation windows, which can increase false-positive rates.
+/// - **Decode budgets** (`max_total_decode_output_bytes`, `max_work_items`,
+///   `max_transform_depth`) cap recursive transform work. Exceeding them
+///   silently discards derived buffers, possibly missing nested findings.
+/// - **Finding cap** (`max_findings_per_chunk`) is enforced at finding
+///   insertion time; later findings in the same chunk are dropped.
+///
+/// # Validation
+///
+/// [`assert_valid`](Tuning::assert_valid) checks a subset of invariants at
+/// engine build time. Additional cross-field checks (e.g.,
+/// `max_transform_depth <= MAX_DECODE_STEPS - 1`) are performed by
+/// `Engine::new`.
 #[derive(Clone, Debug)]
 pub struct Tuning {
-    /// Window merge gap in bytes when coalescing adjacent anchor hits.
-    /// Typical values: 64–256 bytes.
+    /// Maximum gap (in bytes) between adjacent anchor-hit windows that will
+    /// be merged into a single validation window. Larger values reduce the
+    /// number of regex evaluations but widen the window fed to the regex.
+    /// Typical values: 64--256 bytes.
     pub merge_gap: usize,
 
-    /// After merging, if windows per (rule, variant) still exceed this, coalesce under pressure.
+    /// After the initial merge pass, if the window count for a single
+    /// (rule, anchor-variant) pair still exceeds this limit, a secondary
+    /// pressure-coalesce pass runs with progressively larger gaps starting
+    /// at `pressure_gap_start`.
     pub max_windows_per_rule_variant: usize,
-    /// Starting gap in bytes used during pressure coalescing.
+
+    /// Starting gap (in bytes) for the pressure-coalesce pass. Must be > 0
+    /// to avoid infinite loops. The gap doubles on each retry until the
+    /// window count drops below `max_windows_per_rule_variant`.
     pub pressure_gap_start: usize,
 
-    /// Prevent vector blowups before merging by collapsing to a single coalesced range.
+    /// Safety valve: if a single (rule, anchor-variant) pair produces more
+    /// raw anchor hits than this before merging, all hits are collapsed
+    /// into one range spanning the first to last hit. This prevents
+    /// pathological `O(n^2)` merge behavior on adversarial input.
     pub max_anchor_hits_per_rule_variant: usize,
 
-    /// Maximum bytes produced when decoding a UTF-16 window for validation.
+    /// Maximum decoded UTF-8 bytes produced when converting a UTF-16 window
+    /// for regex validation. Windows that would exceed this are truncated.
     pub max_utf16_decoded_bytes_per_window: usize,
 
-    /// Max transform depth (number of decode steps) per work item chain.
-    /// Must be <= `MAX_DECODE_STEPS - 1`; enforced at engine build time.
+    /// Maximum recursive transform depth per work-item chain. Each decode
+    /// step (URL-decode, Base64-decode) adds one level. Must be <=
+    /// `MAX_DECODE_STEPS - 1` (the root step occupies one slot).
     pub max_transform_depth: usize,
 
-    /// Maximum total decoded output bytes across all transforms per scan.
-    /// Counts ALL decoded output bytes:
-    /// - full decodes
-    /// - streaming gate decoded chunks
-    /// - UTF-16 window decode output
+    /// Global byte budget for all decoded output within a single scan call.
+    /// Counts every decoded byte produced by any transform, streaming gate,
+    /// or UTF-16 window decode. Once exhausted, further decode attempts are
+    /// skipped for the remainder of the scan.
     pub max_total_decode_output_bytes: usize,
 
-    /// Hard cap on number of enqueued decoded buffers (DoS control).
+    /// Hard cap on the number of enqueued child buffers (decoded work items)
+    /// per scan call. Prevents unbounded memory growth from deeply nested or
+    /// heavily encoded content.
     pub max_work_items: usize,
 
-    /// Final hard cap on findings emitted per buffer/chunk after suppression.
+    /// Hard cap on findings emitted per chunk. Enforced at insertion time;
+    /// findings beyond this limit are silently dropped.
     pub max_findings_per_chunk: usize,
 
-    /// Whether to scan UTF-16 anchor variants at all.
+    /// Whether to scan UTF-16 anchor variants (LE and BE).
     ///
-    /// When false, only raw anchors are scanned (UTF-16 is skipped even if NULs
-    /// are present). This is useful for modes that avoid binary/UTF-16 content.
+    /// When `false`, only raw (ASCII) anchors are compiled into the
+    /// Vectorscan pattern database. Disabling this saves pattern-database
+    /// memory and avoids false hits on binary content that happens to
+    /// contain NUL bytes.
     pub scan_utf16_variants: bool,
 }
 
@@ -1299,14 +1410,24 @@ impl Tuning {
 
 /// Policy for selecting anchors during engine compilation.
 ///
-/// Determines whether to derive anchors from regexes, use manual anchors, or both.
-/// This choice only affects compilation; runtime scanning uses the compiled anchors.
+/// Determines whether to derive anchors from regexes, use manual anchors, or
+/// both. This choice only affects compilation; runtime scanning uses the
+/// compiled anchors regardless of how they were selected.
 ///
-/// # Choosing a Policy
-/// - [`PreferDerived`]: Default for most use cases; automatic anchor extraction
-///   with manual fallback ensures coverage.
-/// - [`ManualOnly`]: Use when regexes are complex and derivation produces poor anchors.
-/// - [`DerivedOnly`]: Use when manual anchors are stale or you want pure automation.
+/// Anchor derivation is handled by `regex2anchor` -- it extracts literal
+/// prefixes/infixes from the regex AST and converts them to Vectorscan-
+/// compatible anchor patterns. Manual anchors come from
+/// [`RuleSpec::anchors`].
+///
+/// # Choosing a policy
+///
+/// - [`PreferDerived`] -- Default for most use cases. Automatic anchor
+///   extraction with manual fallback ensures coverage even when the regex
+///   has no extractable literals.
+/// - [`ManualOnly`] -- Use when regexes are complex and derivation produces
+///   low-selectivity anchors (e.g., single-byte literals).
+/// - [`DerivedOnly`] -- Use when manual anchors are stale or you want pure
+///   automation; ignores manual anchors entirely.
 ///
 /// [`PreferDerived`]: AnchorPolicy::PreferDerived
 /// [`ManualOnly`]: AnchorPolicy::ManualOnly
@@ -1324,16 +1445,28 @@ pub enum AnchorPolicy {
 // -------------------------------------------------------------------------
 // Policy-hash encodings (canonical, deterministic)
 // -------------------------------------------------------------------------
-// These encodings must stay in lockstep with `policy_hash` in
-// `src/git_scan/policy_hash.rs`. Any semantic change requires bumping the
-// policy hash version to avoid false cache hits.
+//
+// Every configuration type that affects scan behavior implements
+// `encode_policy(&self, out: &mut Vec<u8>)`. Together these produce a
+// deterministic, order-invariant byte string that is hashed to form the
+// *policy hash* -- a fingerprint of the full scan configuration.
+//
+// The policy hash is used by `src/git_scan/policy_hash.rs` to detect
+// configuration changes between runs. A different hash means cached results
+// are invalid and a full re-scan is required.
+//
+// **Stability contract:** any semantic change to these encodings (field
+// additions, reorderings, changed tag values) must be accompanied by a
+// version bump in the policy-hash module. Failing to do so causes false
+// cache hits.
 
 impl RuleSpec {
     /// Encodes this rule into a canonical byte representation for policy hashing.
     ///
-    /// The encoding is deterministic and order-invariant for anchor/keyword lists.
-    /// Callers should treat this as an internal serialization format and bump
-    /// the policy-hash version if it changes.
+    /// The encoding is deterministic and order-invariant for anchor/keyword lists
+    /// (lists are sorted and deduplicated before serialization). Callers should
+    /// treat this as an internal serialization format; any change to the encoding
+    /// requires a policy-hash version bump in `src/git_scan/policy_hash.rs`.
     pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
         push_bytes_u32(out, self.name.as_bytes());
         encode_bytes_list(out, self.anchors);
@@ -1633,6 +1766,11 @@ fn encode_bytes_list(out: &mut Vec<u8>, list: &[&[u8]]) {
         push_bytes_u32(out, item);
     }
 }
+
+// -- Primitive serialization helpers for policy-hash encoding. All write
+// little-endian bytes to `out`. These are intentionally minimal; the
+// encoding is not self-describing and must be read back in the exact same
+// field order.
 
 fn push_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));

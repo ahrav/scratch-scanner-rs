@@ -130,30 +130,58 @@ pub(crate) struct YamlRulesFile {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlRule {
+    /// Unique rule identifier used for diagnostics and finding attribution.
     pub name: String,
+    /// Pattern compiled into a [`regex::bytes::Regex`] during parsing.
     pub regex: String,
+    /// Literal byte strings fed to the Vectorscan pre-filter; at least one
+    /// must appear in the input for a scan window to be opened.
     pub anchors: Vec<String>,
+    /// Byte radius around each anchor hit that defines the scan window.
     pub radius: usize,
+    /// Cheap byte-substring gate applied before the regex. When set, the
+    /// window must contain this literal or it is skipped entirely.
     #[serde(default)]
     pub must_contain: Option<String>,
+    /// Local keyword gate (any-of). At least one keyword must appear in the
+    /// scan window for the regex to run. Evaluated on raw window bytes,
+    /// including auto-generated UTF-16LE/BE variants.
     #[serde(default)]
     pub keywords_any: Option<Vec<String>>,
+    /// Post-match suppressor gate (any-of). If any literal appears inside
+    /// the extracted secret bytes, the finding is silently dropped. Useful
+    /// for filtering known placeholders like `EXAMPLE` or `DUMMY_TOKEN`.
     #[serde(default)]
     pub value_suppressors_any: Option<Vec<String>>,
+    /// Shannon/min-entropy gate on the extracted secret. See [`YamlEntropy`].
     #[serde(default)]
     pub entropy: Option<YamlEntropy>,
+    /// Character-class distribution pre-filter. See [`YamlCharClass`].
+    /// When absent and entropy threshold >= 3.0 bits/byte, the parser
+    /// auto-enables a default gate.
     #[serde(default)]
     pub char_class: Option<YamlCharClass>,
+    /// Two-phase confirm-then-expand configuration. See [`YamlTwoPhase`].
     #[serde(default)]
     pub two_phase: Option<YamlTwoPhase>,
+    /// Post-extraction structural context check. See [`YamlLocalContext`].
     #[serde(default)]
     pub local_context: Option<YamlLocalContext>,
+    /// Offline structural validation (checksums, format checks).
+    /// See [`YamlOfflineValidation`].
     #[serde(default)]
     pub offline_validation: Option<YamlOfflineValidation>,
+    /// Capture group index for secret extraction. `None` uses the default
+    /// heuristic (first non-empty capture in groups 1..N, else full match).
     #[serde(default)]
     pub secret_group: Option<u16>,
+    /// When `true`, bypass the UUID-format quick-reject in the safelist.
+    /// Required for providers that issue API keys in 8-4-4-4-12 hex format.
     #[serde(default)]
     pub uuid_format_secret: bool,
+    /// Per-rule minimum confidence floor. Findings scoring below this are
+    /// suppressed. `None` selects an auto-default derived from the rule's
+    /// compiled gate configuration. Valid range: `0..=10`.
     #[serde(default)]
     pub min_confidence: Option<i8>,
 }
@@ -179,11 +207,24 @@ pub(crate) struct YamlRule {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
+    /// Shannon entropy threshold in bits/byte. Secrets below this are
+    /// rejected as likely false positives. Valid range: `[0.0, 8.0]`.
     pub min_bits_per_byte: f32,
+    /// Secrets shorter than this length bypass the entropy check entirely
+    /// because Shannon entropy is unreliable on small samples.
     pub min_len: usize,
+    /// Maximum bytes evaluated for entropy. Longer secrets are capped to
+    /// bound compute cost without rejecting the entire candidate.
     pub max_len: usize,
+    /// Optional stricter gate based on NIST SP 800-90B min-entropy.
+    /// Catches byte distributions skewed toward a single dominant value
+    /// that Shannon entropy alone may miss. `None` disables this gate.
     #[serde(default)]
     pub min_entropy_bits_per_byte: Option<f32>,
+    /// When `true`, all-digit candidates in the evaluated entropy slice
+    /// are penalized by `1.2 / log2(len)` before the Shannon threshold
+    /// comparison. Targets false positives from numeric-only strings in
+    /// hex-like rules (e.g. version numbers, timestamps).
     #[serde(default)]
     pub digit_penalty: bool,
 }
@@ -202,7 +243,11 @@ pub(crate) struct YamlEntropy {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlCharClass {
+    /// Maximum percentage of lowercase ASCII bytes (`a`-`z`) allowed in
+    /// the scan window. Windows exceeding this are rejected. Range: 0-100.
     pub max_lower_pct: u8,
+    /// Minimum window length (bytes) for the gate to apply. Shorter
+    /// windows pass unconditionally because the percentage is too noisy.
     pub min_window_len: u16,
 }
 
@@ -220,8 +265,13 @@ pub(crate) struct YamlCharClass {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlTwoPhase {
+    /// Narrow window radius (bytes) for the cheap Phase 1 literal scan.
     pub seed_radius: usize,
+    /// Expanded window radius (bytes) for Phase 2 regex evaluation.
+    /// Must be >= `seed_radius`.
     pub full_radius: usize,
+    /// Confirming literals (any-of). At least one must appear in the
+    /// seed window or the candidate is dropped before Phase 2.
     pub confirm_any: Vec<String>,
 }
 
@@ -236,12 +286,19 @@ pub(crate) struct YamlTwoPhase {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlLocalContext {
+    /// Bytes to examine before the start of the regex match span.
     pub lookbehind: usize,
+    /// Bytes to examine after the end of the regex match span.
     pub lookahead: usize,
+    /// Require an assignment separator (`=`, `:`, etc.) on the same line
+    /// preceding the secret. Catches unanchored regex matches in prose.
     #[serde(default)]
     pub require_same_line_assignment: bool,
+    /// Require the secret to be wrapped in matching quotes (`"`, `'`).
     #[serde(default)]
     pub require_quoted: bool,
+    /// Key names (any-of) that must appear on the same line as the match.
+    /// When `None`, no key-name check is performed.
     #[serde(default)]
     pub key_names_any: Option<Vec<String>>,
 }
@@ -270,12 +327,18 @@ pub(crate) struct YamlLocalContext {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlOfflineValidation {
+    /// Validation algorithm selector. Renamed from `type` in YAML to
+    /// avoid the Rust keyword. See the struct-level table for valid values.
     #[serde(rename = "type")]
     pub kind: String,
+    /// Bytes to skip before the payload region. Required for `crc32_base62`.
     #[serde(default)]
     pub prefix_skip: Option<u8>,
+    /// Length of the payload region in bytes. Required for `crc32_base62`.
     #[serde(default)]
     pub payload_len: Option<u8>,
+    /// Length of the base-62-encoded CRC-32 checksum. Required for
+    /// `crc32_base62`; must be <= 6 (max digits for a `u32` in base 62).
     #[serde(default)]
     pub checksum_len: Option<u8>,
 }
@@ -310,8 +373,14 @@ pub(crate) struct YamlOfflineValidation {
 /// `parse_yaml_rules` calls for the lifetime of the process.
 #[derive(Default)]
 struct RuleAtomPool {
+    /// Rule names: owned `String` key -> leaked `&'static str`.
     strings: HashMap<String, &'static str>,
+    /// Individual byte atoms (anchors, keywords, must_contain literals):
+    /// owned `Vec<u8>` key -> leaked `&'static [u8]`.
     bytes: HashMap<Vec<u8>, &'static [u8]>,
+    /// Composite byte-slice arrays (anchor lists, keyword lists):
+    /// owned `Vec<Vec<u8>>` key -> leaked `&'static [&'static [u8]]`.
+    /// Inner slices are also interned via `bytes` for cross-rule sharing.
     bytes_slices: HashMap<Vec<Vec<u8>>, &'static [&'static [u8]]>,
 }
 

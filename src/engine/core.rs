@@ -169,7 +169,16 @@ const _: () = assert!(
         && std::mem::size_of::<CachePaddedAtomicU64>() == 64
 );
 
-/// Internal atomic counters used to build `VectorscanStats`.
+/// Internal atomic counters used to build [`VectorscanStats`].
+///
+/// Each counter is cache-line padded ([`CachePaddedAtomicU64`]) to avoid
+/// false sharing between concurrent worker threads.  Counters are updated
+/// with `Relaxed` ordering during scans and snapshotted via [`snapshot`]
+/// for reporting.  Individual counter reads are atomic but the snapshot as
+/// a whole is not linearised -- callers should treat each field as
+/// independently sampled.
+///
+/// [`snapshot`]: VectorscanCounters::snapshot
 #[cfg(feature = "stats")]
 #[derive(Default)]
 pub(super) struct VectorscanCounters {
@@ -376,7 +385,15 @@ impl Engine {
 
     /// Compiles rule specs into an engine with a specific anchor policy.
     ///
-    /// # Design Notes
+    /// This is the primary construction entry point. Compilation proceeds in
+    /// two passes (see the module-level "Build phase" docs):
+    /// 1. Compile each [`RuleSpec`](crate::api::RuleSpec) into a
+    ///    [`RuleCompiled`] with gates pooled into Engine-owned vectors.
+    /// 2. Derive or select anchor patterns, build deduped pattern maps, and
+    ///    construct Vectorscan prefilter DBs (raw, UTF-16, stream, gate) plus
+    ///    the Base64 YARA pre-gate.
+    ///
+    /// # Policy behaviour
     /// - `AnchorPolicy::ManualOnly` uses only explicit anchors provided by rules.
     /// - `AnchorPolicy::DerivedOnly` ignores manual anchors and relies on derived
     ///   anchors/residue gates; rules that cannot be gated are reported via
@@ -1134,10 +1151,21 @@ impl Engine {
 
     /// Returns whether a root finding should be suppressed by the global safelist.
     ///
+    /// Only root-layer findings (`step_id == STEP_ROOT`) are checked; decoded
+    /// findings return `false` immediately because their context may not be the
+    /// original input bytes.
+    ///
     /// `root_hint_start`/`root_hint_end` are absolute file offsets in the same
-    /// coordinate space as `context_base_offset`. `last_decision` is a single-entry
-    /// cache scoped to one `for_each_capture_match` invocation; consecutive matches
-    /// that rebase to the same `(start, end)` slice reuse the previous result.
+    /// coordinate space as `context_base_offset`. The hint range is clipped to
+    /// `context_buf` bounds before the safelist is evaluated.
+    ///
+    /// # Caching
+    ///
+    /// `last_decision` is a single-entry `(start, end, suppressed)` cache that
+    /// avoids redundant safelist evaluations when consecutive regex captures
+    /// produce the same root-hint window. The cache is scoped to a single
+    /// `for_each_capture_match` invocation; the caller is responsible for
+    /// initialising it to `None` at the start of each match loop.
     #[inline]
     pub(super) fn suppress_root_finding_by_safelist(
         &self,
@@ -1197,6 +1225,15 @@ impl Engine {
         }
     }
 
+    /// Resolves the two-phase confirmation gate for a rule.
+    ///
+    /// Two-phase gates narrow the prefilter window in two steps: a cheap seed
+    /// check at a small radius, then a full-radius regex validation only for
+    /// confirmed seeds. This reduces expensive regex work on noisy prefilter
+    /// hits.
+    ///
+    /// # Panics
+    /// Panics on out-of-bounds index, indicating corrupted compiled rule data.
     #[inline(always)]
     pub(super) fn two_phase_gate(&self, idx: u32) -> Option<&TwoPhaseCompiled> {
         if idx == NO_GATE {
@@ -1930,6 +1967,9 @@ impl Engine {
     ///
     /// Delegates to [`Engine::scan_chunk_into`]; the same preconditions apply
     /// (`buf.len() <= u32::MAX`, exclusive `scratch` ownership).
+    ///
+    /// The returned slice borrows `scratch` and is valid until `scratch` is
+    /// reused for another scan.
     pub fn scan_chunk_records<'a>(
         &self,
         buf: &[u8],
@@ -2141,6 +2181,15 @@ pub(super) fn url_percent_gate_check(
     false
 }
 
+// --------------------------
+// Benchmark helpers (feature = "bench")
+// --------------------------
+//
+// The functions and types below expose internal hot-path routines to the
+// benchmark harness. They are compiled out of production builds. Each wrapper
+// delegates directly to the production implementation so benchmarks measure
+// real code paths, not simplified stubs.
+
 /// Benchmark helper to expose span detection for transform configs.
 #[cfg(feature = "bench")]
 pub fn bench_find_spans_into(
@@ -2151,10 +2200,11 @@ pub fn bench_find_spans_into(
     find_spans_into(tc, buf, out);
 }
 
-/// Benchmark helper that stores pre-packed literal patterns for memmem gates.
+/// Pre-packed literal patterns for benchmark-only memmem gate checks.
 ///
-/// This wrapper lets benchmarks compile literals once and measure only the
-/// `contains_any_memmem` hot-path check per iteration.
+/// Wraps [`PackedPatterns`] so benchmarks compile literals once during setup
+/// and measure only the `contains_any_memmem` / `contains_all_memmem`
+/// hot-path check per timed iteration.
 #[cfg(feature = "bench")]
 #[derive(Clone, Debug)]
 pub struct BenchPackedPatterns {
@@ -2188,7 +2238,14 @@ pub fn bench_contains_all_memmem(hay: &[u8], needles: &BenchPackedPatterns) -> b
     super::helpers::contains_all_memmem(hay, &needles.patterns)
 }
 
-/// Benchmark helper for the entropy gate (delegates to `entropy_gate_outcome` internally).
+/// Reusable benchmark state for entropy-gate micro-benchmarks.
+///
+/// Pre-builds the `log2` lookup table and owns an [`EntropyScratch`] histogram
+/// buffer so that setup cost is excluded from timed iterations. The `max_len`
+/// field tracks the table size; call [`ensure_max_len`] when the window size
+/// changes between benchmark parameters.
+///
+/// [`ensure_max_len`]: BenchEntropyState::ensure_max_len
 #[cfg(feature = "bench")]
 pub struct BenchEntropyState {
     max_len: usize,
@@ -2281,6 +2338,11 @@ pub fn bench_shannon_entropy(bytes: &[u8], max_len: usize) -> f32 {
 }
 
 /// Reusable benchmark state for `merge_ranges_with_gap_sorted`.
+///
+/// Owns a pre-allocated [`ScratchVec<SpanU32>`] so that the benchmark inner
+/// loop measures only the merge algorithm, not allocation overhead.  Call
+/// [`bench_merge_ranges_load`] to populate the state from `(start, end)`
+/// tuples, then [`bench_merge_ranges_run`] to execute the merge.
 #[cfg(feature = "bench")]
 pub struct BenchMergeRangesState {
     ranges: crate::scratch_memory::ScratchVec<super::hit_pool::SpanU32>,
@@ -2353,6 +2415,11 @@ pub fn bench_merge_ranges(ranges: &[(u32, u32)], gap: u32) -> usize {
 }
 
 /// Reusable benchmark state for UTF-16 decode helpers.
+///
+/// Owns a pre-allocated output buffer so the benchmark inner loop measures
+/// only decode throughput, not allocation overhead.  Call
+/// [`bench_build_utf16_decode_state`] to create, then use the `*_with_state`
+/// variants of the decode benchmarks.
 #[cfg(feature = "bench")]
 pub struct BenchUtf16DecodeState {
     max_out: usize,
