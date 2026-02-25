@@ -72,7 +72,7 @@ pub enum MutOp {
 
 /// Fieldless mirror of [`MutOp`] used by [`TokenFamily::allowed_ops`] to
 /// declare which operator categories are valid for a given token format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutOpKind {
     Truncate,
     CharsetViolate,

@@ -106,9 +106,10 @@ impl TokenFamily {
 
     /// Mutation operator kinds that produce meaningful test cases for this family.
     ///
-    /// Families without a checksum exclude `ChecksumCorrupt` (it would be a
-    /// no-op on the detection path). Blob families exclude `PrefixMangle`
-    /// because they have no structural prefix to corrupt.
+    /// Only CRC-bearing families include `ChecksumCorrupt` (the XOR of the
+    /// last byte may or may not affect detection for other families). Blob
+    /// families exclude `PrefixMangle` because they have no structural prefix
+    /// to corrupt.
     pub fn allowed_ops(&self) -> &'static [MutOpKind] {
         use MutOpKind::*;
         match self {
@@ -404,6 +405,7 @@ fn gen_url_encoded_blob(rng: &mut SimRng) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::mutation::encode::test_helpers::base62_decode;
     use crate::sim::rng::SimRng;
 
     #[test]
@@ -443,7 +445,7 @@ mod tests {
         assert!(token.starts_with(b"github_pat_"));
         // Verify CRC: hash first 87 bytes, decode last 6.
         let expected_crc = crc32fast::hash(&token[..87]);
-        let decoded_crc = base62_decode_test(&token[87..93]);
+        let decoded_crc = base62_decode(&token[87..93]);
         assert_eq!(expected_crc, decoded_crc, "CRC-32 mismatch");
     }
 
@@ -454,7 +456,7 @@ mod tests {
         assert!(token.starts_with(b"ghp_"));
         // CRC of payload only (bytes 4–33)
         let expected_crc = crc32fast::hash(&token[4..34]);
-        let decoded_crc = base62_decode_test(&token[34..40]);
+        let decoded_crc = base62_decode(&token[34..40]);
         assert_eq!(expected_crc, decoded_crc, "CRC-32 mismatch");
     }
 
@@ -623,20 +625,5 @@ mod tests {
             Outcome::MustNotMatch,
             "extend+truncate below canonical length should be MustNotMatch",
         );
-    }
-
-    /// Minimal base-62 decoder for test assertions.
-    fn base62_decode_test(bytes: &[u8]) -> u32 {
-        let mut acc: u64 = 0;
-        for &b in bytes {
-            let v = match b {
-                b'0'..=b'9' => (b - b'0') as u64,
-                b'A'..=b'Z' => (b - b'A') as u64 + 10,
-                b'a'..=b'z' => (b - b'a') as u64 + 36,
-                _ => panic!("invalid base62 char: {b:#x}"),
-            };
-            acc = acc * 62 + v;
-        }
-        acc as u32
     }
 }

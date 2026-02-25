@@ -218,6 +218,24 @@ pub fn hex_nibble(n: u8) -> u8 {
 }
 
 #[cfg(test)]
+pub(crate) mod test_helpers {
+    /// Minimal base-62 decoder for test assertions (inverse of [`super::base62_encode_u32`]).
+    pub(crate) fn base62_decode(bytes: &[u8]) -> u32 {
+        let mut acc: u64 = 0;
+        for &b in bytes {
+            let v = match b {
+                b'0'..=b'9' => (b - b'0') as u64,
+                b'A'..=b'Z' => (b - b'A') as u64 + 10,
+                b'a'..=b'z' => (b - b'a') as u64 + 36,
+                _ => panic!("invalid base62 char: {b:#x}"),
+            };
+            acc = acc * 62 + v;
+        }
+        acc as u32
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -338,25 +356,12 @@ mod tests {
 
     #[test]
     fn base62_roundtrip() {
-        // Inline a minimal decode for test verification.
-        fn decode(bytes: &[u8]) -> u32 {
-            let mut acc: u64 = 0;
-            for &b in bytes {
-                let v = match b {
-                    b'0'..=b'9' => (b - b'0') as u64,
-                    b'A'..=b'Z' => (b - b'A') as u64 + 10,
-                    b'a'..=b'z' => (b - b'a') as u64 + 36,
-                    _ => panic!("invalid base62 char"),
-                };
-                acc = acc * 62 + v;
-            }
-            acc as u32
-        }
+        use super::test_helpers::base62_decode;
 
         for val in [0u32, 1, 61, 62, 3843, 100_000, u32::MAX] {
             let mut buf = [0u8; 6];
             base62_encode_u32(val, &mut buf);
-            assert_eq!(decode(&buf), val, "roundtrip failed for {val}");
+            assert_eq!(base62_decode(&buf), val, "roundtrip failed for {val}");
         }
     }
 

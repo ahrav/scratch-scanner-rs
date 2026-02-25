@@ -49,7 +49,7 @@ pub enum ContextWrap {
 /// **Invariant:** `bytes[token_offset .. token_offset + token_len]` always
 /// exactly recovers the original (possibly mutated) token bytes that were
 /// passed to [`ContextWrap::wrap`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct WrappedToken {
     /// The full byte buffer including context prefix, token, and suffix.
     pub bytes: Vec<u8>,
@@ -114,77 +114,27 @@ impl ContextWrap {
                 token_offset: 0,
                 token_len: token.len(),
             },
-            ContextWrap::EnvAssignment => {
-                let prefix = b"SECRET_KEY=";
-                let suffix = b"\n";
-                let mut bytes = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
-                bytes.extend_from_slice(prefix);
-                let offset = bytes.len();
-                bytes.extend_from_slice(token);
-                bytes.extend_from_slice(suffix);
-                WrappedToken {
-                    bytes,
-                    token_offset: offset,
-                    token_len: token.len(),
-                }
-            }
-            ContextWrap::JsonField => {
-                let prefix = br#"{"token":""#;
-                let suffix = br#""}"#;
-                let mut bytes = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
-                bytes.extend_from_slice(prefix);
-                let offset = bytes.len();
-                bytes.extend_from_slice(token);
-                bytes.extend_from_slice(suffix);
-                WrappedToken {
-                    bytes,
-                    token_offset: offset,
-                    token_len: token.len(),
-                }
-            }
-            ContextWrap::YamlValue => {
-                let prefix = b"token: ";
-                let suffix = b"\n";
-                let mut bytes = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
-                bytes.extend_from_slice(prefix);
-                let offset = bytes.len();
-                bytes.extend_from_slice(token);
-                bytes.extend_from_slice(suffix);
-                WrappedToken {
-                    bytes,
-                    token_offset: offset,
-                    token_len: token.len(),
-                }
-            }
-            ContextWrap::SingleLineComment => {
-                let prefix = b"// ";
-                let suffix = b"\n";
-                let mut bytes = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
-                bytes.extend_from_slice(prefix);
-                let offset = bytes.len();
-                bytes.extend_from_slice(token);
-                bytes.extend_from_slice(suffix);
-                WrappedToken {
-                    bytes,
-                    token_offset: offset,
-                    token_len: token.len(),
-                }
-            }
-            ContextWrap::MultiLineString => {
-                let prefix = b"\"\"\"\n";
-                let suffix = b"\n\"\"\"";
-                let mut bytes = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
-                bytes.extend_from_slice(prefix);
-                let offset = bytes.len();
-                bytes.extend_from_slice(token);
-                bytes.extend_from_slice(suffix);
-                WrappedToken {
-                    bytes,
-                    token_offset: offset,
-                    token_len: token.len(),
-                }
-            }
+            ContextWrap::EnvAssignment => wrap_with(b"SECRET_KEY=", token, b"\n"),
+            ContextWrap::JsonField => wrap_with(br#"{"token":""#, token, br#""}"#),
+            ContextWrap::YamlValue => wrap_with(b"token: ", token, b"\n"),
+            ContextWrap::SingleLineComment => wrap_with(b"// ", token, b"\n"),
+            ContextWrap::MultiLineString => wrap_with(b"\"\"\"\n", token, b"\n\"\"\""),
         }
+    }
+}
+
+/// Assemble a [`WrappedToken`] from prefix + token + suffix, recording the
+/// token's byte offset within the combined buffer.
+fn wrap_with(prefix: &[u8], token: &[u8], suffix: &[u8]) -> WrappedToken {
+    let mut bytes = Vec::with_capacity(prefix.len() + token.len() + suffix.len());
+    bytes.extend_from_slice(prefix);
+    let offset = bytes.len();
+    bytes.extend_from_slice(token);
+    bytes.extend_from_slice(suffix);
+    WrappedToken {
+        bytes,
+        token_offset: offset,
+        token_len: token.len(),
     }
 }
 
