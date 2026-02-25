@@ -12,7 +12,7 @@ use crate::archive::formats::TarRead;
 use crate::archive::util::write_u64_hex_lower;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult,
-    EntryPathCanonicalizer, EntrySkipReason, PartialReason, VirtualPathBuilder,
+    EntryPathCanonicalizer, PartialReason, VirtualPathBuilder,
 };
 use crate::store::{FsFindingRecord, StoreProducer};
 
@@ -136,19 +136,6 @@ pub(super) fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialR
     }
 }
 
-/// Map entry-scope skip reasons into entry partial-reason telemetry buckets.
-///
-/// `EntryInflationRatioExceeded` is promoted to `PartialReason::InflationRatioExceeded`;
-/// unknown/future variants conservatively fall back to `EntryOutputBudgetExceeded`.
-#[inline(always)]
-fn map_entry_skip_to_partial(reason: EntrySkipReason) -> PartialReason {
-    match reason {
-        EntrySkipReason::EntryOutputBudgetExceeded => PartialReason::EntryOutputBudgetExceeded,
-        EntrySkipReason::EntryInflationRatioExceeded => PartialReason::InflationRatioExceeded,
-        _ => PartialReason::EntryOutputBudgetExceeded,
-    }
-}
-
 /// Extract the [`PartialReason`] from a [`BudgetHit`].
 ///
 /// Every budget violation carries a reason; this collapses the four `BudgetHit`
@@ -160,7 +147,7 @@ pub(super) fn budget_hit_to_partial_reason(hit: BudgetHit) -> PartialReason {
         BudgetHit::PartialArchive(r) => r,
         BudgetHit::StopRoot(r) => r,
         BudgetHit::SkipArchive(r) => map_archive_skip_to_partial(r),
-        BudgetHit::SkipEntry(r) => map_entry_skip_to_partial(r),
+        BudgetHit::SkipEntry(r) => r.to_partial(),
     }
 }
 
@@ -173,7 +160,7 @@ pub(super) fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
         BudgetHit::SkipArchive(r) => ArchiveEnd::Skipped(r),
         BudgetHit::PartialArchive(r) => ArchiveEnd::Partial(r),
         BudgetHit::StopRoot(r) => ArchiveEnd::Partial(r),
-        BudgetHit::SkipEntry(r) => ArchiveEnd::Partial(map_entry_skip_to_partial(r)),
+        BudgetHit::SkipEntry(r) => ArchiveEnd::Partial(r.to_partial()),
     }
 }
 

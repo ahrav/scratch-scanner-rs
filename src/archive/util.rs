@@ -171,21 +171,7 @@ pub(crate) fn read_exact_n<R: Read + ?Sized>(
 // ── Budget-hit mapping ───────────────────────────────────────────────────────
 
 use crate::archive::budget::BudgetHit;
-use crate::archive::outcome::{ArchiveSkipReason, EntrySkipReason, PartialReason};
-
-/// Map entry-scope skip reasons to entry partial-reason telemetry.
-///
-/// `EntryInflationRatioExceeded` is promoted to the shared
-/// `PartialReason::InflationRatioExceeded` bucket. Unknown/future variants
-/// conservatively fall back to `EntryOutputBudgetExceeded`.
-#[inline(always)]
-fn map_entry_skip_to_partial(reason: EntrySkipReason) -> PartialReason {
-    match reason {
-        EntrySkipReason::EntryOutputBudgetExceeded => PartialReason::EntryOutputBudgetExceeded,
-        EntrySkipReason::EntryInflationRatioExceeded => PartialReason::InflationRatioExceeded,
-        _ => PartialReason::EntryOutputBudgetExceeded,
-    }
-}
+use crate::archive::outcome::{ArchiveSkipReason, PartialReason};
 
 /// Map a [`BudgetHit`] to the [`PartialReason`] that should be recorded on
 /// the current entry.
@@ -218,6 +204,6 @@ pub(crate) fn budget_hit_to_partial(
             // counterpart (disabled/encrypted/corrupt/I/O/policy gates).
             _ => format_fallback,
         },
-        BudgetHit::SkipEntry(r) => map_entry_skip_to_partial(r),
+        BudgetHit::SkipEntry(r) => r.to_partial(),
     }
 }

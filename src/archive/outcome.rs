@@ -139,6 +139,19 @@ impl EntrySkipReason {
             Self::EntryInflationRatioExceeded => "entry_inflation_ratio_exceeded",
         }
     }
+
+    /// Convert to the corresponding [`PartialReason`] for telemetry recording.
+    ///
+    /// `EntryInflationRatioExceeded` maps to `PartialReason::InflationRatioExceeded`.
+    /// All other variants (including future additions) conservatively fall back to
+    /// `PartialReason::EntryOutputBudgetExceeded`.
+    pub const fn to_partial(self) -> PartialReason {
+        match self {
+            Self::EntryOutputBudgetExceeded => PartialReason::EntryOutputBudgetExceeded,
+            Self::EntryInflationRatioExceeded => PartialReason::InflationRatioExceeded,
+            _ => PartialReason::EntryOutputBudgetExceeded,
+        }
+    }
 }
 
 /// Why an archive was only partially scanned.

@@ -344,18 +344,7 @@ fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
         BudgetHit::SkipArchive(r) => ArchiveEnd::Skipped(r),
         BudgetHit::PartialArchive(r) => ArchiveEnd::Partial(r),
         BudgetHit::StopRoot(r) => ArchiveEnd::Partial(r),
-        BudgetHit::SkipEntry(r) => {
-            let partial = match r {
-                EntrySkipReason::EntryOutputBudgetExceeded => {
-                    PartialReason::EntryOutputBudgetExceeded
-                }
-                EntrySkipReason::EntryInflationRatioExceeded => {
-                    PartialReason::InflationRatioExceeded
-                }
-                _ => PartialReason::EntryOutputBudgetExceeded,
-            };
-            ArchiveEnd::Partial(partial)
-        }
+        BudgetHit::SkipEntry(r) => ArchiveEnd::Partial(r.to_partial()),
     }
 }
 
