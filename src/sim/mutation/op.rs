@@ -83,22 +83,48 @@ pub enum MutOpKind {
     Extend,
 }
 
-/// Apply mutation operators left-to-right, returning the final bytes.
+/// Result of [`apply_ops`], carrying both the final bytes and how many
+/// operators were actually applied before the pipeline halted.
 ///
-/// An empty `ops` slice returns a copy of `input` unchanged. If any single
-/// operator would produce output exceeding [`MAX_OUTPUT_BYTES`], the pipeline
-/// halts early and returns the last in-bounds state. This makes the function
-/// safe to call with arbitrarily deep randomly-generated operator chains.
-pub fn apply_ops(input: &[u8], ops: &[MutOp]) -> Vec<u8> {
+/// When the output stays within [`MAX_OUTPUT_BYTES`], `ops_applied` equals
+/// `ops.len()`. If a size-limit truncation occurs, `ops_applied` is the
+/// number of operators that completed successfully -- callers can use this
+/// to slice the original `ops` list and pass only the applied operators to
+/// the expectation oracle.
+#[derive(Clone, Debug)]
+pub struct ApplyResult {
+    /// Final mutated bytes.
+    pub bytes: Vec<u8>,
+    /// Number of operators from the input slice that were actually applied.
+    pub ops_applied: usize,
+}
+
+/// Apply mutation operators left-to-right, returning the final bytes and
+/// the number of operators that were actually applied.
+///
+/// An empty `ops` slice returns a copy of `input` unchanged with
+/// `ops_applied == 0`. If any single operator would produce output exceeding
+/// [`MAX_OUTPUT_BYTES`], the pipeline halts early and returns the last
+/// in-bounds state together with the count of operators that completed
+/// successfully. This makes the function safe to call with arbitrarily deep
+/// randomly-generated operator chains, and lets callers (e.g. the expectation
+/// oracle) reason only about the operators that actually ran.
+pub fn apply_ops(input: &[u8], ops: &[MutOp]) -> ApplyResult {
     let mut cur = input.to_vec();
-    for op in ops {
+    for (i, op) in ops.iter().enumerate() {
         let next = apply_single(&cur, op);
         if next.len() > MAX_OUTPUT_BYTES {
-            return cur;
+            return ApplyResult {
+                bytes: cur,
+                ops_applied: i,
+            };
         }
         cur = next;
     }
-    cur
+    ApplyResult {
+        bytes: cur,
+        ops_applied: ops.len(),
+    }
 }
 
 /// Apply a single mutation operator. All out-of-range parameters are clamped
