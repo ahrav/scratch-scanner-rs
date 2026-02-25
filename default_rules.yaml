@@ -1872,6 +1872,9 @@ rules:
     min_bits_per_byte: 3.5
     min_len: 16
     max_len: 256
+  # Stage 1 policy for this broad catch-all: emit only at confidence >= 5,
+  # requiring measured entropy alongside assignment-shape + keyword signals.
+  min_confidence: 5
   two_phase: null
   local_context:
     lookbehind: 256
