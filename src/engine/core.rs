@@ -1110,7 +1110,8 @@ impl Engine {
         }
     }
 
-    /// Resolves the Shannon entropy gate for a rule.
+    /// Resolves the entropy-family gate for a rule (Shannon, optional min-entropy,
+    /// optional digit-penalty).
     ///
     /// # Panics
     /// Panics on out-of-bounds index, indicating corrupted compiled rule data.

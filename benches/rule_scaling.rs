@@ -15,8 +15,9 @@
 //! 1. **Cost per rule**: How much throughput do we lose per additional rule?
 //!    Helps decide whether to add new detection rules or optimize existing ones.
 //!
-//! 2. **UTF-16 impact**: UTF-16 variants double pattern count (LE + BE). When is
-//!    this cost justified vs. scanning only UTF-8?
+//! 2. **UTF-16 impact**: UTF-16 variants add LE and BE copies of every anchor
+//!    (tripling the prefilter pattern count). When is this cost justified
+//!    vs. scanning only UTF-8?
 //!
 //! 3. **Inflection points**: At what rule counts does Vectorscan's automaton
 //!    become less efficient (state explosion, cache pressure)?
@@ -84,9 +85,10 @@ const BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Generate pseudo-random lowercase ASCII text with 80-character lines.
 ///
-/// This represents "clean" data with no secrets—the worst case for Vectorscan
-/// because it must scan the entire buffer without finding any anchors. The
-/// xorshift PRNG ensures deterministic output for reproducible benchmarks.
+/// This represents "clean" data with no secrets—the best case for Vectorscan
+/// because zero anchor callbacks fire. This isolates Vectorscan's raw
+/// scanning speed from post-match validation overhead. The xorshift PRNG
+/// ensures deterministic output for reproducible benchmarks.
 ///
 /// # Why lowercase only?
 ///
@@ -138,9 +140,11 @@ fn gen_clean_ascii(size: usize, seed: u64) -> Vec<u8> {
 ///   stress Vectorscan's state machine with many patterns
 /// - 8+ chars: Unrealistic; most real anchors (AKIA, ghp_, etc.) are 3-8 chars
 ///
-/// # Panics
+/// # Wrapping behavior
 ///
-/// Panics if `count` exceeds 456,976 (26^4), exhausting the base-26 address space.
+/// If `count` exceeds 456,976 (26^4), anchors wrap around and collide.
+/// This is acceptable for benchmark purposes since the tested range
+/// (up to 250 rules) is well within the unique address space.
 fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
     (0..count)
         .map(|i| {
@@ -197,7 +201,7 @@ fn generate_unique_rules(count: usize) -> Vec<RuleSpec> {
 /// # Anchor structure
 ///
 /// - Group prefix: 2 chars based on group number (AA, AB, AC, ...)
-/// - Rule suffix: 2 chars based on rule index within group
+/// - Rule suffix: 2 chars based on global rule index (not per-group index)
 /// - Full anchor: 4 chars (e.g., "AAAB" = group 0, rule 1)
 ///
 /// # Note
@@ -631,7 +635,8 @@ fn bench_grouped_vs_unique(c: &mut Criterion) {
 /// # Trade-off
 ///
 /// - **Benefit**: Detect secrets in UTF-16 files without preprocessing
-/// - **Cost**: Roughly 2x pattern count, larger automaton, more cache pressure
+/// - **Cost**: ~3x total prefilter pattern count (raw + LE + BE), larger
+///   automaton, more cache pressure
 ///
 /// # Test methodology
 ///
@@ -653,8 +658,8 @@ fn bench_utf16_impact(c: &mut Criterion) {
 
     let rules = generate_realistic_rules(100);
 
-    // Baseline: UTF-8 only — the engine compiles one Vectorscan database
-    // containing only the original anchor patterns.
+    // Baseline: `scan_utf16_variants = false` — the prefilter DB still contains
+    // UTF-16 patterns, but the separate UTF-16 anchor DB scan is skipped at runtime.
     let tuning_no_utf16 = Tuning {
         max_transform_depth: 0,
         scan_utf16_variants: false,

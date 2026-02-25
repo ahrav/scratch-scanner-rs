@@ -75,9 +75,11 @@ use regex::bytes::Regex;
 
 /// Encoding variant that determines byte layout for anchors, keywords, and gate patterns.
 ///
-/// Every anchor, keyword, and gate literal is compiled into three encoding
+/// Anchors, keywords, and most gate literals are compiled into three encoding
 /// variants (Raw, UTF-16LE, UTF-16BE) so the scan loop can gate on raw bytes
-/// without runtime encoding conversion. The variant also controls window
+/// without runtime encoding conversion. Value suppressors are the exception:
+/// they run on extracted secret bytes (always decoded) and are compiled raw-only.
+/// The variant also controls window
 /// scaling: UTF-16 encodes each ASCII character as two bytes, so window radii
 /// must double to cover the same number of logical characters.
 ///

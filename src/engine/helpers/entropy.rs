@@ -28,8 +28,10 @@
 //!
 //! 1. **Length check** -- `len < min_len` returns `BypassedShortLen` immediately.
 //!    Short samples have noisy entropy; failing open avoids false negatives.
-//! 2. **Histogram + metrics** -- a single fused pass computes Shannon entropy,
-//!    max bin count, and the all-digits flag over `bytes[..min(len, max_len)]`.
+//! 2. **Histogram + metrics** -- two fused loops compute all metrics over
+//!    `bytes[..min(len, max_len)]`: a byte-level pass builds the histogram
+//!    and tracks the all-digits flag, then a 256-bin scan derives Shannon
+//!    entropy and max-bin-count.
 //! 3. **Digit penalty** (if enabled) -- for all-digit slices, subtract
 //!    `1.2 / log2(capped_len)` from Shannon before thresholding.
 //! 4. **Shannon check** -- compare effective Shannon against `min_bits_per_byte`.
@@ -90,10 +92,10 @@ fn log2_lookup(table: &[f32], n: usize) -> f32 {
 
 /// Raw metric values from the entropy-family gate.
 ///
-/// All fields are computed in a single fused pass over the 256-bin histogram
-/// inside [`compute_entropy_metrics`]. Shannon entropy uses all bins;
-/// min-entropy only needs `max_bin_count`; the digit-penalty flag is
-/// piggybacked onto the histogram loop to avoid a second scan.
+/// Shannon entropy and max-bin-count are computed in a single fused pass over
+/// the 256-bin histogram inside [`compute_entropy_metrics`]; the all-digits
+/// flag is piggybacked onto the preceding histogram-building loop; `log2_n`
+/// is a standalone table lookup.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EntropyMetrics {
     /// Shannon entropy in bits per byte.

@@ -21,7 +21,8 @@
 //!    which mirror the on-disk schema using owned `String` / `Vec` types.
 //! 2. **Compile regex** — the pattern string is compiled into a
 //!    `regex::bytes::Regex` via [`super::build_regex`], which retries with
-//!    progressively larger DFA size limits on `CompiledTooBig` errors. This
+//!    progressively larger compile-size limits (both compiled regex and DFA
+//!    cache) on `CompiledTooBig` errors. This
 //!    step runs *outside* the interning lock to avoid holding the mutex
 //!    during potentially expensive compilation.
 //! 3. **Intern and assemble** — string/byte fields are interned into the
@@ -286,15 +287,15 @@ pub(crate) struct YamlTwoPhase {
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlLocalContext {
-    /// Bytes to examine before the start of the regex match span.
+    /// Bytes to examine before the start of the secret span.
     pub lookbehind: usize,
-    /// Bytes to examine after the end of the regex match span.
+    /// Bytes to examine after the end of the secret span.
     pub lookahead: usize,
-    /// Require an assignment separator (`=`, `:`, etc.) on the same line
+    /// Require an assignment separator (`=`, `:`, or `>`) on the same line
     /// preceding the secret. Catches unanchored regex matches in prose.
     #[serde(default)]
     pub require_same_line_assignment: bool,
-    /// Require the secret to be wrapped in matching quotes (`"`, `'`).
+    /// Require the secret to be wrapped in matching quotes (`"`, `'`, or `` ` ``).
     #[serde(default)]
     pub require_quoted: bool,
     /// Key names (any-of) that must appear on the same line as the match.

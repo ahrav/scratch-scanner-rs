@@ -56,8 +56,8 @@
 //! # Relationship to `rule_scaling`
 //!
 //! `rule_scaling` measures how throughput changes as the *number* of rules
-//! grows. This benchmark holds rule count roughly constant and varies *which*
-//! rules are active, isolating per-rule quality rather than quantity.
+//! grows. This benchmark varies *which* rules are active (and sometimes isolates
+//! a single rule), focusing on per-rule quality rather than quantity.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use regex::bytes::Regex;
@@ -329,7 +329,7 @@ fn aws_rule() -> RuleSpec {
 ///
 /// # Experimental design
 ///
-/// Four engine configurations, each with 10 total rule slots:
+/// Four engine configurations (three padded to 10 rules, one isolated):
 ///
 /// | Config               | Rule composition                        |
 /// |----------------------|-----------------------------------------|
@@ -495,7 +495,7 @@ fn bench_generic_api_key_impact(c: &mut Criterion) {
 
 /// Measure throughput of the full production rule set as an absolute reference.
 ///
-/// Uses `demo_engine_with_anchor_mode(Manual)` which loads all ~200 gitleaks
+/// Uses `demo_engine_with_anchor_mode(Manual)` which loads all ~220 gitleaks
 /// rules with their hand-specified anchors. This provides the "real world"
 /// throughput number that the isolation benchmarks above help explain: if the
 /// full engine is slow, the per-rule benchmarks show which rule(s) are to blame.

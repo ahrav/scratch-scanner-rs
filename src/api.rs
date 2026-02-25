@@ -603,8 +603,8 @@ pub struct LocalContextSpec {
     /// line before the secret. Fail-open when line bounds cannot be
     /// determined.
     pub require_same_line_assignment: bool,
-    /// Require the secret to be wrapped in matching quotes (`"..."` or
-    /// `'...'`). Fail-open when the secret span is outside the window.
+    /// Require the secret to be wrapped in matching quotes (`"..."`,
+    /// `'...'`, or `` `...` ``). Fail-open when the secret span is outside the window.
     pub require_quoted: bool,
     /// Optional key names that must appear on the same line before the
     /// secret (any-of match). When `Some`, at least one literal must be
@@ -657,9 +657,11 @@ impl LocalContextSpec {
 ///
 /// # Performance
 /// - Smaller `radius` values reduce regex work but can miss matches if too small.
-/// - `must_contain`, `keywords_any`, `char_class`, and `entropy` act as
-///   lightweight pre-/post-regex filters evaluated on the match window
-///   (each cheaper than full regex evaluation).
+/// - `must_contain`, `keywords_any`, and `char_class` act as lightweight
+///   pre-/post-regex filters evaluated on the match window (each cheaper
+///   than full regex evaluation).
+/// - `entropy` is a post-extraction filter evaluated on the extracted
+///   secret bytes, not the full match window.
 /// - `value_suppressors_any` is a post-extraction filter that runs after regex
 ///   matching and entropy gating; it adds minimal cost per confirmed match but
 ///   does not reduce regex work.
