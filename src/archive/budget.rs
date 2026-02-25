@@ -1145,6 +1145,22 @@ mod tests {
         b.end_entry(true);
     }
 
+    #[test]
+    fn ratio_zero_disables_all_ratio_enforcement() {
+        let mut c = cfg();
+        c.max_inflation_ratio = 0;
+        c.max_uncompressed_bytes_per_entry = u64::MAX;
+        c.max_total_uncompressed_bytes_per_archive = u64::MAX;
+        c.max_total_uncompressed_bytes_per_root = u64::MAX;
+
+        let mut b = ArchiveBudgets::new(&c);
+        b.enter_archive().unwrap();
+        b.begin_entry().unwrap();
+        b.charge_compressed_in(1);
+        // ratio=0 disables enforcement; unlimited output allowed.
+        assert_eq!(b.charge_decompressed_out(1_000_000), ChargeResult::Ok);
+    }
+
     /// The constructor clamps `max_uncompressed_bytes_per_entry` to
     /// `ENTRY_NOT_OPEN - 1`, preventing the sentinel collision where
     /// `saturating_add` could reach `u64::MAX`.

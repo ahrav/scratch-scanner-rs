@@ -1173,6 +1173,47 @@ fn tar_nested_gzip_ratio_partial_allows_later_entries() {
 }
 
 #[test]
+fn tar_nested_gzip_entry_ratio_fires_per_entry() {
+    let tmp = TempDir::new().unwrap();
+    let tar_path = tmp.path().join("entry_ratio.tar");
+
+    // 8 KiB of repeated bytes compresses to ~30 bytes in gzip, giving a
+    // ratio well above 2.  The second entry is a normal plaintext file.
+    let bomb_payload = vec![b'A'; 8192];
+    let bomb_gz = build_gz_bytes(&bomb_payload);
+    let later = payload_with_secret_at(0);
+    let tar_bytes = build_tar(&[("bomb.gz", bomb_gz.as_slice()), ("later.txt", &later)]);
+    fs::write(&tar_path, tar_bytes).unwrap();
+
+    let mut cfg = cfg_archives_enabled();
+    cfg.archive.max_inflation_ratio = 2;
+
+    let (out, report) = run_scan(vec![file_from_path(&tar_path)], cfg);
+    let findings = parse_findings(&out);
+
+    // The later entry should still be scanned despite the bomb triggering ratio.
+    let hit = findings.iter().find(|f| f.path.contains("later.txt"));
+    assert!(
+        hit.is_some(),
+        "expected finding in later entry; output: {out}"
+    );
+    assert_locator(&hit.unwrap().path, 't');
+
+    // Verify the entry-level skip reason counter was incremented (not just
+    // the archive-level partial reason).
+    assert_perf!(
+        report.metrics.archive.entry_skip_reasons
+            [EntrySkipReason::EntryInflationRatioExceeded.as_usize()]
+            > 0,
+        report.metrics.archive.entry_skip_reasons
+            [EntrySkipReason::EntryInflationRatioExceeded.as_usize()]
+            == 0,
+        "expected entry inflation ratio skip to be recorded; metrics={:?}",
+        report.metrics.archive
+    );
+}
+
+#[test]
 fn finds_secret_in_targz_with_virtual_path() {
     let tmp = TempDir::new().unwrap();
     let tgz = tmp.path().join("bundle.tar.gz");

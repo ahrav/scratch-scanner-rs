@@ -143,13 +143,22 @@ impl EntrySkipReason {
     /// Convert to the corresponding [`PartialReason`] for telemetry recording.
     ///
     /// `EntryInflationRatioExceeded` maps to `PartialReason::InflationRatioExceeded`.
-    /// All other variants (including future additions) conservatively fall back to
-    /// `PartialReason::EntryOutputBudgetExceeded`.
+    /// All other variants map to `PartialReason::EntryOutputBudgetExceeded`.
+    ///
+    /// The match is exhaustive so that adding a new `EntrySkipReason` variant
+    /// produces a compile error, forcing an explicit mapping decision.
     pub const fn to_partial(self) -> PartialReason {
         match self {
             Self::EntryOutputBudgetExceeded => PartialReason::EntryOutputBudgetExceeded,
             Self::EntryInflationRatioExceeded => PartialReason::InflationRatioExceeded,
-            _ => PartialReason::EntryOutputBudgetExceeded,
+            Self::NonRegular
+            | Self::MalformedPath
+            | Self::EncryptedEntry
+            | Self::UnsupportedCompression
+            | Self::CorruptPayload
+            | Self::CorruptEntry
+            | Self::IoError
+            | Self::UnsupportedFeature => PartialReason::EntryOutputBudgetExceeded,
         }
     }
 }
