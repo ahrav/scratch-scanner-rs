@@ -16,8 +16,8 @@ deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
 |-----|-------------------------|--------------------------------------------|---------|----------------------|-------------------------------------------------------------|
 | 1   | Property tests          | `tests/property/` (19 files)               | ~5,032  | `property-tests`     | Mathematical invariants (soundness, determinism, roundtrip) |
 | 2   | Simulation tests        | `tests/simulation/` (13 `.rs` files)       | ~3,059  | `sim-harness` etc.   | System-level behavior (scheduling, chunking, faults)        |
-| 3   | Corpus replay — scanner | `tests/corpus/scanner/` (72 `.case.json`)  | N/A     | `sim-harness`        | Deterministic regression replay                             |
-| 4   | Corpus replay — git     | `tests/corpus/git_scan/` (12 `.case.json`) | N/A     | `sim-harness`        | Git deterministic regression replay                         |
+| 3   | Corpus replay — scanner | `tests/corpus/scanner/` (71 `.case.json`)  | N/A     | `sim-harness`        | Deterministic regression replay                             |
+| 4   | Corpus replay — git     | `tests/corpus/git_scan/` (11 `.case.json`) | N/A     | `sim-harness`        | Git deterministic regression replay                         |
 | 5   | Scanner sim module      | `src/sim_scanner/` (7 files)               | ~3,550  | `sim-harness`        | Scenario generation, runner, oracles                        |
 | 6   | Git sim module          | `src/sim_git_scan/` (18 files)             | ~4,171  | `sim-harness`        | Git repo model generation, stage pipeline                   |
 | 7   | Shared sim infra        | `src/sim/` (9 files)                       | ~1,745  | `sim-harness`        | RNG, fault injection, minimization, executor                |
@@ -54,7 +54,7 @@ behind `sim-harness`.
 
 ### 1.3 Corpus Replay
 
-Seventy-two scanner `.case.json` files and twelve git-scan `.case.json` files
+Seventy-one scanner `.case.json` files and eleven git-scan `.case.json` files
 in `tests/corpus/`. Each case is a serialized scenario + fault plan + schedule
 seed that deterministically replays in milliseconds. New failures discovered by
 random simulation are minimized and added here. This is the fastest regression
