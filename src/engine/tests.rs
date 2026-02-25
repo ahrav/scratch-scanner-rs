@@ -7024,3 +7024,51 @@ fn digit_penalty_rejects_all_digit_secret() {
         "without digit_penalty the same all-digit secret should pass Shannon"
     );
 }
+
+/// Integration test: full `Engine::scan_chunk → window_validate → entropy_gate_outcome`
+/// pipeline with `digit_penalty: true`.
+///
+/// An all-digit secret clears 3.0 bpb Shannon on its own but the penalty
+/// pushes effective entropy below the threshold → rejected.  A mixed hex
+/// secret of the same length is unaffected by the penalty → accepted.
+#[test]
+fn digit_penalty_integration_mixed_vs_all_digit() {
+    let rule = RuleSpec {
+        radius: 64,
+        entropy: Some(EntropySpec {
+            min_bits_per_byte: 3.0,
+            min_len: 8,
+            max_len: 32,
+            min_entropy_bits_per_byte: None,
+            digit_penalty: true,
+        }),
+        secret_group: Some(1),
+        ..base_rule(
+            "dp-hex",
+            &[b"TOK_"],
+            Regex::new(r"TOK_([A-Fa-f0-9]{10})").unwrap(),
+        )
+    };
+
+    let engine = Engine::new_with_anchor_policy(
+        vec![rule],
+        Vec::new(),
+        demo_tuning(),
+        AnchorPolicy::ManualOnly,
+    );
+
+    // All-digit secret: Shannon ~3.32 bpb clears 3.0 without penalty, but
+    // the digit-only penalty pushes it below → should be rejected.
+    let all_digit = scan_chunk_findings(&engine, b"prefix TOK_0123456789 suffix");
+    assert!(
+        all_digit.is_empty(),
+        "digit_penalty should reject all-digit secret in full pipeline"
+    );
+
+    // Mixed hex secret: penalty does not apply → should pass entropy gate.
+    let mixed_hex = scan_chunk_findings(&engine, b"prefix TOK_0a1b2c3d4e suffix");
+    assert!(
+        !mixed_hex.is_empty(),
+        "mixed hex secret should pass entropy gate despite digit_penalty being enabled"
+    );
+}
