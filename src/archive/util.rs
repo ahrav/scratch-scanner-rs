@@ -171,7 +171,21 @@ pub(crate) fn read_exact_n<R: Read + ?Sized>(
 // ── Budget-hit mapping ───────────────────────────────────────────────────────
 
 use crate::archive::budget::BudgetHit;
-use crate::archive::outcome::{ArchiveSkipReason, PartialReason};
+use crate::archive::outcome::{ArchiveSkipReason, EntrySkipReason, PartialReason};
+
+/// Map entry-scope skip reasons to entry partial-reason telemetry.
+///
+/// `EntryInflationRatioExceeded` is promoted to the shared
+/// `PartialReason::InflationRatioExceeded` bucket. Unknown/future variants
+/// conservatively fall back to `EntryOutputBudgetExceeded`.
+#[inline(always)]
+fn map_entry_skip_to_partial(reason: EntrySkipReason) -> PartialReason {
+    match reason {
+        EntrySkipReason::EntryOutputBudgetExceeded => PartialReason::EntryOutputBudgetExceeded,
+        EntrySkipReason::EntryInflationRatioExceeded => PartialReason::InflationRatioExceeded,
+        _ => PartialReason::EntryOutputBudgetExceeded,
+    }
+}
 
 /// Map a [`BudgetHit`] to the [`PartialReason`] that should be recorded on
 /// the current entry.
@@ -180,6 +194,8 @@ use crate::archive::outcome::{ArchiveSkipReason, PartialReason};
 /// `PartialReason` counterpart collapse to `format_fallback`, which the
 /// caller sets to the format-specific malformed reason (e.g.
 /// `PartialReason::MalformedTar`, `PartialReason::MalformedZip`).
+///
+/// `SkipEntry` is always promoted into an entry-level partial reason.
 #[inline(always)]
 pub(crate) fn budget_hit_to_partial(
     hit: BudgetHit,
@@ -198,13 +214,10 @@ pub(crate) fn budget_hit_to_partial(
             ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
             ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
             ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-            // Catch-all for format-specific skip reasons (e.g. MalformedTar,
-            // MalformedZip) that don't have a direct PartialReason variant.
+            // Catch-all for archive-skip reasons with no direct partial
+            // counterpart (disabled/encrypted/corrupt/I/O/policy gates).
             _ => format_fallback,
         },
-        // The budget system only ever produces
-        // `SkipEntry(EntryOutputBudgetExceeded)`, so the inner reason is
-        // redundant here.  We discard it and map directly.
-        BudgetHit::SkipEntry(_) => PartialReason::EntryOutputBudgetExceeded,
+        BudgetHit::SkipEntry(r) => map_entry_skip_to_partial(r),
     }
 }
