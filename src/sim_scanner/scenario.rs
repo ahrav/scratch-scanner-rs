@@ -92,16 +92,7 @@ pub struct ExpectedSecret {
     pub disposition: ExpectedDisposition,
 }
 
-/// Classification of how a secret is represented in the file.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum SecretRepr {
-    Raw,
-    Base64,
-    UrlPercent,
-    Utf16Le,
-    Utf16Be,
-    Nested { depth: u8 },
-}
+pub use crate::sim::mutation::SecretRepr;
 
 /// Byte span with half-open semantics `[start, end)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
