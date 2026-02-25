@@ -20,6 +20,8 @@
 #     min_bits_per_byte    — Minimum bits of Shannon entropy per byte.
 #     min_entropy_bits_per_byte — Min-entropy (NIST SP 800-90B) floor;
 #                                  see "Min-entropy gate" section below.
+#     digit_penalty        — When true, subtract 1.2/log2(len) from Shannon
+#                             for all-digit entropy slices.
 #     min_len / max_len    — Length bounds for entropy measurement.
 #   two_phase              — Two-pass scan: seed_radius → confirm_any → full_radius.
 #   local_context          — Structural context checks (assignment, quoting, key names).
@@ -237,6 +239,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -761,6 +764,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -830,6 +834,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -1271,6 +1276,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -1559,6 +1565,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -1595,6 +1602,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -2722,6 +2730,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -2825,6 +2834,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -3732,6 +3742,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null
@@ -3784,6 +3795,7 @@ rules:
     min_len: 16
     max_len: 256
     min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
   two_phase: null
   local_context: null
   secret_group: null

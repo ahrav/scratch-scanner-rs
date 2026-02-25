@@ -2193,6 +2193,7 @@ fn value_suppressor_with_entropy_and_local_context_combined() {
             min_len: 8,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         local_context: Some(LocalContextSpec {
             lookbehind: 64,
@@ -2395,6 +2396,7 @@ fn entropy_gate_filters_low_entropy_matches() {
             min_len: 8,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         ..base_rule(
             "entropy-gate",
@@ -2435,6 +2437,7 @@ fn entropy_gate_evaluated_on_extracted_secret() {
         min_len: 4,
         max_len: 64,
         min_entropy_bits_per_byte: None,
+        digit_penalty: false,
     });
 
     // --- (a) Reject: full match high entropy, secret zero entropy ----------
@@ -3444,6 +3447,7 @@ fn scan_rules_reference(
                             if let Some(spec) = rule.entropy.as_ref() {
                                 let ent = EntropyCompiled {
                                     min_bits_per_byte: spec.min_bits_per_byte,
+                                    digit_penalty: spec.digit_penalty,
                                     min_len: spec.min_len,
                                     max_len: spec.max_len,
                                     min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
@@ -3566,6 +3570,7 @@ fn scan_rules_reference(
                                 if let Some(spec) = rule.entropy.as_ref() {
                                     let ent = EntropyCompiled {
                                         min_bits_per_byte: spec.min_bits_per_byte,
+                                        digit_penalty: spec.digit_penalty,
                                         min_len: spec.min_len,
                                         max_len: spec.max_len,
                                         min_entropy_bits_per_byte: spec.min_entropy_bits_per_byte,
@@ -6366,6 +6371,7 @@ fn confidence_score_entropy_gate() {
             min_len: 4,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         secret_group: Some(1),
         ..base_rule(
@@ -6499,6 +6505,7 @@ fn confidence_score_multiple_gates_accumulate() {
             min_len: 4,
             max_len: 32,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         offline_validation: Some(OfflineValidationSpec::Crc32Base62 {
             prefix_skip: 4,
@@ -6582,6 +6589,7 @@ fn stage1_generic_api_key_rule() -> RuleSpec {
             min_len: 16,
             max_len: 64,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         min_confidence: Some(5),
         secret_group: None,
@@ -6663,6 +6671,7 @@ fn keyword_entropy_auto_tier_requires_measured_entropy_evidence() {
             min_len: 16,
             max_len: 64,
             min_entropy_bits_per_byte: None,
+            digit_penalty: false,
         }),
         secret_group: Some(1),
         ..base_rule(
@@ -6759,6 +6768,7 @@ fn rule_min_confidence_keywords_plus_entropy_default_is_three() {
         min_len: 4,
         max_len: 32,
         min_entropy_bits_per_byte: None,
+        digit_penalty: false,
     });
     let engine = Engine::new_with_anchor_policy(
         vec![rule],
@@ -6818,6 +6828,7 @@ fn rule_min_confidence_offline_plus_keywords_entropy_uses_keyword_tier() {
         min_len: 4,
         max_len: 32,
         min_entropy_bits_per_byte: None,
+        digit_penalty: false,
     });
     let engine = Engine::new_with_anchor_policy(
         vec![rule],

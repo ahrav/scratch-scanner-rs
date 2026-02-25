@@ -55,6 +55,7 @@ fn rulespec_to_yaml(rule: &RuleSpec) -> YamlRule {
         min_len: e.min_len,
         max_len: e.max_len,
         min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
+        digit_penalty: e.digit_penalty,
     });
 
     let two_phase = rule.two_phase.as_ref().map(|tp| YamlTwoPhase {
@@ -915,6 +916,7 @@ fn default_rules_yaml_has_no_unknown_fields() {
         "min_len",
         "max_len",
         "min_entropy_bits_per_byte",
+        "digit_penalty",
     ];
     let two_phase_fields: &[&str] = &["seed_radius", "full_radius", "confirm_any"];
     let local_ctx_fields: &[&str] = &[
@@ -2018,6 +2020,10 @@ rules:
         Some(2.0),
         "parsed min_entropy_bits_per_byte should be Some(2.0)"
     );
+    assert!(
+        !ent.digit_penalty,
+        "digit_penalty should default to false when omitted"
+    );
 
     // Round-trip through YAML serialization.
     let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
@@ -2032,6 +2038,42 @@ rules:
         reparsed_ent.min_entropy_bits_per_byte,
         Some(2.0),
         "round-tripped min_entropy_bits_per_byte should be Some(2.0)"
+    );
+    assert!(
+        !reparsed_ent.digit_penalty,
+        "round-tripped digit_penalty should stay false when omitted"
+    );
+}
+
+#[test]
+fn roundtrip_digit_penalty_true() {
+    let yaml = r#"
+rules:
+  - name: "rt-digit-penalty"
+    regex: '[a-f0-9]{40}'
+    anchors: ["tok_"]
+    radius: 64
+    entropy:
+      min_bits_per_byte: 3.0
+      min_len: 20
+      max_len: 128
+      digit_penalty: true
+"#;
+    let original = parse_yaml_rules(yaml).expect("parse");
+    let ent = original[0].entropy.as_ref().expect("entropy present");
+    assert!(ent.digit_penalty, "parsed digit_penalty should be true");
+
+    let yaml_rules: Vec<YamlRule> = original.iter().map(rulespec_to_yaml).collect();
+    let file = YamlRulesFile { rules: yaml_rules };
+    let yaml_str = serde_norway::to_string(&file).expect("serialize");
+    let parsed = parse_yaml_rules(&yaml_str).expect("re-parse");
+    let reparsed_ent = parsed[0]
+        .entropy
+        .as_ref()
+        .expect("entropy present after roundtrip");
+    assert!(
+        reparsed_ent.digit_penalty,
+        "round-tripped digit_penalty should stay true"
     );
 }
 

@@ -176,6 +176,7 @@ graph TB
         MinLen["min_len: usize"]
         MaxLen["max_len: usize"]
         MinEntropyBpb["min_entropy_bits_per_byte: Option&lt;f32&gt;"]
+        DigitPenalty["digit_penalty: bool"]
     end
 
     subgraph CharClassSpec["CharClassSpec (optional)"]
@@ -296,6 +297,7 @@ rules:
     min_len: 16                     # skip gate if secret < min_len bytes
     max_len: 256                    # cap measurement at max_len bytes
     min_entropy_bits_per_byte: null  # min-entropy floor (null = disabled)
+    digit_penalty: false            # subtract 1.2/log2(len) for all-digit entropy slices
   char_class: null                  # auto-enabled when entropy.min_bits_per_byte >= 3.0
   #   max_lower_pct: 95            # override: max % lowercase ASCII before rejection
   #   min_window_len: 32           # override: skip gate for short windows

@@ -61,6 +61,7 @@ impl RuleCase {
                     min_len: *min_len,
                     max_len: *max_len,
                     min_entropy_bits_per_byte: None,
+                    digit_penalty: false,
                 }),
             two_phase: self
                 .two_phase
@@ -272,6 +273,10 @@ proptest! {
                 prop_assert!((entropy.min_bits_per_byte - (*bits_x10 as f32 / 10.0)).abs() <= 1e-6);
                 prop_assert_eq!(entropy.min_len, *min_len);
                 prop_assert_eq!(entropy.max_len, *max_len);
+                prop_assert!(
+                    !entropy.digit_penalty,
+                    "digit_penalty should default to false when omitted"
+                );
             }
             (None, None) => {}
             _ => panic!("entropy presence mismatch"),

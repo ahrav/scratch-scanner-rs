@@ -5,10 +5,12 @@
 //! supported:
 //!
 //! - **Shannon entropy** (always): measures average information per byte. Rejects
-//!   ~80-90% of non-secret matches (repeated characters, prose fragments).
+//!   many non-secret matches (repeated characters, prose fragments).
 //! - **Min-entropy** (optional, per NIST SP 800-90B): `H_inf = log2(n) - log2(max_count)`.
 //!   Catches skewed distributions where one byte dominates even though Shannon
 //!   looks moderate.
+//! - **Digit-only penalty** (optional): for all-ASCII-digit slices, subtract
+//!   `1.2 / log2(len)` from Shannon before thresholding (detect-secrets style).
 //!
 //! # Role in the confidence model
 //!
@@ -29,6 +31,9 @@
 
 use crate::engine::rule_repr::EntropyCompiled;
 use crate::engine::scratch::EntropyScratch;
+
+/// detect-secrets digit-only penalty coefficient.
+const DIGIT_ONLY_PENALTY_NUMERATOR: f32 = 1.2;
 
 /// Precomputes log2 values for entropy calculations.
 ///
@@ -71,6 +76,8 @@ pub(crate) struct EntropyMetrics {
     /// min-entropy calculation without a second table lookup after the
     /// `scratch.reset()` / `bzero` barrier that prevents CSE.
     pub(crate) log2_n: f32,
+    /// True when every evaluated byte is an ASCII digit (`0..=9`).
+    pub(crate) all_ascii_digits: bool,
 }
 
 /// Canonical decision outcome for an entropy gate evaluation.
@@ -108,7 +115,7 @@ impl EntropyGateOutcome {
 /// - `scratch` contents are unspecified after return; it is meant for reuse.
 ///
 /// # Returns
-/// - `EntropyMetrics { shannon_bpb: 0.0, max_bin_count: 0, log2_n: 0.0 }` for empty input.
+/// - `EntropyMetrics { shannon_bpb: 0.0, max_bin_count: 0, log2_n: 0.0, all_ascii_digits: false }` for empty input.
 #[inline]
 pub(crate) fn compute_entropy_metrics(
     bytes: &[u8],
@@ -121,14 +128,17 @@ pub(crate) fn compute_entropy_metrics(
             shannon_bpb: 0.0,
             max_bin_count: 0,
             log2_n: 0.0,
+            all_ascii_digits: false,
         };
     }
 
     // Branchless histogram: unconditionally increment the bin for each byte.
     // No "first touch" tracking — the reset zeroes all 256 bins via memset.
+    let mut all_ascii_digits = true;
     for &b in bytes {
         // SAFETY: b is u8, so b as usize is in 0..256; counts has exactly 256 entries.
         unsafe { *scratch.counts.get_unchecked_mut(b as usize) += 1 };
+        all_ascii_digits &= b.is_ascii_digit();
     }
 
     // Shannon entropy: H = log2(n) - (1/n) * sum(c_i * log2(c_i))
@@ -163,6 +173,7 @@ pub(crate) fn compute_entropy_metrics(
         shannon_bpb: log2_n - (sum_c_log2_c / (n as f32)),
         max_bin_count,
         log2_n,
+        all_ascii_digits,
     }
 }
 
@@ -189,7 +200,10 @@ pub(crate) fn shannon_entropy_bits_per_byte(
 /// # Behavior
 /// - Buffers shorter than `spec.min_len` always pass (entropy is noisy).
 /// - Longer buffers are capped at `spec.max_len` for the computation.
-/// - Shannon entropy is always checked first (rejects ~80-90% of non-secrets).
+/// - If `spec.digit_penalty` is enabled, all-digit bytes in the capped slice
+///   use `effective_shannon = shannon - (1.2 / log2(capped_len))`.
+///   (`capped_len == 1` skips the penalty.)
+/// - Shannon entropy is always checked first.
 /// - Min-entropy (optional, per NIST SP 800-90B) is checked second: it catches
 ///   distributions where one byte dominates even though Shannon looks moderate.
 ///
@@ -213,8 +227,17 @@ pub(crate) fn entropy_gate_outcome(
     let capped = len.min(spec.max_len);
     let metrics = compute_entropy_metrics(&bytes[..capped], scratch, log2_table);
 
+    // detect-secrets style penalty for digit-only strings in the capped slice:
+    // effective_shannon = shannon - (1.2 / log2(capped_len)); skip when len==1.
+    let effective_shannon =
+        if spec.digit_penalty && metrics.all_ascii_digits && metrics.log2_n > 0.0 {
+            metrics.shannon_bpb - (DIGIT_ONLY_PENALTY_NUMERATOR / metrics.log2_n)
+        } else {
+            metrics.shannon_bpb
+        };
+
     // Shannon (always checked).
-    if metrics.shannon_bpb < spec.min_bits_per_byte {
+    if effective_shannon < spec.min_bits_per_byte {
         return EntropyGateOutcome::Failed;
     }
 
@@ -339,6 +362,7 @@ mod tests {
     fn entropy_gate_none_min_entropy_is_shannon_only() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 3.0,
+            digit_penalty: false,
             min_len: 1,
             max_len: 256,
             min_entropy_bits_per_byte: None,
@@ -357,6 +381,7 @@ mod tests {
     fn entropy_outcome_failed_when_measured_entropy_below_threshold() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 7.0,
+            digit_penalty: false,
             min_len: 8,
             max_len: 64,
             min_entropy_bits_per_byte: None,
@@ -374,6 +399,7 @@ mod tests {
     fn entropy_outcome_bypassed_for_short_input() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 8.0,
+            digit_penalty: false,
             min_len: 10,
             max_len: 64,
             min_entropy_bits_per_byte: Some(8.0),
@@ -391,6 +417,7 @@ mod tests {
     fn entropy_outcome_passed_when_measured_entropy_meets_threshold() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 3.0,
+            digit_penalty: false,
             min_len: 8,
             max_len: 64,
             min_entropy_bits_per_byte: None,
@@ -409,6 +436,7 @@ mod tests {
     fn entropy_gate_rejects_via_min_entropy() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 1.0, // Very low Shannon threshold (passes)
+            digit_penalty: false,
             min_len: 1,
             max_len: 256,
             min_entropy_bits_per_byte: Some(2.0), // Min-entropy gate catches it
@@ -432,6 +460,7 @@ mod tests {
     fn entropy_gate_below_min_len_passes() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 8.0, // Impossibly high
+            digit_penalty: false,
             min_len: 10,
             max_len: 256,
             min_entropy_bits_per_byte: Some(8.0), // Impossibly high
@@ -450,6 +479,7 @@ mod tests {
     fn entropy_gate_caps_at_max_len() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 3.0,
+            digit_penalty: false,
             min_len: 1,
             max_len: 10,
             min_entropy_bits_per_byte: None,
@@ -477,6 +507,7 @@ mod tests {
     fn short_hex_token_passes_without_min_entropy_gate() {
         let spec = EntropyCompiled {
             min_bits_per_byte: 2.5,
+            digit_penalty: false,
             min_len: 16,
             max_len: 256,
             min_entropy_bits_per_byte: None, // No min-entropy for short hex
@@ -490,6 +521,88 @@ mod tests {
         assert!(
             entropy_gate_outcome(&spec, token, &mut scratch, &table).allows_candidate(),
             "short hex token with repeated nibble should pass without min-entropy gate"
+        );
+    }
+
+    #[test]
+    fn digit_penalty_is_opt_in() {
+        let base = EntropyCompiled {
+            min_bits_per_byte: 3.0,
+            digit_penalty: false,
+            min_len: 1,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+        };
+        let with_penalty = EntropyCompiled {
+            digit_penalty: true,
+            ..base
+        };
+
+        let input = b"0123456789";
+        let table = build_log2_table(64);
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&base, input, &mut scratch, &table),
+            EntropyGateOutcome::PassedMeasured
+        );
+        assert_eq!(
+            entropy_gate_outcome(&with_penalty, input, &mut scratch, &table),
+            EntropyGateOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn digit_penalty_skips_mixed_candidates() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 3.0,
+            digit_penalty: true,
+            min_len: 1,
+            max_len: 64,
+            min_entropy_bits_per_byte: None,
+        };
+        let input = b"01234a6789";
+        let table = build_log2_table(64);
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&spec, input, &mut scratch, &table),
+            EntropyGateOutcome::PassedMeasured
+        );
+    }
+
+    #[test]
+    fn digit_penalty_uses_capped_entropy_window() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 3.0,
+            digit_penalty: true,
+            min_len: 1,
+            max_len: 10,
+            min_entropy_bits_per_byte: None,
+        };
+        // First max_len bytes are all digits; tail byte is non-digit.
+        let input = b"0123456789X";
+        let table = build_log2_table(input.len());
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&spec, input, &mut scratch, &table),
+            EntropyGateOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn digit_penalty_len_one_guard_does_not_penalize() {
+        let spec = EntropyCompiled {
+            min_bits_per_byte: 0.0,
+            digit_penalty: true,
+            min_len: 1,
+            max_len: 1,
+            min_entropy_bits_per_byte: None,
+        };
+        let input = b"7";
+        let table = build_log2_table(1);
+        let mut scratch = EntropyScratch::new();
+        assert_eq!(
+            entropy_gate_outcome(&spec, input, &mut scratch, &table),
+            EntropyGateOutcome::PassedMeasured
         );
     }
 }

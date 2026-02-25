@@ -377,6 +377,12 @@ pub(super) struct EntropyCompiled {
     /// Candidates below this threshold are rejected as low-entropy
     /// (e.g., repeated characters, sequential digits).
     pub(super) min_bits_per_byte: f32,
+    /// Applies a detect-secrets style penalty to all-digit candidates.
+    ///
+    /// When enabled, `1.2 / log2(len)` is subtracted from Shannon entropy for
+    /// entropy slices composed entirely of ASCII digits, using the capped
+    /// entropy window length (`len == 1` is skipped).
+    pub(super) digit_penalty: bool,
     /// Minimum candidate length in bytes for the entropy check to apply.
     pub(super) min_len: usize,
     /// Maximum number of bytes used for the entropy computation.
@@ -394,6 +400,9 @@ pub(super) struct EntropyCompiled {
     /// are rejected even if Shannon entropy passes.
     pub(super) min_entropy_bits_per_byte: Option<f32>,
 }
+
+// Keep this hot-path gate compact: `ResolvedGates` copies it by value.
+const _: () = assert!(core::mem::size_of::<EntropyCompiled>() <= 32);
 
 /// Compiled character-class distribution gate.
 ///
@@ -756,6 +765,7 @@ pub(super) fn compile_rule(spec: &RuleSpec) -> (RuleCompiled, CompiledGates) {
 
     let entropy = spec.entropy.as_ref().map(|e| EntropyCompiled {
         min_bits_per_byte: e.min_bits_per_byte,
+        digit_penalty: e.digit_penalty,
         min_len: e.min_len,
         max_len: e.max_len,
         min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
@@ -1083,6 +1093,7 @@ mod tests {
                 min_len: 4,
                 max_len: 32,
                 min_entropy_bits_per_byte: None,
+                digit_penalty: false,
             });
         }
         if is_generic_api_key {

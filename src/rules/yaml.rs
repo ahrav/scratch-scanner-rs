@@ -76,9 +76,9 @@ use super::RulesError;
 /// for prose rather than a real secret. Rules below it target passwords or
 /// low-entropy strings where the same gate would cause false negatives.
 ///
-/// 3.0 bits/byte was chosen empirically: it separates the ~6 low-entropy
-/// rules (e.g. `nuget-config-password` at 1.0, `asana-client-id` at 2.5)
-/// from the bulk of token-oriented rules.
+/// 3.0 bits/byte was chosen empirically: it separates low-entropy rules
+/// (e.g. `nuget-config-password` at 1.0, `asana-client-id` at 2.5)
+/// from token-oriented rules.
 pub(crate) const AUTO_CHAR_CLASS_ENTROPY_THRESHOLD: f32 = 3.0;
 
 /// Default max-lowercase-percentage for auto-enabled `char_class` gates.
@@ -171,6 +171,11 @@ pub(crate) struct YamlRule {
 /// probability of the single most frequent byte, catching skewed
 /// distributions where one byte value dominates even though the Shannon
 /// entropy across all byte values looks moderate.
+///
+/// `digit_penalty` is an opt-in false-positive reducer for hex-like rules:
+/// when enabled, all-digit candidates in the evaluated entropy slice (after
+/// `max_len` capping) are penalized by `1.2 / log2(len)` before Shannon
+/// threshold comparison (`len == 1` is left unpenalized).
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct YamlEntropy {
@@ -179,6 +184,8 @@ pub(crate) struct YamlEntropy {
     pub max_len: usize,
     #[serde(default)]
     pub min_entropy_bits_per_byte: Option<f32>,
+    #[serde(default)]
+    pub digit_penalty: bool,
 }
 
 /// Character-class pre-filter gate parameters for a rule.
@@ -450,7 +457,7 @@ fn yaml_offline_to_spec(
 ///
 /// 1. Compile the regex pattern (outside the interning lock).
 /// 2. Intern string/byte fields under the global atom pool lock.
-/// 3. Map numeric spec fields (`entropy`, `char_class`) directly.
+/// 3. Map gate config fields (`entropy`, `char_class`) directly.
 /// 4. Apply implicit defaults — auto-enable `char_class` when entropy
 ///    threshold >= [`AUTO_CHAR_CLASS_ENTROPY_THRESHOLD`] and no explicit
 ///    gate is provided.
@@ -541,6 +548,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
             min_len: e.min_len,
             max_len: e.max_len,
             min_entropy_bits_per_byte: e.min_entropy_bits_per_byte,
+            digit_penalty: e.digit_penalty,
         });
 
         let char_class = char_class.map(|cc| CharClassSpec {
@@ -551,7 +559,7 @@ pub(crate) fn parse_yaml_rules(content: &str) -> Result<Vec<RuleSpec>, RulesErro
         // Auto-enable char_class for high-entropy rules that don't explicitly
         // set it. Rules with entropy threshold >= 3.0 bits/byte are scanning
         // for secrets (API keys, tokens), not passwords or low-entropy strings.
-        // Excludes ~6 low-entropy password rules (e.g. nuget-config-password
+        // Excludes low-entropy password-like rules (e.g. nuget-config-password
         // at 1.0).
         //
         // Note: `char_class: null` in YAML deserializes to `None` (same as

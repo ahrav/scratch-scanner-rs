@@ -302,6 +302,7 @@ fn generate_realistic_rules(count: usize) -> Vec<RuleSpec> {
                     min_len: 16,
                     max_len: 256,
                     min_entropy_bits_per_byte: None,
+                    digit_penalty: false,
                 })
             } else {
                 None

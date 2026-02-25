@@ -2239,6 +2239,7 @@ pub fn bench_entropy_gate_passes_with_state(
 ) -> bool {
     let spec = super::rule_repr::EntropyCompiled {
         min_bits_per_byte: min_bits,
+        digit_penalty: false,
         min_len,
         max_len: state.max_len,
         min_entropy_bits_per_byte: None,

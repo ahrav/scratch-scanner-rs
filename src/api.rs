@@ -798,6 +798,10 @@ impl RuleSpec {
 /// - Entropy is computed over the extracted secret span (not the full regex match).
 /// - Matches shorter than `min_len` pass (entropy is noisy on tiny samples).
 /// - Matches longer than `max_len` are capped for cost control (first `max_len` bytes).
+/// - If `digit_penalty` is enabled and the evaluated entropy slice (after
+///   `max_len` capping) is all ASCII digits, Shannon is adjusted by
+///   `-1.2 / log2(len)` before thresholding.
+/// - For `len == 1`, the digit penalty is skipped (`log2(1) == 0`).
 /// - Shannon entropy is checked first. If an optional min-entropy threshold
 ///   (`min_entropy_bits_per_byte`) is configured, it is checked second to
 ///   catch skewed distributions that Shannon alone misses.
@@ -822,6 +826,14 @@ pub struct EntropySpec {
     ///
     /// Candidates below this threshold are rejected. `None` skips the gate.
     pub min_entropy_bits_per_byte: Option<f32>,
+    /// When `true`, apply a digit-only penalty before the Shannon check.
+    ///
+    /// If the evaluated (possibly capped) entropy slice is composed entirely
+    /// of ASCII digits, subtract `1.2 / log2(len)` from Shannon entropy.
+    /// The adjustment is skipped for `len == 1`. This targets common false
+    /// positives such as phone numbers, timestamps, and numeric IDs that can
+    /// clear a 3.0 bits/byte hex threshold.
+    pub digit_penalty: bool,
 }
 
 impl EntropySpec {
@@ -1015,9 +1027,7 @@ pub enum OfflineVerdict {
 /// - Offline valid (5): strong — CRC, check-digit, or charset validation is
 ///   near-cryptographic proof of a real token.
 ///
-/// Phase 1 range: 0–10. With planned future signals (XOR filter -3,
-/// hotword proximity +2, ML classifier +3, paired credential +2) the
-/// range extends to roughly -3–17, well within `i8`.
+/// Phase 1 range: 0–10, well within `i8`.
 pub mod confidence {
     /// Entropy gate passed — secret has sufficient randomness.
     pub const ENTROPY_PASS: i8 = 1;
@@ -1400,6 +1410,7 @@ impl EntropySpec {
                 push_u32_le(out, v.to_bits());
             }
         }
+        push_bool(out, self.digit_penalty);
     }
 }
 
