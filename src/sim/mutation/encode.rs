@@ -78,7 +78,7 @@ pub fn encode_secret(raw: &[u8], repr: &SecretRepr) -> Vec<u8> {
         SecretRepr::UrlPercent => percent_encode_all(raw),
         SecretRepr::Utf16Le => encode_utf16(raw, false),
         SecretRepr::Utf16Be => encode_utf16(raw, true),
-        SecretRepr::Nested { depth } => encode_nested(raw, *depth),
+        SecretRepr::Nested { depth } => encode_nested(raw, *depth, super::op::MAX_OUTPUT_BYTES),
     }
 }
 
@@ -140,22 +140,27 @@ pub fn percent_encode_all(input: &[u8]) -> Vec<u8> {
 /// (e.g. a base64 token stored in a URL query parameter that is itself
 /// percent-encoded).
 ///
-/// **Growth warning:** Each base64 layer expands size by ~4/3x and each
-/// percent layer by 3x. Callers should bound `depth` to avoid runaway
-/// allocation; see [`op::MAX_NESTED_DEPTH`](super::op::MAX_NESTED_DEPTH).
+/// After each layer, the intermediate size is checked against `max_bytes`.
+/// If exceeded, the function returns the last result that fit within the
+/// limit. This prevents transient multi-megabyte allocations when deep
+/// nesting is applied to large inputs.
 ///
 /// Depth 0 returns the raw bytes unchanged.
-pub fn encode_nested(raw: &[u8], depth: u8) -> Vec<u8> {
+pub fn encode_nested(raw: &[u8], depth: u8, max_bytes: usize) -> Vec<u8> {
     if depth == 0 {
         return raw.to_vec();
     }
     let mut cur = raw.to_vec();
     for i in 0..depth {
-        if i % 2 == 0 {
-            cur = base64_encode_std(&cur);
+        let next = if i % 2 == 0 {
+            base64_encode_std(&cur)
         } else {
-            cur = percent_encode_all(&cur);
+            percent_encode_all(&cur)
+        };
+        if next.len() > max_bytes {
+            return cur;
         }
+        cur = next;
     }
     cur
 }
@@ -274,7 +279,7 @@ mod tests {
     #[test]
     fn nested_depth_zero_is_identity() {
         let raw = b"hello";
-        assert_eq!(encode_nested(raw, 0), raw);
+        assert_eq!(encode_nested(raw, 0, usize::MAX), raw);
     }
 
     #[test]
@@ -282,7 +287,7 @@ mod tests {
         let raw = b"hi";
         let d1 = base64_encode_std(raw); // base64 layer
         let d2 = percent_encode_all(&d1); // percent layer
-        assert_eq!(encode_nested(raw, 2), d2);
+        assert_eq!(encode_nested(raw, 2, usize::MAX), d2);
     }
 
     // -- base64url --
@@ -353,5 +358,24 @@ mod tests {
             base62_encode_u32(val, &mut buf);
             assert_eq!(decode(&buf), val, "roundtrip failed for {val}");
         }
+    }
+
+    #[test]
+    fn encode_nested_respects_max_bytes() {
+        // ~100KB input at depth 4: base64 (~133KB) → percent (~400KB) → base64 (~533KB) → percent (~1.6MB).
+        // With a 512KB cap, the function should stop before the final percent layer.
+        let input = vec![0xABu8; 100_000];
+        let max = 512 * 1024;
+        let result = encode_nested(&input, 4, max);
+        assert!(
+            result.len() <= max,
+            "encode_nested exceeded max_bytes: {} > {max}",
+            result.len(),
+        );
+        // Should have applied at least one layer (base64 of 100KB ≈ 133KB < 512KB).
+        assert_ne!(
+            result, input,
+            "at least one encoding layer should have been applied"
+        );
     }
 }

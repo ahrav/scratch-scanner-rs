@@ -18,29 +18,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::family::TokenFamily;
+use super::family::{Outcome, TokenFamily};
 use super::op::{apply_ops, MutOp};
 use crate::sim::rng::SimRng;
-
-/// Expected detection outcome for a mutated token.
-///
-/// This three-valued logic lets the test oracle distinguish between mutations
-/// that **provably** break a detection invariant and mutations whose effect
-/// depends on engine heuristics (entropy thresholds, boundary lookahead, etc.).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Outcome {
-    /// The engine **must** detect this token. No mutation alters a property
-    /// the engine checks, so a miss is a false negative bug.
-    MustMatch,
-    /// The engine **must not** detect this token. At least one mutation breaks
-    /// a hard constraint (length, charset, prefix, or checksum), so a hit is
-    /// a false positive bug.
-    MustNotMatch,
-    /// The engine **may or may not** detect this token. The mutation affects
-    /// a soft heuristic (entropy, encoding depth, trailing bytes), so either
-    /// outcome is acceptable.
-    MayMatch,
-}
 
 /// Surrounding context in which a mutated token is embedded.
 ///

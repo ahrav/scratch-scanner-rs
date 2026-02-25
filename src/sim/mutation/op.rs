@@ -148,7 +148,7 @@ fn apply_single(input: &[u8], op: &MutOp) -> Vec<u8> {
         MutOp::Encode { repr } => {
             if let SecretRepr::Nested { depth } = repr {
                 let clamped = (*depth).min(MAX_NESTED_DEPTH);
-                return super::encode::encode_nested(input, clamped);
+                return super::encode::encode_nested(input, clamped, MAX_OUTPUT_BYTES);
             }
             super::encode::encode_secret(input, repr)
         }

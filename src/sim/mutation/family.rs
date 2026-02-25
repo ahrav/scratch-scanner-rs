@@ -28,8 +28,27 @@ use super::encode::{
     base62_encode_u32, base64_encode_std, base64url_encode_nopad, percent_encode_all, BASE62_CHARS,
 };
 use super::op::{MutOp, MutOpKind};
-use super::plan::Outcome;
 use crate::sim::rng::SimRng;
+
+/// Expected detection outcome for a mutated token.
+///
+/// This three-valued logic lets the test oracle distinguish between mutations
+/// that **provably** break a detection invariant and mutations whose effect
+/// depends on engine heuristics (entropy thresholds, boundary lookahead, etc.).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    /// The engine **must** detect this token. No mutation alters a property
+    /// the engine checks, so a miss is a false negative bug.
+    MustMatch,
+    /// The engine **must not** detect this token. At least one mutation breaks
+    /// a hard constraint (length, charset, prefix, or checksum), so a hit is
+    /// a false positive bug.
+    MustNotMatch,
+    /// The engine **may or may not** detect this token. The mutation affects
+    /// a soft heuristic (entropy, encoding depth, trailing bytes), so either
+    /// outcome is acceptable.
+    MayMatch,
+}
 
 /// AWS base-32 alphabet (RFC 4648 section 6): `A`--`Z` map to 0--25, `2`--`7`
 /// map to 26--31. Used for the 16-character body of AWS access key IDs.
@@ -136,11 +155,12 @@ impl TokenFamily {
     ///   on engine heuristics (e.g. entropy thresholds), so the test harness
     ///   should accept either outcome.
     ///
-    /// The scan is first-match: the method returns as soon as any single
-    /// operator produces a definitive `MustNotMatch` or `MayMatch` result.
-    /// Operators that are no-ops at their given parameters (e.g. `Truncate`
-    /// with `len >= canonical.len()`) fall through without affecting the
-    /// outcome.
+    /// The oracle evaluates the full operator chain left-to-right, tracking
+    /// the running token length so that later operators (e.g. a `Truncate`
+    /// after an `Extend`) can be evaluated against the post-mutation state
+    /// rather than the original canonical token. A `MustNotMatch` from any
+    /// operator immediately dominates the result. Soft effects (`MayMatch`)
+    /// are accumulated but can be overridden by a later hard breaker.
     ///
     /// Receives the canonical (pre-mutation) token so that length-dependent
     /// operators like `Truncate` can compare against the original size.
@@ -149,20 +169,28 @@ impl TokenFamily {
             return Outcome::MustMatch;
         }
 
+        let canonical_len = canonical.len();
+        let mut running_len = canonical_len;
+        let mut worst = Outcome::MustMatch;
+
         for op in ops {
             match op {
-                MutOp::Truncate { len } if *len < canonical.len() => {
-                    return Outcome::MustNotMatch;
+                MutOp::Truncate { len } => {
+                    if *len < running_len {
+                        running_len = *len;
+                    }
+                    // A truncated length below the canonical length is a hard break.
+                    if running_len < canonical_len {
+                        return Outcome::MustNotMatch;
+                    }
                 }
                 MutOp::CharsetViolate { positions, .. } => {
-                    if positions.iter().any(|&p| p < canonical.len()) {
+                    if positions.iter().any(|&p| p < running_len) {
                         return Outcome::MustNotMatch;
                     }
                 }
                 MutOp::PrefixMangle { .. } => return Outcome::MustNotMatch,
                 MutOp::ChecksumCorrupt => {
-                    // Only CRC-bearing families have a checksum the engine verifies;
-                    // for others the corruption lands on an arbitrary byte.
                     return match self {
                         TokenFamily::GithubFinegrainedPat | TokenFamily::GithubClassicPat => {
                             Outcome::MustNotMatch
@@ -171,17 +199,18 @@ impl TokenFamily {
                     };
                 }
                 MutOp::EntropyReduce { count, .. } if *count > 0 => {
-                    return Outcome::MayMatch;
+                    worst = Outcome::MayMatch;
                 }
                 MutOp::Encode { .. } => return Outcome::MayMatch,
                 MutOp::Extend { suffix } if !suffix.is_empty() => {
-                    return Outcome::MayMatch;
+                    running_len += suffix.len();
+                    worst = Outcome::MayMatch;
                 }
                 _ => {}
             }
         }
 
-        Outcome::MustMatch
+        worst
     }
 }
 
@@ -189,18 +218,68 @@ impl TokenFamily {
 // Per-family generators
 // ---------------------------------------------------------------------------
 
-/// Generate an AWS access key ID: `AKIA` prefix + 16 random base-32 characters.
+/// Maximum valid AWS account ID. The engine's validator
+/// (`engine/offline_validate.rs`) rejects decoded IDs above this threshold.
+const AWS_MAX_ACCOUNT_ID: u64 = 999_999_999_999;
+
+/// Generate an AWS access key ID: `AKIA` prefix + 16 base-32 characters.
 ///
 /// The `AKIA` prefix identifies a long-term credential (as opposed to `ASIA`
-/// for temporary STS tokens). The 16-character body uses the RFC 4648 base-32
-/// alphabet that AWS employs for key IDs.
+/// for temporary STS tokens). The 16-character body encodes 80 bits in RFC 4648
+/// base-32 with an embedded 40-bit account ID at bits \[1..41\]. The engine
+/// validator rejects account IDs above 999,999,999,999, so we construct the
+/// 80-bit payload explicitly rather than picking random base-32 chars:
+///
+/// ```text
+/// Bit layout (MSB first across 10 decoded bytes):
+///   [0]     flag bit (random)
+///   [1..41] account ID (uniform in 0..=999_999_999_999)
+///   [41..80] remaining 39 bits (random)
+/// ```
 fn gen_aws_access_key(rng: &mut SimRng) -> Vec<u8> {
+    let flag: u8 = rng.gen_range(0, 2) as u8;
+    let account_id: u64 = rng.gen_range(0, (AWS_MAX_ACCOUNT_ID + 1) as u32) as u64
+        | ((rng.gen_range(0, (((AWS_MAX_ACCOUNT_ID + 1) >> 32) + 1) as u32) as u64) << 32);
+    // Clamp in case the two-part generation overshot.
+    let account_id = account_id % (AWS_MAX_ACCOUNT_ID + 1);
+
+    let remaining_hi: u32 = rng.gen_range(0, 1 << 7); // 7 bits
+    let remaining_lo: u32 = rng.gen_range(0, u32::MAX); // 32 bits
+
+    // Pack into 10 bytes (80 bits, MSB first).
+    // Byte 0: [flag(1)][account_id bits 39..33(7)]
+    // Bytes 1-4: account_id bits 32..0
+    // Byte 5: [account_id bit 0 (already in byte 4)] — actually:
+    //   byte 5 top bit = account_id bit 0, lower 7 bits = remaining[0..7]
+    // Bytes 6-9: remaining[7..39]
+    let mut decoded = [0u8; 10];
+    decoded[0] = (flag << 7) | ((account_id >> 33) as u8 & 0x7F);
+    decoded[1] = (account_id >> 25) as u8;
+    decoded[2] = (account_id >> 17) as u8;
+    decoded[3] = (account_id >> 9) as u8;
+    decoded[4] = (account_id >> 1) as u8;
+    decoded[5] = ((account_id as u8 & 1) << 7) | (remaining_hi as u8 & 0x7F);
+    decoded[6] = (remaining_lo >> 24) as u8;
+    decoded[7] = (remaining_lo >> 16) as u8;
+    decoded[8] = (remaining_lo >> 8) as u8;
+    decoded[9] = remaining_lo as u8;
+
+    // Encode 10 bytes as 16 base-32 characters (5 bits per char).
     let mut out = Vec::with_capacity(20);
     out.extend_from_slice(b"AKIA");
-    for _ in 0..16 {
-        let idx = rng.gen_range(0, 32) as usize;
-        out.push(AWS_BASE32_CHARS[idx]);
+
+    let mut bit_buf: u64 = 0;
+    let mut bits_in_buf: u32 = 0;
+    for &byte in &decoded {
+        bit_buf = (bit_buf << 8) | byte as u64;
+        bits_in_buf += 8;
+        while bits_in_buf >= 5 {
+            bits_in_buf -= 5;
+            let idx = ((bit_buf >> bits_in_buf) & 0x1F) as usize;
+            out.push(AWS_BASE32_CHARS[idx]);
+        }
     }
+    debug_assert_eq!(out.len(), 20);
     out
 }
 
@@ -468,6 +547,82 @@ mod tests {
         assert!(TokenFamily::GithubClassicPat
             .allowed_ops()
             .contains(&MutOpKind::ChecksumCorrupt));
+    }
+
+    /// Verify that generated AWS keys have account IDs within the engine's
+    /// accepted range (≤ 999_999_999_999). If the generator picks random
+    /// base-32 chars without constraining the decoded 40-bit account ID,
+    /// some seeds will produce keys the engine rejects as invalid.
+    #[test]
+    fn aws_account_id_within_valid_range() {
+        // Decode 16 base-32 chars into the embedded 40-bit account ID,
+        // mirroring the logic in engine/offline_validate.rs.
+        fn decode_account_id(suffix: &[u8]) -> Option<u64> {
+            if suffix.len() != 16 {
+                return None;
+            }
+            let mut decoded = [0u8; 10];
+            let mut bit_buf: u64 = 0;
+            let mut bits_in_buf: u32 = 0;
+            let mut out_idx = 0;
+            for &b in suffix {
+                let val = match b {
+                    b'A'..=b'Z' => (b - b'A') as u64,
+                    b'2'..=b'7' => (b - b'2') as u64 + 26,
+                    _ => return None,
+                };
+                bit_buf = (bit_buf << 5) | val;
+                bits_in_buf += 5;
+                while bits_in_buf >= 8 {
+                    bits_in_buf -= 8;
+                    decoded[out_idx] = (bit_buf >> bits_in_buf) as u8;
+                    bit_buf &= (1u64 << bits_in_buf) - 1;
+                    out_idx += 1;
+                }
+            }
+            let raw_40 = ((decoded[0] as u64 & 0x7F) << 33)
+                | ((decoded[1] as u64) << 25)
+                | ((decoded[2] as u64) << 17)
+                | ((decoded[3] as u64) << 9)
+                | ((decoded[4] as u64) << 1)
+                | ((decoded[5] as u64) >> 7);
+            Some(raw_40)
+        }
+
+        // Test 200 seeds — with ~9% failure rate on unconstrained random
+        // base-32 chars, this should catch the bug reliably.
+        for seed in 0..200u64 {
+            let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(seed));
+            let suffix = &token[4..20];
+            let account_id = decode_account_id(suffix)
+                .unwrap_or_else(|| panic!("seed {seed}: failed to decode base-32 suffix"));
+            assert!(
+                account_id <= 999_999_999_999,
+                "seed {seed}: account ID {account_id} exceeds 999_999_999_999",
+            );
+        }
+    }
+
+    /// Verify that the expectation oracle handles chained operators correctly.
+    /// A soft op (Extend) followed by a hard breaker (Truncate below canonical
+    /// length) should produce MustNotMatch, not MayMatch.
+    #[test]
+    fn expectation_extend_then_truncate_below_canonical() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        assert_eq!(token.len(), 20);
+
+        // Extend by 1 byte, then truncate to 5 — well below canonical length.
+        // apply_ops produces a 5-byte token which definitively cannot match.
+        let ops = vec![
+            MutOp::Extend { suffix: vec![0] },
+            MutOp::Truncate { len: 5 },
+        ];
+        let outcome = TokenFamily::AwsAccessKey.expectation(&token, &ops);
+        assert_eq!(
+            outcome,
+            Outcome::MustNotMatch,
+            "extend+truncate below canonical length should be MustNotMatch",
+        );
     }
 
     /// Minimal base-62 decoder for test assertions.

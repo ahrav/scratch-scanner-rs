@@ -13,6 +13,6 @@ pub use encode::{
     encode_utf16, hex_nibble, percent_encode_all, SecretRepr, BASE62_CHARS, BASE64_STD,
     TOKEN_ALPHABET,
 };
-pub use family::TokenFamily;
+pub use family::{Outcome, TokenFamily};
 pub use op::{apply_ops, MutOp, MutOpKind};
-pub use plan::{execute_plan, ContextWrap, GeneratedCase, MutationPlan, Outcome, WrappedToken};
+pub use plan::{execute_plan, ContextWrap, GeneratedCase, MutationPlan, WrappedToken};
