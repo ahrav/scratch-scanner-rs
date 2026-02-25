@@ -200,9 +200,13 @@ pub(crate) fn budget_hit_to_partial(
             ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
             ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
             ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-            // Catch-all for archive-skip reasons with no direct partial
-            // counterpart (disabled/encrypted/corrupt/I/O/policy gates).
-            _ => format_fallback,
+            ArchiveSkipReason::Disabled
+            | ArchiveSkipReason::UnsupportedFormat
+            | ArchiveSkipReason::EncryptedArchive
+            | ArchiveSkipReason::DepthExceeded
+            | ArchiveSkipReason::NeedsRandomAccessNoSpill
+            | ArchiveSkipReason::IoError
+            | ArchiveSkipReason::Corrupt => format_fallback,
         },
         BudgetHit::SkipEntry(r) => r.to_partial(),
     }

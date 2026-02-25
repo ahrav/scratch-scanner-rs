@@ -118,8 +118,8 @@ pub(super) enum ArchiveEnd {
 /// Map an archive-level skip reason to the corresponding partial-scan reason.
 ///
 /// Used when a nested archive is skipped mid-stream, promoting the skip into
-/// a partial outcome for the parent entry/archive. Unmapped variants fall
-/// through to `MalformedZip` as the legacy conservative fallback in this path.
+/// a partial outcome for the parent entry/archive. Variants without a direct
+/// `PartialReason` counterpart map to `MalformedZip` as a conservative fallback.
 #[inline(always)]
 pub(super) fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialReason {
     match reason {
@@ -132,7 +132,13 @@ pub(super) fn map_archive_skip_to_partial(reason: ArchiveSkipReason) -> PartialR
         ArchiveSkipReason::RootOutputBudgetExceeded => PartialReason::RootOutputBudgetExceeded,
         ArchiveSkipReason::InflationRatioExceeded => PartialReason::InflationRatioExceeded,
         ArchiveSkipReason::UnsupportedFeature => PartialReason::UnsupportedFeature,
-        _ => PartialReason::MalformedZip,
+        ArchiveSkipReason::Disabled
+        | ArchiveSkipReason::UnsupportedFormat
+        | ArchiveSkipReason::EncryptedArchive
+        | ArchiveSkipReason::DepthExceeded
+        | ArchiveSkipReason::NeedsRandomAccessNoSpill
+        | ArchiveSkipReason::IoError
+        | ArchiveSkipReason::Corrupt => PartialReason::MalformedZip,
     }
 }
 
