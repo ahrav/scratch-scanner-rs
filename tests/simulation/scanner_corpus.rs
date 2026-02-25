@@ -41,7 +41,15 @@ fn replay_scanner_corpus_cases() {
         let artifact: ReproArtifact = serde_json::from_slice(&bytes).expect("parse corpus case");
         let engine = build_engine_from_suite(&artifact.scenario.rule_suite, &artifact.run_config)
             .expect("build engine from suite");
-        let runner = ScannerSimRunner::new(artifact.run_config.clone(), artifact.schedule_seed);
+        let mut run_config = artifact.run_config.clone();
+        let required = engine.required_overlap() as u32;
+        if run_config.overlap < required {
+            run_config.overlap = required;
+        }
+        if run_config.chunk_size < run_config.overlap {
+            run_config.chunk_size = run_config.overlap;
+        }
+        let runner = ScannerSimRunner::new(run_config, artifact.schedule_seed);
         match runner.run(&artifact.scenario, &engine, &artifact.fault_plan) {
             RunOutcome::Ok { .. } => {}
             RunOutcome::Failed(fail) => {

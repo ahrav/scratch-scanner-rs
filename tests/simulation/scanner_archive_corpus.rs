@@ -59,6 +59,9 @@ fn archive_corpus_smoke() {
     if run_cfg.overlap < required {
         run_cfg.overlap = required;
     }
+    if run_cfg.chunk_size < run_cfg.overlap {
+        run_cfg.chunk_size = run_cfg.overlap;
+    }
 
     let runner = ScannerSimRunner::new(run_cfg, 0xC0FF_EE10);
     let fault_plan = FaultPlan {
@@ -799,6 +802,9 @@ fn run_archive_scenario(scenario: Scenario, archive_cfg: ArchiveConfig, seed: u6
     let required = engine.required_overlap() as u32;
     if run_cfg.overlap < required {
         run_cfg.overlap = required;
+    }
+    if run_cfg.chunk_size < run_cfg.overlap {
+        run_cfg.chunk_size = run_cfg.overlap;
     }
 
     let runner = ScannerSimRunner::new(run_cfg, seed);

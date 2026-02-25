@@ -110,6 +110,9 @@ fn bounded_random_scanner_sims() {
         if run_cfg.overlap < required {
             run_cfg.overlap = required;
         }
+        if run_cfg.chunk_size < run_cfg.overlap {
+            run_cfg.chunk_size = run_cfg.overlap;
+        }
 
         let fault_plan = random_fault_plan(&mut rng, &scenario, run_cfg.chunk_size, deep);
         let schedule_seed = seed.wrapping_add(0xC0FF_EE00);
