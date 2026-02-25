@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// token. Each variant corresponds to a transform the engine is expected to
 /// reverse during scanning. `Nested` models the real-world pattern of
 /// double- or triple-encoded credentials (e.g. base64-inside-percent-encoding).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretRepr {
     /// No encoding -- the raw token bytes appear verbatim.
     Raw,
@@ -31,9 +31,9 @@ pub enum SecretRepr {
     Base64,
     /// Every byte percent-encoded as `%XX` with uppercase hex.
     UrlPercent,
-    /// ASCII widened to UTF-16 little-endian (zero high byte, value low byte).
+    /// ASCII widened to UTF-16 little-endian (value byte first, zero byte second).
     Utf16Le,
-    /// ASCII widened to UTF-16 big-endian (zero high byte first).
+    /// ASCII widened to UTF-16 big-endian (zero byte first, value byte second).
     Utf16Be,
     /// Alternating base64 and percent-encoding layers, applied `depth` times.
     /// Depth 0 is equivalent to `Raw`.
@@ -49,7 +49,7 @@ pub const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 /// Base-62 character table in GMP ordering: `0-9`, `A-Z`, `a-z`.
 ///
-/// Matches `BASE62_LUT` in `engine/offline_validate.rs`.
+/// Inverse of `BASE62_LUT` in `engine/offline_validate.rs`.
 pub const BASE62_CHARS: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -65,6 +65,7 @@ pub fn base62_encode_u32(mut val: u32, buf: &mut [u8]) {
         *slot = BASE62_CHARS[(val % 62) as usize];
         val /= 62;
     }
+    debug_assert_eq!(val, 0, "base62_encode_u32: buffer too small for value");
 }
 
 /// Dispatch raw token bytes through the encoding layer described by `repr`.
@@ -140,13 +141,17 @@ pub fn percent_encode_all(input: &[u8]) -> Vec<u8> {
 /// (e.g. a base64 token stored in a URL query parameter that is itself
 /// percent-encoded).
 ///
-/// After each layer, the intermediate size is checked against `max_bytes`.
-/// If exceeded, the function returns the last result that fit within the
-/// limit. This prevents transient multi-megabyte allocations when deep
-/// nesting is applied to large inputs.
+/// `depth` is clamped to [`MAX_NESTED_DEPTH`] (currently 4) to prevent
+/// accidental multi-megabyte allocations from randomly generated depths.
+/// After each layer, the intermediate size is also checked against
+/// `max_bytes`. If exceeded, the function returns the last result that fit
+/// within the limit.
 ///
 /// Depth 0 returns the raw bytes unchanged.
+///
+/// [`MAX_NESTED_DEPTH`]: super::op::MAX_NESTED_DEPTH
 pub fn encode_nested(raw: &[u8], depth: u8, max_bytes: usize) -> Vec<u8> {
+    let depth = depth.min(super::op::MAX_NESTED_DEPTH);
     if depth == 0 {
         return raw.to_vec();
     }
@@ -172,6 +177,10 @@ pub fn encode_nested(raw: &[u8], depth: u8, max_bytes: usize) -> Vec<u8> {
 /// Unicode encoder. That limitation is fine here because all generated tokens
 /// consist exclusively of ASCII characters.
 pub fn encode_utf16(bytes: &[u8], be: bool) -> Vec<u8> {
+    debug_assert!(
+        bytes.iter().all(|&b| b.is_ascii()),
+        "encode_utf16: input contains non-ASCII bytes"
+    );
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
     for &b in bytes {
         let hi = 0u8;
@@ -208,9 +217,14 @@ pub fn base64url_encode_nopad(input: &[u8]) -> Vec<u8> {
 
 /// Convert a nibble (0--15) to an uppercase hex ASCII byte (`'0'`--`'F'`).
 ///
-/// Panics in debug builds if `n >= 16`.
+/// # Panics
+///
+/// Panics if `n >= 16`.
 pub fn hex_nibble(n: u8) -> u8 {
-    debug_assert!(n < 16);
+    assert!(
+        n < 16,
+        "hex_nibble: value {n} is not a valid nibble (0..15)"
+    );
     match n {
         0..=9 => b'0' + n,
         _ => b'A' + (n - 10),
@@ -255,12 +269,7 @@ mod tests {
             let de: SecretRepr = serde_json::from_str(json).unwrap();
             let re = serde_json::to_string(&de).unwrap();
             let re_de: SecretRepr = serde_json::from_str(&re).unwrap();
-            // Compare via JSON to avoid needing PartialEq.
-            assert_eq!(
-                serde_json::to_string(&expected).unwrap(),
-                serde_json::to_string(&re_de).unwrap(),
-                "roundtrip failed for {json}",
-            );
+            assert_eq!(*expected, re_de, "roundtrip failed for {json}");
         }
     }
 
@@ -317,9 +326,10 @@ mod tests {
         let std = base64_encode_std(input);
         let url = base64url_encode_nopad(input);
 
-        assert!(std.contains(&b'+') || std.contains(&b'/'));
-        assert!(!url.contains(&b'+'));
-        assert!(!url.contains(&b'/'));
+        assert!(std.contains(&b'+'), "standard base64 should contain '+'");
+        assert!(std.contains(&b'/'), "standard base64 should contain '/'");
+        assert!(!url.contains(&b'+'), "base64url must not contain '+'");
+        assert!(!url.contains(&b'/'), "base64url must not contain '/'");
         assert!(!url.contains(&b'='));
     }
 

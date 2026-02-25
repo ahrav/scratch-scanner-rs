@@ -37,7 +37,7 @@ pub const MAX_OUTPUT_BYTES: usize = 1 << 20;
 /// Each variant targets a different detection-engine gate. The test harness
 /// generates these randomly (constrained by [`TokenFamily::allowed_ops`]) and
 /// uses [`TokenFamily::expectation`] to predict the detection outcome.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutOp {
     /// Cut the token to `len` bytes. Tests the engine's minimum-length gate.
     /// If `len >= input.len()`, the token is left unchanged (no-op).
@@ -55,7 +55,8 @@ pub enum MutOp {
     PrefixMangle { replacement: Vec<u8> },
     /// XOR the last byte with `0xFF`, corrupting any trailing checksum.
     /// For CRC-bearing families this breaks the checksum; for other families
-    /// the corrupted byte may or may not affect detection.
+    /// the corrupted byte may or may not affect detection. On empty input,
+    /// this is a no-op.
     ChecksumCorrupt,
     /// Overwrite the first `count` bytes with `repeat_byte`, reducing Shannon
     /// entropy. Tests the engine's minimum-entropy threshold. `count` is
@@ -81,6 +82,25 @@ pub enum MutOpKind {
     EntropyReduce,
     Encode,
     Extend,
+}
+
+impl MutOp {
+    /// Return the fieldless [`MutOpKind`] discriminant for this operator.
+    ///
+    /// Provides a structural link between `MutOp` and `MutOpKind` so that
+    /// the two enums cannot silently drift apart — adding a variant to
+    /// `MutOp` without a corresponding `MutOpKind` arm is a compile error.
+    pub fn kind(&self) -> MutOpKind {
+        match self {
+            MutOp::Truncate { .. } => MutOpKind::Truncate,
+            MutOp::CharsetViolate { .. } => MutOpKind::CharsetViolate,
+            MutOp::PrefixMangle { .. } => MutOpKind::PrefixMangle,
+            MutOp::ChecksumCorrupt => MutOpKind::ChecksumCorrupt,
+            MutOp::EntropyReduce { .. } => MutOpKind::EntropyReduce,
+            MutOp::Encode { .. } => MutOpKind::Encode,
+            MutOp::Extend { .. } => MutOpKind::Extend,
+        }
+    }
 }
 
 /// Result of [`apply_ops`], carrying both the final bytes and how many
@@ -171,13 +191,7 @@ fn apply_single(input: &[u8], op: &MutOp) -> Vec<u8> {
             }
             out
         }
-        MutOp::Encode { repr } => {
-            if let SecretRepr::Nested { depth } = repr {
-                let clamped = (*depth).min(MAX_NESTED_DEPTH);
-                return super::encode::encode_nested(input, clamped, MAX_OUTPUT_BYTES);
-            }
-            super::encode::encode_secret(input, repr)
-        }
+        MutOp::Encode { repr } => super::encode::encode_secret(input, repr),
         MutOp::Extend { suffix } => {
             let mut out = input.to_vec();
             out.extend_from_slice(suffix);
@@ -193,7 +207,9 @@ mod tests {
     #[test]
     fn empty_ops_returns_input_unchanged() {
         let input = b"hello";
-        assert_eq!(apply_ops(input, &[]), input);
+        let result = apply_ops(input, &[]);
+        assert_eq!(result.bytes, input);
+        assert_eq!(result.ops_applied, 0);
     }
 
     #[test]
@@ -207,13 +223,16 @@ mod tests {
         ];
         let a = apply_ops(input, &ops);
         let b = apply_ops(input, &ops);
-        assert_eq!(a, b);
+        assert_eq!(a.bytes, b.bytes);
     }
 
     #[test]
     fn truncate_beyond_length_is_identity() {
         let input = b"short";
-        assert_eq!(apply_ops(input, &[MutOp::Truncate { len: 100 }]), input);
+        assert_eq!(
+            apply_ops(input, &[MutOp::Truncate { len: 100 }]).bytes,
+            input
+        );
     }
 
     #[test]
@@ -224,7 +243,7 @@ mod tests {
             replacement: b'X',
         }];
         let result = apply_ops(input, &ops);
-        assert_eq!(result, b"Xbc");
+        assert_eq!(result.bytes, b"Xbc");
     }
 
     #[test]
@@ -234,14 +253,14 @@ mod tests {
             replacement: b"LONGPREFIX".to_vec(),
         }];
         let result = apply_ops(input, &ops);
-        assert_eq!(result, b"LO");
+        assert_eq!(result.bytes, b"LO");
     }
 
     #[test]
     fn checksum_corrupt_flips_last_byte() {
         let input = b"abc";
         let result = apply_ops(input, &[MutOp::ChecksumCorrupt]);
-        assert_eq!(result, &[b'a', b'b', b'c' ^ 0xFF]);
+        assert_eq!(result.bytes, &[b'a', b'b', b'c' ^ 0xFF]);
     }
 
     #[test]
@@ -254,7 +273,7 @@ mod tests {
                 count: 100,
             }],
         );
-        assert_eq!(result, b"AAA");
+        assert_eq!(result.bytes, b"AAA");
     }
 
     #[test]
@@ -278,9 +297,9 @@ mod tests {
                 MutOp::Truncate { len: 3 },
             ],
         );
-        assert_ne!(trunc_then_extend, extend_then_trunc);
-        assert_eq!(trunc_then_extend, b"abcXY");
-        assert_eq!(extend_then_trunc, b"abc");
+        assert_ne!(trunc_then_extend.bytes, extend_then_trunc.bytes);
+        assert_eq!(trunc_then_extend.bytes, b"abcXY");
+        assert_eq!(extend_then_trunc.bytes, b"abc");
     }
 
     #[test]
@@ -300,7 +319,7 @@ mod tests {
                 },
             }],
         );
-        assert_eq!(deep, clamped);
+        assert_eq!(deep.bytes, clamped.bytes);
     }
 
     #[test]
@@ -313,6 +332,108 @@ mod tests {
             })
             .collect();
         let result = apply_ops(&input, &ops);
-        assert!(result.len() <= MAX_OUTPUT_BYTES);
+        assert!(result.bytes.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn ops_applied_count_on_early_halt() {
+        // Chain of Encode ops that eventually exceeds MAX_OUTPUT_BYTES.
+        let input = vec![0u8; 1024];
+        let ops: Vec<MutOp> = (0..30)
+            .map(|_| MutOp::Encode {
+                repr: SecretRepr::Base64,
+            })
+            .collect();
+        let result = apply_ops(&input, &ops);
+        // Pipeline halted early, so ops_applied < ops.len().
+        assert!(
+            result.ops_applied < ops.len(),
+            "expected early halt: ops_applied={} should be < {}",
+            result.ops_applied,
+            ops.len(),
+        );
+        assert!(result.ops_applied > 0, "at least one op should have run");
+    }
+
+    #[test]
+    fn ops_applied_full_when_no_truncation() {
+        let input = b"hello";
+        let ops = vec![
+            MutOp::Truncate { len: 3 },
+            MutOp::Extend {
+                suffix: b"XY".to_vec(),
+            },
+        ];
+        let result = apply_ops(input, &ops);
+        assert_eq!(result.ops_applied, 2);
+        assert_eq!(result.bytes, b"helXY");
+    }
+
+    #[test]
+    fn kind_roundtrip_all_variants() {
+        let ops = vec![
+            (MutOp::Truncate { len: 5 }, MutOpKind::Truncate),
+            (
+                MutOp::CharsetViolate {
+                    positions: vec![0],
+                    replacement: b'X',
+                },
+                MutOpKind::CharsetViolate,
+            ),
+            (
+                MutOp::PrefixMangle {
+                    replacement: vec![0],
+                },
+                MutOpKind::PrefixMangle,
+            ),
+            (MutOp::ChecksumCorrupt, MutOpKind::ChecksumCorrupt),
+            (
+                MutOp::EntropyReduce {
+                    repeat_byte: b'A',
+                    count: 1,
+                },
+                MutOpKind::EntropyReduce,
+            ),
+            (
+                MutOp::Encode {
+                    repr: SecretRepr::Base64,
+                },
+                MutOpKind::Encode,
+            ),
+            (MutOp::Extend { suffix: vec![0xAB] }, MutOpKind::Extend),
+        ];
+        for (op, expected_kind) in &ops {
+            assert_eq!(op.kind(), *expected_kind, "kind mismatch for {op:?}");
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_all_mut_op_variants() {
+        let ops = vec![
+            MutOp::Truncate { len: 10 },
+            MutOp::CharsetViolate {
+                positions: vec![0, 3],
+                replacement: b'Z',
+            },
+            MutOp::PrefixMangle {
+                replacement: b"XXXX".to_vec(),
+            },
+            MutOp::ChecksumCorrupt,
+            MutOp::EntropyReduce {
+                repeat_byte: b'A',
+                count: 5,
+            },
+            MutOp::Encode {
+                repr: SecretRepr::Base64,
+            },
+            MutOp::Extend {
+                suffix: b"tail".to_vec(),
+            },
+        ];
+        for op in &ops {
+            let json = serde_json::to_string(op).unwrap();
+            let de: MutOp = serde_json::from_str(&json).unwrap();
+            assert_eq!(*op, de, "serde roundtrip failed for {op:?}");
+        }
     }
 }

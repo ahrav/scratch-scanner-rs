@@ -14,5 +14,5 @@ pub use encode::{
     TOKEN_ALPHABET,
 };
 pub use family::{Outcome, TokenFamily};
-pub use op::{apply_ops, MutOp, MutOpKind};
+pub use op::{apply_ops, ApplyResult, MutOp, MutOpKind};
 pub use plan::{execute_plan, ContextWrap, GeneratedCase, MutationPlan, WrappedToken};

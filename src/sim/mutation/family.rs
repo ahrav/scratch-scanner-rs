@@ -87,6 +87,16 @@ pub enum TokenFamily {
 }
 
 impl TokenFamily {
+    /// All token families, for exhaustive iteration in tests.
+    pub const ALL: [TokenFamily; 6] = [
+        TokenFamily::AwsAccessKey,
+        TokenFamily::GithubFinegrainedPat,
+        TokenFamily::GithubClassicPat,
+        TokenFamily::JwtLike,
+        TokenFamily::Base64Blob,
+        TokenFamily::UrlEncodedBlob,
+    ];
+
     /// Generate a structurally valid token for this family.
     ///
     /// The returned token satisfies all format constraints (prefix, charset,
@@ -190,7 +200,9 @@ impl TokenFamily {
                         return Outcome::MustNotMatch;
                     }
                 }
-                MutOp::PrefixMangle { .. } => return Outcome::MustNotMatch,
+                MutOp::PrefixMangle { replacement } if !replacement.is_empty() => {
+                    return Outcome::MustNotMatch;
+                }
                 MutOp::ChecksumCorrupt => {
                     return match self {
                         TokenFamily::GithubFinegrainedPat | TokenFamily::GithubClassicPat => {
@@ -202,7 +214,14 @@ impl TokenFamily {
                 MutOp::EntropyReduce { count, .. } if *count > 0 => {
                     worst = Outcome::MayMatch;
                 }
-                MutOp::Encode { .. } => return Outcome::MayMatch,
+                MutOp::Encode { repr } => {
+                    use super::encode::SecretRepr;
+                    match repr {
+                        // Identity encodings do not alter the bytes.
+                        SecretRepr::Raw | SecretRepr::Nested { depth: 0 } => {}
+                        _ => return Outcome::MayMatch,
+                    }
+                }
                 MutOp::Extend { suffix } if !suffix.is_empty() => {
                     running_len += suffix.len();
                     worst = Outcome::MayMatch;
@@ -410,15 +429,7 @@ mod tests {
 
     #[test]
     fn determinism_all_families() {
-        let families = [
-            TokenFamily::AwsAccessKey,
-            TokenFamily::GithubFinegrainedPat,
-            TokenFamily::GithubClassicPat,
-            TokenFamily::JwtLike,
-            TokenFamily::Base64Blob,
-            TokenFamily::UrlEncodedBlob,
-        ];
-        for family in families {
+        for family in TokenFamily::ALL {
             let a = family.gen_valid(&mut SimRng::new(42));
             let b = family.gen_valid(&mut SimRng::new(42));
             assert_eq!(a, b, "determinism failed for {family:?}");
@@ -624,6 +635,135 @@ mod tests {
             outcome,
             Outcome::MustNotMatch,
             "extend+truncate below canonical length should be MustNotMatch",
+        );
+    }
+
+    // -- Oracle path coverage (F6) --
+
+    #[test]
+    fn oracle_truncate_below_canonical_is_must_not_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::Truncate { len: 5 }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustNotMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_truncate_at_canonical_len_is_must_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::Truncate {
+            len: token.len() + 10,
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_charset_violate_in_range_is_must_not_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::CharsetViolate {
+            positions: vec![0],
+            replacement: 0xFF,
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustNotMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_charset_violate_out_of_range_is_must_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::CharsetViolate {
+            positions: vec![999],
+            replacement: 0xFF,
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_checksum_corrupt_non_crc_family_is_may_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &[MutOp::ChecksumCorrupt]),
+            Outcome::MayMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_entropy_reduce_zero_count_is_must_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::EntropyReduce {
+            repeat_byte: b'A',
+            count: 0,
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_entropy_reduce_nonzero_count_is_may_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::EntropyReduce {
+            repeat_byte: b'A',
+            count: 5,
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MayMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_encode_is_may_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::Encode {
+            repr: super::super::encode::SecretRepr::Base64,
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MayMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_extend_empty_suffix_is_must_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::Extend { suffix: vec![] }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_extend_nonempty_suffix_is_may_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::Extend { suffix: vec![0xAB] }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MayMatch,
+        );
+    }
+
+    #[test]
+    fn oracle_prefix_mangle_empty_replacement_is_must_match() {
+        let token = TokenFamily::AwsAccessKey.gen_valid(&mut SimRng::new(1));
+        let ops = vec![MutOp::PrefixMangle {
+            replacement: vec![],
+        }];
+        assert_eq!(
+            TokenFamily::AwsAccessKey.expectation(&token, &ops),
+            Outcome::MustMatch,
         );
     }
 }

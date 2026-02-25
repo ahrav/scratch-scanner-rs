@@ -59,6 +59,40 @@ pub struct WrappedToken {
     pub token_len: usize,
 }
 
+impl ContextWrap {
+    /// All context wrappers, for exhaustive iteration in tests.
+    pub const ALL: [ContextWrap; 6] = [
+        ContextWrap::Raw,
+        ContextWrap::EnvAssignment,
+        ContextWrap::JsonField,
+        ContextWrap::YamlValue,
+        ContextWrap::SingleLineComment,
+        ContextWrap::MultiLineString,
+    ];
+}
+
+impl WrappedToken {
+    /// The embedded token bytes (slice into `bytes` at the recorded offset).
+    pub fn token(&self) -> &[u8] {
+        &self.bytes[self.token_offset..self.token_offset + self.token_len]
+    }
+
+    /// The full buffer including context prefix, token, and suffix.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Byte offset where the token begins within the full buffer.
+    pub fn token_offset(&self) -> usize {
+        self.token_offset
+    }
+
+    /// Length of the embedded token in bytes.
+    pub fn token_len(&self) -> usize {
+        self.token_len
+    }
+}
+
 /// A complete mutation test plan -- the serializable recipe for one test case.
 ///
 /// Plans are designed to be generated in bulk (e.g. by a fuzzer or a property
@@ -144,15 +178,22 @@ fn wrap_with(prefix: &[u8], token: &[u8], suffix: &[u8]) -> WrappedToken {
 /// byte-identical output. This property is what makes corpus replay work --
 /// a serialized plan can be re-executed months later and still produce the
 /// exact same test case.
+///
+/// When the mutation pipeline halts early due to [`MAX_OUTPUT_BYTES`], only
+/// the operators that actually ran are passed to the expectation oracle. This
+/// prevents the oracle from predicting based on operators that never executed.
+///
+/// [`MAX_OUTPUT_BYTES`]: super::op::MAX_OUTPUT_BYTES
 pub fn execute_plan(plan: &MutationPlan) -> GeneratedCase {
     let mut rng = SimRng::new(plan.base_seed);
     let canonical = plan.family.gen_valid(&mut rng);
-    let mutated = apply_ops(&canonical, &plan.ops);
-    let expectation = plan.family.expectation(&canonical, &plan.ops);
-    let wrapped = plan.context.wrap(&mutated);
+    let result = apply_ops(&canonical, &plan.ops);
+    let applied_ops = &plan.ops[..result.ops_applied];
+    let expectation = plan.family.expectation(&canonical, applied_ops);
+    let wrapped = plan.context.wrap(&result.bytes);
     GeneratedCase {
         canonical,
-        mutated,
+        mutated: result.bytes,
         wrapped,
         expectation,
         plan: plan.clone(),
@@ -166,18 +207,13 @@ mod tests {
     #[test]
     fn context_wrap_preserves_token_at_offset() {
         let token = b"my_secret_token";
-        for ctx in [
-            ContextWrap::Raw,
-            ContextWrap::EnvAssignment,
-            ContextWrap::JsonField,
-            ContextWrap::YamlValue,
-            ContextWrap::SingleLineComment,
-            ContextWrap::MultiLineString,
-        ] {
+        for ctx in ContextWrap::ALL {
             let wrapped = ctx.wrap(token);
-            let extracted =
-                &wrapped.bytes[wrapped.token_offset..wrapped.token_offset + wrapped.token_len];
-            assert_eq!(extracted, token, "context {ctx:?} broke offset invariant");
+            assert_eq!(
+                wrapped.token(),
+                token,
+                "context {ctx:?} broke offset invariant"
+            );
         }
     }
 
@@ -192,14 +228,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_context_wrap() {
-        for ctx in [
-            ContextWrap::Raw,
-            ContextWrap::EnvAssignment,
-            ContextWrap::JsonField,
-            ContextWrap::YamlValue,
-            ContextWrap::SingleLineComment,
-            ContextWrap::MultiLineString,
-        ] {
+        for ctx in ContextWrap::ALL {
             let json = serde_json::to_string(&ctx).unwrap();
             let de: ContextWrap = serde_json::from_str(&json).unwrap();
             assert_eq!(de, ctx);
@@ -221,5 +250,86 @@ mod tests {
         assert_eq!(de.family, plan.family);
         assert_eq!(de.base_seed, plan.base_seed);
         assert_eq!(de.case_id, plan.case_id);
+        assert_eq!(de.ops, plan.ops);
+        assert_eq!(de.context, plan.context);
+    }
+
+    // -- execute_plan tests --
+
+    #[test]
+    fn execute_plan_determinism() {
+        let plan = MutationPlan {
+            family: TokenFamily::AwsAccessKey,
+            base_seed: 42,
+            case_id: 1,
+            ops: vec![MutOp::Truncate { len: 10 }],
+            context: ContextWrap::JsonField,
+        };
+        let a = execute_plan(&plan);
+        let b = execute_plan(&plan);
+        assert_eq!(a.canonical, b.canonical);
+        assert_eq!(a.mutated, b.mutated);
+        assert_eq!(a.wrapped.bytes, b.wrapped.bytes);
+        assert_eq!(a.expectation, b.expectation);
+    }
+
+    #[test]
+    fn execute_plan_no_ops_identity() {
+        let plan = MutationPlan {
+            family: TokenFamily::AwsAccessKey,
+            base_seed: 7,
+            case_id: 2,
+            ops: vec![],
+            context: ContextWrap::Raw,
+        };
+        let case = execute_plan(&plan);
+        assert_eq!(case.canonical, case.mutated);
+        assert_eq!(case.expectation, Outcome::MustMatch);
+    }
+
+    #[test]
+    fn execute_plan_prefix_mangle_wiring() {
+        let plan = MutationPlan {
+            family: TokenFamily::AwsAccessKey,
+            base_seed: 99,
+            case_id: 3,
+            ops: vec![MutOp::PrefixMangle {
+                replacement: b"XXXX".to_vec(),
+            }],
+            context: ContextWrap::EnvAssignment,
+        };
+        let case = execute_plan(&plan);
+        assert_ne!(case.mutated, case.canonical);
+        assert_eq!(case.expectation, Outcome::MustNotMatch);
+        // Verify wrapped token offset is correct.
+        let extracted = &case.wrapped.bytes
+            [case.wrapped.token_offset..case.wrapped.token_offset + case.wrapped.token_len];
+        assert_eq!(extracted, &case.mutated);
+    }
+
+    #[test]
+    fn execute_plan_truncated_pipeline_uses_applied_ops() {
+        // Build a plan whose pipeline will hit MAX_OUTPUT_BYTES, then verify
+        // the expectation oracle only sees the ops that actually ran.
+        let plan = MutationPlan {
+            family: TokenFamily::Base64Blob,
+            base_seed: 1,
+            case_id: 4,
+            ops: {
+                let mut ops: Vec<MutOp> = (0..30)
+                    .map(|_| MutOp::Encode {
+                        repr: super::super::encode::SecretRepr::Base64,
+                    })
+                    .collect();
+                // Append a hard-breaker that would produce MustNotMatch if it ran.
+                ops.push(MutOp::Truncate { len: 1 });
+                ops
+            },
+            context: ContextWrap::Raw,
+        };
+        let case = execute_plan(&plan);
+        // The pipeline halts on size, so Truncate{1} never runs.
+        // The oracle should NOT see MustNotMatch from the truncation.
+        assert_ne!(case.expectation, Outcome::MustNotMatch);
     }
 }
