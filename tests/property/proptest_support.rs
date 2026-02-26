@@ -722,7 +722,7 @@ impl MutationPlanValueTree {
     /// search ranges.
     ///
     /// Delegates to [`field_layout`] for the canonical field list, then
-    /// converts each `(kind, value)` pair into a `ParamSearch` entry.
+    /// converts each value into a `ParamSearch` entry.
     fn extract_fields(op: &MutOp) -> Vec<ParamSearch> {
         field_layout(op)
             .into_iter()
