@@ -31,9 +31,9 @@ pub enum SecretRepr {
     Base64,
     /// Every byte percent-encoded as `%XX` with uppercase hex.
     UrlPercent,
-    /// ASCII widened to UTF-16 little-endian (value byte first, zero byte second).
+    /// Bytes widened to UTF-16 little-endian (value byte first, zero byte second).
     Utf16Le,
-    /// ASCII widened to UTF-16 big-endian (zero byte first, value byte second).
+    /// Bytes widened to UTF-16 big-endian (zero byte first, value byte second).
     Utf16Be,
     /// Alternating base64 and percent-encoding layers, applied `depth` times.
     /// Depth 0 is equivalent to `Raw`.
@@ -170,17 +170,13 @@ pub fn encode_nested(raw: &[u8], depth: u8, max_bytes: usize) -> Vec<u8> {
     cur
 }
 
-/// Widen ASCII bytes into UTF-16 code units.
+/// Widen bytes into UTF-16 code units by zero-extending each byte to 16 bits.
 ///
-/// Each input byte is zero-extended to a 16-bit code unit. This is only correct
-/// for code points in the ASCII range (0x00-0x7F); it is **not** a general
-/// Unicode encoder. That limitation is fine here because all generated tokens
-/// consist exclusively of ASCII characters.
+/// Every input byte `b` becomes the code unit `0x00bb` (i.e. U+0000 through
+/// U+00FF). This covers the full Latin-1 supplement range and is sufficient
+/// for mutation testing where intermediate bytes may include non-ASCII values
+/// produced by earlier operators (e.g. `Extend` with arbitrary suffix bytes).
 pub fn encode_utf16(bytes: &[u8], be: bool) -> Vec<u8> {
-    debug_assert!(
-        bytes.iter().all(|&b| b.is_ascii()),
-        "encode_utf16: input contains non-ASCII bytes"
-    );
     let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
     for &b in bytes {
         let hi = 0u8;

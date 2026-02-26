@@ -7,14 +7,6 @@
 //!   Truncate-then-Extend differs from Extend-then-Truncate.
 //! - **Offset correctness (P6)**: the `WrappedToken` offset metadata correctly
 //!   locates the mutated token within its context bytes.
-//!
-//! Plans that trigger the known `encode_utf16` debug_assert panic (from
-//! Extend+Utf16 chains producing non-ASCII intermediates) are handled via
-//! `catch_unwind` with panic-payload inspection. Only the known panic message
-//! is suppressed; all other panics re-surface as test failures.
-
-use std::any::Any;
-use std::panic;
 
 use proptest::prelude::*;
 
@@ -23,72 +15,19 @@ use scanner_rs::sim::SimRng;
 
 use super::proptest_support::{arb_family, arb_plan};
 
-/// Check whether a `catch_unwind` payload is the known `encode_utf16`
-/// debug_assert panic. Returns `true` only for payloads containing
-/// `"encode_utf16"`, allowing all other panics to propagate as failures.
-fn is_expected_utf16_panic(payload: &Box<dyn Any + Send>) -> bool {
-    payload.downcast_ref::<&str>().map_or_else(
-        || {
-            payload
-                .downcast_ref::<String>()
-                .is_some_and(|s| s.contains("encode_utf16"))
-        },
-        |s| s.contains("encode_utf16"),
-    )
-}
-
 // P3: Determinism -- same plan executed twice yields identical output.
-//
-// Uses catch_unwind to handle the known Extend+Utf16 debug_assert. If both
-// executions panic with the expected message, that is deterministic (pass).
-// If one panics and the other does not, the framework is non-deterministic
-// (fail). Unexpected panics always fail.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     #[test]
     fn same_seed_same_plan_same_bytes(plan in arb_plan()) {
-        let plan_clone = plan.clone();
-        let result_a = panic::catch_unwind(|| execute_plan(&plan));
-        let result_b = panic::catch_unwind(|| execute_plan(&plan_clone));
+        let a = execute_plan(&plan);
+        let b = execute_plan(&plan.clone());
 
-        match (&result_a, &result_b) {
-            (Ok(a), Ok(b)) => {
-                prop_assert_eq!(&a.canonical, &b.canonical, "canonical bytes differ");
-                prop_assert_eq!(&a.mutated, &b.mutated, "mutated bytes differ");
-                prop_assert_eq!(&a.wrapped.bytes, &b.wrapped.bytes, "wrapped bytes differ");
-                prop_assert_eq!(a.expectation, b.expectation, "expectation differs");
-            }
-            (Err(pa), Err(pb)) => {
-                // Both panicked -- only acceptable if both are the known UTF-16 panic.
-                prop_assert!(
-                    is_expected_utf16_panic(pa),
-                    "first execution panicked with unexpected message",
-                );
-                prop_assert!(
-                    is_expected_utf16_panic(pb),
-                    "second execution panicked with unexpected message",
-                );
-            }
-            (Ok(_), Err(p)) => {
-                if !is_expected_utf16_panic(p) {
-                    prop_assert!(false, "second execution panicked unexpectedly");
-                }
-                prop_assert!(
-                    false,
-                    "non-deterministic: first execution succeeded, second panicked",
-                );
-            }
-            (Err(p), Ok(_)) => {
-                if !is_expected_utf16_panic(p) {
-                    prop_assert!(false, "first execution panicked unexpectedly");
-                }
-                prop_assert!(
-                    false,
-                    "non-deterministic: first execution panicked, second succeeded",
-                );
-            }
-        }
+        prop_assert_eq!(&a.canonical, &b.canonical, "canonical bytes differ");
+        prop_assert_eq!(&a.mutated, &b.mutated, "mutated bytes differ");
+        prop_assert_eq!(&a.wrapped.bytes, &b.wrapped.bytes, "wrapped bytes differ");
+        prop_assert_eq!(a.expectation, b.expectation, "expectation differs");
     }
 }
 
@@ -140,48 +79,34 @@ proptest! {
 // 1. token_offset + token_len <= bytes.len() (bounds)
 // 2. bytes[token_offset..token_offset+token_len] == mutated (content)
 // 3. Raw context implies token_offset == 0
-//
-// Plans that trigger the known UTF-16 panic are rejected via prop_assume!
-// so that proptest regenerates to fill the 500-case budget.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     #[test]
     fn wrapped_token_at_correct_offset(plan in arb_plan()) {
-        let result = panic::catch_unwind(|| execute_plan(&plan));
-        match result {
-            Ok(case) => {
-                let w = &case.wrapped;
-                // Sub-invariant 1: bounds
-                prop_assert!(
-                    w.token_offset + w.token_len <= w.bytes.len(),
-                    "offset ({}) + len ({}) exceeds buffer ({})",
-                    w.token_offset,
-                    w.token_len,
-                    w.bytes.len(),
-                );
-                // Sub-invariant 2: content
-                prop_assert_eq!(
-                    &w.bytes[w.token_offset..w.token_offset + w.token_len],
-                    case.mutated.as_slice(),
-                    "wrapped token bytes do not match mutated bytes",
-                );
-                // Sub-invariant 3: Raw context => offset 0
-                if plan.context == ContextWrap::Raw {
-                    prop_assert_eq!(
-                        w.token_offset, 0,
-                        "Raw context should have token_offset == 0",
-                    );
-                }
-            }
-            Err(payload) => {
-                if is_expected_utf16_panic(&payload) {
-                    // Known panic -- reject this case so proptest regenerates.
-                    prop_assume!(false, "skipping known encode_utf16 panic");
-                } else {
-                    prop_assert!(false, "unexpected panic during execute_plan");
-                }
-            }
+        let case = execute_plan(&plan);
+        let w = &case.wrapped;
+
+        // Sub-invariant 1: bounds
+        prop_assert!(
+            w.token_offset + w.token_len <= w.bytes.len(),
+            "offset ({}) + len ({}) exceeds buffer ({})",
+            w.token_offset,
+            w.token_len,
+            w.bytes.len(),
+        );
+        // Sub-invariant 2: content
+        prop_assert_eq!(
+            &w.bytes[w.token_offset..w.token_offset + w.token_len],
+            case.mutated.as_slice(),
+            "wrapped token bytes do not match mutated bytes",
+        );
+        // Sub-invariant 3: Raw context => offset 0
+        if plan.context == ContextWrap::Raw {
+            prop_assert_eq!(
+                w.token_offset, 0,
+                "Raw context should have token_offset == 0",
+            );
         }
     }
 }
