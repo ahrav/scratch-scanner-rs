@@ -8,7 +8,8 @@
 //! | Property | Boundary tested | Expected outcome |
 //! |----------|--------------------------------------------------------------|------------------|
 //! | P1 | No mutation (identity) | `MustMatch` |
-//! | P2 | Single hard-breaking mutation (prefix, charset, length) | `MustNotMatch` |
+//! | P2a | PrefixMangle on 4 prefix-bearing families | `MustNotMatch` |
+//! | P2b | Truncate / CharsetViolate on all 6 families | `MustNotMatch` |
 //! | P5 | Checksum corruption on CRC-bearing families | `MustNotMatch` |
 //! | P7 | Soft-only mutations (encoding, entropy, trailing bytes) | `MayMatch` |
 //!
@@ -74,15 +75,17 @@ proptest! {
 
 // P2: Single hard-breaking mutations produce MustNotMatch.
 //
-// Each of PrefixMangle, CharsetViolate, and Truncate independently breaks a
-// hard detection gate (prefix structure, character set, or minimum length).
-// The oracle must classify every one of these as MustNotMatch, regardless of
-// the family or seed.
+// Split into two tests by family scope:
 //
-// Family subset: only the four families that support PrefixMangle are tested
-// (AwsAccessKey, GithubFinegrainedPat, GithubClassicPat, JwtLike). The blob
-// families (Base64Blob, UrlEncodedBlob) exclude PrefixMangle from their
-// allowed_ops because they have no structural prefix to corrupt.
+// - P2a (`hard_breaking_prefix_mangle`): PrefixMangle only applies to the four
+//   families with a structural prefix (AwsAccessKey, GithubFinegrainedPat,
+//   GithubClassicPat, JwtLike). Blob families exclude PrefixMangle from their
+//   allowed_ops because they have no prefix to corrupt.
+//
+// - P2b (`hard_breaking_truncate_and_charset`): Truncate and CharsetViolate
+//   apply to ALL six families — the oracle's logic for these ops is
+//   family-independent (charset position check, length check). Testing only
+//   4 families here would leave a coverage gap for blob families.
 //
 // Parameter choices are deliberately extreme to guarantee the hard break:
 //   - PrefixMangle with b"ZZZZ": no real token family uses this prefix.
@@ -93,7 +96,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     #[test]
-    fn near_miss_mutations_change_outcome(
+    fn hard_breaking_prefix_mangle(
         family in prop_oneof![
             Just(TokenFamily::AwsAccessKey),
             Just(TokenFamily::GithubFinegrainedPat),
@@ -101,22 +104,34 @@ proptest! {
             Just(TokenFamily::JwtLike),
         ],
         seed in any::<u64>(),
-        mutation_kind in 0u8..3,
+    ) {
+        let canonical = family.gen_valid(&mut SimRng::new(seed));
+        let op = MutOp::PrefixMangle { replacement: b"ZZZZ".to_vec() };
+
+        let outcome = family.expectation(&canonical, &[op]);
+        prop_assert_eq!(
+            outcome,
+            Outcome::MustNotMatch,
+            "family={:?} seed={}: PrefixMangle should be MustNotMatch",
+            family,
+            seed,
+        );
+    }
+
+    #[test]
+    fn hard_breaking_truncate_and_charset(
+        family in arb_family(),
+        seed in any::<u64>(),
+        mutation_kind in 0u8..2,
     ) {
         let canonical = family.gen_valid(&mut SimRng::new(seed));
 
-        // Each arm targets a distinct hard gate in the oracle. The parameters
-        // are chosen to unconditionally trigger MustNotMatch regardless of the
-        // canonical token's contents — see the comment block above for rationale.
         let op = match mutation_kind {
-            0 => MutOp::PrefixMangle { replacement: b"ZZZZ".to_vec() },
-            1 => MutOp::CharsetViolate { positions: vec![0], replacement: 0xFF },
-            2 => MutOp::Truncate { len: 1 },
+            0 => MutOp::CharsetViolate { positions: vec![0], replacement: 0xFF },
+            1 => MutOp::Truncate { len: 1 },
             _ => unreachable!(),
         };
 
-        // Call expectation() directly rather than execute_plan() to isolate
-        // the oracle's classification logic from generation and wrapping.
         let outcome = family.expectation(&canonical, &[op]);
         prop_assert_eq!(
             outcome,
@@ -176,8 +191,8 @@ proptest! {
 //
 // Each op is constructed with non-identity parameters to ensure it actually
 // shifts the outcome away from MustMatch:
-//   - Encode with Base64: a non-identity repr (neither Raw nor Nested{0})
-//     triggers MayMatch.
+//   - Encode with a non-identity repr (Base64, UrlPercent, Utf16Le, Utf16Be,
+//     or Nested{1..=4}) — any of these triggers MayMatch.
 //   - EntropyReduce with count=1: at least one byte is replaced, affecting
 //     the entropy signal.
 //   - Extend with a 1-byte suffix: adds trailing bytes the engine may ignore.
@@ -189,14 +204,21 @@ proptest! {
         family in arb_family(),
         seed in any::<u64>(),
         soft_op_kind in 0u8..3,
+        repr in prop_oneof![
+            Just(SecretRepr::Base64),
+            Just(SecretRepr::UrlPercent),
+            Just(SecretRepr::Utf16Le),
+            Just(SecretRepr::Utf16Be),
+            (1u8..=4).prop_map(|depth| SecretRepr::Nested { depth }),
+        ],
         repeat_byte in any::<u8>(),
         suffix_byte in any::<u8>(),
     ) {
         let canonical = family.gen_valid(&mut SimRng::new(seed));
 
         let op = match soft_op_kind {
-            // Encode with a non-identity repr (Base64 always shifts to MayMatch).
-            0 => MutOp::Encode { repr: SecretRepr::Base64 },
+            // Encode with a non-identity repr (varied across all non-Raw representations).
+            0 => MutOp::Encode { repr },
             // EntropyReduce with count > 0.
             1 => MutOp::EntropyReduce { repeat_byte, count: 1 },
             // Extend with a non-empty suffix.

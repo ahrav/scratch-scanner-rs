@@ -78,8 +78,14 @@ proptest! {
 // asserts that they diverge. The arithmetic guarantees divergence for any
 // non-empty canonical token of length N:
 //
-//   Truncate(N/2) then Extend(1 byte) => N/2 + 1 output bytes
-//   Extend(1 byte) then Truncate(N/2) => N/2 output bytes
+//   Truncate(max(N/2,1)) then Extend(1 byte) => max(N/2,1) + 1 output bytes
+//   Extend(1 byte) then Truncate(max(N/2,1)) => max(N/2,1) output bytes
+//
+// The `.max(1)` guard is defensive: current families always generate tokens
+// of at least 20 bytes, but if a future family produced a 1-byte token
+// (N=1 => N/2 = 0), a trunc_len of 0 would still produce divergent outputs
+// (1 byte vs 0 bytes). The guard keeps both orderings non-empty, making the
+// divergence more obvious and robust against edge cases.
 //
 // The output lengths alone differ, so the byte sequences must differ. We
 // generate the canonical token from an arbitrary family + seed rather than
@@ -99,7 +105,7 @@ proptest! {
         suffix_byte in any::<u8>(),
     ) {
         let canonical = family.gen_valid(&mut SimRng::new(seed));
-        let trunc_len = canonical.len() / 2;
+        let trunc_len = (canonical.len() / 2).max(1);
 
         let ops_ab = vec![
             MutOp::Truncate { len: trunc_len },

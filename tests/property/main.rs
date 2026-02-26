@@ -6,6 +6,9 @@ mod archive_entry_ratio;
 mod archive_path_canonicalization;
 mod archive_sliding_window;
 mod binary_classification;
+mod counterexample_determinism;
+mod counterexample_family_soundness;
+mod counterexample_shrinker;
 mod entropy_threshold_soundness;
 // Log-based persistence removed in favor of SQLite. See src/store/db/.
 // mod fs_log_codec;
@@ -22,7 +25,4 @@ mod regex2anchor_soundness;
 mod secret_bytes_safelist_soundness;
 mod value_suppressor_soundness;
 
-mod counterexample_determinism;
-mod counterexample_family_soundness;
-mod counterexample_shrinker;
 mod proptest_support;

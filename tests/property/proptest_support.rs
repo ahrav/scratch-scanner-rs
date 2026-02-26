@@ -135,62 +135,50 @@ fn repr_from_ordinal(ord: usize) -> SecretRepr {
 // values) delegate here, so adding or reordering a field in one automatically
 // updates the other.
 
-/// Classifies a shrinkable field for the unified field layout.
-#[derive(Clone, Copy, Debug)]
-enum FieldKind {
-    /// Collection prefix length (truncated to `hi` elements).
-    CollectionLen,
-    /// Scalar byte value (cast from/to `u8`).
-    ScalarU8,
-    /// Scalar `usize` value.
-    ScalarUsize,
-    /// Enum ordinal (decoded via `repr_from_ordinal`).
-    Ordinal,
-}
-
-/// Return the canonical field layout for an op: one `(kind, current_value)`
-/// entry per shrinkable numeric field, in a fixed order per variant.
-fn field_layout(op: &MutOp) -> Vec<(FieldKind, usize)> {
+/// Return the canonical field layout for an op: one current value per
+/// shrinkable numeric field, in a fixed order per variant.
+///
+/// The shrinker binary-searches each value toward 0. Callers do not need to
+/// know the semantic type of each field — `rebuild_op_from_values` handles
+/// reconstruction from the flat value array.
+fn field_layout(op: &MutOp) -> Vec<usize> {
     match op {
-        MutOp::Truncate { len } => vec![(FieldKind::ScalarUsize, *len)],
+        MutOp::Truncate { len } => vec![*len],
         MutOp::CharsetViolate {
             positions,
             replacement,
         } => {
             let mut fields = Vec::new();
             if !positions.is_empty() {
-                fields.push((FieldKind::CollectionLen, positions.len()));
+                fields.push(positions.len());
             }
-            fields.push((FieldKind::ScalarU8, *replacement as usize));
+            fields.push(*replacement as usize);
             fields
         }
         MutOp::PrefixMangle { replacement } => {
             if replacement.is_empty() {
                 vec![]
             } else {
-                vec![(FieldKind::CollectionLen, replacement.len())]
+                vec![replacement.len()]
             }
         }
         MutOp::ChecksumCorrupt => vec![],
         MutOp::EntropyReduce {
             repeat_byte, count, ..
-        } => vec![
-            (FieldKind::ScalarU8, *repeat_byte as usize),
-            (FieldKind::ScalarUsize, *count),
-        ],
+        } => vec![*repeat_byte as usize, *count],
         MutOp::Encode { repr } => {
             let ord = repr_to_ordinal(repr);
             if ord == 0 {
                 vec![]
             } else {
-                vec![(FieldKind::Ordinal, ord)]
+                vec![ord]
             }
         }
         MutOp::Extend { suffix } => {
             if suffix.is_empty() {
                 vec![]
             } else {
-                vec![(FieldKind::CollectionLen, suffix.len())]
+                vec![suffix.len()]
             }
         }
     }
@@ -290,7 +278,7 @@ pub(super) fn arb_family() -> impl Strategy<Value = TokenFamily> {
 }
 
 /// Uniform strategy over all 6 `ContextWrap` variants.
-pub(super) fn arb_context_wrap() -> impl Strategy<Value = ContextWrap> {
+fn arb_context_wrap() -> impl Strategy<Value = ContextWrap> {
     prop_oneof![
         Just(ContextWrap::Raw),
         Just(ContextWrap::EnvAssignment),
@@ -321,7 +309,7 @@ fn arb_secret_repr() -> impl Strategy<Value = SecretRepr> {
 /// [`family_bound`] so that generated values stay within the token's realistic
 /// size range. The resulting strategy is boxed because the variant set differs
 /// per family.
-pub(super) fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
+fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
     let allowed = family.allowed_ops();
     let bound = family_bound(family);
 
@@ -334,7 +322,7 @@ pub(super) fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
             }
             MutOpKind::CharsetViolate => {
                 variants.push(
-                    (proptest::collection::vec(0..bound, 0..=3), any::<u8>())
+                    (proptest::collection::vec(0..bound, 1..=3), any::<u8>())
                         .prop_map(|(positions, replacement)| MutOp::CharsetViolate {
                             positions,
                             replacement,
@@ -667,7 +655,7 @@ impl MutationPlanValueTree {
         let vals: Vec<usize> = layout
             .iter()
             .enumerate()
-            .map(|(i, &(_, original))| target.fields.get(i).map_or(original, |f| f.hi))
+            .map(|(i, &original)| target.fields.get(i).map_or(original, |f| f.hi))
             .collect();
         rebuild_op_from_values(op, &vals)
     }
@@ -738,7 +726,7 @@ impl MutationPlanValueTree {
     fn extract_fields(op: &MutOp) -> Vec<ParamSearch> {
         field_layout(op)
             .into_iter()
-            .map(|(_, val)| ParamSearch { lo: 0, hi: val })
+            .map(|val| ParamSearch { lo: 0, hi: val })
             .collect()
     }
 
@@ -1036,5 +1024,54 @@ fn repr_ordinal_roundtrip_no_collision() {
         if let Some(prev) = seen.insert(ord, repr.clone()) {
             panic!("ordinal collision: {repr:?} and {prev:?} both map to ordinal {ord}",);
         }
+    }
+}
+
+/// Verify that `rebuild_op_from_values(op, &field_layout(op)) == op` for every
+/// `MutOp` variant with fields. This guards the coupling between `field_layout`
+/// and `rebuild_op_from_values` — if a field is added or reordered in one
+/// function but not the other, this test catches the mismatch.
+#[test]
+fn field_layout_rebuild_roundtrip() {
+    let ops = vec![
+        MutOp::Truncate { len: 42 },
+        MutOp::CharsetViolate {
+            positions: vec![1, 3, 5],
+            replacement: 0xAB,
+        },
+        MutOp::CharsetViolate {
+            positions: vec![],
+            replacement: 0xFF,
+        },
+        MutOp::PrefixMangle {
+            replacement: b"AAAA".to_vec(),
+        },
+        MutOp::PrefixMangle {
+            replacement: vec![],
+        },
+        MutOp::ChecksumCorrupt,
+        MutOp::EntropyReduce {
+            repeat_byte: 0x00,
+            count: 10,
+        },
+        MutOp::Encode {
+            repr: SecretRepr::Base64,
+        },
+        MutOp::Encode {
+            repr: SecretRepr::Raw,
+        },
+        MutOp::Extend {
+            suffix: vec![1, 2, 3],
+        },
+        MutOp::Extend { suffix: vec![] },
+    ];
+
+    for op in &ops {
+        let layout = field_layout(op);
+        let rebuilt = rebuild_op_from_values(op, &layout);
+        assert_eq!(
+            *op, rebuilt,
+            "roundtrip failed for {op:?}: field_layout={layout:?}, rebuilt={rebuilt:?}",
+        );
     }
 }

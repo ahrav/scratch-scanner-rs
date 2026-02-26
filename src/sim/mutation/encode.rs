@@ -292,11 +292,14 @@ mod tests {
     #[test]
     fn utf16_le_known() {
         assert_eq!(encode_utf16(b"AB", false), &[b'A', 0, b'B', 0]);
+        // Non-ASCII bytes are zero-extended to Latin-1 code units.
+        assert_eq!(encode_utf16(&[0x80, 0xFF], false), &[0x80, 0, 0xFF, 0]);
     }
 
     #[test]
     fn utf16_be_known() {
         assert_eq!(encode_utf16(b"AB", true), &[0, b'A', 0, b'B']);
+        assert_eq!(encode_utf16(&[0x80, 0xFF], true), &[0, 0x80, 0, 0xFF]);
     }
 
     #[test]
