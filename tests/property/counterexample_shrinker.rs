@@ -1,7 +1,22 @@
-//! Tests for the custom `MutationPlanValueTree` shrinker.
+//! Tests for the custom [`MutationPlanValueTree`] shrinker.
 //!
-//! All tests use synthetic predicates — they exercise the shrinking state
-//! machine without requiring scanner internals.
+//! These tests validate the shrinker's state machine by driving it through
+//! `simplify()` / `complicate()` cycles with synthetic predicates — the same
+//! contract that proptest's internal test runner uses. Each test targets a
+//! specific property of well-behaved shrinking:
+//!
+//! - **Monotonicity**: shrinking never increases plan complexity.
+//! - **Determinism**: identical seeds produce identical shrink sequences.
+//! - **Validity**: every intermediate candidate satisfies the family's op
+//!   constraints.
+//! - **Minimality**: the shrinker converges to a near-minimal plan that still
+//!   satisfies the predicate.
+//! - **Context convergence**: unrestricted shrinking drives context to `Raw`.
+//! - **Robustness**: edge cases (empty ops, interleaved simplify/complicate)
+//!   do not panic.
+//!
+//! No scanner engine internals are invoked; the tests exercise only the
+//! generation and shrinking layers from [`super::proptest_support`].
 
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
@@ -11,7 +26,34 @@ use scanner_rs::sim::mutation::{ContextWrap, MutOp, MutOpKind, MutationPlan, Tok
 
 use super::proptest_support::{arb_plan, is_valid_plan, MutationPlanValueTree};
 
-/// Helper: generate a plan from the custom strategy with a fixed seed.
+/// Drive `simplify()` / `complicate()` cycles on `tree`, keeping the last
+/// candidate that satisfies `predicate`. Returns that candidate after the
+/// shrinker is exhausted or 500 steps elapse.
+fn shrink_while(
+    tree: &mut MutationPlanValueTree,
+    predicate: impl Fn(&MutationPlan) -> bool,
+) -> MutationPlan {
+    let mut last_valid = tree.current();
+    for _ in 0..500 {
+        if !tree.simplify() {
+            break;
+        }
+        let candidate = tree.current();
+        if predicate(&candidate) {
+            last_valid = candidate;
+        } else {
+            tree.complicate();
+        }
+    }
+    last_valid
+}
+
+/// Build a deterministic `MutationPlanValueTree` from a single `u64` seed.
+///
+/// The seed is expanded to a 32-byte ChaCha key by repeating its little-endian
+/// bytes 4 times. This makes tests reproducible — the same `seed` always
+/// produces the same plan and the same shrink sequence — while still providing
+/// enough entropy for proptest's internal generation.
 fn generate_plan(seed: u64) -> (MutationPlanValueTree, MutationPlan) {
     let config = Config::default();
     let mut runner = TestRunner::new_with_rng(
@@ -26,7 +68,12 @@ fn generate_plan(seed: u64) -> (MutationPlanValueTree, MutationPlan) {
     (tree, initial)
 }
 
-/// 1. Shrinking reduces the op count while the predicate still holds.
+/// Shrinking never increases op count when the predicate accepts any non-empty
+/// plan.
+///
+/// Uses the predicate "has at least 1 op" and verifies that the shrunk plan
+/// has fewer (or equal) ops than the initial. This tests that phases 0 and 1
+/// monotonically reduce the op list.
 #[test]
 fn shrinker_reduces_ops_while_reproducing() {
     // Try several seeds to find one that generates a plan with ops.
@@ -36,28 +83,8 @@ fn shrinker_reduces_ops_while_reproducing() {
             continue;
         }
 
-        // Predicate: plan has at least 1 op.
         let initial_count = initial.ops.len();
-        let mut last_valid = initial.clone();
-
-        // Shrink while the predicate holds.
-        let mut steps = 0;
-        loop {
-            if !tree.simplify() {
-                break;
-            }
-            let candidate = tree.current();
-            if !candidate.ops.is_empty() {
-                last_valid = candidate;
-            } else {
-                // Predicate failed, complicate to restore.
-                tree.complicate();
-            }
-            steps += 1;
-            if steps > 500 {
-                break;
-            }
-        }
+        let last_valid = shrink_while(&mut tree, |p| !p.ops.is_empty());
 
         // The shrunk plan should have fewer or equal ops.
         assert!(
@@ -70,7 +97,13 @@ fn shrinker_reduces_ops_while_reproducing() {
     panic!("no seed produced a plan with ops");
 }
 
-/// 2. Same seed produces identical shrink sequences.
+/// Determinism: the same seed produces byte-identical shrink sequences across
+/// independent runs.
+///
+/// This is critical for reproducibility — a failing seed recorded in CI must
+/// replay the exact same counterexample months later. The test collects the
+/// first 20 `simplify()` outputs from two independently constructed trees and
+/// asserts they are equal.
 #[test]
 fn shrinker_output_stable_across_runs() {
     let seed = 12345u64;
@@ -91,8 +124,11 @@ fn shrinker_output_stable_across_runs() {
     assert_eq!(a, b, "shrink sequences differ across runs");
 }
 
-// Every generated plan is valid (ops match family's allowed_ops)
-// and can be executed without panicking.
+// Generation validity: every plan produced by `arb_plan()` must satisfy the
+// family's op constraints and survive execution without panicking. The
+// `catch_unwind` around `execute_plan` absorbs debug_assert failures from
+// Extend+Encode chains that produce non-ASCII intermediates before a UTF-16
+// encoding layer — those are expected in debug builds and not a test failure.
 proptest! {
     #![proptest_config(Config::with_cases(200))]
 
@@ -102,16 +138,19 @@ proptest! {
             is_valid_plan(&plan),
             "generated plan has ops not in family's allowed_ops: {plan:?}",
         );
-        // Execute — debug_assert in encode_utf16 may fire on non-ASCII bytes
-        // from Extend+Encode chains. This is expected in debug builds when
-        // mutation ops produce non-ASCII intermediates before a UTF-16 layer.
         let _ = std::panic::catch_unwind(|| {
             scanner_rs::sim::mutation::execute_plan(&plan)
         });
     }
 }
 
-/// 4. Walking the full simplify sequence never produces an invalid plan.
+/// Every candidate produced during an unrestricted `simplify()` walk satisfies
+/// [`is_valid_plan`].
+///
+/// This is the shrinker's central safety property: no matter what phase or
+/// binary search path is taken, the emitted plan always respects the family's
+/// allowed-ops constraint. Tested across 20 seeds with a 500-step safety bound
+/// per seed.
 #[test]
 fn all_shrink_candidates_valid() {
     for seed in 0..20u64 {
@@ -136,7 +175,12 @@ fn all_shrink_candidates_valid() {
     }
 }
 
-/// 5. A plan with a Truncate op shrinks to a minimal plan.
+/// A multi-op plan shrinks to at most 2 ops while preserving a `Truncate` op.
+///
+/// Uses the predicate "plan contains a Truncate op" on plans with >= 3 ops.
+/// After exhaustive shrinking, the surviving plan should have at most 2 ops
+/// (ideally just the single Truncate), demonstrating that phases 0 and 1
+/// effectively strip away unrelated ops.
 #[test]
 fn complex_plan_shrinks_to_minimal() {
     // Predicate: plan contains a Truncate op.
@@ -152,24 +196,7 @@ fn complex_plan_shrinks_to_minimal() {
             continue;
         }
 
-        // Shrink while predicate holds.
-        let mut last_valid = initial.clone();
-        let mut steps = 0;
-        loop {
-            if !tree.simplify() {
-                break;
-            }
-            let candidate = tree.current();
-            if has_truncate(&candidate) {
-                last_valid = candidate;
-            } else {
-                tree.complicate();
-            }
-            steps += 1;
-            if steps > 500 {
-                break;
-            }
-        }
+        let last_valid = shrink_while(&mut tree, &has_truncate);
 
         assert!(
             last_valid.ops.len() <= 2,
@@ -182,7 +209,12 @@ fn complex_plan_shrinks_to_minimal() {
     panic!("no seed produced a multi-op plan with Truncate");
 }
 
-/// 6. Full simplification drives context toward Raw.
+/// Unrestricted simplification drives context to `Raw` (ordinal 0).
+///
+/// Phase 3 of the shrinker decrements the context ordinal until it reaches 0.
+/// When no predicate rejects the smaller context, the final plan must have
+/// `ContextWrap::Raw`. This confirms that phase 3 is reachable and correctly
+/// walks the ordinal down.
 #[test]
 fn context_shrinks_toward_raw() {
     for seed in 0..50u64 {
@@ -212,7 +244,13 @@ fn context_shrinks_toward_raw() {
     panic!("no seed produced a plan with non-Raw context");
 }
 
-/// 7. Empty-ops plans do not panic during simplify/complicate cycles.
+/// Edge case: an empty-ops plan with non-Raw context does not panic during
+/// interleaved `simplify()` / `complicate()` cycles.
+///
+/// When ops are empty, phases 0--2 have nothing to do and must gracefully
+/// skip to phase 3 (context shrinking). The interleaved complicate calls
+/// exercise the undo path on the context ordinal. The final plan should have
+/// `ContextWrap::Raw` and an empty ops list.
 #[test]
 fn empty_ops_plan_shrink_does_not_panic() {
     let plan = MutationPlan {

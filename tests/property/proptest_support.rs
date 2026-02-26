@@ -1,15 +1,33 @@
 //! Proptest strategies and custom shrinker for `MutationPlan`.
 //!
-//! The core deliverable is `MutationPlanValueTree`, a custom `ValueTree` that
-//! shrinks mutation plans in a structured priority order:
+//! # Why a custom `ValueTree`?
 //!
-//! 1. Truncate ops suffix (binary search on length)
-//! 2. Remove individual ops (bitset soft deletion, backward cursor)
-//! 3. Shrink op parameters (lazy binary search per field toward 0)
-//! 4. Shrink context (walk ordinal toward `Raw`)
+//! Proptest's built-in combinators shrink each field independently, which would
+//! generate plans where ops violate the family's `allowed_ops` constraint (e.g.
+//! shrinking an `AwsAccessKey` plan's op into `ChecksumCorrupt`, which that
+//! family does not allow). A custom [`MutationPlanValueTree`] keeps `family`
+//! and `base_seed` immutable throughout shrinking and validates every candidate
+//! against [`is_valid_plan`] before emitting it, guaranteeing that proptest
+//! never reports an invalid plan as a minimal counterexample.
 //!
-//! Phase transitions are monotonic — once a phase exhausts, the shrinker
-//! advances to the next phase and never returns.
+//! # Shrink phases
+//!
+//! The shrinker proceeds through four phases in strict priority order, spending
+//! the shrinking budget on the highest-impact reductions first:
+//!
+//! 1. **Truncate ops suffix** — binary search on the included-ops prefix
+//!    length, rapidly halving the op count.
+//! 2. **Remove individual ops** — bitset soft-deletion with a backward cursor,
+//!    trying to eliminate each remaining op one at a time.
+//! 3. **Shrink op parameters** — per-field binary search toward 0 on each
+//!    surviving op's numeric parameters (lengths, byte values, ordinals).
+//! 4. **Shrink context** — decrement the `ContextWrap` ordinal toward `Raw`.
+//!
+//! Phase transitions are monotonic — once a phase exhausts its search space,
+//! the shrinker advances to the next phase and never returns. This ordering
+//! ensures that structural simplifications (fewer ops) are preferred over
+//! parametric ones (smaller values within an op), producing more readable
+//! minimal counterexamples.
 
 use proptest::prelude::*;
 use proptest::strategy::{NewTree, ValueTree};
@@ -23,6 +41,13 @@ use scanner_rs::sim::mutation::{
 // Conservative upper bounds per family (token length)
 // ---------------------------------------------------------------------------
 
+/// Upper bound on generated numeric parameters (e.g. `Truncate { len }`,
+/// `EntropyReduce { count }`) for a given family.
+///
+/// These approximate (or slightly exceed) the canonical token lengths from
+/// `TokenFamily::gen_valid` so that generated parameter values stay within
+/// realistic ranges rather than producing degenerate cases like
+/// `Truncate { len: usize::MAX }`.
 fn family_bound(family: TokenFamily) -> usize {
     match family {
         TokenFamily::AwsAccessKey => 20,
@@ -38,6 +63,12 @@ fn family_bound(family: TokenFamily) -> usize {
 // Ordinal conversions
 // ---------------------------------------------------------------------------
 
+// The ordinal mappings below impose a total order on `ContextWrap` and
+// `SecretRepr` so that the shrinker can binary-search toward 0 (the "simplest"
+// variant: `Raw` for both types). The ordering is arbitrary but must be
+// stable — changing it would alter shrink sequences for existing seeds.
+
+/// Map a `ContextWrap` to a numeric ordinal for shrinking (0 = `Raw` = simplest).
 fn context_to_ordinal(ctx: ContextWrap) -> usize {
     match ctx {
         ContextWrap::Raw => 0,
@@ -49,6 +80,8 @@ fn context_to_ordinal(ctx: ContextWrap) -> usize {
     }
 }
 
+/// Inverse of [`context_to_ordinal`]. Out-of-range ordinals saturate to
+/// `MultiLineString` (the highest variant).
 fn context_from_ordinal(ord: usize) -> ContextWrap {
     match ord {
         0 => ContextWrap::Raw,
@@ -60,6 +93,12 @@ fn context_from_ordinal(ord: usize) -> ContextWrap {
     }
 }
 
+/// Map a `SecretRepr` to a numeric ordinal for shrinking (0 = `Raw` = simplest).
+///
+/// `Nested { depth: d }` maps to `5 + (d - 1)`, so `Nested { depth: 1 }` = 5.
+/// The `saturating_sub` means `Nested { depth: 0 }` maps to ordinal 5,
+/// colliding with `Nested { depth: 1 }`. This is harmless because the
+/// generation strategy never produces `depth: 0` (it generates `1..=4`).
 fn repr_to_ordinal(repr: &SecretRepr) -> usize {
     match repr {
         SecretRepr::Raw => 0,
@@ -71,6 +110,8 @@ fn repr_to_ordinal(repr: &SecretRepr) -> usize {
     }
 }
 
+/// Inverse of [`repr_to_ordinal`]. Ordinals >= 5 produce `Nested { depth }`
+/// with depth = `ord - 4`.
 fn repr_from_ordinal(ord: usize) -> SecretRepr {
     match ord {
         0 => SecretRepr::Raw,
@@ -89,6 +130,11 @@ fn repr_from_ordinal(ord: usize) -> SecretRepr {
 // ---------------------------------------------------------------------------
 
 /// Check that every op in the plan uses an op kind allowed by the family.
+///
+/// This is the shrinker's validity predicate: every candidate produced by
+/// `simplify()` is checked against this function, and invalid candidates are
+/// rejected (the shrinker reverts and tries a different reduction). It is also
+/// used in property tests to assert that generation never produces invalid plans.
 pub fn is_valid_plan(plan: &MutationPlan) -> bool {
     let allowed = plan.family.allowed_ops();
     plan.ops
@@ -136,7 +182,14 @@ fn arb_secret_repr() -> impl Strategy<Value = SecretRepr> {
     ]
 }
 
-/// Generate a `MutOp` from the family's allowed ops with bounded parameters.
+/// Generate a `MutOp` constrained to the family's allowed ops with bounded
+/// parameters.
+///
+/// Builds a `Union` strategy over one sub-strategy per allowed `MutOpKind`.
+/// Numeric parameters (lengths, positions, byte values) are bounded by
+/// [`family_bound`] so that generated values stay within the token's realistic
+/// size range. The resulting strategy is boxed because the variant set differs
+/// per family.
 fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
     let allowed = family.allowed_ops();
     let bound = family_bound(family);
@@ -202,14 +255,21 @@ fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
 // MutationPlanStrategy — the public entry point
 // ---------------------------------------------------------------------------
 
+/// Maximum ops per generated plan. Kept small to make shrinking fast; 8 ops
+/// is enough to exercise multi-op interactions (e.g. Extend then Truncate)
+/// without blowing up the shrink search space.
 const DEFAULT_MAX_OPS: usize = 8;
 
-/// The public strategy for generating `MutationPlan` values with a custom
-/// `ValueTree` that performs structured shrinking.
+/// Proptest strategy that generates `MutationPlan` values paired with a custom
+/// [`MutationPlanValueTree`] for structured shrinking.
+///
+/// Use [`arb_plan`] as the ergonomic entry point. The strategy picks a random
+/// `TokenFamily` first, then generates ops constrained to that family's
+/// `allowed_ops`, so every generated plan is valid by construction.
 #[derive(Debug)]
 pub struct MutationPlanStrategy;
 
-/// Convenience constructor.
+/// Convenience constructor for use in `proptest!` blocks and manual test code.
 pub fn arb_plan() -> MutationPlanStrategy {
     MutationPlanStrategy
 }
@@ -219,7 +279,10 @@ impl Strategy for MutationPlanStrategy {
     type Value = MutationPlan;
 
     fn new_tree(&self, runner: &mut TestRunner) -> NewTree<Self> {
-        // Generate initial values via combinator helpers.
+        // Family is generated first because ops depend on it — each family has
+        // a different set of allowed op kinds. We snapshot `family` immediately
+        // and use it to build the ops strategy, so the generated ops are always
+        // valid for the chosen family.
         let family_tree = arb_family().new_tree(runner)?;
         let family = family_tree.current();
 
@@ -230,6 +293,9 @@ impl Strategy for MutationPlanStrategy {
             proptest::collection::vec(arb_op_for_family(family), 0..=DEFAULT_MAX_OPS);
         let ops_tree = ops_strategy.new_tree(runner)?;
 
+        // We discard the sub-trees (family_tree, seed_tree, etc.) and hand full
+        // control to MutationPlanValueTree, which keeps family and base_seed
+        // immutable and only shrinks ops + context.
         let initial = MutationPlan {
             family,
             base_seed: seed_tree.current(),
@@ -247,79 +313,155 @@ impl Strategy for MutationPlanStrategy {
 // ---------------------------------------------------------------------------
 
 /// Shrinking phase — strictly sequential, monotonic transitions.
+///
+/// The ordering is deliberate: coarse structural reductions (fewer ops) come
+/// before fine parametric ones (smaller values), and context shrinking is last
+/// because it is independent of the ops. `Done` is a terminal absorbing state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShrinkPhase {
+    /// Binary search on the prefix length of the included-ops list.
     OpsLength,
+    /// Try removing individual ops via bitset soft-deletion.
     RemoveOp,
+    /// Binary-search each surviving op's numeric parameters toward 0.
     ShrinkParam,
+    /// Decrement the `ContextWrap` ordinal toward `Raw`.
     ShrinkContext,
+    /// All phases exhausted; `simplify()` returns `false`.
     Done,
 }
 
-/// Tracks the last successful simplify action for `complicate()` undo.
+/// Tracks the last successful `simplify()` action so that `complicate()` can
+/// undo it.
+///
+/// Proptest calls `complicate()` when the simplified candidate *passes* the
+/// test (no longer triggers the failure) — meaning the reduction removed
+/// something essential and needs to be partially undone. Each variant stores
+/// just enough state to undo one simplify step and adjust the binary search
+/// bounds so the next `simplify()` tries the other half.
 #[derive(Clone, Debug)]
 enum PrevShrink {
-    /// Phase 0: restored ops length from `len` to `prev_hi`.
+    /// Phase 0: truncated ops to `len_hi = mid`; `prev_hi` is the bound before
+    /// truncation, needed to restore the search range.
     TruncatedTo { prev_hi: usize },
-    /// Phase 1: removed op at index `idx`.
+    /// Phase 1: soft-deleted op at backing-vec index `idx`.
     RemovedOp { idx: usize },
-    /// Phase 2: shrank param at (op_idx_in_targets, field_idx) from prev_hi.
+    /// Phase 2: halved a parameter field's `hi` bound; `prev_hi` is the
+    /// pre-shrink upper bound for restoration.
     ShrankParam {
         target_idx: usize,
         field_idx: usize,
         prev_hi: usize,
     },
-    /// Phase 3: context ordinal was decremented.
+    /// Phase 3: decremented the context ordinal from `prev_ordinal`.
     ShrankContext { prev_ordinal: usize },
 }
 
-/// Per-field binary search state for parameter shrinking.
+/// Binary search state for one shrinkable field of an op.
+///
+/// `lo` is the current smallest-known-valid value (starts at 0); `hi` is the
+/// current upper bound (starts at the field's generated value). On each
+/// `simplify()` step, the midpoint `(lo + hi) / 2` is tried as the new `hi`;
+/// on `complicate()`, `lo` is set to `mid + 1` and `hi` is restored. When
+/// `lo >= hi`, this field is fully shrunk and the cursor advances.
+///
+/// The reconstructed op uses `lo` as the effective field value (see
+/// [`MutationPlanValueTree::apply_param_shrinks`]), so progress toward 0 is
+/// reflected in every `current()` call.
 #[derive(Clone, Debug)]
 struct ParamSearch {
     lo: usize,
     hi: usize,
 }
 
-/// Per-op shrink targets — which fields to binary-search.
+/// Collects the shrinkable fields for one op, built lazily at the
+/// phase 1 -> phase 2 transition.
+///
+/// `op_idx` refers to the backing `ops` vec (not the filtered view), so it
+/// remains valid even as the `included` bitset changes during earlier phases.
 #[derive(Clone, Debug)]
 struct OpParamTargets {
-    /// Index into `self.ops` (the original backing vec).
+    /// Index into the backing `ops` vec (stable across shrink phases).
     op_idx: usize,
-    /// One `ParamSearch` per shrinkable field.
+    /// One [`ParamSearch`] per shrinkable numeric field in this op.
+    /// `ChecksumCorrupt` has no fields; `CharsetViolate` has one or two
+    /// (position count when non-empty, plus replacement byte).
     fields: Vec<ParamSearch>,
 }
 
-/// Custom `ValueTree` for `MutationPlan` with structured multi-phase shrinking.
+/// Custom [`ValueTree`] for `MutationPlan` with structured multi-phase shrinking.
+///
+/// # Invariants
+///
+/// - `family` and `base_seed` are **immutable** throughout the tree's lifetime.
+///   Only `ops` (via `included` bitset + parameter shrinks) and `context` (via
+///   ordinal) change during shrinking.
+/// - The backing `ops` vec is never mutated. Inclusion/exclusion is tracked by
+///   a parallel `included` bitset, and parameter shrinks are applied on the fly
+///   during `current_ops()` reconstruction.
+/// - Every plan returned by `current()` satisfies [`is_valid_plan`]. Invalid
+///   candidates are silently reverted within each phase's `simplify_*` method.
+///
+/// # Reconstruction
+///
+/// `current()` rebuilds the plan from scratch each time: it filters `ops` by
+/// the `included` bitset, overlays parameter shrinks from `param_targets`, and
+/// converts `context_ordinal` back to a `ContextWrap`. This is cheap (the ops
+/// vec is at most [`DEFAULT_MAX_OPS`] = 8 elements) and avoids maintaining a
+/// synchronized mutable copy.
 pub struct MutationPlanValueTree {
-    /// The initial generated plan (family + base_seed are immutable).
+    /// Snapshot of the generated plan. `family` and `base_seed` are read from
+    /// here on every `current()` call; `ops` and `context` are ignored in
+    /// favor of the shrinker's own state.
     initial: MutationPlan,
-    /// Backing ops storage (never modified during shrinking).
+    /// Immutable backing storage for the generated ops. Never modified; the
+    /// `included` bitset and `param_targets` overlay determine what `current()`
+    /// returns.
     ops: Vec<MutOp>,
-    /// Bitset: which ops are included (soft deletion).
+    /// Parallel bitset: `included[i]` is `true` if `ops[i]` is part of the
+    /// current candidate. Phases 0 and 1 flip bits to `false` to remove ops.
     included: Vec<bool>,
 
-    // Phase 0 state: binary search on prefix length.
+    // -- Phase 0: prefix-length binary search --
     phase: ShrinkPhase,
+    /// Lower bound (inclusive) of the binary search on included-ops count.
     len_lo: usize,
+    /// Upper bound (exclusive) of the binary search on included-ops count.
     len_hi: usize,
 
-    // Phase 1 state: removal cursor.
+    // -- Phase 1: individual op removal --
+    /// Backing-vec index at or below which the next removal will be attempted.
+    /// Scans backward (high to low) so that later ops are removed first.
     remove_cursor: usize,
+    /// Set when the cursor reaches 0, signaling that phase 1 is complete.
     remove_exhausted: bool,
 
-    // Phase 2 state: per-op param shrink targets (lazily built).
+    // -- Phase 2: per-field parameter shrinking --
+    /// One entry per surviving op that has shrinkable fields, built lazily at
+    /// the phase 1 -> 2 transition by [`build_param_targets`].
     param_targets: Vec<OpParamTargets>,
+    /// Cursor into `param_targets` (which op we are currently shrinking).
     param_target_idx: usize,
+    /// Cursor into `param_targets[param_target_idx].fields` (which field).
     param_field_idx: usize,
 
-    // Phase 3 state: context ordinal.
+    // -- Phase 3: context ordinal --
+    /// Current context ordinal; shrinks by decrementing toward 0 (`Raw`).
     context_ordinal: usize,
 
-    // Undo tracking.
+    // -- Undo tracking --
+    /// The most recent successful simplify action, consumed by `complicate()`
+    /// to undo it. `None` after `complicate()` is called or if no simplify
+    /// has succeeded yet.
     prev_shrink: Option<PrevShrink>,
 }
 
 impl MutationPlanValueTree {
+    /// Create a new value tree rooted at the given plan.
+    ///
+    /// The plan's `ops` are cloned into immutable backing storage, and all
+    /// shrinker cursors are initialized to their starting positions (phase 0,
+    /// full inclusion, context ordinal matching `plan.context`).
     pub fn new(plan: MutationPlan) -> Self {
         let n = plan.ops.len();
         let context_ordinal = context_to_ordinal(plan.context);
@@ -341,6 +483,10 @@ impl MutationPlanValueTree {
     }
 
     /// Reconstruct the current `MutationPlan` from the shrinker state.
+    ///
+    /// Reads `family` and `base_seed` from the immutable initial plan, builds
+    /// the ops list via [`current_ops`](Self::current_ops), and converts the
+    /// context ordinal back to a `ContextWrap`.
     fn current_plan(&self) -> MutationPlan {
         MutationPlan {
             family: self.initial.family,
@@ -352,6 +498,15 @@ impl MutationPlanValueTree {
     }
 
     /// Collect included ops, applying any parameter shrinks from phase 2.
+    ///
+    /// Two-pass reconstruction:
+    /// 1. Filter `self.ops` by the `included` bitset to get the base list.
+    /// 2. For each `OpParamTargets`, find its op in the filtered list and
+    ///    replace it with a copy whose fields reflect the current `lo` values
+    ///    from the binary searches.
+    ///
+    /// The lookup in pass 2 re-derives the filtered index from the backing
+    /// index because the filtered position changes as earlier ops are removed.
     fn current_ops(&self) -> Vec<MutOp> {
         let mut ops: Vec<MutOp> = self
             .ops
@@ -381,7 +536,13 @@ impl MutationPlanValueTree {
         ops
     }
 
-    /// Apply the current binary search values from a target's fields to an op.
+    /// Replace an op's numeric fields with their current shrunk values.
+    ///
+    /// Each field uses `lo` as the effective value (the smallest value known to
+    /// still produce a valid plan). For collection fields (e.g. `positions` in
+    /// `CharsetViolate`), `lo` controls the prefix length — the collection is
+    /// truncated to `lo` elements. For scalar fields (e.g. `replacement`), `lo`
+    /// is used directly, cast to the appropriate type.
     fn apply_param_shrinks(&self, op: &MutOp, target: &OpParamTargets) -> MutOp {
         match op {
             MutOp::Truncate { .. } => {
@@ -438,7 +599,9 @@ impl MutationPlanValueTree {
         self.included.iter().filter(|&&b| b).count()
     }
 
-    /// Advance to the next phase.
+    /// Advance to the next shrinking phase, performing any one-time setup
+    /// needed by the new phase (e.g. resetting the removal cursor for phase 1
+    /// or building parameter targets for phase 2).
     fn advance_phase(&mut self) {
         self.phase = match self.phase {
             ShrinkPhase::OpsLength => {
@@ -458,7 +621,11 @@ impl MutationPlanValueTree {
         };
     }
 
-    /// Lazily build phase 2 shrink targets from the post-removal ops.
+    /// Build phase 2 shrink targets from the surviving (included) ops.
+    ///
+    /// Called once at the phase 1 -> 2 transition. Ops with no shrinkable
+    /// fields (e.g. `ChecksumCorrupt`) are skipped. The targets are built from
+    /// the post-removal state so that removed ops are not shrunk.
     fn build_param_targets(&mut self) {
         self.param_targets.clear();
         for (i, op) in self.ops.iter().enumerate() {
@@ -473,7 +640,16 @@ impl MutationPlanValueTree {
         }
     }
 
-    /// Extract shrinkable fields from an op as binary search ranges.
+    /// Extract shrinkable fields from an op as `[0, current_value)` binary
+    /// search ranges.
+    ///
+    /// Each numeric or collection-length field becomes one `ParamSearch` entry.
+    /// Some variants (e.g. `PrefixMangle` with an empty replacement, `Encode`
+    /// at ordinal 0) skip entry creation when there is nothing to shrink.
+    /// Others (e.g. `Truncate`, `EntropyReduce`) always emit entries;
+    /// convergent entries where `lo >= hi` are skipped by the binary search
+    /// loop in phase 2. The field ordering per variant must match the
+    /// reconstruction order in [`apply_param_shrinks`](Self::apply_param_shrinks).
     fn extract_fields(op: &MutOp) -> Vec<ParamSearch> {
         match op {
             MutOp::Truncate { len } => vec![ParamSearch { lo: 0, hi: *len }],
@@ -535,7 +711,17 @@ impl MutationPlanValueTree {
         }
     }
 
-    /// Phase 0: binary search on ops prefix length.
+    /// Phase 0: binary search on the number of included ops.
+    ///
+    /// Each step tries the midpoint `mid = (lo + hi) / 2`, excluding all ops
+    /// beyond the first `mid` included ones. If the resulting plan is invalid
+    /// (an excluded op was required by the family), the exclusion is reverted
+    /// and `lo` advances past `mid`. When `lo >= hi`, the binary search is
+    /// exhausted and the shrinker advances to phase 1.
+    ///
+    /// The validity revert is a full reset of the `included` bitset because
+    /// the exclusion modifies multiple bits at once and partial rollback would
+    /// be error-prone.
     fn simplify_ops_length(&mut self) -> bool {
         if self.len_lo >= self.len_hi {
             self.advance_phase();
@@ -575,7 +761,13 @@ impl MutationPlanValueTree {
         true
     }
 
-    /// Phase 1: remove individual ops via bitset soft deletion.
+    /// Phase 1: remove individual ops one at a time via bitset soft deletion.
+    ///
+    /// Scans backward from `remove_cursor` (high index to low) so that later
+    /// ops — which are more likely to be "extra" — are tried first. If removing
+    /// an op produces an invalid plan, the removal is reverted and the cursor
+    /// moves to the next lower index. When all indices have been tried (or the
+    /// included set is empty), the phase advances to parameter shrinking.
     fn simplify_remove_op(&mut self) -> bool {
         if self.remove_exhausted {
             self.advance_phase();
@@ -622,7 +814,13 @@ impl MutationPlanValueTree {
         }
     }
 
-    /// Phase 2: shrink op parameters via binary search.
+    /// Phase 2: shrink op parameters via per-field binary search toward 0.
+    ///
+    /// Iterates over `(param_target_idx, param_field_idx)` in order, performing
+    /// one binary search step per `simplify()` call. Each step halves the
+    /// field's `hi` bound; if the result is invalid, `lo` advances past the
+    /// midpoint instead. Fields that converge (`lo >= hi`) are skipped. When all
+    /// targets and fields are exhausted, the phase advances to context shrinking.
     fn simplify_shrink_param(&mut self) -> bool {
         loop {
             if self.param_target_idx >= self.param_targets.len() {
@@ -665,7 +863,11 @@ impl MutationPlanValueTree {
         }
     }
 
-    /// Phase 3: shrink context ordinal toward Raw (0).
+    /// Phase 3: decrement the context ordinal by 1 toward `Raw` (ordinal 0).
+    ///
+    /// Unlike the other phases, this is a simple linear walk (not a binary
+    /// search) because there are only 6 variants and `complicate()` can restore
+    /// the previous ordinal if the test runner needs it.
     fn simplify_shrink_context(&mut self) -> bool {
         if self.context_ordinal == 0 {
             self.advance_phase();
@@ -679,6 +881,11 @@ impl MutationPlanValueTree {
     }
 }
 
+/// Proptest's `ValueTree` contract: `current()` returns the current candidate,
+/// `simplify()` tries to make it smaller (returns `true` if it changed),
+/// `complicate()` partially undoes the last simplification (returns `true` if
+/// it changed). The test runner alternates simplify/complicate to binary-search
+/// for the minimal failing input.
 impl ValueTree for MutationPlanValueTree {
     type Value = MutationPlan;
 
@@ -686,6 +893,10 @@ impl ValueTree for MutationPlanValueTree {
         self.current_plan()
     }
 
+    /// Dispatch to the current phase's simplification logic.
+    ///
+    /// Returns `true` if the candidate changed (a smaller plan was produced),
+    /// `false` if no further simplification is possible across all phases.
     fn simplify(&mut self) -> bool {
         match self.phase {
             ShrinkPhase::OpsLength => self.simplify_ops_length(),
@@ -696,6 +907,11 @@ impl ValueTree for MutationPlanValueTree {
         }
     }
 
+    /// Undo the last simplification step and adjust search bounds so that
+    /// the next `simplify()` explores the complementary half of the range.
+    ///
+    /// Returns `false` if there is nothing to undo (no prior simplification
+    /// succeeded, or `complicate()` was already called).
     fn complicate(&mut self) -> bool {
         let Some(prev) = self.prev_shrink.take() else {
             return false;
@@ -703,12 +919,15 @@ impl ValueTree for MutationPlanValueTree {
 
         match prev {
             PrevShrink::TruncatedTo { prev_hi } => {
-                // Undo: restore len_hi, set lo = current hi + 1.
+                // The last simplify set len_hi = mid. Undo by restoring
+                // len_hi to prev_hi and advancing len_lo past mid so the
+                // next binary search step explores the upper half.
                 let current_hi = self.len_hi;
                 self.len_hi = prev_hi;
                 self.len_lo = current_hi + 1;
 
-                // Re-include ops up to prev_hi.
+                // Re-include ops up to prev_hi (full reset because the
+                // truncation may have flipped multiple bits).
                 self.included = vec![false; self.ops.len()];
                 for (i, b) in self.included.iter_mut().enumerate() {
                     if i < prev_hi {
@@ -719,10 +938,9 @@ impl ValueTree for MutationPlanValueTree {
             }
             PrevShrink::RemovedOp { idx } => {
                 self.included[idx] = true;
-                // After re-including, cursor is already past this index,
-                // so the next simplify won't retry it. If we were at idx=0
-                // and flagged exhausted, clear the flag but keep phase at
-                // RemoveOp so the next simplify transitions to Phase 2.
+                // The cursor is already below this index, so re-including it
+                // won't cause a retry. If idx == 0, there are no lower indices
+                // to try, so mark the phase exhausted.
                 if idx == 0 {
                     self.remove_exhausted = true;
                 }
@@ -733,6 +951,9 @@ impl ValueTree for MutationPlanValueTree {
                 field_idx,
                 prev_hi,
             } => {
+                // Restore the upper bound and advance the lower bound past the
+                // midpoint that was tried, mirroring standard binary search
+                // "complicate" semantics.
                 if target_idx < self.param_targets.len()
                     && field_idx < self.param_targets[target_idx].fields.len()
                 {
