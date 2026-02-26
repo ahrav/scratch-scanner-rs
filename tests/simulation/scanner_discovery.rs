@@ -53,6 +53,9 @@ fn discovery_falls_back_when_type_hint_missing() {
     if run_cfg.overlap < required {
         run_cfg.overlap = required;
     }
+    if run_cfg.chunk_size < run_cfg.overlap {
+        run_cfg.chunk_size = run_cfg.overlap;
+    }
 
     let runner = ScannerSimRunner::new(run_cfg.clone(), 0xC0FF_EE01);
     let fault_plan = FaultPlan {

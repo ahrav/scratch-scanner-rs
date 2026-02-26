@@ -52,6 +52,9 @@ fn bounded_random_archive_sims() {
         if run_cfg.overlap < required {
             run_cfg.overlap = required;
         }
+        if run_cfg.chunk_size < run_cfg.overlap {
+            run_cfg.chunk_size = run_cfg.overlap;
+        }
 
         let runner = ScannerSimRunner::new(run_cfg, seed.wrapping_add(0xC0FF_EE20));
         let fault_plan = FaultPlan {

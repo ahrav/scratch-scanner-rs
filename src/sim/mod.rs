@@ -17,6 +17,7 @@ pub mod executor;
 pub mod fault;
 pub mod fs;
 pub mod minimize;
+pub mod mutation;
 pub mod rng;
 pub mod trace;
 

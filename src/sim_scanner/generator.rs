@@ -19,6 +19,7 @@ use crate::api::{
 };
 use crate::archive::ArchiveConfig;
 use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
+use crate::sim::mutation::{encode_secret, TOKEN_ALPHABET};
 use crate::sim::rng::SimRng;
 use crate::sim_archive::{entry_paths, materialize_archive};
 use crate::sim_scanner::scenario::{
@@ -28,8 +29,6 @@ use crate::sim_scanner::scenario::{
 };
 use crate::Engine;
 
-const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-const BASE64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
 
 /// Configuration for generating synthetic scanner scenarios.
@@ -488,104 +487,6 @@ fn append_noise(rng: &mut SimRng, cfg: &ScenarioGenConfig, buf: &mut Vec<u8>) {
     };
     // Use lowercase filler to avoid matching uppercase rule prefixes.
     buf.resize(buf.len().saturating_add(noise_len as usize), b'x');
-}
-
-/// Encode the raw token into the requested representation.
-fn encode_secret(raw: &[u8], repr: &SecretRepr) -> Vec<u8> {
-    match repr {
-        SecretRepr::Raw => raw.to_vec(),
-        SecretRepr::Base64 => base64_encode_std(raw),
-        SecretRepr::UrlPercent => percent_encode_all(raw),
-        SecretRepr::Utf16Le => encode_utf16(raw, false),
-        SecretRepr::Utf16Be => encode_utf16(raw, true),
-        SecretRepr::Nested { depth } => encode_nested(raw, *depth),
-    }
-}
-
-/// Apply alternating base64 and URL-percent layers `depth` times.
-///
-/// Depth 0 returns the raw bytes unchanged.
-fn encode_nested(raw: &[u8], depth: u8) -> Vec<u8> {
-    if depth == 0 {
-        return raw.to_vec();
-    }
-    let mut cur = raw.to_vec();
-    // Alternate between base64 and URL percent to build nested transforms.
-    for i in 0..depth {
-        if i % 2 == 0 {
-            cur = base64_encode_std(&cur);
-        } else {
-            cur = percent_encode_all(&cur);
-        }
-    }
-    cur
-}
-
-/// Percent-encode every byte using uppercase hex.
-fn percent_encode_all(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len().saturating_mul(3));
-    for &b in input {
-        out.push(b'%');
-        out.push(hex_nibble((b >> 4) & 0x0f));
-        out.push(hex_nibble(b & 0x0f));
-    }
-    out
-}
-
-/// Base64-encode with the standard alphabet and `=` padding.
-fn base64_encode_std(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i + 3 <= input.len() {
-        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | input[i + 2] as u32;
-        out.push(BASE64_STD[((n >> 18) & 63) as usize]);
-        out.push(BASE64_STD[((n >> 12) & 63) as usize]);
-        out.push(BASE64_STD[((n >> 6) & 63) as usize]);
-        out.push(BASE64_STD[(n & 63) as usize]);
-        i += 3;
-    }
-
-    let rem = input.len() - i;
-    if rem == 1 {
-        let n = (input[i] as u32) << 16;
-        out.push(BASE64_STD[((n >> 18) & 63) as usize]);
-        out.push(BASE64_STD[((n >> 12) & 63) as usize]);
-        out.push(b'=');
-        out.push(b'=');
-    } else if rem == 2 {
-        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
-        out.push(BASE64_STD[((n >> 18) & 63) as usize]);
-        out.push(BASE64_STD[((n >> 12) & 63) as usize]);
-        out.push(BASE64_STD[((n >> 6) & 63) as usize]);
-        out.push(b'=');
-    }
-
-    out
-}
-
-fn hex_nibble(n: u8) -> u8 {
-    debug_assert!(n < 16);
-    match n {
-        0..=9 => b'0' + n,
-        _ => b'A' + (n - 10),
-    }
-}
-
-/// Widen ASCII bytes into UTF-16 code units (not a general Unicode encoder).
-fn encode_utf16(bytes: &[u8], be: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
-    for &b in bytes {
-        let hi = 0u8;
-        let lo = b;
-        if be {
-            out.push(hi);
-            out.push(lo);
-        } else {
-            out.push(lo);
-            out.push(hi);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

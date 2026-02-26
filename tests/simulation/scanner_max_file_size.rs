@@ -58,6 +58,9 @@ fn open_time_size_cap_skips_growth_after_discovery() {
     if run_cfg.overlap < required {
         run_cfg.overlap = required;
     }
+    if run_cfg.chunk_size < run_cfg.overlap {
+        run_cfg.chunk_size = run_cfg.overlap;
+    }
 
     let runner = ScannerSimRunner::new(run_cfg, 0xC0FF_EE02);
     let fault_plan = FaultPlan {
