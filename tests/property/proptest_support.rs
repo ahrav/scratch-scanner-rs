@@ -278,7 +278,7 @@ pub fn is_valid_plan(plan: &MutationPlan) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Uniform strategy over all 6 `TokenFamily` variants.
-fn arb_family() -> impl Strategy<Value = TokenFamily> {
+pub(super) fn arb_family() -> impl Strategy<Value = TokenFamily> {
     prop_oneof![
         Just(TokenFamily::AwsAccessKey),
         Just(TokenFamily::GithubFinegrainedPat),
@@ -290,7 +290,7 @@ fn arb_family() -> impl Strategy<Value = TokenFamily> {
 }
 
 /// Uniform strategy over all 6 `ContextWrap` variants.
-fn arb_context_wrap() -> impl Strategy<Value = ContextWrap> {
+pub(super) fn arb_context_wrap() -> impl Strategy<Value = ContextWrap> {
     prop_oneof![
         Just(ContextWrap::Raw),
         Just(ContextWrap::EnvAssignment),
@@ -321,7 +321,7 @@ fn arb_secret_repr() -> impl Strategy<Value = SecretRepr> {
 /// [`family_bound`] so that generated values stay within the token's realistic
 /// size range. The resulting strategy is boxed because the variant set differs
 /// per family.
-fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
+pub(super) fn arb_op_for_family(family: TokenFamily) -> BoxedStrategy<MutOp> {
     let allowed = family.allowed_ops();
     let bound = family_bound(family);
 

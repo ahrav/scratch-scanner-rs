@@ -22,5 +22,7 @@ mod regex2anchor_soundness;
 mod secret_bytes_safelist_soundness;
 mod value_suppressor_soundness;
 
+mod counterexample_determinism;
+mod counterexample_family_soundness;
 mod counterexample_shrinker;
 mod proptest_support;
