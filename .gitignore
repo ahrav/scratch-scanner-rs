@@ -80,3 +80,4 @@ eval-results/**/repo-scans/
 eval-results/**/repo-scans-off/
 eval-results/**/linux-uring-parity/*.log
 eval-results/**/creddata-subset/*-table.txt
+.osgrep

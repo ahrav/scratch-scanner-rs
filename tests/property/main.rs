@@ -21,3 +21,6 @@ mod path_policy_soundness;
 mod regex2anchor_soundness;
 mod secret_bytes_safelist_soundness;
 mod value_suppressor_soundness;
+
+mod counterexample_shrinker;
+mod proptest_support;
