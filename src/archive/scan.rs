@@ -539,6 +539,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     let mut outcome = ArchiveEnd::Scanned;
     let mut entry_scanned = false;
     let mut entry_partial_reason: Option<PartialReason> = None;
+    let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
     loop {
         if carry > 0 && have > 0 {
@@ -548,6 +549,9 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
         if allowance == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
                 let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -561,6 +565,9 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
         if read_max == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
                 let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -586,6 +593,9 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
         let mut allowed = n as u64;
         if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
+            if let BudgetHit::SkipEntry(reason) = hit {
+                entry_skip_reason = Some(reason);
+            }
             let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
@@ -627,6 +637,9 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     if !entry_scanned && outcome == ArchiveEnd::Scanned {
         outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
         entry_partial_reason = Some(PartialReason::GzipCorrupt);
+    }
+    if let Some(reason) = entry_skip_reason {
+        scan.stats.record_entry_skipped(reason, display, false);
     }
     if let Some(r) = entry_partial_reason {
         scan.stats.record_entry_partial(r, display, false);
