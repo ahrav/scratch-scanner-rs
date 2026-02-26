@@ -196,7 +196,7 @@ fn complex_plan_shrinks_to_minimal() {
             continue;
         }
 
-        let last_valid = shrink_while(&mut tree, &has_truncate);
+        let last_valid = shrink_while(&mut tree, |p| has_truncate(p));
 
         assert!(
             last_valid.ops.len() <= 2,
