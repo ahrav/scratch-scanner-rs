@@ -1,12 +1,42 @@
 //! Determinism and structural invariant property tests for the mutation framework.
 //!
-//! These tests verify three core properties:
+//! The mutation testing pipeline (`execute_plan`) turns a serializable
+//! [`MutationPlan`] into a fully materialized [`GeneratedCase`] through four
+//! stages: generate a canonical token, apply mutation operators left-to-right,
+//! predict the detection outcome, and embed the result in surrounding context
+//! bytes. For this pipeline to be useful as a test oracle, three structural
+//! properties must hold universally:
 //!
-//! - **Determinism (P3)**: identical plans always produce byte-identical output.
-//! - **Non-commutativity (P4)**: op ordering is semantically significant —
-//!   Truncate-then-Extend differs from Extend-then-Truncate.
-//! - **Offset correctness (P6)**: the `WrappedToken` offset metadata correctly
-//!   locates the mutated token within its context bytes.
+//! - **Determinism (P3)** — identical plans always produce byte-identical
+//!   output. This is the foundation that makes corpus serialization, CI
+//!   replay, and shrink-sequence reproducibility possible. If `execute_plan`
+//!   were non-deterministic, a failing seed recorded today could not be
+//!   reproduced tomorrow.
+//!
+//! - **Non-commutativity (P4)** — operator ordering is semantically
+//!   significant. `Truncate`-then-`Extend` must differ from
+//!   `Extend`-then-`Truncate`. This confirms that `apply_ops` composes
+//!   operators as a strict left-to-right pipeline rather than treating them
+//!   as a commutative set, which would collapse distinct mutation scenarios
+//!   into identical outputs.
+//!
+//! - **Offset correctness (P6)** — the [`WrappedToken`] offset metadata
+//!   correctly locates the mutated token within its surrounding context
+//!   bytes. The detection engine relies on these offsets to extract the
+//!   candidate token from context (JSON field, env assignment, etc.); if
+//!   they are wrong, every downstream assertion on detection behavior is
+//!   meaningless.
+//!
+//! Each property is tested with 500 proptest cases using strategies from
+//! [`super::proptest_support`] that generate arbitrary families, seeds, ops,
+//! and context wrappers. The custom [`MutationPlanValueTree`] shrinker (tested
+//! separately in [`super::counterexample_shrinker`]) ensures that any
+//! counterexample found here is minimized structurally before being reported.
+//!
+//! [`MutationPlan`]: scanner_rs::sim::mutation::MutationPlan
+//! [`GeneratedCase`]: scanner_rs::sim::mutation::GeneratedCase
+//! [`WrappedToken`]: scanner_rs::sim::mutation::WrappedToken
+//! [`MutationPlanValueTree`]: super::proptest_support::MutationPlanValueTree
 
 use proptest::prelude::*;
 
@@ -15,7 +45,16 @@ use scanner_rs::sim::SimRng;
 
 use super::proptest_support::{arb_family, arb_plan};
 
-// P3: Determinism -- same plan executed twice yields identical output.
+// Determinism: executing the same plan twice must produce byte-identical
+// results across all four pipeline outputs (canonical token, mutated bytes,
+// wrapped buffer, and predicted outcome). We clone the plan to ensure the
+// two calls receive structurally equal but independently owned inputs,
+// ruling out aliasing as a source of accidental equality.
+//
+// This property underpins corpus storage (plans are serialized to JSON and
+// replayed later) and shrink reproducibility (the shrinker re-executes plans
+// hundreds of times during minimization). A violation here would make every
+// other property test in this module unreliable.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
@@ -31,12 +70,24 @@ proptest! {
     }
 }
 
-// P4: Op ordering is semantically significant.
+// Non-commutativity: reversing the order of two ops must produce different
+// output, proving that `apply_ops` is a true left-to-right pipeline.
 //
-// Truncate-then-Extend and Extend-then-Truncate produce different byte
-// sequences for any non-trivial token. Given a canonical token of length N,
-// truncating to N/2 then extending by 1 byte yields (N/2 + 1) bytes, while
-// extending by 1 then truncating to N/2 yields N/2 bytes.
+// The test constructs two orderings of the same (Truncate, Extend) pair and
+// asserts that they diverge. The arithmetic guarantees divergence for any
+// non-empty canonical token of length N:
+//
+//   Truncate(N/2) then Extend(1 byte) => N/2 + 1 output bytes
+//   Extend(1 byte) then Truncate(N/2) => N/2 output bytes
+//
+// The output lengths alone differ, so the byte sequences must differ. We
+// generate the canonical token from an arbitrary family + seed rather than
+// using a fixed input to exercise the full range of token lengths (20--200
+// bytes depending on family).
+//
+// Why this matters: if the pipeline accidentally treated ops as commutative
+// (e.g. by sorting them), distinct mutation scenarios would collapse into
+// the same output and the expectation oracle would produce wrong predictions.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
@@ -61,8 +112,6 @@ proptest! {
         let result_ab = apply_ops(&canonical, &ops_ab);
         let result_ba = apply_ops(&canonical, &ops_ba);
 
-        // Truncate(N/2) then Extend(1) => N/2 + 1 bytes
-        // Extend(1) then Truncate(N/2) => N/2 bytes
         prop_assert_ne!(
             result_ab.bytes,
             result_ba.bytes,
@@ -73,12 +122,24 @@ proptest! {
     }
 }
 
-// P6: WrappedToken offset metadata correctly locates the mutated token.
+// Offset correctness: the WrappedToken metadata must accurately locate the
+// mutated token within its surrounding context buffer. The detection engine
+// uses these offsets to extract candidate tokens from lines that contain
+// context bytes (e.g. `{"token":"<secret>"}`); if the offset or length is
+// wrong, the engine would feed garbage to the validation gates.
 //
-// Three sub-invariants:
-// 1. token_offset + token_len <= bytes.len() (bounds)
-// 2. bytes[token_offset..token_offset+token_len] == mutated (content)
-// 3. Raw context implies token_offset == 0
+// Three sub-invariants are checked independently:
+//
+// 1. Bounds safety — the (offset, len) window must not exceed the buffer.
+//    A violation here would cause an out-of-bounds slice in production.
+//
+// 2. Content identity — the bytes at the recorded window must be exactly
+//    the mutated token bytes from the pipeline. This catches off-by-one
+//    errors in ContextWrap::wrap's prefix-length calculation.
+//
+// 3. Raw passthrough — when context is `Raw`, there is no prefix or suffix,
+//    so the token must start at offset 0. This catches bugs where `Raw`
+//    accidentally inserts empty wrapper bytes.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
@@ -87,7 +148,7 @@ proptest! {
         let case = execute_plan(&plan);
         let w = &case.wrapped;
 
-        // Sub-invariant 1: bounds
+        // Bounds safety: the offset window must fit within the buffer.
         prop_assert!(
             w.token_offset + w.token_len <= w.bytes.len(),
             "offset ({}) + len ({}) exceeds buffer ({})",
@@ -95,13 +156,15 @@ proptest! {
             w.token_len,
             w.bytes.len(),
         );
-        // Sub-invariant 2: content
+
+        // Content identity: the windowed bytes must equal the mutated token.
         prop_assert_eq!(
             &w.bytes[w.token_offset..w.token_offset + w.token_len],
             case.mutated.as_slice(),
             "wrapped token bytes do not match mutated bytes",
         );
-        // Sub-invariant 3: Raw context => offset 0
+
+        // Raw passthrough: no context wrapper means offset must be zero.
         if plan.context == ContextWrap::Raw {
             prop_assert_eq!(
                 w.token_offset, 0,

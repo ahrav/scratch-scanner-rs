@@ -997,3 +997,44 @@ impl std::fmt::Debug for MutationPlanValueTree {
             .finish()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ordinal roundtrip guards
+// ---------------------------------------------------------------------------
+
+/// Verify that `repr_to_ordinal` → `repr_from_ordinal` roundtrips for every
+/// `SecretRepr` variant the generation strategy can produce (unit variants +
+/// `Nested { depth: 1..=4 }`). Also asserts no two distinct variants share
+/// an ordinal, catching silent collisions.
+#[test]
+fn repr_ordinal_roundtrip_no_collision() {
+    use scanner_rs::sim::mutation::SecretRepr;
+    use std::collections::HashMap;
+
+    let variants: Vec<SecretRepr> = vec![
+        SecretRepr::Raw,
+        SecretRepr::Base64,
+        SecretRepr::UrlPercent,
+        SecretRepr::Utf16Le,
+        SecretRepr::Utf16Be,
+        SecretRepr::Nested { depth: 1 },
+        SecretRepr::Nested { depth: 2 },
+        SecretRepr::Nested { depth: 3 },
+        SecretRepr::Nested { depth: 4 },
+    ];
+
+    let mut seen: HashMap<usize, SecretRepr> = HashMap::new();
+
+    for repr in &variants {
+        let ord = repr_to_ordinal(repr);
+        let back = repr_from_ordinal(ord);
+        assert_eq!(
+            *repr, back,
+            "roundtrip failed: {repr:?} -> ordinal {ord} -> {back:?}",
+        );
+
+        if let Some(prev) = seen.insert(ord, repr.clone()) {
+            panic!("ordinal collision: {repr:?} and {prev:?} both map to ordinal {ord}",);
+        }
+    }
+}
