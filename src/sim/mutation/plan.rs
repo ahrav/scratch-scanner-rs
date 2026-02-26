@@ -99,7 +99,7 @@ impl WrappedToken {
 /// test), serialized to JSON for corpus storage, and replayed deterministically
 /// via [`execute_plan`]. The `base_seed` and `family` together fully determine
 /// the canonical token; `ops` and `context` determine the mutation and wrapping.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationPlan {
     /// Which secret format archetype to generate.
     pub family: TokenFamily,
