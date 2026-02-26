@@ -8,10 +8,11 @@
 //! properties must hold universally:
 //!
 //! - **Determinism (P3)** — identical plans always produce byte-identical
-//!   output. This is the foundation that makes corpus serialization, CI
-//!   replay, and shrink-sequence reproducibility possible. If `execute_plan`
-//!   were non-deterministic, a failing seed recorded today could not be
-//!   reproduced tomorrow.
+//!   output. This is the foundation that makes shrink-sequence
+//!   reproducibility possible and enables future corpus serialization and
+//!   CI replay (the plan derives `Serialize`/`Deserialize` for this
+//!   purpose). If `execute_plan` were non-deterministic, a failing seed
+//!   recorded today could not be reproduced tomorrow.
 //!
 //! - **Non-commutativity (P4)** — operator ordering is semantically
 //!   significant. `Truncate`-then-`Extend` must differ from
@@ -22,10 +23,10 @@
 //!
 //! - **Offset correctness (P6)** — the [`WrappedToken`] offset metadata
 //!   correctly locates the mutated token within its surrounding context
-//!   bytes. The detection engine relies on these offsets to extract the
-//!   candidate token from context (JSON field, env assignment, etc.); if
-//!   they are wrong, every downstream assertion on detection behavior is
-//!   meaningless.
+//!   bytes. The test harness relies on these offsets to verify that the
+//!   mutated token can be recovered from context (JSON field, env
+//!   assignment, etc.); if they are wrong, every downstream assertion on
+//!   detection behavior is meaningless.
 //!
 //! Each property is tested with 500 proptest cases using strategies from
 //! [`super::proptest_support`] that generate arbitrary families, seeds, ops,
@@ -51,10 +52,10 @@ use super::proptest_support::{arb_family, arb_plan};
 // two calls receive structurally equal but independently owned inputs,
 // ruling out aliasing as a source of accidental equality.
 //
-// This property underpins corpus storage (plans are serialized to JSON and
-// replayed later) and shrink reproducibility (the shrinker re-executes plans
-// hundreds of times during minimization). A violation here would make every
-// other property test in this module unreliable.
+// This property underpins corpus storage (plans are designed to be serialized
+// to JSON and replayed later) and shrink reproducibility (the test runner
+// re-executes plans many times during minimization). A violation here would
+// make every other property test in this module unreliable.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
@@ -82,7 +83,7 @@ proptest! {
 //
 // The output lengths alone differ, so the byte sequences must differ. We
 // generate the canonical token from an arbitrary family + seed rather than
-// using a fixed input to exercise the full range of token lengths (20--200
+// using a fixed input to exercise the full range of token lengths (20--96
 // bytes depending on family).
 //
 // Why this matters: if the pipeline accidentally treated ops as commutative
@@ -123,10 +124,11 @@ proptest! {
 }
 
 // Offset correctness: the WrappedToken metadata must accurately locate the
-// mutated token within its surrounding context buffer. The detection engine
-// uses these offsets to extract candidate tokens from lines that contain
-// context bytes (e.g. `{"token":"<secret>"}`); if the offset or length is
-// wrong, the engine would feed garbage to the validation gates.
+// mutated token within its surrounding context buffer. The test harness uses
+// these offsets to extract candidate tokens from lines that contain context
+// bytes (e.g. `{"token":"<secret>"}`); if the offset or length is wrong,
+// the harness would extract incorrect bytes and every downstream detection
+// assertion would be meaningless.
 //
 // Three sub-invariants are checked independently:
 //
