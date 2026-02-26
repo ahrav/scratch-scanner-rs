@@ -1131,6 +1131,7 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
         let mut have: usize = 0;
         let mut entry_scanned = false;
         let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
         while remaining > 0 {
             if carry > 0 && have > 0 {
@@ -1140,6 +1141,9 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
             let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                    if let BudgetHit::SkipEntry(reason) = hit {
+                        entry_skip_reason = Some(reason);
+                    }
                     let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
@@ -1154,6 +1158,9 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
+                    if let BudgetHit::SkipEntry(reason) = hit {
+                        entry_skip_reason = Some(reason);
+                    }
                     let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
@@ -1183,6 +1190,9 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
             if let ChargeResult::Clamp { allowed: a, hit } =
                 budgets.charge_decompressed_out(allowed)
             {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
                 let r = util::budget_hit_to_partial(hit, PartialReason::MalformedTar);
                 allowed = a;
                 outcome = ArchiveEnd::Partial(r);
@@ -1236,6 +1246,10 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
         budgets.end_entry(offset > 0);
 
+        if let Some(reason) = entry_skip_reason {
+            scan.stats
+                .record_entry_skipped(reason, entry_display, false);
+        }
         if let Some(r) = entry_partial_reason {
             scan.stats.record_entry_partial(r, entry_display, false);
         }
@@ -1528,6 +1542,7 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
         let mut have: usize = 0;
         let mut entry_scanned = false;
         let mut entry_partial_reason: Option<PartialReason> = None;
+        let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
         loop {
             if carry > 0 && have > 0 {
@@ -1540,6 +1555,9 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
+                    if let BudgetHit::SkipEntry(reason) = hit {
+                        entry_skip_reason = Some(reason);
+                    }
                     let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
@@ -1554,6 +1572,9 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if read_max == 0 {
                 if let ChargeResult::Clamp { hit, .. } = scratch.budgets.charge_decompressed_out(1)
                 {
+                    if let BudgetHit::SkipEntry(reason) = hit {
+                        entry_skip_reason = Some(reason);
+                    }
                     let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                     outcome = ArchiveEnd::Partial(r);
                     entry_partial_reason = Some(r);
@@ -1587,6 +1608,9 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
             if let ChargeResult::Clamp { allowed: a, hit } =
                 scratch.budgets.charge_decompressed_out(allowed)
             {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
                 let r = util::budget_hit_to_partial(hit, PartialReason::MalformedZip);
                 allowed = a;
                 outcome = ArchiveEnd::Partial(r);
@@ -1624,6 +1648,9 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
 
         sink.on_entry_end()?;
         scratch.budgets.end_entry(offset > 0);
+        if let Some(reason) = entry_skip_reason {
+            stats.record_entry_skipped(reason, entry_display, false);
+        }
         if let Some(r) = entry_partial_reason {
             stats.record_entry_partial(r, entry_display, false);
         }

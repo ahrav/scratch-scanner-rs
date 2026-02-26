@@ -7,7 +7,10 @@ use std::fs::File;
 use std::io::Read;
 
 use crate::archive::formats::GzipStream;
-use crate::archive::{ArchiveSkipReason, ChargeResult, PartialReason, DEFAULT_MAX_COMPONENTS};
+use crate::archive::{
+    ArchiveSkipReason, BudgetHit, ChargeResult, EntrySkipReason, PartialReason,
+    DEFAULT_MAX_COMPONENTS,
+};
 
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
@@ -285,6 +288,7 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
     let mut outcome = ArchiveEnd::Scanned;
     let mut entry_scanned = false;
     let mut entry_partial_reason: Option<PartialReason> = None;
+    let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
     loop {
         if carry > 0 && have > 0 {
@@ -296,6 +300,9 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
             .remaining_decompressed_allowance_with_ratio_probe(true);
         if allowance == 0 {
             if let ChargeResult::Clamp { hit, .. } = scan.budgets.charge_decompressed_out(1) {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
                 let r = budget_hit_to_partial_reason(hit);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -309,6 +316,9 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
 
         if read_max == 0 {
             if let ChargeResult::Clamp { hit, .. } = scan.budgets.charge_decompressed_out(1) {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
                 let r = budget_hit_to_partial_reason(hit);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
@@ -338,6 +348,9 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
         if let ChargeResult::Clamp { allowed: a, hit } =
             scan.budgets.charge_decompressed_out(allowed)
         {
+            if let BudgetHit::SkipEntry(reason) = hit {
+                entry_skip_reason = Some(reason);
+            }
             let r = budget_hit_to_partial_reason(hit);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
@@ -371,6 +384,11 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
     if !entry_scanned && outcome == ArchiveEnd::Scanned {
         outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
         entry_partial_reason = Some(PartialReason::GzipCorrupt);
+    }
+    if let Some(reason) = entry_skip_reason {
+        scan.metrics
+            .archive
+            .record_entry_skipped(reason, display, false);
     }
     if let Some(r) = entry_partial_reason {
         scan.metrics.archive.record_entry_partial(r, display, false);
