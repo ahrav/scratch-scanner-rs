@@ -15,13 +15,13 @@
 //! The shrinker proceeds through four phases in strict priority order, spending
 //! the shrinking budget on the highest-impact reductions first:
 //!
-//! 1. **Truncate ops suffix** — binary search on the included-ops prefix
+//! 0. **Truncate ops suffix** — binary search on the included-ops prefix
 //!    length, rapidly halving the op count.
-//! 2. **Remove individual ops** — bitset soft-deletion with a backward cursor,
+//! 1. **Remove individual ops** — bitset soft-deletion with a backward cursor,
 //!    trying to eliminate each remaining op one at a time.
-//! 3. **Shrink op parameters** — per-field binary search toward 0 on each
+//! 2. **Shrink op parameters** — per-field binary search toward 0 on each
 //!    surviving op's numeric parameters (lengths, byte values, ordinals).
-//! 4. **Shrink context** — decrement the `ContextWrap` ordinal toward `Raw`.
+//! 3. **Shrink context** — decrement the `ContextWrap` ordinal toward `Raw`.
 //!
 //! Phase transitions are monotonic — once a phase exhausts its search space,
 //! the shrinker advances to the next phase and never returns. This ordering
@@ -122,6 +122,137 @@ fn repr_from_ordinal(ord: usize) -> SecretRepr {
         n => SecretRepr::Nested {
             depth: (n - 4) as u8,
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified field layout
+// ---------------------------------------------------------------------------
+
+// `field_layout` is the single source of truth for the shrinkable fields of
+// each `MutOp` variant. Both `extract_fields` (which builds `ParamSearch`
+// entries) and `apply_param_shrinks` (which reconstructs ops from shrunk
+// values) delegate here, so adding or reordering a field in one automatically
+// updates the other.
+
+/// Classifies a shrinkable field for the unified field layout.
+#[derive(Clone, Copy, Debug)]
+enum FieldKind {
+    /// Collection prefix length (truncated to `hi` elements).
+    CollectionLen,
+    /// Scalar byte value (cast from/to `u8`).
+    ScalarU8,
+    /// Scalar `usize` value.
+    ScalarUsize,
+    /// Enum ordinal (decoded via `repr_from_ordinal`).
+    Ordinal,
+}
+
+/// Return the canonical field layout for an op: one `(kind, current_value)`
+/// entry per shrinkable numeric field, in a fixed order per variant.
+fn field_layout(op: &MutOp) -> Vec<(FieldKind, usize)> {
+    match op {
+        MutOp::Truncate { len } => vec![(FieldKind::ScalarUsize, *len)],
+        MutOp::CharsetViolate {
+            positions,
+            replacement,
+        } => {
+            let mut fields = Vec::new();
+            if !positions.is_empty() {
+                fields.push((FieldKind::CollectionLen, positions.len()));
+            }
+            fields.push((FieldKind::ScalarU8, *replacement as usize));
+            fields
+        }
+        MutOp::PrefixMangle { replacement } => {
+            if replacement.is_empty() {
+                vec![]
+            } else {
+                vec![(FieldKind::CollectionLen, replacement.len())]
+            }
+        }
+        MutOp::ChecksumCorrupt => vec![],
+        MutOp::EntropyReduce {
+            repeat_byte, count, ..
+        } => vec![
+            (FieldKind::ScalarU8, *repeat_byte as usize),
+            (FieldKind::ScalarUsize, *count),
+        ],
+        MutOp::Encode { repr } => {
+            let ord = repr_to_ordinal(repr);
+            if ord == 0 {
+                vec![]
+            } else {
+                vec![(FieldKind::Ordinal, ord)]
+            }
+        }
+        MutOp::Extend { suffix } => {
+            if suffix.is_empty() {
+                vec![]
+            } else {
+                vec![(FieldKind::CollectionLen, suffix.len())]
+            }
+        }
+    }
+}
+
+/// Reconstruct an op from a flat array of shrunk field values.
+///
+/// The `vals` slice has the same length and ordering as `field_layout(op)`.
+/// Collection fields use `vals[i]` as the prefix length (clamped to the
+/// original collection size); scalar fields use `vals[i]` directly.
+fn rebuild_op_from_values(op: &MutOp, vals: &[usize]) -> MutOp {
+    match op {
+        MutOp::Truncate { .. } => MutOp::Truncate { len: vals[0] },
+        MutOp::CharsetViolate { positions, .. } => {
+            if positions.is_empty() {
+                MutOp::CharsetViolate {
+                    positions: vec![],
+                    replacement: vals[0] as u8,
+                }
+            } else {
+                MutOp::CharsetViolate {
+                    positions: positions[..vals[0].min(positions.len())].to_vec(),
+                    replacement: vals[1] as u8,
+                }
+            }
+        }
+        MutOp::PrefixMangle { replacement } => {
+            if vals.is_empty() {
+                MutOp::PrefixMangle {
+                    replacement: replacement.clone(),
+                }
+            } else {
+                MutOp::PrefixMangle {
+                    replacement: replacement[..vals[0].min(replacement.len())].to_vec(),
+                }
+            }
+        }
+        MutOp::ChecksumCorrupt => MutOp::ChecksumCorrupt,
+        MutOp::EntropyReduce { .. } => MutOp::EntropyReduce {
+            repeat_byte: vals[0] as u8,
+            count: vals[1],
+        },
+        MutOp::Encode { repr } => {
+            if vals.is_empty() {
+                MutOp::Encode { repr: repr.clone() }
+            } else {
+                MutOp::Encode {
+                    repr: repr_from_ordinal(vals[0]),
+                }
+            }
+        }
+        MutOp::Extend { suffix } => {
+            if vals.is_empty() {
+                MutOp::Extend {
+                    suffix: suffix.clone(),
+                }
+            } else {
+                MutOp::Extend {
+                    suffix: suffix[..vals[0].min(suffix.len())].to_vec(),
+                }
+            }
+        }
     }
 }
 
@@ -527,73 +658,18 @@ impl MutationPlanValueTree {
 
     /// Replace an op's numeric fields with their current shrunk values.
     ///
-    /// Each field uses `hi` as the effective value — the current upper bound of
-    /// the binary search. `simplify()` lowers `hi` toward `lo` (the target,
-    /// typically 0), while `complicate()` restores `hi` and advances `lo`. This
-    /// follows proptest's standard convention where the "current candidate" is
-    /// the upper bound, ensuring that unsimplified fields retain their original
-    /// values until the binary search cursor reaches them.
-    ///
-    /// For collection fields (e.g. `positions` in `CharsetViolate`), `hi`
-    /// controls the prefix length — the collection is truncated to `hi`
-    /// elements. For scalar fields (e.g. `replacement`), `hi` is used directly,
-    /// cast to the appropriate type.
+    /// Delegates to [`field_layout`] for the canonical field ordering, reads
+    /// the shrunk `hi` value from each corresponding `target.fields` entry,
+    /// and passes the value array to [`rebuild_op_from_values`] for
+    /// reconstruction. This keeps the field-ordering coupling in one place.
     fn apply_param_shrinks(&self, op: &MutOp, target: &OpParamTargets) -> MutOp {
-        match op {
-            MutOp::Truncate { .. } => {
-                let len = target.fields.first().map_or(0, |f| f.hi);
-                MutOp::Truncate { len }
-            }
-            MutOp::CharsetViolate {
-                positions,
-                replacement,
-            } => {
-                // Field layout mirrors extract_fields: positions field is only
-                // present when non-empty, replacement field is always last.
-                let (pos_count, repl) = if positions.is_empty() {
-                    let repl = target.fields.first().map_or(*replacement, |f| f.hi as u8);
-                    (0, repl)
-                } else {
-                    let pos_count = target.fields.first().map_or(positions.len(), |f| f.hi);
-                    let repl = target.fields.get(1).map_or(*replacement, |f| f.hi as u8);
-                    (pos_count, repl)
-                };
-                MutOp::CharsetViolate {
-                    positions: positions[..pos_count.min(positions.len())].to_vec(),
-                    replacement: repl,
-                }
-            }
-            MutOp::PrefixMangle { replacement } => {
-                let len = target.fields.first().map_or(replacement.len(), |f| f.hi);
-                MutOp::PrefixMangle {
-                    replacement: replacement[..len.min(replacement.len())].to_vec(),
-                }
-            }
-            MutOp::ChecksumCorrupt => MutOp::ChecksumCorrupt,
-            MutOp::EntropyReduce { repeat_byte, count } => {
-                let rb = target.fields.first().map_or(*repeat_byte, |f| f.hi as u8);
-                let c = target.fields.get(1).map_or(*count, |f| f.hi);
-                MutOp::EntropyReduce {
-                    repeat_byte: rb,
-                    count: c,
-                }
-            }
-            MutOp::Encode { repr } => {
-                let ord = target
-                    .fields
-                    .first()
-                    .map_or(repr_to_ordinal(repr), |f| f.hi);
-                MutOp::Encode {
-                    repr: repr_from_ordinal(ord),
-                }
-            }
-            MutOp::Extend { suffix } => {
-                let len = target.fields.first().map_or(suffix.len(), |f| f.hi);
-                MutOp::Extend {
-                    suffix: suffix[..len.min(suffix.len())].to_vec(),
-                }
-            }
-        }
+        let layout = field_layout(op);
+        let vals: Vec<usize> = layout
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, original))| target.fields.get(i).map_or(original, |f| f.hi))
+            .collect();
+        rebuild_op_from_values(op, &vals)
     }
 
     /// Check whether the current shrinker state produces a valid plan without
@@ -657,72 +733,13 @@ impl MutationPlanValueTree {
     /// Extract shrinkable fields from an op as `[0, current_value)` binary
     /// search ranges.
     ///
-    /// Each numeric or collection-length field becomes one `ParamSearch` entry.
-    /// Some variants (e.g. `PrefixMangle` with an empty replacement, `Encode`
-    /// at ordinal 0) skip entry creation when there is nothing to shrink.
-    /// Others (e.g. `Truncate`, `EntropyReduce`) always emit entries;
-    /// convergent entries where `lo >= hi` are skipped by the binary search
-    /// loop in phase 2. The field ordering per variant must match the
-    /// reconstruction order in [`apply_param_shrinks`](Self::apply_param_shrinks).
+    /// Delegates to [`field_layout`] for the canonical field list, then
+    /// converts each `(kind, value)` pair into a `ParamSearch` entry.
     fn extract_fields(op: &MutOp) -> Vec<ParamSearch> {
-        match op {
-            MutOp::Truncate { len } => vec![ParamSearch { lo: 0, hi: *len }],
-            MutOp::CharsetViolate {
-                positions,
-                replacement,
-            } => {
-                let mut fields = Vec::new();
-                if !positions.is_empty() {
-                    fields.push(ParamSearch {
-                        lo: 0,
-                        hi: positions.len(),
-                    });
-                }
-                fields.push(ParamSearch {
-                    lo: 0,
-                    hi: *replacement as usize,
-                });
-                fields
-            }
-            MutOp::PrefixMangle { replacement } => {
-                if replacement.is_empty() {
-                    vec![]
-                } else {
-                    vec![ParamSearch {
-                        lo: 0,
-                        hi: replacement.len(),
-                    }]
-                }
-            }
-            MutOp::ChecksumCorrupt => vec![],
-            MutOp::EntropyReduce {
-                repeat_byte, count, ..
-            } => vec![
-                ParamSearch {
-                    lo: 0,
-                    hi: *repeat_byte as usize,
-                },
-                ParamSearch { lo: 0, hi: *count },
-            ],
-            MutOp::Encode { repr } => {
-                let ord = repr_to_ordinal(repr);
-                if ord == 0 {
-                    vec![]
-                } else {
-                    vec![ParamSearch { lo: 0, hi: ord }]
-                }
-            }
-            MutOp::Extend { suffix } => {
-                if suffix.is_empty() {
-                    vec![]
-                } else {
-                    vec![ParamSearch {
-                        lo: 0,
-                        hi: suffix.len(),
-                    }]
-                }
-            }
-        }
+        field_layout(op)
+            .into_iter()
+            .map(|(_, val)| ParamSearch { lo: 0, hi: val })
+            .collect()
     }
 
     /// Phase 0: binary search on the number of included ops.

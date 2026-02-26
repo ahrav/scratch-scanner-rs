@@ -12,6 +12,9 @@
 //! - **Minimality**: the shrinker converges to a near-minimal plan that still
 //!   satisfies the predicate.
 //! - **Context convergence**: unrestricted shrinking drives context to `Raw`.
+//! - **Parameter convergence**: phase 2 binary search reaches the minimum
+//!   satisfying value (or 0) for each field, including edge cases like
+//!   empty collection fields.
 //! - **Robustness**: edge cases (empty ops, interleaved simplify/complicate)
 //!   do not panic.
 //!
