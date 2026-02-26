@@ -244,6 +244,107 @@ fn context_shrinks_toward_raw() {
     panic!("no seed produced a plan with non-Raw context");
 }
 
+/// CharsetViolate with empty positions should still shrink the replacement byte
+/// toward 0 during unrestricted shrinking.
+///
+/// When `positions` is empty, `extract_fields` emits only one field (the
+/// replacement byte). `apply_param_shrinks` must recognize this and use
+/// `fields[0]` for the replacement — not treat it as the positions count.
+#[test]
+fn charset_violate_empty_positions_shrinks_replacement() {
+    let plan = MutationPlan {
+        family: TokenFamily::AwsAccessKey,
+        base_seed: 42,
+        case_id: 0,
+        ops: vec![MutOp::CharsetViolate {
+            positions: vec![],
+            replacement: 200,
+        }],
+        context: ContextWrap::Raw,
+    };
+
+    let mut tree = MutationPlanValueTree::new(plan);
+    let result = shrink_while(&mut tree, |p| {
+        p.ops
+            .iter()
+            .any(|op| matches!(op, MutOp::CharsetViolate { .. }))
+    });
+
+    let replacement = match &result.ops[0] {
+        MutOp::CharsetViolate { replacement, .. } => *replacement,
+        other => panic!("expected CharsetViolate, got {other:?}"),
+    };
+    assert_eq!(
+        replacement, 0,
+        "replacement byte should shrink to 0 when positions is empty, got {replacement}"
+    );
+}
+
+/// Parameter binary search should converge toward the minimum value satisfying
+/// the predicate, not stall at ~half the original.
+///
+/// With a `Truncate { len: 100 }` op and predicate "len >= 1", the shrinker
+/// should converge to len=1 (the minimum satisfying value). If the binary
+/// search uses the wrong field reference, it converges to ~51 instead.
+#[test]
+fn param_shrink_converges_to_minimum_satisfying_value() {
+    let plan = MutationPlan {
+        family: TokenFamily::AwsAccessKey,
+        base_seed: 42,
+        case_id: 0,
+        ops: vec![MutOp::Truncate { len: 100 }],
+        context: ContextWrap::Raw,
+    };
+
+    let mut tree = MutationPlanValueTree::new(plan);
+    let result = shrink_while(&mut tree, |p| {
+        p.ops
+            .iter()
+            .any(|op| matches!(op, MutOp::Truncate { len } if *len >= 1))
+    });
+
+    let len = match &result.ops[0] {
+        MutOp::Truncate { len } => *len,
+        other => panic!("expected Truncate, got {other:?}"),
+    };
+    assert!(
+        len <= 5,
+        "Truncate.len should shrink close to 1, but got {len}"
+    );
+}
+
+/// Phase 2 parameter shrinking drives `Truncate { len }` to 0 when the
+/// predicate requires a Truncate op but places no constraint on `len`.
+///
+/// The "has Truncate" predicate prevents phases 0 and 1 from removing the
+/// op entirely, forcing the shrinker into phase 2 where it binary-searches
+/// `len` toward 0. This confirms that phase 2 fully exhausts its search
+/// space and doesn't stall at a non-zero midpoint.
+#[test]
+fn param_shrink_drives_truncate_len_to_zero() {
+    let plan = MutationPlan {
+        family: TokenFamily::AwsAccessKey,
+        base_seed: 42,
+        case_id: 0,
+        ops: vec![MutOp::Truncate { len: 50 }],
+        context: ContextWrap::Raw,
+    };
+
+    let mut tree = MutationPlanValueTree::new(plan);
+    let result = shrink_while(&mut tree, |p| {
+        p.ops.iter().any(|op| op.kind() == MutOpKind::Truncate)
+    });
+
+    let len = match &result.ops[0] {
+        MutOp::Truncate { len } => *len,
+        other => panic!("expected Truncate, got {other:?}"),
+    };
+    assert_eq!(
+        len, 0,
+        "Truncate.len should shrink to 0 with unconstrained predicate, got {len}"
+    );
+}
+
 /// Edge case: an empty-ops plan with non-Raw context does not panic during
 /// interleaved `simplify()` / `complicate()` cycles.
 ///

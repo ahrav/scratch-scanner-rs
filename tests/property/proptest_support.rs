@@ -37,6 +37,11 @@ use scanner_rs::sim::mutation::{
     ContextWrap, MutOp, MutOpKind, MutationPlan, SecretRepr, TokenFamily,
 };
 
+// Compile-time guards: if a variant is added to these enums, the assertion
+// fires and the ordinal mappings / strategy lists below must be updated.
+const _: () = assert!(ContextWrap::ALL.len() == 6);
+const _: () = assert!(TokenFamily::ALL.len() == 6);
+
 // ---------------------------------------------------------------------------
 // Conservative upper bounds per family (token length)
 // ---------------------------------------------------------------------------
@@ -65,32 +70,27 @@ fn family_bound(family: TokenFamily) -> usize {
 
 // The ordinal mappings below impose a total order on `ContextWrap` and
 // `SecretRepr` so that the shrinker can binary-search toward 0 (the "simplest"
-// variant: `Raw` for both types). The ordering is arbitrary but must be
-// stable — changing it would alter shrink sequences for existing seeds.
+// variant: `Raw` for both types). `ContextWrap` ordinals are derived from
+// `ContextWrap::ALL` to auto-sync with production code. `SecretRepr` ordinals
+// use explicit match arms because the parametric `Nested` variant cannot be
+// enumerated in a const array.
 
 /// Map a `ContextWrap` to a numeric ordinal for shrinking (0 = `Raw` = simplest).
+///
+/// Derived from [`ContextWrap::ALL`] so the mapping auto-syncs when variants
+/// are added. The compile-time guard at the top of this file catches count
+/// changes.
 fn context_to_ordinal(ctx: ContextWrap) -> usize {
-    match ctx {
-        ContextWrap::Raw => 0,
-        ContextWrap::EnvAssignment => 1,
-        ContextWrap::JsonField => 2,
-        ContextWrap::YamlValue => 3,
-        ContextWrap::SingleLineComment => 4,
-        ContextWrap::MultiLineString => 5,
-    }
+    ContextWrap::ALL.iter().position(|&c| c == ctx).unwrap()
 }
 
-/// Inverse of [`context_to_ordinal`]. Out-of-range ordinals saturate to
-/// `MultiLineString` (the highest variant).
+/// Inverse of [`context_to_ordinal`]. Out-of-range ordinals saturate to the
+/// last variant in [`ContextWrap::ALL`].
 fn context_from_ordinal(ord: usize) -> ContextWrap {
-    match ord {
-        0 => ContextWrap::Raw,
-        1 => ContextWrap::EnvAssignment,
-        2 => ContextWrap::JsonField,
-        3 => ContextWrap::YamlValue,
-        4 => ContextWrap::SingleLineComment,
-        _ => ContextWrap::MultiLineString,
-    }
+    ContextWrap::ALL
+        .get(ord)
+        .copied()
+        .unwrap_or(*ContextWrap::ALL.last().unwrap())
 }
 
 /// Map a `SecretRepr` to a numeric ordinal for shrinking (0 = `Raw` = simplest).
@@ -359,15 +359,16 @@ enum PrevShrink {
 
 /// Binary search state for one shrinkable field of an op.
 ///
-/// `lo` is the current smallest-known-valid value (starts at 0); `hi` is the
-/// current upper bound (starts at the field's generated value). On each
+/// `lo` is the search floor (starts at 0, the shrink target); `hi` is the
+/// current candidate value (starts at the field's generated value). On each
 /// `simplify()` step, the midpoint `(lo + hi) / 2` is tried as the new `hi`;
 /// on `complicate()`, `lo` is set to `mid + 1` and `hi` is restored. When
 /// `lo >= hi`, this field is fully shrunk and the cursor advances.
 ///
-/// The reconstructed op uses `lo` as the effective field value (see
-/// [`MutationPlanValueTree::apply_param_shrinks`]), so progress toward 0 is
-/// reflected in every `current()` call.
+/// The reconstructed op uses `hi` as the effective field value (see
+/// [`MutationPlanValueTree::apply_param_shrinks`]), matching proptest's
+/// standard convention where `simplify()` lowers `hi` and `complicate()`
+/// restores it.
 #[derive(Clone, Debug)]
 struct ParamSearch {
     lo: usize,
@@ -499,37 +500,25 @@ impl MutationPlanValueTree {
 
     /// Collect included ops, applying any parameter shrinks from phase 2.
     ///
-    /// Two-pass reconstruction:
-    /// 1. Filter `self.ops` by the `included` bitset to get the base list.
-    /// 2. For each `OpParamTargets`, find its op in the filtered list and
-    ///    replace it with a copy whose fields reflect the current `lo` values
-    ///    from the binary searches.
-    ///
-    /// The lookup in pass 2 re-derives the filtered index from the backing
-    /// index because the filtered position changes as earlier ops are removed.
+    /// Single-pass reconstruction: builds the filtered ops list while recording
+    /// a backing-index → filtered-index mapping. Parameter shrinks are then
+    /// applied in O(m) using the precomputed mapping instead of re-scanning
+    /// the included bitset for every target.
     fn current_ops(&self) -> Vec<MutOp> {
-        let mut ops: Vec<MutOp> = self
-            .ops
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| self.included[i])
-            .map(|(_, op): (usize, &MutOp)| op.clone())
-            .collect();
+        let mut backing_to_filtered = [usize::MAX; DEFAULT_MAX_OPS];
+        let mut ops = Vec::with_capacity(self.included_count());
+        for (i, op) in self.ops.iter().enumerate() {
+            if self.included[i] {
+                backing_to_filtered[i] = ops.len();
+                ops.push(op.clone());
+            }
+        }
 
         // Apply parameter shrinks from phase 2 targets.
         for target in &self.param_targets {
-            // Find this op's position in the filtered list.
-            let filtered_idx = self
-                .ops
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.included[*i])
-                .position(|(i, _)| i == target.op_idx);
-
-            if let Some(idx) = filtered_idx {
-                if idx < ops.len() {
-                    ops[idx] = self.apply_param_shrinks(&ops[idx], target);
-                }
+            let idx = backing_to_filtered[target.op_idx];
+            if idx < ops.len() {
+                ops[idx] = self.apply_param_shrinks(&self.ops[target.op_idx], target);
             }
         }
 
@@ -538,39 +527,52 @@ impl MutationPlanValueTree {
 
     /// Replace an op's numeric fields with their current shrunk values.
     ///
-    /// Each field uses `lo` as the effective value (the smallest value known to
-    /// still produce a valid plan). For collection fields (e.g. `positions` in
-    /// `CharsetViolate`), `lo` controls the prefix length — the collection is
-    /// truncated to `lo` elements. For scalar fields (e.g. `replacement`), `lo`
-    /// is used directly, cast to the appropriate type.
+    /// Each field uses `hi` as the effective value — the current upper bound of
+    /// the binary search. `simplify()` lowers `hi` toward `lo` (the target,
+    /// typically 0), while `complicate()` restores `hi` and advances `lo`. This
+    /// follows proptest's standard convention where the "current candidate" is
+    /// the upper bound, ensuring that unsimplified fields retain their original
+    /// values until the binary search cursor reaches them.
+    ///
+    /// For collection fields (e.g. `positions` in `CharsetViolate`), `hi`
+    /// controls the prefix length — the collection is truncated to `hi`
+    /// elements. For scalar fields (e.g. `replacement`), `hi` is used directly,
+    /// cast to the appropriate type.
     fn apply_param_shrinks(&self, op: &MutOp, target: &OpParamTargets) -> MutOp {
         match op {
             MutOp::Truncate { .. } => {
-                let len = target.fields.first().map_or(0, |f| f.lo);
+                let len = target.fields.first().map_or(0, |f| f.hi);
                 MutOp::Truncate { len }
             }
             MutOp::CharsetViolate {
                 positions,
                 replacement,
             } => {
-                // Shrink positions toward empty and replacement toward 0.
-                let pos_count = target.fields.first().map_or(positions.len(), |f| f.lo);
-                let repl = target.fields.get(1).map_or(*replacement, |f| f.lo as u8);
+                // Field layout mirrors extract_fields: positions field is only
+                // present when non-empty, replacement field is always last.
+                let (pos_count, repl) = if positions.is_empty() {
+                    let repl = target.fields.first().map_or(*replacement, |f| f.hi as u8);
+                    (0, repl)
+                } else {
+                    let pos_count = target.fields.first().map_or(positions.len(), |f| f.hi);
+                    let repl = target.fields.get(1).map_or(*replacement, |f| f.hi as u8);
+                    (pos_count, repl)
+                };
                 MutOp::CharsetViolate {
                     positions: positions[..pos_count.min(positions.len())].to_vec(),
                     replacement: repl,
                 }
             }
             MutOp::PrefixMangle { replacement } => {
-                let len = target.fields.first().map_or(replacement.len(), |f| f.lo);
+                let len = target.fields.first().map_or(replacement.len(), |f| f.hi);
                 MutOp::PrefixMangle {
                     replacement: replacement[..len.min(replacement.len())].to_vec(),
                 }
             }
             MutOp::ChecksumCorrupt => MutOp::ChecksumCorrupt,
             MutOp::EntropyReduce { repeat_byte, count } => {
-                let rb = target.fields.first().map_or(*repeat_byte, |f| f.lo as u8);
-                let c = target.fields.get(1).map_or(*count, |f| f.lo);
+                let rb = target.fields.first().map_or(*repeat_byte, |f| f.hi as u8);
+                let c = target.fields.get(1).map_or(*count, |f| f.hi);
                 MutOp::EntropyReduce {
                     repeat_byte: rb,
                     count: c,
@@ -580,18 +582,30 @@ impl MutationPlanValueTree {
                 let ord = target
                     .fields
                     .first()
-                    .map_or(repr_to_ordinal(repr), |f| f.lo);
+                    .map_or(repr_to_ordinal(repr), |f| f.hi);
                 MutOp::Encode {
                     repr: repr_from_ordinal(ord),
                 }
             }
             MutOp::Extend { suffix } => {
-                let len = target.fields.first().map_or(suffix.len(), |f| f.lo);
+                let len = target.fields.first().map_or(suffix.len(), |f| f.hi);
                 MutOp::Extend {
                     suffix: suffix[..len.min(suffix.len())].to_vec(),
                 }
             }
         }
+    }
+
+    /// Check whether the current shrinker state produces a valid plan without
+    /// constructing the full `MutationPlan`. Walks the `included` bitset and
+    /// verifies every included op's kind is in the family's `allowed_ops`.
+    fn is_current_valid(&self) -> bool {
+        let allowed = self.initial.family.allowed_ops();
+        self.ops
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.included[*i])
+            .all(|(_, op)| allowed.contains(&op.kind()))
     }
 
     /// Count currently included ops.
@@ -713,19 +727,13 @@ impl MutationPlanValueTree {
 
     /// Phase 0: binary search on the number of included ops.
     ///
-    /// Each step tries the midpoint `mid = (lo + hi) / 2`, excluding all ops
-    /// beyond the first `mid` included ones. If the resulting plan is invalid
-    /// (an excluded op was required by the family), the exclusion is reverted
-    /// and `lo` advances past `mid`. When `lo >= hi`, the binary search is
-    /// exhausted and the shrinker advances to phase 1.
-    ///
-    /// The validity revert is a full reset of the `included` bitset because
-    /// the exclusion modifies multiple bits at once and partial rollback would
-    /// be error-prone.
-    fn simplify_ops_length(&mut self) -> bool {
+    /// Returns `Some(true)` when a valid truncation is found, `None` when the
+    /// binary search is exhausted and the caller should advance to the next
+    /// phase. Internal recursion retries after an invalid midpoint (bounded by
+    /// `log2(DEFAULT_MAX_OPS)` = 3 levels).
+    fn try_simplify_ops_length(&mut self) -> Option<bool> {
         if self.len_lo >= self.len_hi {
-            self.advance_phase();
-            return self.simplify();
+            return None;
         }
 
         let mid = self.len_lo + (self.len_hi - self.len_lo) / 2;
@@ -741,8 +749,7 @@ impl MutationPlanValueTree {
             }
         }
 
-        let plan = self.current_plan();
-        if !is_valid_plan(&plan) {
+        if !self.is_current_valid() {
             // Revert: restore all included, then re-exclude beyond len_hi.
             self.included = vec![true; self.ops.len()];
             for (i, b) in self.included.iter_mut().enumerate() {
@@ -751,53 +758,43 @@ impl MutationPlanValueTree {
                 }
             }
             self.len_lo = mid + 1;
-            return self.simplify_ops_length();
+            return self.try_simplify_ops_length();
         }
 
         self.prev_shrink = Some(PrevShrink::TruncatedTo {
             prev_hi: self.len_hi,
         });
         self.len_hi = mid;
-        true
+        Some(true)
     }
 
     /// Phase 1: remove individual ops one at a time via bitset soft deletion.
     ///
-    /// Scans backward from `remove_cursor` (high index to low) so that later
-    /// ops — which are more likely to be "extra" — are tried first. If removing
-    /// an op produces an invalid plan, the removal is reverted and the cursor
-    /// moves to the next lower index. When all indices have been tried (or the
-    /// included set is empty), the phase advances to parameter shrinking.
-    fn simplify_remove_op(&mut self) -> bool {
+    /// Returns `Some(true)` when an op is successfully removed, `None` when
+    /// all candidates have been tried and the caller should advance phases.
+    fn try_simplify_remove_op(&mut self) -> Option<bool> {
         if self.remove_exhausted {
-            self.advance_phase();
-            return self.simplify();
+            return None;
         }
 
         // Find next included index, scanning backward from cursor.
         loop {
             if !self.included.iter().any(|&b| b) {
-                self.advance_phase();
-                return self.simplify();
+                return None;
             }
 
             // Find an included index at or before cursor.
             let candidate = (0..=self.remove_cursor).rev().find(|&i| self.included[i]);
 
-            let Some(idx) = candidate else {
-                self.advance_phase();
-                return self.simplify();
-            };
+            let idx = candidate?;
 
             self.included[idx] = false;
 
-            let plan = self.current_plan();
-            if !is_valid_plan(&plan) {
+            if !self.is_current_valid() {
                 // Revert and try next position.
                 self.included[idx] = true;
                 if idx == 0 {
-                    self.advance_phase();
-                    return self.simplify();
+                    return None;
                 }
                 self.remove_cursor = idx - 1;
                 continue;
@@ -810,22 +807,18 @@ impl MutationPlanValueTree {
             } else {
                 self.remove_cursor = idx - 1;
             }
-            return true;
+            return Some(true);
         }
     }
 
     /// Phase 2: shrink op parameters via per-field binary search toward 0.
     ///
-    /// Iterates over `(param_target_idx, param_field_idx)` in order, performing
-    /// one binary search step per `simplify()` call. Each step halves the
-    /// field's `hi` bound; if the result is invalid, `lo` advances past the
-    /// midpoint instead. Fields that converge (`lo >= hi`) are skipped. When all
-    /// targets and fields are exhausted, the phase advances to context shrinking.
-    fn simplify_shrink_param(&mut self) -> bool {
+    /// Returns `Some(true)` when a field is successfully shrunk, `None` when
+    /// all targets and fields are exhausted and the caller should advance.
+    fn try_simplify_shrink_param(&mut self) -> Option<bool> {
         loop {
             if self.param_target_idx >= self.param_targets.len() {
-                self.advance_phase();
-                return self.simplify();
+                return None;
             }
 
             let target = &self.param_targets[self.param_target_idx];
@@ -846,8 +839,7 @@ impl MutationPlanValueTree {
 
             self.param_targets[self.param_target_idx].fields[self.param_field_idx].hi = mid;
 
-            let plan = self.current_plan();
-            if !is_valid_plan(&plan) {
+            if !self.is_current_valid() {
                 // Revert.
                 self.param_targets[self.param_target_idx].fields[self.param_field_idx].hi = prev_hi;
                 self.param_targets[self.param_target_idx].fields[self.param_field_idx].lo = mid + 1;
@@ -859,25 +851,23 @@ impl MutationPlanValueTree {
                 field_idx: self.param_field_idx,
                 prev_hi,
             });
-            return true;
+            return Some(true);
         }
     }
 
     /// Phase 3: decrement the context ordinal by 1 toward `Raw` (ordinal 0).
     ///
-    /// Unlike the other phases, this is a simple linear walk (not a binary
-    /// search) because there are only 6 variants and `complicate()` can restore
-    /// the previous ordinal if the test runner needs it.
-    fn simplify_shrink_context(&mut self) -> bool {
+    /// Returns `Some(true)` when the ordinal is decremented, `None` when
+    /// already at 0 and the caller should advance to `Done`.
+    fn try_simplify_shrink_context(&mut self) -> Option<bool> {
         if self.context_ordinal == 0 {
-            self.advance_phase();
-            return false;
+            return None;
         }
 
         let prev = self.context_ordinal;
         self.context_ordinal -= 1;
         self.prev_shrink = Some(PrevShrink::ShrankContext { prev_ordinal: prev });
-        true
+        Some(true)
     }
 }
 
@@ -895,15 +885,23 @@ impl ValueTree for MutationPlanValueTree {
 
     /// Dispatch to the current phase's simplification logic.
     ///
-    /// Returns `true` if the candidate changed (a smaller plan was produced),
-    /// `false` if no further simplification is possible across all phases.
+    /// Loops through phases: when a phase returns `None` (exhausted), the
+    /// shrinker advances to the next phase and retries. Returns `true` if the
+    /// candidate changed (a smaller plan was produced), `false` when all
+    /// phases are exhausted.
     fn simplify(&mut self) -> bool {
-        match self.phase {
-            ShrinkPhase::OpsLength => self.simplify_ops_length(),
-            ShrinkPhase::RemoveOp => self.simplify_remove_op(),
-            ShrinkPhase::ShrinkParam => self.simplify_shrink_param(),
-            ShrinkPhase::ShrinkContext => self.simplify_shrink_context(),
-            ShrinkPhase::Done => false,
+        loop {
+            let result = match self.phase {
+                ShrinkPhase::OpsLength => self.try_simplify_ops_length(),
+                ShrinkPhase::RemoveOp => self.try_simplify_remove_op(),
+                ShrinkPhase::ShrinkParam => self.try_simplify_shrink_param(),
+                ShrinkPhase::ShrinkContext => self.try_simplify_shrink_context(),
+                ShrinkPhase::Done => return false,
+            };
+            match result {
+                Some(progress) => return progress,
+                None => self.advance_phase(),
+            }
         }
     }
 
