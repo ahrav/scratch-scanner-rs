@@ -128,10 +128,7 @@ fn shrinker_output_stable_across_runs() {
 }
 
 // Generation validity: every plan produced by `arb_plan()` must satisfy the
-// family's op constraints and survive execution without panicking. The
-// `catch_unwind` around `execute_plan` absorbs debug_assert failures from
-// Extend+Encode chains that produce non-ASCII intermediates before a UTF-16
-// encoding layer — those are expected in debug builds and not a test failure.
+// family's op constraints and survive execution without panicking.
 proptest! {
     #![proptest_config(Config::with_cases(200))]
 
@@ -141,9 +138,25 @@ proptest! {
             is_valid_plan(&plan),
             "generated plan has ops not in family's allowed_ops: {plan:?}",
         );
-        let _ = std::panic::catch_unwind(|| {
-            scanner_rs::sim::mutation::execute_plan(&plan)
-        });
+
+        let case = scanner_rs::sim::mutation::execute_plan(&plan);
+        let w = &case.wrapped;
+
+        // Bounds safety: the offset window must fit within the buffer.
+        prop_assert!(
+            w.token_offset + w.token_len <= w.bytes.len(),
+            "offset ({}) + len ({}) exceeds buffer ({})",
+            w.token_offset,
+            w.token_len,
+            w.bytes.len(),
+        );
+
+        // Content identity: the windowed bytes must equal the mutated token.
+        prop_assert_eq!(
+            &w.bytes[w.token_offset..w.token_offset + w.token_len],
+            case.mutated.as_slice(),
+            "wrapped token bytes do not match mutated bytes",
+        );
     }
 }
 
@@ -283,11 +296,11 @@ fn charset_violate_empty_positions_shrinks_replacement() {
     );
 }
 
-/// Parameter binary search should converge toward the minimum value satisfying
+/// Parameter binary search should converge to the minimum value satisfying
 /// the predicate, not stall at ~half the original.
 ///
 /// With a `Truncate { len: 100 }` op and predicate "len >= 1", the shrinker
-/// should converge to len=1 (the minimum satisfying value). If the binary
+/// must converge to exactly len=1 (the minimum satisfying value). If the binary
 /// search uses the wrong field reference, it converges to ~51 instead.
 #[test]
 fn param_shrink_converges_to_minimum_satisfying_value() {
@@ -310,9 +323,9 @@ fn param_shrink_converges_to_minimum_satisfying_value() {
         MutOp::Truncate { len } => *len,
         other => panic!("expected Truncate, got {other:?}"),
     };
-    assert!(
-        len <= 5,
-        "Truncate.len should shrink close to 1, but got {len}"
+    assert_eq!(
+        len, 1,
+        "Truncate.len should shrink to exactly 1 (minimum satisfying len >= 1), but got {len}"
     );
 }
 
