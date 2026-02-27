@@ -43,6 +43,10 @@ pub enum Outcome {
     /// The engine **must not** detect this token. At least one mutation breaks
     /// a hard constraint (length, charset, prefix, or checksum), so a hit is
     /// a false positive bug.
+    ///
+    /// Note: the mutation adapter tolerates matches for tokens predicted as
+    /// MustNotMatch due to context-wrapper boundary effects; see
+    /// [`adapter::check_mutation_expectations`] for rationale.
     MustNotMatch,
     /// The engine **may or may not** detect this token. The mutation affects
     /// a soft heuristic (entropy, encoding depth, trailing bytes), so either
@@ -86,6 +90,9 @@ pub enum TokenFamily {
     UrlEncodedBlob,
 }
 
+/// Compile-time assertion: `rule_id()` assumes `ALL` has exactly 6 entries.
+const _: () = assert!(TokenFamily::ALL.len() == 6);
+
 impl TokenFamily {
     /// All token families, for exhaustive iteration in tests.
     pub const ALL: [TokenFamily; 6] = [
@@ -96,6 +103,23 @@ impl TokenFamily {
         TokenFamily::Base64Blob,
         TokenFamily::UrlEncodedBlob,
     ];
+
+    /// Positional index of this family in [`TokenFamily::ALL`], used as the
+    /// rule ID throughout the mutation adapter.
+    ///
+    /// This is the single source of truth for family→rule_id mapping. Both
+    /// scenario construction and post-run checking use it, so rule IDs are
+    /// consistent across the entire mutation pipeline.
+    pub const fn rule_id(self) -> u32 {
+        match self {
+            TokenFamily::AwsAccessKey => 0,
+            TokenFamily::GithubFinegrainedPat => 1,
+            TokenFamily::GithubClassicPat => 2,
+            TokenFamily::JwtLike => 3,
+            TokenFamily::Base64Blob => 4,
+            TokenFamily::UrlEncodedBlob => 5,
+        }
+    }
 
     /// Generate a structurally valid token for this family.
     ///
@@ -655,7 +679,7 @@ mod tests {
         );
     }
 
-    // -- Oracle path coverage (F6) --
+    // -- Oracle path coverage --
 
     #[test]
     fn oracle_truncate_below_canonical_is_must_not_match() {
@@ -770,6 +794,17 @@ mod tests {
             TokenFamily::AwsAccessKey.expectation(&token, &ops),
             Outcome::MayMatch,
         );
+    }
+
+    #[test]
+    fn token_family_rule_id_matches_all_index() {
+        for (i, family) in TokenFamily::ALL.iter().enumerate() {
+            assert_eq!(
+                family.rule_id(),
+                i as u32,
+                "{family:?}.rule_id() does not match its index in ALL",
+            );
+        }
     }
 
     #[test]

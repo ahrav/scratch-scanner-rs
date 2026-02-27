@@ -93,12 +93,12 @@ fn bounded_random_mutation_scanner_sims() {
         match outcome {
             RunOutcome::Ok { findings } => {
                 let check = check_mutation_expectations(&cases, actual_noise_len, &findings);
-                if !check.passed {
+                if !check.passed() {
                     if std::env::var_os("SCANNER_SIM_WRITE_FAIL").is_some() {
-                        write_mutation_failure(seed, &plans, &run_cfg, &check.violations);
+                        write_mutation_failure(seed, &plans, &run_cfg, check.violations());
                     }
                     let msgs: Vec<&str> = check
-                        .violations
+                        .violations()
                         .iter()
                         .map(|v| v.message.as_str())
                         .collect();

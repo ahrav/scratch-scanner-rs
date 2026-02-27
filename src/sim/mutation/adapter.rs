@@ -45,32 +45,49 @@ use crate::{Engine, FindingRec};
 
 /// Aggregate result of [`check_mutation_expectations`].
 ///
-/// `passed` is `true` when every case's expectation was satisfied. When
-/// `false`, `violations` contains one entry per failing case with diagnostic
-/// details. Note that only `MustMatch`-not-found failures are recorded;
-/// `MustNotMatch`-but-found cases are intentionally tolerated (see
-/// [`check_mutation_expectations`] for rationale).
+/// [`passed()`](MutationCheckResult::passed) returns `true` when every case's
+/// expectation was satisfied. When `false`,
+/// [`violations()`](MutationCheckResult::violations) contains one entry per
+/// failing case with diagnostic details. Note that only `MustMatch`-not-found
+/// failures are recorded; `MustNotMatch`-but-found cases are intentionally
+/// tolerated (see [`check_mutation_expectations`] for rationale).
 #[derive(Clone, Debug)]
 pub struct MutationCheckResult {
-    pub passed: bool,
-    pub violations: Vec<MutationViolation>,
+    violations: Vec<MutationViolation>,
+}
+
+impl MutationCheckResult {
+    /// Construct a result from a list of violations.
+    pub fn new(violations: Vec<MutationViolation>) -> Self {
+        Self { violations }
+    }
+
+    /// `true` when every case's expectation was satisfied.
+    pub fn passed(&self) -> bool {
+        self.violations.is_empty()
+    }
+
+    /// Per-case violation diagnostics (empty when [`passed()`](Self::passed)).
+    pub fn violations(&self) -> &[MutationViolation] {
+        &self.violations
+    }
 }
 
 /// A single mutation expectation that was violated.
 ///
-/// Currently only generated for `MustMatch` cases where no overlapping
-/// finding was produced. The `message` field contains a human-readable
-/// diagnostic including the rule ID and expected byte span.
+/// Only generated for `MustMatch` cases where no overlapping finding was
+/// produced. Carries structured fields for programmatic access alongside a
+/// human-readable diagnostic.
 #[derive(Clone, Debug)]
 pub struct MutationViolation {
     /// Index into the original `plans` / `cases` slice.
     pub case_index: usize,
     /// Token family of the failing case.
     pub family: TokenFamily,
-    /// The oracle's prediction (always `MustMatch` for current violations).
-    pub expected: Outcome,
-    /// Whether the engine produced a matching finding.
-    pub found: bool,
+    /// Rule ID that should have matched.
+    pub rule_id: u32,
+    /// Expected token span as `(start, end)` byte offsets within the file.
+    pub expected_span: (u64, u64),
     /// Human-readable diagnostic with rule ID, family, and byte span.
     pub message: String,
 }
@@ -282,8 +299,8 @@ pub fn check_mutation_expectations(
                 violations.push(MutationViolation {
                     case_index: case_idx,
                     family: case.plan.family,
-                    expected: Outcome::MustMatch,
-                    found: false,
+                    rule_id,
+                    expected_span: (span_start, span_end),
                     message: format!(
                         "case {case_idx} ({:?}): MustMatch but not found (rule_id={rule_id}, span={span_start}..{span_end})",
                         case.plan.family,
@@ -291,21 +308,18 @@ pub fn check_mutation_expectations(
                 });
             }
             Outcome::MustNotMatch if found => {
-                // The expectation oracle predicts MustNotMatch but the engine
-                // detected the token. This can happen when context wrappers
-                // contribute chars that extend the regex match, or when the
-                // engine's validation window is wider than the oracle assumed.
-                // Phase 1: log but do not fail. False-negative detection
-                // (MustMatch not found) is the primary mutation testing value.
+                // Silently tolerated: context wrappers can contribute characters
+                // that extend a regex match beyond what the oracle predicted, and
+                // the engine's validation window may be wider than assumed.
+                // Treating these as failures would produce noisy false alarms
+                // without meaningful signal. Only MustMatch-not-found cases carry
+                // actionable false-negative signal.
             }
             _ => {}
         }
     }
 
-    MutationCheckResult {
-        passed: violations.is_empty(),
-        violations,
-    }
+    MutationCheckResult::new(violations)
 }
 
 // -------------------------------------------------------------------------
@@ -332,18 +346,12 @@ fn mutation_case_file_ids(case_count: usize) -> Vec<crate::api::FileId> {
     ids
 }
 
-/// Map a [`TokenFamily`] to its rule ID (its positional index in
-/// [`TokenFamily::ALL`]).
+/// Map a [`TokenFamily`] to its rule ID.
 ///
-/// This index-based mapping is the single source of truth for correlating
-/// families to rules throughout the adapter. Both `build_family_rules` and
-/// `check_mutation_expectations` use it, so rule IDs are consistent between
-/// scenario construction and post-run checking.
+/// Delegates to [`TokenFamily::rule_id`], the single source of truth for
+/// the family→rule_id mapping.
 fn family_rule_id(family: TokenFamily) -> u32 {
-    TokenFamily::ALL
-        .iter()
-        .position(|f| *f == family)
-        .expect("family must be in ALL") as u32
+    family.rule_id()
 }
 
 /// Build one [`FamilyRule`] per token family with anchors, regex, and radius
@@ -352,9 +360,9 @@ fn family_rule_id(family: TokenFamily) -> u32 {
 /// Families with a known structural prefix (AWS, GitHub, JWT) use that prefix
 /// as the anchor and a regex that matches the full canonical format. Blob
 /// families (Base64Blob, UrlEncodedBlob) lack a fixed prefix, so they derive
-/// a short anchor from the first case's canonical token via
-/// [`first_canonical_prefix`]. This makes the anchor seed-dependent but
-/// deterministic.
+/// anchors from every case's canonical token via [`all_canonical_prefixes`].
+/// Each unique prefix is registered as a separate anchor so the engine can
+/// detect tokens regardless of which case's seed produced them.
 ///
 /// Radius values are set to slightly exceed the maximum canonical token
 /// length so the engine's search window covers the entire token after an
@@ -384,12 +392,12 @@ fn build_family_rules(cases: &[GeneratedCase]) -> Vec<FamilyRule> {
                 300,
             ),
             TokenFamily::Base64Blob => {
-                let anchor = first_canonical_prefix(cases, family, 4);
-                (vec![anchor], "[A-Za-z0-9+/]{32,68}={0,2}".to_string(), 80)
+                let anchors = all_canonical_prefixes(cases, family, 4);
+                (anchors, "[A-Za-z0-9+/]{32,68}={0,2}".to_string(), 80)
             }
             TokenFamily::UrlEncodedBlob => {
-                let anchor = first_canonical_prefix(cases, family, 6);
-                (vec![anchor], r"(?:%[0-9A-Fa-f]{2}){16,32}".to_string(), 120)
+                let anchors = all_canonical_prefixes(cases, family, 6);
+                (anchors, r"(?:%[0-9A-Fa-f]{2}){16,32}".to_string(), 120)
             }
         };
         rules.push(FamilyRule {
@@ -403,22 +411,37 @@ fn build_family_rules(cases: &[GeneratedCase]) -> Vec<FamilyRule> {
     rules
 }
 
-/// Extract the first `len` bytes of the canonical token for `family` from the
-/// generated cases, to use as an anchor for families without a fixed prefix.
+/// Collect the unique `len`-byte canonical prefixes from every case matching
+/// `family`, to use as anchors for families without a fixed prefix.
 ///
 /// Falls back to generating a fresh token with seed 0 if no case matches
 /// (e.g. if the plan batch does not include this family). The fallback is
 /// deterministic but may produce a different anchor than a case-derived one,
 /// so callers should ensure every family has at least one case when anchor
 /// stability matters.
-fn first_canonical_prefix(cases: &[GeneratedCase], family: TokenFamily, len: usize) -> Vec<u8> {
+fn all_canonical_prefixes(
+    cases: &[GeneratedCase],
+    family: TokenFamily,
+    len: usize,
+) -> Vec<Vec<u8>> {
+    let mut prefixes: Vec<Vec<u8>> = Vec::new();
     for case in cases {
         if case.plan.family == family {
-            return case.canonical[..len.min(case.canonical.len())].to_vec();
+            let prefix = case.canonical[..len.min(case.canonical.len())].to_vec();
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
         }
     }
-    let token = family.gen_valid(&mut SimRng::new(0));
-    token[..len.min(token.len())].to_vec()
+    if prefixes.is_empty() {
+        // Fallback for families not present in this plan batch (e.g.
+        // single-family unit tests). Deterministic but may differ from
+        // case-derived anchors; callers needing anchor stability should
+        // ensure every family has at least one case.
+        let token = family.gen_valid(&mut SimRng::new(0));
+        prefixes.push(token[..len.min(token.len())].to_vec());
+    }
+    prefixes
 }
 
 #[cfg(test)]
@@ -520,11 +543,11 @@ mod tests {
 
         // Case 1 has no finding from its file — it should be a violation.
         assert!(
-            !result.passed,
+            !result.passed(),
             "case 1 has no finding from its own file but check reported passed",
         );
-        assert_eq!(result.violations.len(), 1);
-        assert_eq!(result.violations[0].case_index, 1);
+        assert_eq!(result.violations().len(), 1);
+        assert_eq!(result.violations()[0].case_index, 1);
     }
 
     #[test]

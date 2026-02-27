@@ -32,8 +32,10 @@ fn corpus_dir() -> PathBuf {
 }
 
 fn list_cases(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("mutation corpus dir {dir:?} exists but is unreadable: {e}"),
     };
     let mut cases: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -62,6 +64,7 @@ fn replay_mutation_corpus_cases() {
     for path in cases {
         let bytes = fs::read(&path).expect("read corpus case");
         let entry: MutationCorpusEntry = serde_json::from_slice(&bytes).expect("parse corpus case");
+        assert!(!entry.plans.is_empty(), "corpus case {path:?} has no plans");
 
         // Initial build to discover required overlap.
         let mut scenario_rng = SimRng::new(entry.seed);
@@ -85,9 +88,9 @@ fn replay_mutation_corpus_cases() {
         match outcome {
             RunOutcome::Ok { findings } => {
                 let check = check_mutation_expectations(&gen_cases, noise_len, &findings);
-                if !check.passed {
+                if !check.passed() {
                     let msgs: Vec<&str> = check
-                        .violations
+                        .violations()
                         .iter()
                         .map(|v| v.message.as_str())
                         .collect();
