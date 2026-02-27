@@ -285,6 +285,14 @@ pub fn check_mutation_expectations(
     noise_len: usize,
     findings: &[FindingRec],
 ) -> MutationCheckResult {
+    // Index findings by rule_id so the per-case lookup is O(findings_for_rule)
+    // instead of O(total_findings).
+    let mut findings_by_rule: std::collections::HashMap<u32, Vec<&FindingRec>> =
+        std::collections::HashMap::new();
+    for f in findings {
+        findings_by_rule.entry(f.rule_id).or_default().push(f);
+    }
+
     let file_ids = mutation_case_file_ids(cases.len());
     let mut violations = Vec::new();
 
@@ -296,11 +304,12 @@ pub fn check_mutation_expectations(
 
         // Any-intersection match: finding overlaps the expected token span
         // AND belongs to this case's file.
-        let found = findings.iter().any(|f| {
-            f.file_id == expected_file_id
-                && f.rule_id == rule_id
-                && f.root_hint_start < span_end
-                && f.root_hint_end > span_start
+        let found = findings_by_rule.get(&rule_id).is_some_and(|fs| {
+            fs.iter().any(|f| {
+                f.file_id == expected_file_id
+                    && f.root_hint_start < span_end
+                    && f.root_hint_end > span_start
+            })
         });
 
         match case.expectation {
@@ -704,6 +713,25 @@ mod tests {
         let result = check_mutation_expectations(&[], 16, &[]);
         assert!(result.passed());
         assert!(result.violations().is_empty());
+    }
+
+    #[test]
+    fn empty_plans_produces_valid_scenario() {
+        let (scenario, cases, noise_len) = build_mutation_scenario(&[], 64);
+        assert!(cases.is_empty());
+        assert_eq!(noise_len, 64);
+        // Only the root directory node; no file nodes.
+        assert_eq!(
+            scenario.fs.nodes.len(),
+            1,
+            "empty plans should produce only the root dir node"
+        );
+        // Rules are still generated (one per family) regardless of plans.
+        assert!(
+            !scenario.rule_suite.rules.is_empty(),
+            "family rules should still be present even with no plans"
+        );
+        assert!(scenario.expected.is_empty());
     }
 }
 

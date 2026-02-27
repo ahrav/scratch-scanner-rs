@@ -53,6 +53,7 @@ fn replay_mutation_corpus_cases() {
     let dir = corpus_dir();
     let cases = list_cases(&dir);
     if cases.is_empty() {
+        eprintln!("WARN: no .mutation.case.json files found in {dir:?}, corpus replay is a no-op");
         return;
     }
 
