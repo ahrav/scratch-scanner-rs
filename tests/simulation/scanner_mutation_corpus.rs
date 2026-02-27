@@ -17,6 +17,12 @@ struct MutationCorpusEntry {
     seed: u64,
     run_config: RunConfig,
     plans: Vec<MutationPlan>,
+    /// Original violation messages captured when the failure was written.
+    /// Defaults to empty for backward-compatible deserialization of older
+    /// corpus files that predate this field.
+    #[serde(default)]
+    #[allow(dead_code)]
+    violation_messages: Vec<String>,
 }
 
 fn corpus_dir() -> PathBuf {
@@ -64,26 +70,13 @@ fn replay_mutation_corpus_cases() {
             .expect("build mutation engine");
         let mut run_config = entry.run_config.clone();
         let required = engine.required_overlap() as u32;
-        if run_config.overlap < required {
-            run_config.overlap = required;
-        }
-        if run_config.chunk_size < run_config.overlap {
-            run_config.chunk_size = run_config.overlap;
-        }
+        run_config.adjust_for_overlap(required);
 
-        // Rebuild with overlap-adjusted noise.
+        // Rebuild scenario with overlap-adjusted noise; reuse the engine since
+        // rules are identical regardless of noise_len.
         let mut scenario_rng = SimRng::new(entry.seed);
         let (scenario, gen_cases, noise_len) =
             build_mutation_scenario(&entry.plans, required as usize, &mut scenario_rng);
-        let engine = build_mutation_engine(&scenario.rule_suite, &run_config)
-            .expect("build mutation engine");
-        let required = engine.required_overlap() as u32;
-        if run_config.overlap < required {
-            run_config.overlap = required;
-        }
-        if run_config.chunk_size < run_config.overlap {
-            run_config.chunk_size = run_config.overlap;
-        }
 
         let schedule_seed = entry.seed.wrapping_add(0xC0FF_EE00);
         let runner = ScannerSimRunner::new(run_config, schedule_seed);

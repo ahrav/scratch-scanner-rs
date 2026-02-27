@@ -229,11 +229,19 @@ pub fn build_mutation_engine(suite: &RuleSuiteSpec, run_cfg: &RunConfig) -> Resu
 ///
 /// For each case, computes the expected token span as
 /// `noise_len + wrapped.token_offset .. + token_len` and checks whether any
-/// finding with the correct `rule_id` intersects that span. Intersection
-/// matching (`finding.start < span.end && finding.end > span.start`) is
-/// deliberately more lenient than the ground-truth oracle's containment
-/// check, because mutations can shift the regex match boundaries relative
-/// to the oracle's predicted span.
+/// finding **from the same file** with the correct `rule_id` intersects that
+/// span. Intersection matching (`finding.start < span.end && finding.end >
+/// span.start`) is deliberately more lenient than the ground-truth oracle's
+/// containment check, because mutations can shift the regex match boundaries
+/// relative to the oracle's predicted span.
+///
+/// Each case maps to a distinct file (`mutation_{idx}.txt`). The oracle
+/// derives the expected `FileId` for each case from the lexicographic sort
+/// order of those paths (matching the sim runner's file-id assignment).
+/// Without this per-file filtering, a finding from one file could
+/// incorrectly satisfy a sibling case's `MustMatch` expectation when
+/// multiple cases share the same family (and thus the same rule_id and
+/// similar per-file byte offsets).
 ///
 /// # Asymmetric failure treatment
 ///
@@ -251,16 +259,22 @@ pub fn check_mutation_expectations(
     noise_len: usize,
     findings: &[FindingRec],
 ) -> MutationCheckResult {
+    let file_ids = mutation_case_file_ids(cases.len());
     let mut violations = Vec::new();
 
     for (case_idx, case) in cases.iter().enumerate() {
         let rule_id = family_rule_id(case.plan.family);
+        let expected_file_id = file_ids[case_idx];
         let span_start = (noise_len + case.wrapped.token_offset) as u64;
         let span_end = span_start + case.wrapped.token_len as u64;
 
-        // Any-intersection match: finding overlaps the expected token span.
+        // Any-intersection match: finding overlaps the expected token span
+        // AND belongs to this case's file.
         let found = findings.iter().any(|f| {
-            f.rule_id == rule_id && f.root_hint_start < span_end && f.root_hint_end > span_start
+            f.file_id == expected_file_id
+                && f.rule_id == rule_id
+                && f.root_hint_start < span_end
+                && f.root_hint_end > span_start
         });
 
         match case.expectation {
@@ -297,6 +311,26 @@ pub fn check_mutation_expectations(
 // -------------------------------------------------------------------------
 // Internal helpers
 // -------------------------------------------------------------------------
+
+/// Compute the expected [`FileId`] for each mutation case.
+///
+/// `build_mutation_scenario` creates files named `mutation_{idx}.txt`. The
+/// sim runner assigns `FileId`s sequentially from 0 based on lexicographic
+/// sort of those file paths. This function replicates that sort to produce
+/// a `Vec` where `result[case_idx]` is the `FileId` the runner assigns to
+/// `mutation_{case_idx}.txt`.
+fn mutation_case_file_ids(case_count: usize) -> Vec<crate::api::FileId> {
+    let mut indexed_paths: Vec<(usize, String)> = (0..case_count)
+        .map(|idx| (idx, format!("mutation_{idx}.txt")))
+        .collect();
+    indexed_paths.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+
+    let mut ids = vec![crate::api::FileId(0); case_count];
+    for (file_id, (case_idx, _)) in indexed_paths.iter().enumerate() {
+        ids[*case_idx] = crate::api::FileId(file_id as u32);
+    }
+    ids
+}
 
 /// Map a [`TokenFamily`] to its rule ID (its positional index in
 /// [`TokenFamily::ALL`]).
@@ -429,6 +463,68 @@ mod tests {
         let json1 = serde_json::to_string(&s1).unwrap();
         let json2 = serde_json::to_string(&s2).unwrap();
         assert_eq!(json1, json2);
+    }
+
+    /// Two MustMatch cases from the same family with the same context wrapper
+    /// produce identical per-file token spans. A finding from one file must
+    /// not satisfy the other case's MustMatch expectation.
+    #[test]
+    fn cross_file_finding_does_not_satisfy_sibling_case() {
+        use super::super::plan::{ContextWrap, MutationPlan};
+
+        let plan0 = MutationPlan {
+            family: TokenFamily::AwsAccessKey,
+            base_seed: 42,
+            case_id: 0,
+            ops: vec![],
+            context: ContextWrap::EnvAssignment,
+        };
+        let plan1 = MutationPlan {
+            family: TokenFamily::AwsAccessKey,
+            base_seed: 99,
+            case_id: 1,
+            ops: vec![],
+            context: ContextWrap::EnvAssignment,
+        };
+
+        let plans = vec![plan0, plan1];
+        let mut rng = SimRng::new(0);
+        let (_scenario, cases, noise_len) = build_mutation_scenario(&plans, 64, &mut rng);
+
+        // Both unmutated → MustMatch.
+        assert_eq!(cases[0].expectation, Outcome::MustMatch);
+        assert_eq!(cases[1].expectation, Outcome::MustMatch);
+
+        // Same family + same context → identical per-file token spans.
+        let span0_start = (noise_len + cases[0].wrapped.token_offset) as u64;
+        let span0_end = span0_start + cases[0].wrapped.token_len as u64;
+        let span1_start = (noise_len + cases[1].wrapped.token_offset) as u64;
+        let span1_end = span1_start + cases[1].wrapped.token_len as u64;
+        assert_eq!(span0_start, span1_start);
+        assert_eq!(span0_end, span1_end);
+
+        // Simulate: engine detected the token in file 0 only (not file 1).
+        let finding = FindingRec {
+            file_id: crate::api::FileId(0),
+            rule_id: family_rule_id(TokenFamily::AwsAccessKey),
+            span_start: span0_start as u32,
+            span_end: span0_end as u32,
+            root_hint_start: span0_start,
+            root_hint_end: span0_end,
+            dedupe_with_span: false,
+            step_id: Default::default(),
+            confidence_score: 0,
+        };
+
+        let result = check_mutation_expectations(&cases, noise_len, &[finding]);
+
+        // Case 1 has no finding from its file — it should be a violation.
+        assert!(
+            !result.passed,
+            "case 1 has no finding from its own file but check reported passed",
+        );
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.violations[0].case_index, 1);
     }
 
     #[test]

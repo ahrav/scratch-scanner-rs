@@ -72,30 +72,19 @@ fn bounded_random_mutation_scanner_sims() {
             build_mutation_engine(&scenario.rule_suite, &base_run_cfg).expect("build engine");
         let required = engine.required_overlap() as u32;
         let mut run_cfg = base_run_cfg.clone();
-        if run_cfg.overlap < required {
-            run_cfg.overlap = required;
-        }
-        if run_cfg.chunk_size < run_cfg.overlap {
-            run_cfg.chunk_size = run_cfg.overlap;
-        }
+        run_cfg.adjust_for_overlap(required);
 
         let noise_len = match std::env::var("SIM_MUTATION_NOISE_LEN") {
             Ok(v) => v.parse().unwrap_or(required as usize),
             Err(_) => required as usize,
         };
 
-        // Rebuild with correct noise_len.
+        // Rebuild scenario with correct noise_len; the engine is reused since
+        // rules are identical regardless of noise_len and synthetic_tuning does
+        // not depend on overlap/chunk_size.
         let mut scenario_rng = SimRng::new(seed);
         let (scenario, cases, actual_noise_len) =
             build_mutation_scenario(&plans, noise_len, &mut scenario_rng);
-        let engine = build_mutation_engine(&scenario.rule_suite, &run_cfg).expect("build engine");
-        let required = engine.required_overlap() as u32;
-        if run_cfg.overlap < required {
-            run_cfg.overlap = required;
-        }
-        if run_cfg.chunk_size < run_cfg.overlap {
-            run_cfg.chunk_size = run_cfg.overlap;
-        }
 
         let schedule_seed = seed.wrapping_add(0xC0FF_EE00);
         let runner = ScannerSimRunner::new(run_cfg.clone(), schedule_seed);
@@ -132,7 +121,9 @@ fn write_mutation_failure(
     run_config: &RunConfig,
     violations: &[MutationViolation],
 ) {
-    let out_dir = "tests/failures";
+    // Write directly to the corpus replay directory so that captured failure
+    // artifacts are automatically picked up by `replay_mutation_corpus_cases`.
+    let out_dir = "tests/corpus/scanner_mutation";
     if let Err(err) = fs::create_dir_all(out_dir) {
         eprintln!("mutation sim: failed to create {out_dir}: {err}");
         return;
