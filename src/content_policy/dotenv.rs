@@ -223,8 +223,12 @@ fn parse_single_quoted<'a>(
     pos: &mut usize,
     out: &mut Vec<u8>,
 ) -> ValueResult {
+    let mut is_continuation = false;
     loop {
         if let Some(end_quote) = memchr(b'\'', segment) {
+            if is_continuation && !trailing_is_ignorable(&segment[end_quote + 1..]) {
+                return ValueResult::Skip;
+            }
             if push_bytes(out, &segment[..end_quote]) {
                 return ValueResult::Ok;
             }
@@ -241,6 +245,7 @@ fn parse_single_quoted<'a>(
             return ValueResult::CapReached;
         }
         segment = next_line(data, pos);
+        is_continuation = true;
     }
 }
 
@@ -260,6 +265,7 @@ fn parse_double_quoted<'a>(
     pos: &mut usize,
     out: &mut Vec<u8>,
 ) -> ValueResult {
+    let mut is_continuation = false;
     loop {
         let mut idx = 0usize;
         while idx < segment.len() {
@@ -272,6 +278,15 @@ fn parse_double_quoted<'a>(
                     }
                     idx += offset;
                     if segment[idx] == b'"' {
+                        // On continuation lines, only accept the close-quote
+                        // when the remainder of the physical line is
+                        // syntactically ignorable (whitespace / comment).
+                        // Otherwise this `"` likely belongs to a separate
+                        // assignment on the next line; treat the value as
+                        // malformed so rollback can re-parse it.
+                        if is_continuation && !trailing_is_ignorable(&segment[idx + 1..]) {
+                            return ValueResult::Skip;
+                        }
                         return ValueResult::Ok;
                     }
                     // Backslash: consume escape pair.
@@ -313,7 +328,18 @@ fn parse_double_quoted<'a>(
             return ValueResult::CapReached;
         }
         segment = next_line(data, pos);
+        is_continuation = true;
     }
+}
+
+/// Check whether the bytes following a closing quote on a continuation line
+/// are syntactically ignorable — either empty, whitespace-only, or whitespace
+/// followed by a `#` comment. Any other content means the `"` was likely an
+/// opening quote for a different assignment, not a valid close for the current
+/// multiline value.
+fn trailing_is_ignorable(tail: &[u8]) -> bool {
+    let trimmed = trim_ascii_start(tail);
+    trimmed.is_empty() || trimmed[0] == b'#'
 }
 
 /// Find the byte offset of the first `#` that starts an inline comment.
@@ -499,6 +525,37 @@ mod tests {
         let result = DotEnvExtractor.extract(input, &mut out, &mut Vec::new());
         assert_eq!(result, expected_result);
         assert_eq!(out, expected_output);
+    }
+
+    /// An unterminated double-quoted value followed by a line whose value
+    /// contains a `"` must not swallow the subsequent assignment. The parser
+    /// should skip the malformed entry and still emit the valid one.
+    #[test]
+    fn unterminated_dquote_does_not_consume_next_quoted_assignment() {
+        let input = b"BROKEN=\"unterminated\nNEXT=\"ok\"\n";
+        let mut out = Vec::new();
+        let result = DotEnvExtractor.extract(input, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "NEXT=ok\n",
+            "malformed BROKEN should be skipped; NEXT should be independently parsed"
+        );
+    }
+
+    /// Same as the double-quote variant: an unterminated single-quoted value
+    /// must not swallow the next quoted assignment.
+    #[test]
+    fn unterminated_squote_does_not_consume_next_quoted_assignment() {
+        let input = b"BROKEN='unterminated\nNEXT='ok'\n";
+        let mut out = Vec::new();
+        let result = DotEnvExtractor.extract(input, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "NEXT=ok\n",
+            "malformed BROKEN should be skipped; NEXT should be independently parsed"
+        );
     }
 
     /// Budget enforcement: when `out` is already near capacity the extractor
