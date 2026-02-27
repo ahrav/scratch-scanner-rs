@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 
 use super::errors::RepoOpenError;
 use super::limits::RepoOpenLimits;
+use crate::stdx::bytes::trim_ascii;
 
 /// Limits required for repository path resolution.
 pub trait RepoLimits {
@@ -449,7 +450,7 @@ where
             break;
         }
 
-        let trimmed = trim_ascii_whitespace(line);
+        let trimmed = trim_ascii(line);
         if trimmed.is_empty() || trimmed.starts_with(b"#") {
             continue;
         }
@@ -530,21 +531,6 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     let s = String::from_utf8_lossy(bytes);
     PathBuf::from(s.as_ref())
-}
-
-/// Trims ASCII whitespace from both ends of a byte slice.
-///
-/// This is ASCII-only; it intentionally does not trim Unicode whitespace.
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map_or(start, |p| p + 1);
-    &bytes[start..end]
 }
 
 /// Checks if a path is a file (follows symlinks).

@@ -51,6 +51,13 @@ use memchr::{memchr, memchr2};
 
 use super::extract::{ExtractResult, Extractor, EXTRACT_OUTPUT_CAP};
 
+/// Maximum number of continuation lines a multiline quoted value may span.
+///
+/// Prevents unbounded scanning when malformed input opens a quote but never
+/// closes it. Beyond this limit the value is treated as malformed
+/// ([`ValueResult::Skip`]) and the parser moves on.
+const MAX_MULTILINE_LINES: usize = 1024;
+
 /// Extracts normalized `KEY=VALUE\n` lines from dotenv files.
 ///
 /// Implements [`Extractor`] by appending one newline-terminated assignment per
@@ -95,7 +102,7 @@ impl Extractor for DotEnvExtractor {
 
         while pos < data.len() {
             let line = next_line(data, &mut pos);
-            let mut line = trim_ascii_start(line);
+            let mut line = line.trim_ascii_start();
             if line.is_empty() || line[0] == b'#' {
                 continue;
             }
@@ -105,7 +112,7 @@ impl Extractor for DotEnvExtractor {
                 continue;
             };
 
-            let key = trim_ascii(&line[..eq]);
+            let key = line[..eq].trim_ascii();
             if key.is_empty() {
                 continue;
             }
@@ -150,7 +157,7 @@ fn append_entry(
 
     let value_start = out.len();
     let resume_pos = *pos;
-    let value = trim_ascii_start(value);
+    let value = value.trim_ascii_start();
     let value_result = match value.first().copied() {
         Some(b'"') => parse_double_quoted(&value[1..], data, pos, out),
         Some(b'\'') => parse_single_quoted(&value[1..], data, pos, out),
@@ -173,9 +180,11 @@ fn append_entry(
                 out.copy_within(value_start + leading_ws.., value_start);
                 out.truncate(out.len() - leading_ws);
             }
-            while out.len() > value_start && out.last().is_some_and(|b| b.is_ascii_whitespace()) {
-                out.pop();
-            }
+            let trim_end = out[value_start..]
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(value_start, |p| value_start + p + 1);
+            out.truncate(trim_end);
             if push_byte(out, b'\n') {
                 LineResult::Appended
             } else {
@@ -203,7 +212,7 @@ fn append_entry(
 /// Unquoted values are always single-line, so this never advances `pos`.
 fn parse_unquoted(value: &[u8], out: &mut Vec<u8>) -> ValueResult {
     let end = unquoted_comment_start(value).unwrap_or(value.len());
-    let value = trim_ascii_end(&value[..end]);
+    let value = value[..end].trim_ascii_end();
     if push_bytes(out, value) {
         ValueResult::Ok
     } else {
@@ -224,6 +233,7 @@ fn parse_single_quoted<'a>(
     out: &mut Vec<u8>,
 ) -> ValueResult {
     let mut is_continuation = false;
+    let mut continuation_lines = 0usize;
     loop {
         if let Some(end_quote) = memchr(b'\'', segment) {
             if is_continuation && !trailing_is_ignorable(&segment[end_quote + 1..]) {
@@ -239,6 +249,10 @@ fn parse_single_quoted<'a>(
             return ValueResult::CapReached;
         }
         if *pos >= data.len() {
+            return ValueResult::Skip;
+        }
+        continuation_lines += 1;
+        if continuation_lines > MAX_MULTILINE_LINES {
             return ValueResult::Skip;
         }
         if !push_byte(out, b'\n') {
@@ -266,6 +280,7 @@ fn parse_double_quoted<'a>(
     out: &mut Vec<u8>,
 ) -> ValueResult {
     let mut is_continuation = false;
+    let mut continuation_lines = 0usize;
     loop {
         let mut idx = 0usize;
         while idx < segment.len() {
@@ -324,6 +339,10 @@ fn parse_double_quoted<'a>(
         if *pos >= data.len() {
             return ValueResult::Skip;
         }
+        continuation_lines += 1;
+        if continuation_lines > MAX_MULTILINE_LINES {
+            return ValueResult::Skip;
+        }
         if !push_byte(out, b'\n') {
             return ValueResult::CapReached;
         }
@@ -338,7 +357,7 @@ fn parse_double_quoted<'a>(
 /// opening quote for a different assignment, not a valid close for the current
 /// multiline value.
 fn trailing_is_ignorable(tail: &[u8]) -> bool {
-    let trimmed = trim_ascii_start(tail);
+    let trimmed = tail.trim_ascii_start();
     trimmed.is_empty() || trimmed[0] == b'#'
 }
 
@@ -369,7 +388,7 @@ fn strip_export_prefix(line: &[u8]) -> &[u8] {
     if line.len() <= 6 || &line[..6] != b"export" || !line[6].is_ascii_whitespace() {
         return line;
     }
-    trim_ascii_start(&line[7..])
+    line[7..].trim_ascii_start()
 }
 
 /// Return the next logical line from `data[*pos..]` and advance `pos` past
@@ -391,29 +410,6 @@ fn next_line<'a>(data: &'a [u8], pos: &mut usize) -> &'a [u8] {
         end -= 1;
     }
     &data[start..end]
-}
-
-/// Strip leading ASCII whitespace from a byte slice.
-fn trim_ascii_start(s: &[u8]) -> &[u8] {
-    let mut start = 0usize;
-    while start < s.len() && s[start].is_ascii_whitespace() {
-        start += 1;
-    }
-    &s[start..]
-}
-
-/// Strip trailing ASCII whitespace from a byte slice.
-fn trim_ascii_end(s: &[u8]) -> &[u8] {
-    let mut end = s.len();
-    while end > 0 && s[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Strip both leading and trailing ASCII whitespace from a byte slice.
-fn trim_ascii(s: &[u8]) -> &[u8] {
-    trim_ascii_end(trim_ascii_start(s))
 }
 
 /// Append one byte to `out` if the extraction budget has not been reached.
@@ -516,6 +512,47 @@ mod tests {
         ExtractResult::Ok,
         b"A=hello\n"
     )]
+    #[case::multiple_equals_in_value(b"KEY=val=ue\n", ExtractResult::Ok, b"KEY=val=ue\n")]
+    #[case::mixed_quote_in_double_quoted(
+        b"KEY=\"it's quoted\"\n",
+        ExtractResult::Ok,
+        b"KEY=it's quoted\n"
+    )]
+    #[case::hyphen_in_key(b"KEY-NAME=value\n", ExtractResult::Ok, b"KEY-NAME=value\n")]
+    #[case::unicode_in_value(
+        "KEY=caf\u{00e9}\n".as_bytes(),
+        ExtractResult::Ok,
+        "KEY=caf\u{00e9}\n".as_bytes()
+    )]
+    #[case::backslash_at_line_boundary_in_dquote(
+        b"KEY=\"hello\\\nworld\"\n",
+        ExtractResult::Ok,
+        b"KEY=hello\\\nworld\n"
+    )]
+    #[case::empty_key_skipped(b"=value\nKEY=ok\n", ExtractResult::Ok, b"KEY=ok\n")]
+    #[case::windows_crlf(b"K1=v1\r\nK2=v2\r\n", ExtractResult::Ok, b"K1=v1\nK2=v2\n")]
+    #[case::windows_crlf_multiline_quoted(
+        b"K=\"line1\r\nline2\"\r\n",
+        ExtractResult::Ok,
+        b"K=line1\nline2\n"
+    )]
+    #[case::incomplete_double_quote_eof(
+        b"A=\"unterminated\n",
+        ExtractResult::Empty,
+        b"" as &[u8]
+    )]
+    #[case::incomplete_single_quote_eof(
+        b"A='unterminated\n",
+        ExtractResult::Empty,
+        b"" as &[u8]
+    )]
+    #[case::key_with_spaces_trimmed(b" MY KEY =value\n", ExtractResult::Ok, b"MY KEY=value\n")]
+    #[case::null_bytes_in_value(b"KEY=ab\x00cd\n", ExtractResult::Ok, b"KEY=ab\x00cd\n")]
+    #[case::export_uppercase_not_stripped(
+        b"EXPORT_PATH=foo\n",
+        ExtractResult::Ok,
+        b"EXPORT_PATH=foo\n"
+    )]
     fn extract_cases(
         #[case] input: &[u8],
         #[case] expected_result: ExtractResult,
@@ -568,6 +605,66 @@ mod tests {
         assert_eq!(result, ExtractResult::Empty);
         assert_eq!(out, original);
     }
+
+    /// A value that, combined with its key and newline, exactly fills the
+    /// output cap should be emitted. One byte over should be rolled back.
+    #[test]
+    fn near_cap_boundary() {
+        // KEY= takes 4 bytes, trailing \n takes 1 byte → value can be cap-5 bytes.
+        let key = b"K";
+        let overhead = key.len() + 1 + 1; // key + '=' + '\n'
+        let max_val_len = EXTRACT_OUTPUT_CAP - overhead;
+
+        // Exactly at cap: should succeed.
+        let val_exact: Vec<u8> = vec![b'x'; max_val_len];
+        let mut input = Vec::new();
+        input.extend_from_slice(key);
+        input.push(b'=');
+        input.extend_from_slice(&val_exact);
+        input.push(b'\n');
+        let mut out = Vec::new();
+        let result = DotEnvExtractor.extract(&input, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert_eq!(out.len(), EXTRACT_OUTPUT_CAP);
+
+        // One byte over: the entry should be rolled back, yielding Empty.
+        let val_over: Vec<u8> = vec![b'x'; max_val_len + 1];
+        let mut input = Vec::new();
+        input.extend_from_slice(key);
+        input.push(b'=');
+        input.extend_from_slice(&val_over);
+        input.push(b'\n');
+        let mut out = Vec::new();
+        let result = DotEnvExtractor.extract(&input, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Empty);
+        assert!(out.is_empty());
+    }
+
+    /// A multiline quoted value exceeding `MAX_MULTILINE_LINES` continuation
+    /// lines is treated as malformed. The parser skips it and continues with
+    /// subsequent assignments.
+    #[test]
+    fn multiline_limit_exceeded_skips_entry() {
+        // Build input: A="line\nline\n...line (>1024 continuations, never closed)
+        // followed by a valid assignment.
+        let mut input = b"A=\"start".to_vec();
+        for _ in 0..MAX_MULTILINE_LINES + 10 {
+            input.extend_from_slice(b"\ncontinuation");
+        }
+        input.extend_from_slice(b"\nOK=yes\n");
+
+        let mut out = Vec::new();
+        let result = DotEnvExtractor.extract(&input, &mut out, &mut Vec::new());
+        assert_eq!(result, ExtractResult::Ok);
+        assert!(
+            out.windows(b"OK=yes\n".len()).any(|w| w == b"OK=yes\n"),
+            "valid assignment after the runaway quote should still be emitted"
+        );
+        assert!(
+            !out.starts_with(b"A="),
+            "the runaway multiline value should be skipped"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "stdx-proptest"))]
@@ -575,8 +672,14 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Generate a single dotenv line of a random syntax variant.
-    fn dotenv_line() -> impl Strategy<Value = Vec<u8>> {
+    /// Generate a single-line dotenv entry (no embedded newlines in values).
+    ///
+    /// Suitable for tests that require idempotent output (re-extracting the
+    /// output yields the same bytes). Multiline quoted values are excluded
+    /// because the output format uses bare `\n` as both line separator and
+    /// embedded literal, so multiline values inherently lose structure on
+    /// re-parse.
+    fn dotenv_line_single() -> impl Strategy<Value = Vec<u8>> {
         prop_oneof![
             // KEY=VALUE (unquoted)
             "[A-Z_]{1,20}=[a-zA-Z0-9_]{0,40}\n".prop_map(|s| s.into_bytes()),
@@ -586,10 +689,108 @@ mod proptests {
             Just(b"\n".to_vec()),
             // export KEY=VALUE
             "export [A-Z_]{1,20}=[a-zA-Z0-9_]{0,40}\n".prop_map(|s| s.into_bytes()),
-            // double-quoted
+            // double-quoted (simple)
             "[A-Z_]{1,20}=\"[a-zA-Z0-9_ ]{0,40}\"\n".prop_map(|s| s.into_bytes()),
-            // single-quoted
+            // single-quoted (simple)
             "[A-Z_]{1,20}='[a-zA-Z0-9_ ]{0,40}'\n".prop_map(|s| s.into_bytes()),
+            // double-quoted with idempotency-safe escapes (\\t, \\\\)
+            //
+            // Excluded: \\n and \\r produce literal newlines that split on
+            // re-parse; \\" produces a `"` that triggers quoting on re-parse.
+            // All excluded escapes are covered by `dotenv_line()`.
+            (
+                "[A-Z_]{1,20}",
+                prop::collection::vec(
+                    prop_oneof![
+                        "[a-zA-Z0-9_ ]{1,10}".prop_map(|s| s.into_bytes()),
+                        Just(b"\\t".to_vec()),
+                        Just(b"\\\\".to_vec()),
+                    ],
+                    1..6,
+                )
+            )
+                .prop_map(|(key, parts)| {
+                    let mut line = key.into_bytes();
+                    line.extend_from_slice(b"=\"");
+                    for p in parts {
+                        line.extend_from_slice(&p);
+                    }
+                    line.extend_from_slice(b"\"\n");
+                    line
+                }),
+            // single-quoted with literal backslash sequences
+            (
+                "[A-Z_]{1,20}",
+                "[a-zA-Z0-9_]{0,10}\\\\[t\"\\\\][a-zA-Z0-9_]{0,10}"
+            )
+                .prop_map(|(key, val)| {
+                    let mut line = key.into_bytes();
+                    line.push(b'\'');
+                    line.extend_from_slice(val.as_bytes());
+                    line.extend_from_slice(b"'\n");
+                    line
+                }),
+        ]
+    }
+
+    /// Generate a dotenv line including multiline quoted variants.
+    ///
+    /// Includes all single-line variants plus multiline double- and
+    /// single-quoted values with embedded newlines. Not suitable for
+    /// idempotency or well-formedness tests (multiline values produce
+    /// output lines without `=` separators).
+    fn dotenv_line() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // All single-line variants (8 arms weighted 8×).
+            8 => dotenv_line_single(),
+            // double-quoted with newline-producing escapes (\\n, \\r)
+            1 => (
+                "[A-Z_]{1,20}",
+                prop::collection::vec(
+                    prop_oneof![
+                        "[a-zA-Z0-9_ ]{1,10}".prop_map(|s| s.into_bytes()),
+                        Just(b"\\n".to_vec()),
+                        Just(b"\\r".to_vec()),
+                        Just(b"\\t".to_vec()),
+                        Just(b"\\\\".to_vec()),
+                        Just(b"\\\"".to_vec()),
+                    ],
+                    1..6,
+                )
+            )
+                .prop_map(|(key, parts)| {
+                    let mut line = key.into_bytes();
+                    line.extend_from_slice(b"=\"");
+                    for p in parts {
+                        line.extend_from_slice(&p);
+                    }
+                    line.extend_from_slice(b"\"\n");
+                    line
+                }),
+            // multiline double-quoted (embedded newline before closing quote)
+            1 => ("[A-Z_]{1,20}", "[a-zA-Z0-9_]{1,20}", "[a-zA-Z0-9_]{1,20}").prop_map(
+                |(key, line1, line2)| {
+                    let mut line = key.into_bytes();
+                    line.extend_from_slice(b"=\"");
+                    line.extend_from_slice(line1.as_bytes());
+                    line.push(b'\n');
+                    line.extend_from_slice(line2.as_bytes());
+                    line.extend_from_slice(b"\"\n");
+                    line
+                }
+            ),
+            // multiline single-quoted (embedded newline before closing quote)
+            1 => ("[A-Z_]{1,20}", "[a-zA-Z0-9_]{1,20}", "[a-zA-Z0-9_]{1,20}").prop_map(
+                |(key, line1, line2)| {
+                    let mut line = key.into_bytes();
+                    line.extend_from_slice(b"='");
+                    line.extend_from_slice(line1.as_bytes());
+                    line.push(b'\n');
+                    line.extend_from_slice(line2.as_bytes());
+                    line.extend_from_slice(b"'\n");
+                    line
+                }
+            ),
         ]
     }
 
@@ -607,8 +808,12 @@ mod proptests {
 
         /// Every non-empty line in the output must contain at least one `=`
         /// with a non-empty key before it.
+        ///
+        /// Uses single-line generators only: multiline quoted values produce
+        /// output lines that are value continuations (no `=`), which is correct
+        /// behavior but violates this per-line structural check.
         #[test]
-        fn output_lines_are_well_formed(lines in prop::collection::vec(dotenv_line(), 1..30)) {
+        fn output_lines_are_well_formed(lines in prop::collection::vec(dotenv_line_single(), 1..30)) {
             let input: Vec<u8> = lines.into_iter().flatten().collect();
             let mut out = Vec::new();
             let _ = DotEnvExtractor.extract(&input, &mut out, &mut Vec::new());
@@ -629,8 +834,13 @@ mod proptests {
         /// output format has a quoting/trimming asymmetry (e.g. quoted
         /// whitespace surviving the first pass but being trimmed on re-parse
         /// as an unquoted value).
+        ///
+        /// Uses single-line generators only: multiline quoted values embed
+        /// literal `\n` in the output, which on re-parse splits into separate
+        /// lines (the continuation part has no `=` and is discarded). This is
+        /// inherent to the unquoted output format, not a normalization bug.
         #[test]
-        fn extraction_is_idempotent(lines in prop::collection::vec(dotenv_line(), 1..20)) {
+        fn extraction_is_idempotent(lines in prop::collection::vec(dotenv_line_single(), 1..20)) {
             let input: Vec<u8> = lines.into_iter().flatten().collect();
             let mut out1 = Vec::new();
             let _ = DotEnvExtractor.extract(&input, &mut out1, &mut Vec::new());

@@ -131,11 +131,14 @@ fn match_extractable_extension(path: &[u8]) -> Option<ExtractableFormat> {
 
 /// Extract the filename component from a byte path.
 ///
-/// Path splitting is POSIX-style (`/`); backslashes are treated as ordinary
-/// bytes.
+/// Splits on both `/` (POSIX) and `\` (Windows) separators so that
+/// extension and basename matching works regardless of path origin
+/// (git tree objects use `/`; Windows filesystem paths use `\`).
 #[inline]
 fn file_name(path: &[u8]) -> &[u8] {
-    let name_start = memchr::memrchr(b'/', path).map(|idx| idx + 1).unwrap_or(0);
+    let name_start = memchr::memrchr2(b'/', b'\\', path)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
     &path[name_start..]
 }
 
@@ -297,6 +300,36 @@ mod tests {
         );
     }
 
+    // ---- file_name helper ----
+
+    #[test]
+    fn file_name_posix_path() {
+        assert_eq!(file_name(b"src/content_policy/mod.rs"), b"mod.rs");
+    }
+
+    #[test]
+    fn file_name_windows_path() {
+        assert_eq!(file_name(b"src\\content_policy\\mod.rs"), b"mod.rs");
+    }
+
+    #[test]
+    fn file_name_mixed_separators() {
+        assert_eq!(file_name(b"C:\\Users\\dev/projects\\.env"), b".env");
+    }
+
+    #[test]
+    fn file_name_no_separator() {
+        assert_eq!(file_name(b".env"), b".env");
+    }
+
+    #[test]
+    fn file_name_trailing_separator() {
+        // Trailing separator yields an empty filename (caller never produces
+        // this, but the function handles it gracefully).
+        assert_eq!(file_name(b"dir/"), b"");
+        assert_eq!(file_name(b"dir\\"), b"");
+    }
+
     // ---- file_extension helper ----
 
     #[test]
@@ -308,6 +341,14 @@ mod tests {
     fn extension_from_nested_path() {
         assert_eq!(
             file_extension(b"src/main/Foo.java"),
+            Some(b"java".as_slice())
+        );
+    }
+
+    #[test]
+    fn extension_from_windows_path() {
+        assert_eq!(
+            file_extension(b"src\\main\\Foo.java"),
             Some(b"java".as_slice())
         );
     }
@@ -363,6 +404,44 @@ mod tests {
         assert_eq!(
             classify_content(data, b"", CHECK_LEN),
             ContentVerdict::Binary
+        );
+    }
+
+    // ---- Windows-style paths through classify_content ----
+
+    #[test]
+    fn dotenv_detected_with_windows_backslash_path() {
+        let data = b"SECRET_KEY=abc";
+        assert_eq!(
+            classify_content(data, b"C:\\Users\\dev\\config\\.env", CHECK_LEN),
+            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+        );
+    }
+
+    #[test]
+    fn dotenv_suffix_detected_with_windows_path() {
+        let data = b"DB_PASS=secret";
+        assert_eq!(
+            classify_content(data, b"projects\\myapp\\.env.production", CHECK_LEN),
+            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+        );
+    }
+
+    #[test]
+    fn extractable_binary_detected_with_windows_path() {
+        let bin = b"\xCA\xFE\xBA\xBE\x00";
+        assert_eq!(
+            classify_content(bin, b"lib\\deps\\Foo.class", CHECK_LEN),
+            ContentVerdict::BinaryExtractable(ExtractableFormat::JavaClass)
+        );
+    }
+
+    #[test]
+    fn non_dotenv_not_matched_with_windows_path() {
+        let data = b"some text";
+        assert_eq!(
+            classify_content(data, b"config\\.envrc", CHECK_LEN),
+            ContentVerdict::Text
         );
     }
 }
