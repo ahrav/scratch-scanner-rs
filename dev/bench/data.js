@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1772080307794,
+  "lastUpdate": 1772166414612,
   "repoUrl": "https://github.com/ahrav/scratch-scanner-rs",
   "entries": {
     "Benchmark": [
@@ -3354,6 +3354,334 @@ window.BENCHMARK_DATA = {
           {
             "name": "offline_validate_slack_token/bot_legacy",
             "value": 32,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/user_token",
+            "value": 62,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/config_access",
+            "value": 82,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/invalid_segments",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/unknown_prefix",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "AhravDutta",
+            "username": "ahrav",
+            "email": "ahravdutta02@gmail.com"
+          },
+          "committer": {
+            "name": "AhravDutta",
+            "username": "ahrav",
+            "email": "ahravdutta02@gmail.com"
+          },
+          "id": "47f4990995eb87c4ddad05d35a0f6413ad4bf92f",
+          "message": "update beads",
+          "timestamp": "2026-02-27T02:57:55Z",
+          "url": "https://github.com/ahrav/scratch-scanner-rs/commit/47f4990995eb87c4ddad05d35a0f6413ad4bf92f"
+        },
+        "date": 1772166413962,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "write_u64/value/small_42",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_u64/value/medium_1_7B",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_u64/value/large_u64_max",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_oid_hex/sha1_20B",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_oid_hex/sha256_32B",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/scalar_short/4",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/scalar_short/8",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/scalar_short/14",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/clean_ascii/32",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/clean_ascii/128",
+            "value": 19,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/clean_ascii/512",
+            "value": 48,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/with_escapes/32",
+            "value": 46,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/with_escapes/128",
+            "value": 119,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/with_escapes/512",
+            "value": 427,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_str/sparse_escapes/512",
+            "value": 76,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_bytes/clean_ascii_128B",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_json_bytes/with_0xff_128B",
+            "value": 340,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "write_f64/81.23",
+            "value": 21,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_finding/fs_finding",
+            "value": 54,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_finding/git_finding",
+            "value": 75,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_commit_meta/no_identity",
+            "value": 25,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_commit_meta/with_identity",
+            "value": 53,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "encode_batch/1000_findings",
+            "value": 70312,
+            "range": "± 165",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_emit/1000_findings_dev_null",
+            "value": 82664,
+            "range": "± 288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "json_sink_emit/1000_findings_dev_null",
+            "value": 86371,
+            "range": "± 3394",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_contention/threads/2",
+            "value": 147705,
+            "range": "± 1449",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_contention/threads/4",
+            "value": 200454,
+            "range": "± 2719",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sink_contention/threads/8",
+            "value": 322768,
+            "range": "± 3559",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "u64_vs_itoa/custom_write_u64",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "u64_vs_itoa/itoa_write",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "f64_vs_ryu/custom_write_f64",
+            "value": 21,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "f64_vs_ryu/ryu_write",
+            "value": 51,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/valid_akia",
+            "value": 32,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/valid_a3t",
+            "value": 29,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/invalid_charset",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_aws_access_key/invalid_prefix",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/valid_small",
+            "value": 62,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/valid_large",
+            "value": 295,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/invalid_prefix",
+            "value": 284,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/invalid_char",
+            "value": 277,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_sentry_org_token/oversized_payload",
+            "value": 39,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/valid",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/wrong_header",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/invalid_char",
+            "value": 29,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_pypi_token/too_short",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/bot_current",
+            "value": 53,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "offline_validate_slack_token/bot_legacy",
+            "value": 33,
             "range": "± 0",
             "unit": "ns/iter"
           },
