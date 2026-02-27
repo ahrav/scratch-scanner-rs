@@ -44,5 +44,11 @@ mod git_scan_random;
 #[cfg(feature = "sim-harness")]
 mod git_scan_shallow_limits;
 
+#[cfg(feature = "sim-harness")]
+mod scanner_mutation_random;
+
+#[cfg(feature = "sim-harness")]
+mod scanner_mutation_corpus;
+
 #[cfg(feature = "real-rules-harness")]
 mod scanner_real_rules;

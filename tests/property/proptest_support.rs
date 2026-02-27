@@ -46,22 +46,10 @@ const _: () = assert!(TokenFamily::ALL.len() == 6);
 // Conservative upper bounds per family (token length)
 // ---------------------------------------------------------------------------
 
-/// Upper bound on generated numeric parameters (e.g. `Truncate { len }`,
-/// `EntropyReduce { count }`) for a given family.
-///
-/// These approximate (or slightly exceed) the canonical token lengths from
-/// `TokenFamily::gen_valid` so that generated parameter values stay within
-/// realistic ranges rather than producing degenerate cases like
-/// `Truncate { len: usize::MAX }`.
+/// Delegate to [`TokenFamily::param_bound`] so both proptest and plan_gen
+/// share a single source of truth.
 fn family_bound(family: TokenFamily) -> usize {
-    match family {
-        TokenFamily::AwsAccessKey => 20,
-        TokenFamily::GithubFinegrainedPat => 93,
-        TokenFamily::GithubClassicPat => 40,
-        TokenFamily::JwtLike => 200,
-        TokenFamily::Base64Blob => 68,
-        TokenFamily::UrlEncodedBlob => 96,
-    }
+    family.param_bound()
 }
 
 // ---------------------------------------------------------------------------

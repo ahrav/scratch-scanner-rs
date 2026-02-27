@@ -114,6 +114,23 @@ impl TokenFamily {
         }
     }
 
+    /// Conservative upper bound on numeric mutation parameters (e.g.
+    /// `Truncate { len }`, `EntropyReduce { count }`) for this family.
+    ///
+    /// Approximates or slightly exceeds the canonical token length so that
+    /// randomly generated values stay within realistic ranges rather than
+    /// producing degenerate cases like `Truncate { len: usize::MAX }`.
+    pub fn param_bound(self) -> usize {
+        match self {
+            TokenFamily::AwsAccessKey => 20,
+            TokenFamily::GithubFinegrainedPat => 93,
+            TokenFamily::GithubClassicPat => 40,
+            TokenFamily::JwtLike => 200,
+            TokenFamily::Base64Blob => 68,
+            TokenFamily::UrlEncodedBlob => 96,
+        }
+    }
+
     /// Mutation operator kinds that produce meaningful test cases for this family.
     ///
     /// Only CRC-bearing families include `ChecksumCorrupt` (the XOR of the
