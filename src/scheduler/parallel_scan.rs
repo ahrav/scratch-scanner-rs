@@ -87,7 +87,7 @@
 //! With defaults (workers=N, pool=4N, chunk=256K, overlap≈256): ~1 MiB per worker.
 
 use super::local_fs_owner::{scan_local, FileSource, LocalConfig, LocalFile, LocalReport};
-use crate::archive::ArchiveConfig;
+use crate::archive::{ArchiveConfig, DEFAULT_WALL_CLOCK_SECS_PER_ROOT};
 use crate::engine::Engine;
 use crate::store::StoreProducer;
 
@@ -326,7 +326,7 @@ impl Default for ParallelScanConfig {
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
             archive: ArchiveConfig {
-                max_wall_clock_secs_per_root: Some(30),
+                max_wall_clock_secs_per_root: Some(DEFAULT_WALL_CLOCK_SECS_PER_ROOT),
                 ..ArchiveConfig::default()
             },
             pin_threads: super::affinity::default_pin_threads(),

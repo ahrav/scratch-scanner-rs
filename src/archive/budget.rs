@@ -1366,6 +1366,27 @@ mod tests {
         b.enter_archive().unwrap();
         assert!(!b.is_deadline_expired());
     }
+
+    /// Successive `reset()` calls must each re-arm the deadline so that every
+    /// root-level scan gets a fresh timeout budget.
+    #[test]
+    fn reset_rearms_deadline_on_second_call() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = Some(60);
+        let mut b = ArchiveBudgets::new(&c);
+
+        b.reset();
+        assert!(
+            !b.is_deadline_expired(),
+            "first reset should arm a valid deadline"
+        );
+
+        b.reset();
+        assert!(
+            !b.is_deadline_expired(),
+            "second reset should re-arm a fresh, non-expired deadline"
+        );
+    }
 }
 
 #[cfg(kani)]

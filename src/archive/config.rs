@@ -42,6 +42,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// Default wall-clock deadline (seconds) per root-level archive scan.
+///
+/// Production scanners should opt in to a wall-clock deadline for CPU-exhaustion
+/// defense. This value bounds the worst-case scan time for a single root file
+/// while being generous enough for large legitimate archives.
+pub const DEFAULT_WALL_CLOCK_SECS_PER_ROOT: u64 = 30;
+
 /// Policy for how to treat encrypted archives or encrypted entries.
 ///
 /// Variants form an escalation ladder from least to most disruptive. The
