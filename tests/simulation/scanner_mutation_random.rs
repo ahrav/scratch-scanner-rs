@@ -81,6 +81,7 @@ fn bounded_random_mutation_scanner_sims() {
         scan_utf16_variants: false,
         archive: ArchiveConfig::default(),
         stability_runs: 1,
+        archive_deadline_countdown: None,
     };
 
     let empty_fault_plan = FaultPlan {

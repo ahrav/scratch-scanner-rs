@@ -68,6 +68,11 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
     let mut outcome = ArchiveEnd::Scanned;
 
     loop {
+        if budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            break;
+        }
+
         let (entry_display, entry_size, entry_pad, entry_typeflag, nested_kind) = {
             let meta = match cur_cursor.next_entry(input, budgets, scan.archive) {
                 Ok(TarNext::End) => break,
@@ -385,7 +390,11 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                             ArchiveEnd::Scanned => None,
                         };
                         if let Some(r) = stop_reason {
-                            if matches!(r, PartialReason::RootOutputBudgetExceeded) {
+                            if matches!(
+                                r,
+                                PartialReason::RootOutputBudgetExceeded
+                                    | PartialReason::WallClockTimeout
+                            ) {
                                 outcome = ArchiveEnd::Partial(r);
                                 stop_archive = true;
                             }
@@ -448,6 +457,13 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
         let mut stop_archive = false;
 
         while remaining > 0 {
+            if budgets.is_deadline_expired() {
+                outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+                entry_partial_reason = Some(PartialReason::WallClockTimeout);
+                stop_archive = true;
+                break;
+            }
+
             if carry > 0 && have > 0 {
                 buf.as_mut_slice().copy_within(have - carry..have, 0);
             }

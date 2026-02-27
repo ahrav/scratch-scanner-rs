@@ -732,6 +732,7 @@ mod tests {
                 scan_utf16_variants: true,
                 archive: archive_cfg,
                 stability_runs: 1,
+                archive_deadline_countdown: None,
             },
             scenario,
             fault_plan: FaultPlan {

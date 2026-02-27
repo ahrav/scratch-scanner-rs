@@ -4,7 +4,7 @@
 //! scheduler, etc.) to provide a common configuration surface and
 //! uniform stats reporting.
 
-use crate::archive::{ArchiveConfig, ArchiveStats};
+use crate::archive::{ArchiveConfig, ArchiveStats, DEFAULT_WALL_CLOCK_SECS_PER_ROOT};
 
 /// Default chunk size used by the pipeline (bytes).
 ///
@@ -61,7 +61,10 @@ impl Default for PipelineConfig {
             chunk_size: DEFAULT_CHUNK_SIZE,
             max_files,
             path_bytes_cap: max_files.saturating_mul(PIPE_PATH_BYTES_PER_FILE),
-            archive: ArchiveConfig::default(),
+            archive: ArchiveConfig {
+                max_wall_clock_secs_per_root: Some(DEFAULT_WALL_CLOCK_SECS_PER_ROOT),
+                ..ArchiveConfig::default()
+            },
         }
     }
 }

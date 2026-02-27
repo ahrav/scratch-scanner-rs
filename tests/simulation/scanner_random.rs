@@ -179,6 +179,7 @@ fn random_run_config(rng: &mut SimRng, deep: bool) -> RunConfig {
         scan_utf16_variants,
         archive: ArchiveConfig::default(),
         stability_runs,
+        archive_deadline_countdown: None,
     }
 }
 

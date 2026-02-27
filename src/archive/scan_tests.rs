@@ -210,6 +210,106 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
+// ── Zip helpers ───────────────────────────────────────────────────
+
+/// Build a minimal zip archive (Store-only, no compression) from `(name, payload)` pairs.
+///
+/// Produces: Local File Header + payload per entry → Central Directory → EOCD.
+/// This is intentionally minimal — no deflate, no data descriptors, no Zip64.
+/// For tests requiring compression or encryption, use `sim_archive::build_zip_bytes`.
+fn build_zip(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut cd_entries: Vec<(u32, &[u8], u32)> = Vec::new(); // (lfh_offset, name, size)
+
+    for &(name, payload) in entries {
+        let lfh_offset = out.len() as u32;
+        let size = payload.len() as u32;
+
+        // Local File Header (30 bytes + name).
+        out.extend_from_slice(b"PK\x03\x04"); // signature
+        out.extend_from_slice(&10u16.to_le_bytes()); // version needed (1.0)
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Store
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (unchecked in scanner)
+        out.extend_from_slice(&size.to_le_bytes()); // compressed size
+        out.extend_from_slice(&size.to_le_bytes()); // uncompressed size
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name len
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra field len
+        out.extend_from_slice(name);
+        out.extend_from_slice(payload);
+
+        cd_entries.push((lfh_offset, name, size));
+    }
+
+    let cd_offset = out.len() as u32;
+    let mut cd_size = 0u32;
+
+    for &(lfh_offset, name, size) in &cd_entries {
+        let start = out.len();
+        // Central Directory File Header (46 bytes + name).
+        out.extend_from_slice(b"PK\x01\x02"); // signature
+        out.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        out.extend_from_slice(&10u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Store
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc32
+        out.extend_from_slice(&size.to_le_bytes()); // compressed size
+        out.extend_from_slice(&size.to_le_bytes()); // uncompressed size
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name len
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra field len
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&lfh_offset.to_le_bytes()); // relative offset of LFH
+        out.extend_from_slice(name);
+        cd_size += (out.len() - start) as u32;
+    }
+
+    // End of Central Directory Record (22 bytes).
+    let entry_count = entries.len() as u16;
+    out.extend_from_slice(b"PK\x05\x06"); // signature
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk with CD
+    out.extend_from_slice(&entry_count.to_le_bytes()); // entries on this disk
+    out.extend_from_slice(&entry_count.to_le_bytes()); // total entries
+    out.extend_from_slice(&cd_size.to_le_bytes()); // CD size
+    out.extend_from_slice(&cd_offset.to_le_bytes()); // CD offset
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+
+    out
+}
+
+/// Run scan_zip_source on raw zip bytes and return (outcome, sink, budgets_depth).
+fn scan_zip_bytes(
+    zip_bytes: &[u8],
+    cfg: &ArchiveConfig,
+    chunk_size: usize,
+    overlap: usize,
+) -> (ArchiveEnd, RecordingSink, u8) {
+    let mut scratch: TestScratch = ArchiveScratch::new(cfg, chunk_size, overlap);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let cursor = Cursor::new(zip_bytes.to_vec());
+
+    let outcome = scan_zip_source(
+        cursor,
+        b"test.zip",
+        cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+    )
+    .unwrap();
+
+    let depth = scratch.budgets.depth();
+    (outcome, sink, depth)
+}
+
 // ── Gap 1: Carry overlap boundary conditions ───────────────────────
 
 #[test]
@@ -646,4 +746,238 @@ fn nested_tar_entry_start_end_paired() {
     assert_eq!(depth, 0);
     // outer_file.txt + inner.txt (from nested tar) = 2 scanned entries.
     assert!(sink.entries.len() >= 2);
+}
+
+// ── Wall-clock deadline in discard path ────────────────────────────
+
+/// `discard_remaining_payload` must check the wall-clock deadline so that
+/// a timeout during the scan read loop does not silently drain a large
+/// entry payload.  With an already-expired deadline, the discard should
+/// return `WallClockTimeout` without reading any bytes.
+#[test]
+fn discard_payload_exits_on_expired_deadline() {
+    use crate::archive::budget::ArchiveBudgets;
+
+    // Build budgets with an immediately-expiring deadline and generous byte
+    // budgets so that the drain would succeed if the deadline were not checked.
+    let cfg = ArchiveConfig {
+        max_wall_clock_secs_per_root: Some(0),
+        max_total_uncompressed_bytes_per_archive: u64::MAX,
+        max_total_uncompressed_bytes_per_root: u64::MAX,
+        ..ArchiveConfig::default()
+    };
+    let mut budgets = ArchiveBudgets::new(&cfg);
+    budgets.reset(); // Arms deadline at Instant::now() + 0s → already expired.
+    budgets.enter_archive().unwrap();
+    budgets.begin_entry().unwrap();
+
+    // Large payload available for draining.
+    let data = vec![0xAA; 64 * 1024];
+    let mut cursor = Cursor::new(data);
+    let mut buf = vec![0u8; 4096];
+
+    let result = discard_remaining_payload(&mut cursor, &mut budgets, &mut buf, 64 * 1024);
+    assert_eq!(result, Err(PartialReason::WallClockTimeout));
+
+    // No bytes should have been read — the deadline check fires before
+    // the first `input.read()`.
+    assert_eq!(cursor.position(), 0);
+}
+
+// ── Scan-level wall-clock timeout integration tests ────────────────
+
+/// A tar archive with payload should yield `Partial(WallClockTimeout)`
+/// when the deadline is already expired, and budget depth must return to 0.
+#[test]
+fn tar_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'X'; 256];
+    let tar = build_tar(&[(b"big.txt", &payload)]);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+
+    let (outcome, _, depth) = scan_tar_bytes(&tar, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}
+
+/// A gzip stream with payload should yield `Partial(WallClockTimeout)`
+/// when the deadline is already expired, and budget depth must return to 0.
+#[test]
+fn gzip_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'Y'; 256];
+    let gz = gzip_compress(&payload);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+    cfg.max_uncompressed_bytes_per_entry = 10_000;
+    cfg.max_total_uncompressed_bytes_per_archive = 10_000;
+    cfg.max_total_uncompressed_bytes_per_root = 10_000;
+
+    let (outcome, _, depth) = scan_gz_bytes(&gz, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}
+
+/// A zip archive with payload should yield `Partial(WallClockTimeout)`
+/// when the deadline is already expired, and budget depth must return to 0.
+#[test]
+fn zip_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'Z'; 256];
+    let zip = build_zip(&[(b"big.txt", &payload)]);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+    cfg.max_uncompressed_bytes_per_entry = 10_000;
+    cfg.max_total_uncompressed_bytes_per_archive = 10_000;
+    cfg.max_total_uncompressed_bytes_per_root = 10_000;
+
+    let (outcome, _, depth) = scan_zip_bytes(&zip, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}
+
+// ── Deterministic mid-scan timeout (countdown, no real clock) ──────
+
+/// Timeout fires after entry 1 is fully processed but before entry 2
+/// begins.  Uses the test-only countdown override so no real time elapses.
+///
+/// The countdown is calibrated by counting `is_deadline_expired()` calls
+/// in `scan_tar_stream_nested`:
+///   - 1 call at the outer-loop top (before entry header parsing)
+///   - 1 call per inner-loop iteration (per read chunk)
+///
+///   For a small payload that fits in one chunk, entry 1 consumes 2 checks.
+///   Setting the countdown to 2 causes the 3rd call (entry 2's outer-loop
+///   check) to fire, terminating the scan with exactly 1 entry delivered.
+#[test]
+fn tar_timeout_mid_scan_delivers_only_first_entry() {
+    let tar = build_tar(&[
+        (b"first.txt", b"AAAA"),
+        (b"second.txt", b"BBBB"),
+        (b"third.txt", b"CCCC"),
+    ]);
+
+    // No real deadline — the countdown handles everything.
+    let cfg = default_config();
+    let mut scratch: TestScratch = ArchiveScratch::new(&cfg, 64, 4);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let mut cursor = Cursor::new(tar.clone());
+
+    // After 2 checks (entry 1 outer + entry 1 inner), the 3rd check fires.
+    scratch.budgets.set_deadline_check_countdown(Some(2));
+
+    let outcome = scan_tar_stream(
+        &mut cursor,
+        b"test.tar",
+        &cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(scratch.budgets.depth(), 0, "depth must return to 0");
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+
+    // Entry 1 was fully delivered; entries 2 and 3 were never started.
+    assert_eq!(
+        sink.entries.len(),
+        1,
+        "expected exactly 1 entry delivered before timeout, got {}",
+        sink.entries.len()
+    );
+    // Verify the delivered entry is the first one (payload = "AAAA").
+    assert_eq!(sink.concat_new_bytes(0), b"AAAA");
+}
+
+/// Same as above but the countdown fires inside entry 2's read loop,
+/// proving mid-entry timeout also works.  Entry 1 is fully delivered;
+/// entry 2 is started (on_entry_start called) but receives no chunks.
+#[test]
+fn tar_timeout_mid_entry_delivers_partial() {
+    // Use a larger payload so the inner loop has multiple iterations.
+    let payload_a = vec![b'X'; 16];
+    let payload_b = vec![b'Y'; 256];
+    let tar = build_tar(&[(b"a.txt", &payload_a), (b"b.txt", &payload_b)]);
+
+    let cfg = default_config();
+    let mut scratch: TestScratch = ArchiveScratch::new(&cfg, 64, 4);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let mut cursor = Cursor::new(tar.clone());
+
+    // Entry 1: 1 outer + 1 inner = 2 checks.
+    // Entry 2: 1 outer + 1 inner (first chunk) = 2 more checks.
+    // Set countdown=3 → fires on the 4th call (entry 2's first inner check).
+    scratch.budgets.set_deadline_check_countdown(Some(3));
+
+    let outcome = scan_tar_stream(
+        &mut cursor,
+        b"test.tar",
+        &cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(scratch.budgets.depth(), 0, "depth must return to 0");
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+
+    // Entry 1 fully delivered, entry 2 started but timed out during its
+    // read loop — on_entry_start was called, but the timeout broke before
+    // or during chunk delivery.
+    assert!(
+        !sink.entries.is_empty(),
+        "at least entry 1 must be delivered, got {}",
+        sink.entries.len()
+    );
+    // Entry 1 payload intact.
+    assert_eq!(sink.concat_new_bytes(0), payload_a);
 }

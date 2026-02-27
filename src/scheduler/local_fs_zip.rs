@@ -112,6 +112,11 @@ pub(super) fn process_zip_file<E: ScanEngine>(
     let mut outcome = ArchiveEnd::Scanned;
 
     loop {
+        if budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            break;
+        }
+
         let (
             flags,
             method,
@@ -298,6 +303,13 @@ pub(super) fn process_zip_file<E: ScanEngine>(
         let mut stop_archive = false;
 
         loop {
+            if budgets.is_deadline_expired() {
+                outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+                entry_partial_reason = Some(PartialReason::WallClockTimeout);
+                stop_archive = true;
+                break;
+            }
+
             if carry > 0 && have > 0 {
                 buf.as_mut_slice().copy_within(have - carry..have, 0);
             }

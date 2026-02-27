@@ -71,6 +71,7 @@ fn budget_invariance_with_size_cap_gating() {
         archive: ArchiveConfig::default(),
         // Two schedules to catch budget leaks or ordering dependence.
         stability_runs: 2,
+        archive_deadline_countdown: None,
     };
 
     let engine =

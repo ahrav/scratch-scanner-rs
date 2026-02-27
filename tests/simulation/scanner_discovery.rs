@@ -45,6 +45,7 @@ fn discovery_falls_back_when_type_hint_missing() {
         scan_utf16_variants: true,
         archive: ArchiveConfig::default(),
         stability_runs: 1,
+        archive_deadline_countdown: None,
     };
 
     let engine =

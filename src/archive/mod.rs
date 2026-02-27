@@ -19,7 +19,10 @@ pub mod scan;
 pub(crate) mod util;
 
 pub use budget::{ArchiveBudgets, BudgetHit, ChargeResult};
-pub use config::{ArchiveConfig, ArchiveConfigError, EncryptedPolicy, UnsupportedPolicy};
+pub use config::{
+    ArchiveConfig, ArchiveConfigError, EncryptedPolicy, UnsupportedPolicy,
+    DEFAULT_WALL_CLOCK_SECS_PER_ROOT, MAX_WALL_CLOCK_SECS_PER_ROOT,
+};
 pub use detect::{
     detect_kind, detect_kind_from_name, detect_kind_from_name_bytes, detect_kind_from_path,
     sniff_kind_from_header, ArchiveKind,
