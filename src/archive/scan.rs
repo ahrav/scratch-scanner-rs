@@ -546,6 +546,12 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
             buf.copy_within(have - carry..have, 0);
         }
 
+        if budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            entry_partial_reason = Some(PartialReason::WallClockTimeout);
+            break;
+        }
+
         let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
         if allowance == 0 {
             if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
@@ -750,6 +756,11 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
     let mut outcome = ArchiveEnd::Scanned;
 
     loop {
+        if budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            break;
+        }
+
         let (entry_display, entry_size, entry_pad, entry_typeflag, nested_kind) = {
             let meta = match cur_cursor.next_entry(input, budgets, scan.archive) {
                 Ok(TarNext::End) => break,
@@ -1138,6 +1149,12 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                 scan.stream_buf.copy_within(have - carry..have, 0);
             }
 
+            if budgets.is_deadline_expired() {
+                outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+                entry_partial_reason = Some(PartialReason::WallClockTimeout);
+                break;
+            }
+
             let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
             if allowance == 0 {
                 if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
@@ -1360,6 +1377,11 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
     let mut outcome = ArchiveEnd::Scanned;
 
     loop {
+        if scratch.budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            break;
+        }
+
         let (
             flags,
             method,
@@ -1547,6 +1569,12 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
         loop {
             if carry > 0 && have > 0 {
                 buf.copy_within(have - carry..have, 0);
+            }
+
+            if scratch.budgets.is_deadline_expired() {
+                outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+                entry_partial_reason = Some(PartialReason::WallClockTimeout);
+                break;
             }
 
             let allowance = scratch

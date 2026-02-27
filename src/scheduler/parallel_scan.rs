@@ -325,7 +325,10 @@ impl Default for ParallelScanConfig {
             skip_hidden: true,
             respect_gitignore: true,
             max_file_size: 100 * 1024 * 1024, // 100 MiB
-            archive: ArchiveConfig::default(),
+            archive: ArchiveConfig {
+                max_wall_clock_secs_per_root: Some(30),
+                ..ArchiveConfig::default()
+            },
             pin_threads: super::affinity::default_pin_threads(),
             skip_binary: true,
             event_sink: Arc::new(crate::unified::events::NullEventSink),

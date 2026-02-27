@@ -2,8 +2,9 @@
 //!
 //! Prevents resource exhaustion from zip bombs and deeply nested archives by
 //! enforcing hard caps on entry counts, decompressed output, metadata, nesting
-//! depth, and inflation ratio.  Budgets are purely deterministic — no wall-clock
-//! timeouts — so identical inputs always produce identical outcomes.
+//! depth, and inflation ratio.  An optional wall-clock deadline can be configured
+//! via `max_wall_clock_secs` for CPU-exhaustion defense; when `None`, the struct
+//! remains purely deterministic and `is_deadline_expired()` is a no-op.
 //!
 //! # Budget Hierarchy
 //!
@@ -43,7 +44,10 @@
 //!
 //! # Invariants
 //!
-//! - Budgets are enforced by counts/bytes only (no wall-clock time).
+//! - Budget accounting is deterministic (counts/bytes only). An optional
+//!   wall-clock deadline can be configured separately for CPU-exhaustion
+//!   defense; when disabled (`None`), no `Instant` is created and the
+//!   struct is fully deterministic.
 //! - All accounting is saturating; overflows are treated as budget hits.
 //! - If no archive frame is active, charge methods clamp to 0 and remaining
 //!   allowance is 0.
@@ -54,6 +58,8 @@
 //! - Per-entry vs per-archive limits are separated to avoid ambiguity.
 //! - The frame stack is preallocated to `max_archive_depth` and never grows
 //!   after startup (no `Vec` push/pop on hot paths).
+
+use std::time::{Duration, Instant};
 
 use super::{ArchiveConfig, ArchiveSkipReason, EntrySkipReason, PartialReason};
 
@@ -107,6 +113,10 @@ pub struct ArchiveBudgets {
     max_total_uncompressed_bytes_per_root: u64,
     max_archive_metadata_bytes: u64,
     max_inflation_ratio: u32,
+
+    // optional wall-clock deadline (CPU-exhaustion defense)
+    max_wall_clock_secs: Option<u64>,
+    deadline: Option<Instant>,
 
     // root counters
     root_decompressed_out: u64,
@@ -206,6 +216,9 @@ impl ArchiveBudgets {
             max_archive_metadata_bytes: cfg.max_archive_metadata_bytes,
             max_inflation_ratio: cfg.max_inflation_ratio,
 
+            max_wall_clock_secs: cfg.max_wall_clock_secs_per_root,
+            deadline: None,
+
             root_decompressed_out: 0,
             frames: vec![ArchiveFrame::default(); frames_cap].into_boxed_slice(),
             depth: 0,
@@ -220,6 +233,9 @@ impl ArchiveBudgets {
     pub fn reset(&mut self) {
         self.root_decompressed_out = 0;
         self.depth = 0;
+        self.deadline = self
+            .max_wall_clock_secs
+            .map(|s| Instant::now() + Duration::from_secs(s));
         self.debug_assert_no_growth();
     }
 
@@ -235,6 +251,15 @@ impl ArchiveBudgets {
                 "archive budget frame stack length changed after startup"
             );
         }
+    }
+
+    /// Returns `true` if the wall-clock deadline has expired.
+    ///
+    /// When `max_wall_clock_secs` is `None`, this always returns `false`
+    /// without calling `Instant::now()`.
+    #[inline(always)]
+    pub fn is_deadline_expired(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     #[inline(always)]
@@ -1181,6 +1206,33 @@ mod tests {
 
         let b = ArchiveBudgets::new(&c);
         assert_eq!(b.max_uncompressed_bytes_per_entry, ENTRY_NOT_OPEN - 1);
+    }
+
+    #[test]
+    fn deadline_none_never_expires() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = None;
+        let mut b = ArchiveBudgets::new(&c);
+        b.reset();
+        assert!(!b.is_deadline_expired());
+    }
+
+    #[test]
+    fn deadline_zero_expires_immediately() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = Some(0);
+        let mut b = ArchiveBudgets::new(&c);
+        b.reset();
+        assert!(b.is_deadline_expired());
+    }
+
+    #[test]
+    fn deadline_large_not_expired_immediately() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = Some(60);
+        let mut b = ArchiveBudgets::new(&c);
+        b.reset();
+        assert!(!b.is_deadline_expired());
     }
 }
 

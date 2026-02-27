@@ -72,6 +72,18 @@ pub struct ArchiveConfig {
     /// Maximum total virtual path bytes stored per archive (pipeline path arena protection).
     pub max_virtual_path_bytes_per_archive: usize,
 
+    /// Optional wall-clock deadline (seconds) per root-level archive scan.
+    ///
+    /// When set, each `reset()` call arms an `Instant`-based deadline in
+    /// [`ArchiveBudgets`](super::ArchiveBudgets). Nested archives share the
+    /// root's deadline (they call `enter_archive()` without `reset()`).
+    ///
+    /// `None` disables the deadline entirely — no `Instant` is created and
+    /// budget tracking remains fully deterministic. Production scanners
+    /// should opt in explicitly (e.g., `Some(30)`).
+    #[serde(default)]
+    pub max_wall_clock_secs_per_root: Option<u64>,
+
     /// Policy for encrypted content.
     pub encrypted_policy: EncryptedPolicy,
     /// Policy for unsupported content.
@@ -105,6 +117,7 @@ pub enum ArchiveConfigError {
         per_entry: usize,
         per_archive: usize,
     },
+    MaxWallClockSecsPerRootZero,
 }
 
 impl fmt::Display for ArchiveConfigError {
@@ -158,6 +171,9 @@ impl fmt::Display for ArchiveConfigError {
                 f,
                 "per-archive path budget must be >= per-entry max length (entry={per_entry}, archive={per_archive})"
             ),
+            ArchiveConfigError::MaxWallClockSecsPerRootZero => {
+                write!(f, "max_wall_clock_secs_per_root must be > 0 when set")
+            }
         }
     }
 }
@@ -178,6 +194,8 @@ impl Default for ArchiveConfig {
 
             max_virtual_path_len_per_entry: 1024,
             max_virtual_path_bytes_per_archive: 1024 * 1024, // 1 MiB
+
+            max_wall_clock_secs_per_root: None,
 
             encrypted_policy: EncryptedPolicy::SkipWithTelemetry,
             unsupported_policy: UnsupportedPolicy::SkipWithTelemetry,
@@ -241,6 +259,9 @@ impl ArchiveConfig {
                 per_archive: self.max_virtual_path_bytes_per_archive,
             });
         }
+        if self.max_wall_clock_secs_per_root == Some(0) {
+            return Err(ArchiveConfigError::MaxWallClockSecsPerRootZero);
+        }
         Ok(())
     }
 }
@@ -268,5 +289,33 @@ mod tests {
             err,
             ArchiveConfigError::ArchiveBytesCapTooSmall { .. }
         ));
+    }
+
+    #[test]
+    fn default_wall_clock_is_none() {
+        let cfg = ArchiveConfig::default();
+        assert_eq!(cfg.max_wall_clock_secs_per_root, None);
+    }
+
+    #[test]
+    fn validate_rejects_zero_wall_clock() {
+        let cfg = ArchiveConfig {
+            max_wall_clock_secs_per_root: Some(0),
+            ..ArchiveConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ArchiveConfigError::MaxWallClockSecsPerRootZero
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_nonzero_wall_clock() {
+        let cfg = ArchiveConfig {
+            max_wall_clock_secs_per_root: Some(30),
+            ..ArchiveConfig::default()
+        };
+        cfg.validate().unwrap();
     }
 }

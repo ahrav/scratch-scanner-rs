@@ -126,6 +126,12 @@ pub(super) fn process_gzip_file<E: ScanEngine>(
             buf.as_mut_slice().copy_within(have - carry..have, 0);
         }
 
+        if scratch.budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            entry_partial_reason = Some(PartialReason::WallClockTimeout);
+            break;
+        }
+
         let allowance = scratch
             .budgets
             .remaining_decompressed_allowance_with_ratio_probe(true);
@@ -293,6 +299,12 @@ pub(super) fn scan_gzip_stream_nested<E: ScanEngine, R: Read>(
     loop {
         if carry > 0 && have > 0 {
             buf.as_mut_slice().copy_within(have - carry..have, 0);
+        }
+
+        if scan.budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            entry_partial_reason = Some(PartialReason::WallClockTimeout);
+            break;
         }
 
         let allowance = scan

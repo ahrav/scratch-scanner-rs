@@ -190,10 +190,12 @@ pub enum PartialReason {
     EntryCountExceeded = 9,
     /// Unsupported container feature (e.g., Zip64 sentinel in CDFH).
     UnsupportedFeature = 10,
+    /// Wall-clock deadline expired (CPU-exhaustion defense).
+    WallClockTimeout = 11,
 }
 
 impl PartialReason {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 12;
 
     #[inline(always)]
     pub const fn as_usize(self) -> usize {
@@ -213,6 +215,7 @@ impl PartialReason {
             Self::MalformedZip => "malformed_zip",
             Self::EntryCountExceeded => "entry_count_exceeded",
             Self::UnsupportedFeature => "unsupported_feature",
+            Self::WallClockTimeout => "wall_clock_timeout",
         }
     }
 }
@@ -263,6 +266,7 @@ const PARTIAL_REASONS: [PartialReason; PartialReason::COUNT] = [
     PartialReason::MalformedZip,
     PartialReason::EntryCountExceeded,
     PartialReason::UnsupportedFeature,
+    PartialReason::WallClockTimeout,
 ];
 
 // -----------------------------
@@ -661,7 +665,7 @@ mod tests {
         );
         assert_eq!(
             PartialReason::COUNT,
-            PartialReason::UnsupportedFeature as usize + 1
+            PartialReason::WallClockTimeout as usize + 1
         );
     }
 
