@@ -293,6 +293,10 @@ impl ScannerSimRunner {
             self.cfg.chunk_size as usize,
             overlap,
         );
+        #[cfg(any(test, feature = "sim-harness"))]
+        if let Some(n) = self.cfg.archive_deadline_countdown {
+            archive_scratch.set_deadline_check_countdown(Some(n));
+        }
         let discover = DiscoverState::new(discovered);
         let discover_id = executor.spawn_external(SimTask {
             kind: TaskKind::Discover as u16,

@@ -160,7 +160,7 @@ pub struct ArchiveBudgets {
     // and returns `true` when it reaches 0 — without any `Instant::now()`.
     // This allows tests to trigger a timeout after exactly N checks,
     // exercising the mid-scan timeout path deterministically.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "sim-harness"))]
     deadline_check_countdown: std::cell::Cell<Option<u32>>,
 
     // -- Mutable root-level counter -------------------------------------------
@@ -275,7 +275,7 @@ impl ArchiveBudgets {
             max_wall_clock_secs: cfg.max_wall_clock_secs_per_root,
             deadline: None,
 
-            #[cfg(test)]
+            #[cfg(any(test, feature = "sim-harness"))]
             deadline_check_countdown: std::cell::Cell::new(None),
 
             root_decompressed_out: 0,
@@ -337,7 +337,7 @@ impl ArchiveBudgets {
     /// tests deterministic control over when the timeout fires.
     #[inline(always)]
     pub fn is_deadline_expired(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "sim-harness"))]
         if let Some(n) = self.deadline_check_countdown.get() {
             if n == 0 {
                 return true;
@@ -357,7 +357,7 @@ impl ArchiveBudgets {
     ///
     /// Pass `None` to disable the countdown and fall back to the real
     /// deadline.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "sim-harness"))]
     pub(crate) fn set_deadline_check_countdown(&self, n: Option<u32>) {
         self.deadline_check_countdown.set(n);
     }

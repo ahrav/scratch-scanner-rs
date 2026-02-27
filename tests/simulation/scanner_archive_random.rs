@@ -45,6 +45,7 @@ fn bounded_random_archive_sims() {
             scan_utf16_variants: true,
             archive: archive_cfg.clone(),
             stability_runs: 1,
+            archive_deadline_countdown: None,
         };
 
         let engine = build_engine_from_suite(&scenario.rule_suite, &run_cfg).expect("build engine");

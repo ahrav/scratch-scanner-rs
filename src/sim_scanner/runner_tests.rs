@@ -27,6 +27,7 @@ fn test_engine() -> crate::Engine {
         scan_utf16_variants: false,
         archive: ArchiveConfig::default(),
         stability_runs: 1,
+        archive_deadline_countdown: None,
     };
     build_engine_from_suite(&suite, &run_cfg).expect("engine build")
 }

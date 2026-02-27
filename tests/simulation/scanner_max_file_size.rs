@@ -50,6 +50,7 @@ fn open_time_size_cap_skips_growth_after_discovery() {
         scan_utf16_variants: true,
         archive: ArchiveConfig::default(),
         stability_runs: 1,
+        archive_deadline_countdown: None,
     };
 
     let engine =

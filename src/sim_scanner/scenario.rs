@@ -52,7 +52,7 @@ pub struct RunConfig {
     /// When set, `is_deadline_expired()` fires after exactly this many calls
     /// instead of consulting the real clock. See
     /// [`ArchiveBudgets::set_deadline_check_countdown`] for semantics.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "sim-harness"))]
     #[serde(skip)]
     pub archive_deadline_countdown: Option<u32>,
 }
