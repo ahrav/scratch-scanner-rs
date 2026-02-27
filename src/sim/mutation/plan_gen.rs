@@ -8,9 +8,12 @@
 //!
 //! # Generation strategy
 //!
-//! Each plan is assembled by drawing from the RNG in a fixed order:
+//! When using [`random_mutation_plan`] (single-plan mode), each plan is
+//! assembled by drawing from the RNG in a fixed order:
 //!
-//! 1. **Family** -- uniform random selection from [`TokenFamily::ALL`].
+//! 1. **Family** -- uniform random selection from [`TokenFamily::ALL`]
+//!    (skipped in batch mode, where the family is determined by the outer
+//!    iteration over [`TokenFamily::ALL`]).
 //! 2. **Base seed** -- a fresh 64-bit value used by [`execute_plan`] to
 //!    generate the canonical token.
 //! 3. **Operator count** -- uniform in `0..=4`. Zero operators test the
@@ -55,9 +58,10 @@ pub fn random_mutation_plan(rng: &mut SimRng, case_id: u64) -> MutationPlan {
 /// so earlier families consume RNG state before later ones. Case IDs are
 /// assigned as a monotonically increasing counter across all families.
 ///
-/// This is the primary entry point used by both the random-seed scanner
-/// test (`bounded_random_mutation_scanner_sims`) and the corpus replay
-/// test (`replay_mutation_corpus_cases`).
+/// This is the primary entry point for the random-seed scanner test
+/// (`bounded_random_mutation_scanner_sims`). The corpus replay test
+/// deserializes previously generated plans from JSON rather than calling
+/// this function.
 pub fn random_mutation_plans_all_families(
     rng: &mut SimRng,
     plans_per_family: u32,
