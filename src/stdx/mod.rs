@@ -30,7 +30,6 @@ pub mod atomic_bitset;
 pub mod atomic_seen_sets;
 pub mod bitset;
 pub mod byte_ring;
-pub mod bytes;
 pub mod fastrange;
 pub mod fixed_set;
 pub mod fixed_vec;

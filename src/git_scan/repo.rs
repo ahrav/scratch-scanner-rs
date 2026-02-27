@@ -34,7 +34,6 @@ use std::path::{Path, PathBuf};
 
 use super::errors::RepoOpenError;
 use super::limits::RepoOpenLimits;
-use crate::stdx::bytes::trim_ascii;
 
 /// Limits required for repository path resolution.
 pub trait RepoLimits {
@@ -450,7 +449,7 @@ where
             break;
         }
 
-        let trimmed = trim_ascii(line);
+        let trimmed = line.trim_ascii();
         if trimmed.is_empty() || trimmed.starts_with(b"#") {
             continue;
         }
