@@ -1,10 +1,23 @@
-//! Byte-slice trimming utilities.
+//! Byte-slice ASCII whitespace trimming.
 //!
-//! ASCII-only equivalents of the nightly `[u8]::trim_ascii*` methods,
-//! provided here so callers across the crate share one implementation
-//! instead of defining local helpers.
+//! Free-function equivalents of [`[u8]::trim_ascii*`][std] (stable since
+//! Rust 1.80). Kept as free functions so call sites that receive an
+//! intermediate `&[u8]` from a chain can pass it directly without rebinding.
+//!
+//! "ASCII whitespace" is the set recognised by [`u8::is_ascii_whitespace`]:
+//! space (`0x20`), horizontal tab (`0x09`), newline (`0x0A`), vertical tab
+//! (`0x0B`), form feed (`0x0C`), and carriage return (`0x0D`). Non-ASCII
+//! bytes (including UTF-8 multi-byte whitespace like `\u{00A0}`) are never
+//! stripped — this is intentional because callers operate on raw `&[u8]`
+//! streams that have not been validated as UTF-8.
+//!
+//! All functions return borrowed subslices and never allocate.
+//!
+//! [std]: https://doc.rust-lang.org/std/primitive.slice.html#method.trim_ascii
 
 /// Returns `bytes` with leading ASCII whitespace removed.
+///
+/// Returns an empty slice when the input is empty or entirely whitespace.
 #[inline]
 pub fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
     let start = bytes
@@ -15,16 +28,22 @@ pub fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
 }
 
 /// Returns `bytes` with trailing ASCII whitespace removed.
+///
+/// Returns an empty slice when the input is empty or entirely whitespace.
 #[inline]
 pub fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
         .rposition(|b| !b.is_ascii_whitespace())
+        // None means every byte is whitespace → empty slice.
         .map_or(0, |p| p + 1);
     &bytes[..end]
 }
 
-/// Returns `bytes` with leading and trailing ASCII whitespace removed.
+/// Returns `bytes` with both leading and trailing ASCII whitespace removed.
+///
+/// Equivalent to `trim_ascii_end(trim_ascii_start(bytes))`.
+/// Returns an empty slice when the input is empty or entirely whitespace.
 #[inline]
 pub fn trim_ascii(bytes: &[u8]) -> &[u8] {
     trim_ascii_end(trim_ascii_start(bytes))

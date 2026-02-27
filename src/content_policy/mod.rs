@@ -32,11 +32,11 @@ pub enum ContentVerdict {
     Text,
     /// Content appears to be binary — skip unless `--scan-binary` is set.
     Binary,
-    /// Content is a known binary format from which text can be extracted.
+    /// Content is a known format from which text can be extracted.
     BinaryExtractable(ExtractableFormat),
 }
 
-/// Binary formats that have a known text-extraction strategy.
+/// Formats that have a known text-extraction strategy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtractableFormat {
     /// Dotenv environment files (`.env`, `.env.*`).
@@ -49,6 +49,16 @@ pub enum ExtractableFormat {
     JarWar,
     /// Python compiled bytecode.
     Pyc,
+}
+
+impl ExtractableFormat {
+    /// Returns `true` for formats extracted from text content (no NUL bytes
+    /// required). Binary-only formats (`.class`, `.jar`, `.pyc`) return
+    /// `false` — a NUL-free file with those extensions is likely a misnamed
+    /// text file that should be scanned as-is rather than extracted.
+    pub const fn extracts_from_text(&self) -> bool {
+        matches!(self, Self::DotEnv | Self::Ipynb)
+    }
 }
 
 /// Returns `true` if the first `check_len` bytes of `data` contain a NUL byte,
@@ -90,8 +100,8 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
         // extensions (.class, .jar, .war, .pyc) should only trigger
         // extraction when the data actually contains NUL bytes — otherwise a
         // misnamed text file would be silently skipped instead of scanned.
-        if let Some(fmt) = match_extractable_extension(path) {
-            if matches!(fmt, ExtractableFormat::Ipynb | ExtractableFormat::DotEnv) {
+        if let Some(fmt) = match_extractable_format(path) {
+            if fmt.extracts_from_text() {
                 return ContentVerdict::BinaryExtractable(fmt);
             }
         }
@@ -99,7 +109,7 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
     }
 
     // Binary content — check if we know how to extract text from it.
-    match match_extractable_extension(path) {
+    match match_extractable_format(path) {
         Some(fmt) => ContentVerdict::BinaryExtractable(fmt),
         None => ContentVerdict::Binary,
     }
@@ -109,7 +119,7 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
 ///
 /// Dotenv is matched by basename first (`.env`, `.env.*`), then other formats
 /// are matched by extension.
-fn match_extractable_extension(path: &[u8]) -> Option<ExtractableFormat> {
+fn match_extractable_format(path: &[u8]) -> Option<ExtractableFormat> {
     if is_dotenv_basename(path) {
         return Some(ExtractableFormat::DotEnv);
     }
@@ -144,7 +154,8 @@ fn file_name(path: &[u8]) -> &[u8] {
 
 /// Returns `true` for dotenv basenames (`.env` and `.env.*`).
 ///
-/// Similar names like `.envrc` intentionally do not match.
+/// Matching is case-insensitive on ASCII bytes (e.g. `.ENV`, `.Env.Local`
+/// also match). Similar names like `.envrc` intentionally do not match.
 fn is_dotenv_basename(path: &[u8]) -> bool {
     let name = file_name(path);
     if name.len() < 4 || !eq_ignore_ascii_case(&name[..4], b".env") {

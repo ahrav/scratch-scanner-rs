@@ -19,7 +19,7 @@
 //! | `KEY=VALUE` | Bare assignment |
 //! | `export KEY=VALUE` | Lowercase `export` prefix stripped |
 //! | Empty lines, `# ...` | Skipped entirely |
-//! | Unquoted value | Trailing whitespace trimmed; `#` starts inline comment at the start of the value or after whitespace |
+//! | Unquoted value | Leading and trailing whitespace trimmed; `#` starts inline comment at the start of the value or after whitespace |
 //! | `'...'` | Single-quoted: literal bytes, no escape processing |
 //! | `"..."` | Double-quoted: `\n`, `\r`, `\t`, `\\`, `\"` unescaped; unknown `\x` keeps `x` |
 //! | Quoted multiline | Spans physical lines until closing quote |
@@ -73,8 +73,6 @@ pub struct DotEnvExtractor;
 enum LineResult {
     /// Entry was fully written to `out`.
     Appended,
-    /// Entry was malformed (e.g. unterminated quote) and `out` was rolled back.
-    Skipped,
     /// The output budget was exhausted; `out` was rolled back and the caller
     /// should stop processing further lines.
     CapReached,
@@ -119,7 +117,7 @@ impl Extractor for DotEnvExtractor {
 
             let value = &line[eq + 1..];
             match append_entry(key, value, data, &mut pos, out) {
-                LineResult::Appended | LineResult::Skipped => {}
+                LineResult::Appended => {}
                 LineResult::CapReached => break,
             }
         }
@@ -193,11 +191,38 @@ fn append_entry(
             }
         }
         ValueResult::Skip => {
-            // Preserve forward progress: malformed multiline quotes should not
-            // consume following assignments.
+            // Roll back position so continuation lines consumed by the
+            // multiline parser are re-evaluated as independent entries.
             *pos = resume_pos;
             out.truncate(checkpoint);
-            LineResult::Skipped
+
+            // Fallback: emit the first physical line's raw value as unquoted.
+            // For a security scanner, silently dropping `DB_URL="postgres://...`
+            // would lose credentials. Strip the opening quote char and parse
+            // the remainder as unquoted (trim + inline-comment strip).
+            let raw = match value.first().copied() {
+                Some(b'"' | b'\'') => value[1..].trim_ascii_start(),
+                _ => value,
+            };
+            if !push_bytes(out, key) || !push_byte(out, b'=') {
+                out.truncate(checkpoint);
+                return LineResult::CapReached;
+            }
+            match parse_unquoted(raw, out) {
+                ValueResult::Ok => {
+                    if push_byte(out, b'\n') {
+                        LineResult::Appended
+                    } else {
+                        out.truncate(checkpoint);
+                        LineResult::CapReached
+                    }
+                }
+                ValueResult::CapReached => {
+                    out.truncate(checkpoint);
+                    LineResult::CapReached
+                }
+                ValueResult::Skip => unreachable!("parse_unquoted never returns Skip"),
+            }
         }
         ValueResult::CapReached => {
             out.truncate(checkpoint);
@@ -493,7 +518,7 @@ mod tests {
     #[case::malformed_lines_skipped(
         b"NO_EQUALS\nBROKEN=\"unterminated\nNEXT=ok\n",
         ExtractResult::Ok,
-        b"NEXT=ok\n"
+        b"BROKEN=unterminated\nNEXT=ok\n"
     )]
     #[case::empty_when_no_assignments(
         b"# just comments\n   \n",
@@ -538,14 +563,27 @@ mod tests {
     )]
     #[case::incomplete_double_quote_eof(
         b"A=\"unterminated\n",
-        ExtractResult::Empty,
-        b"" as &[u8]
+        ExtractResult::Ok,
+        b"A=unterminated\n"
     )]
     #[case::incomplete_single_quote_eof(
         b"A='unterminated\n",
-        ExtractResult::Empty,
-        b"" as &[u8]
+        ExtractResult::Ok,
+        b"A=unterminated\n"
     )]
+    #[case::unterminated_double_quote_fallback(
+        b"DB_URL=\"postgres://user:pass@host/db\n",
+        ExtractResult::Ok,
+        b"DB_URL=postgres://user:pass@host/db\n"
+    )]
+    #[case::unterminated_single_quote_fallback(
+        b"SECRET='partial_value\n",
+        ExtractResult::Ok,
+        b"SECRET=partial_value\n"
+    )]
+    #[case::crlf_with_export(b"export API_KEY=value\r\n", ExtractResult::Ok, b"API_KEY=value\n")]
+    #[case::no_trailing_newline(b"A=1\nB=2", ExtractResult::Ok, b"A=1\nB=2\n")]
+    #[case::single_entry_no_trailing_newline(b"SECRET=abc", ExtractResult::Ok, b"SECRET=abc\n")]
     #[case::key_with_spaces_trimmed(b" MY KEY =value\n", ExtractResult::Ok, b"MY KEY=value\n")]
     #[case::null_bytes_in_value(b"KEY=ab\x00cd\n", ExtractResult::Ok, b"KEY=ab\x00cd\n")]
     #[case::export_uppercase_not_stripped(
@@ -566,7 +604,8 @@ mod tests {
 
     /// An unterminated double-quoted value followed by a line whose value
     /// contains a `"` must not swallow the subsequent assignment. The parser
-    /// should skip the malformed entry and still emit the valid one.
+    /// should emit a raw fallback for the malformed entry and still emit the
+    /// valid one.
     #[test]
     fn unterminated_dquote_does_not_consume_next_quoted_assignment() {
         let input = b"BROKEN=\"unterminated\nNEXT=\"ok\"\n";
@@ -575,8 +614,8 @@ mod tests {
         assert_eq!(result, ExtractResult::Ok);
         assert_eq!(
             String::from_utf8_lossy(&out),
-            "NEXT=ok\n",
-            "malformed BROKEN should be skipped; NEXT should be independently parsed"
+            "BROKEN=unterminated\nNEXT=ok\n",
+            "malformed BROKEN should emit raw fallback; NEXT should be independently parsed"
         );
     }
 
@@ -590,8 +629,8 @@ mod tests {
         assert_eq!(result, ExtractResult::Ok);
         assert_eq!(
             String::from_utf8_lossy(&out),
-            "NEXT=ok\n",
-            "malformed BROKEN should be skipped; NEXT should be independently parsed"
+            "BROKEN=unterminated\nNEXT=ok\n",
+            "malformed BROKEN should emit raw fallback; NEXT should be independently parsed"
         );
     }
 
@@ -661,8 +700,8 @@ mod tests {
             "valid assignment after the runaway quote should still be emitted"
         );
         assert!(
-            !out.starts_with(b"A="),
-            "the runaway multiline value should be skipped"
+            out.starts_with(b"A=start\n"),
+            "the runaway multiline value should emit the first line as raw fallback"
         );
     }
 }
@@ -767,6 +806,18 @@ mod proptests {
                     line.extend_from_slice(b"\"\n");
                     line
                 }),
+            // double-quoted with escape sequences producing non-newline output
+            1 => "[A-Z_]{1,20}=\"[a-zA-Z0-9_ ]{0,15}\\\\n[a-zA-Z0-9_ ]{0,15}\"\n"
+                .prop_map(|s| s.into_bytes()),
+            // unquoted with inline comment
+            1 => "[A-Z_]{1,20}=[a-zA-Z0-9_]{1,20} #[a-zA-Z ]{0,20}\n"
+                .prop_map(|s| s.into_bytes()),
+            // CRLF line ending
+            1 => "[A-Z_]{1,20}=[a-zA-Z0-9_]{0,40}\r\n".prop_map(|s| s.into_bytes()),
+            // unterminated double quote (triggers fallback)
+            1 => "[A-Z_]{1,20}=\"[a-zA-Z0-9_]{0,40}\n".prop_map(|s| s.into_bytes()),
+            // unterminated single quote (triggers fallback)
+            1 => "[A-Z_]{1,20}='[a-zA-Z0-9_]{0,40}\n".prop_map(|s| s.into_bytes()),
             // multiline double-quoted (embedded newline before closing quote)
             1 => ("[A-Z_]{1,20}", "[a-zA-Z0-9_]{1,20}", "[a-zA-Z0-9_]{1,20}").prop_map(
                 |(key, line1, line2)| {

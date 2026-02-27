@@ -1,11 +1,11 @@
-//! Binary content extraction framework.
+//! Content extraction framework.
 //!
 //! Defines the [`Extractor`] trait and a format-aware dispatcher that routes
 //! [`ExtractableFormat`] variants to the appropriate extractor implementation.
 //!
 //! # Architecture
 //!
-//! Each supported binary format has a dedicated [`Extractor`] implementation
+//! Each supported format has a dedicated [`Extractor`] implementation
 //! that knows how to parse the format and emit any embedded text (string
 //! literals, code cells, constant pool entries, etc.) that a secret-scanning
 //! engine can then match against.
@@ -34,9 +34,9 @@ pub const EXTRACT_OUTPUT_CAP: usize = 32 * 1024;
 /// Pre-allocation hint for JAR entry scratch buffers.
 pub const JAR_ENTRY_CAP: usize = 32 * 1024;
 
-/// Trait for extracting scannable text from a known binary format.
+/// Trait for extracting scannable text from a known format.
 ///
-/// Implementors parse a single format (e.g. `.class`, `.pyc`) and append
+/// Implementors parse a single format (e.g. `.class`, `.pyc`, `.env`) and append
 /// any human-readable strings to the output buffer. The extracted text
 /// need not be valid UTF-8 — the scan engine treats it as raw bytes.
 ///
