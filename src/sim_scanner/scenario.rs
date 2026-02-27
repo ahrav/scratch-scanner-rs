@@ -48,6 +48,23 @@ pub struct RunConfig {
     pub stability_runs: u32,
 }
 
+impl RunConfig {
+    /// Clamp `overlap` and `chunk_size` so they satisfy the engine's minimum
+    /// overlap requirement.
+    ///
+    /// After calling this, `self.overlap >= required_overlap` and
+    /// `self.chunk_size >= self.overlap`. This is the single source of truth
+    /// for the two-pass adjustment pattern used by mutation test harnesses.
+    pub fn adjust_for_overlap(&mut self, required_overlap: u32) {
+        if self.overlap < required_overlap {
+            self.overlap = required_overlap;
+        }
+        if self.chunk_size < self.overlap {
+            self.chunk_size = self.overlap;
+        }
+    }
+}
+
 fn default_max_file_size() -> u64 {
     u64::MAX
 }
