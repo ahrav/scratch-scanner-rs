@@ -46,6 +46,15 @@ pub struct RunConfig {
 
     /// Number of stability runs per scenario (different schedules).
     pub stability_runs: u32,
+
+    /// Test-only countdown for deterministic wall-clock timeout testing.
+    ///
+    /// When set, `is_deadline_expired()` fires after exactly this many calls
+    /// instead of consulting the real clock. See
+    /// [`ArchiveBudgets::set_deadline_check_countdown`] for semantics.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub archive_deadline_countdown: Option<u32>,
 }
 
 impl RunConfig {

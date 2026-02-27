@@ -49,6 +49,14 @@ use serde::{Deserialize, Serialize};
 /// while being generous enough for large legitimate archives.
 pub const DEFAULT_WALL_CLOCK_SECS_PER_ROOT: u64 = 30;
 
+/// Maximum allowed value for `max_wall_clock_secs_per_root` (24 hours).
+///
+/// Values beyond this are almost certainly configuration errors. More
+/// importantly, very large values can cause `Instant::now().checked_add()`
+/// to return `None`, silently disabling the deadline. This cap ensures
+/// the deadline always arms successfully.
+pub const MAX_WALL_CLOCK_SECS_PER_ROOT: u64 = 86_400;
+
 /// Policy for how to treat encrypted archives or encrypted entries.
 ///
 /// Variants form an escalation ladder from least to most disruptive. The
@@ -228,6 +236,12 @@ pub enum ArchiveConfigError {
         per_archive: usize,
     },
     MaxWallClockSecsPerRootZero,
+    /// Wall-clock deadline is so large that `Instant::now().checked_add()`
+    /// could return `None`, silently disabling the deadline.
+    MaxWallClockSecsPerRootTooLarge {
+        value: u64,
+        max: u64,
+    },
 }
 
 impl fmt::Display for ArchiveConfigError {
@@ -284,6 +298,10 @@ impl fmt::Display for ArchiveConfigError {
             ArchiveConfigError::MaxWallClockSecsPerRootZero => {
                 write!(f, "max_wall_clock_secs_per_root must be > 0 when set")
             }
+            ArchiveConfigError::MaxWallClockSecsPerRootTooLarge { value, max } => write!(
+                f,
+                "max_wall_clock_secs_per_root ({value}) exceeds maximum ({max})"
+            ),
         }
     }
 }
@@ -393,8 +411,16 @@ impl ArchiveConfig {
                 per_archive: self.max_virtual_path_bytes_per_archive,
             });
         }
-        if self.max_wall_clock_secs_per_root == Some(0) {
-            return Err(ArchiveConfigError::MaxWallClockSecsPerRootZero);
+        if let Some(secs) = self.max_wall_clock_secs_per_root {
+            if secs == 0 {
+                return Err(ArchiveConfigError::MaxWallClockSecsPerRootZero);
+            }
+            if secs > MAX_WALL_CLOCK_SECS_PER_ROOT {
+                return Err(ArchiveConfigError::MaxWallClockSecsPerRootTooLarge {
+                    value: secs,
+                    max: MAX_WALL_CLOCK_SECS_PER_ROOT,
+                });
+            }
         }
         Ok(())
     }
@@ -448,6 +474,28 @@ mod tests {
     fn validate_accepts_nonzero_wall_clock() {
         let cfg = ArchiveConfig {
             max_wall_clock_secs_per_root: Some(30),
+            ..ArchiveConfig::default()
+        };
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_excessive_wall_clock() {
+        let cfg = ArchiveConfig {
+            max_wall_clock_secs_per_root: Some(MAX_WALL_CLOCK_SECS_PER_ROOT + 1),
+            ..ArchiveConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ArchiveConfigError::MaxWallClockSecsPerRootTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_max_wall_clock_boundary() {
+        let cfg = ArchiveConfig {
+            max_wall_clock_secs_per_root: Some(MAX_WALL_CLOCK_SECS_PER_ROOT),
             ..ArchiveConfig::default()
         };
         cfg.validate().unwrap();

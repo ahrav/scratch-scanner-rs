@@ -312,6 +312,18 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
     pub fn clear_abort(&mut self) {
         self.abort_run = false;
     }
+
+    /// Arm a deterministic countdown that overrides `is_deadline_expired()` in
+    /// the underlying [`ArchiveBudgets`].
+    ///
+    /// See [`ArchiveBudgets::set_deadline_check_countdown`] for semantics.
+    /// This forwarding method exists so that simulation tests can reach the
+    /// budget countdown through the `ArchiveScratch` without exposing the
+    /// `budgets` field.
+    #[cfg(test)]
+    pub(crate) fn set_deadline_check_countdown(&self, n: Option<u32>) {
+        self.budgets.set_deadline_check_countdown(n);
+    }
 }
 
 /// Borrow-split view over [`ArchiveScratch`] plus the caller's sink and stats.

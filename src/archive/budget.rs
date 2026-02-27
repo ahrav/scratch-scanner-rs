@@ -896,6 +896,7 @@ const _: () = assert!(std::mem::size_of::<ArchiveFrame>() == 48);
 mod tests {
     use super::*;
     use crate::archive::ArchiveConfig;
+    use rstest::rstest;
 
     fn cfg() -> ArchiveConfig {
         ArchiveConfig {
@@ -1331,61 +1332,30 @@ mod tests {
         assert_eq!(b.max_uncompressed_bytes_per_entry, ENTRY_NOT_OPEN - 1);
     }
 
-    #[test]
-    fn deadline_none_never_expires() {
+    /// Deadline configuration behaves correctly across all edge cases:
+    /// - `None` → never expires (no wall-clock limit configured)
+    /// - `Some(0)` after reset → expires immediately (safe degradation)
+    /// - `Some(60)` after reset → not expired yet (normal operation)
+    /// - `Some(u64::MAX)` after reset → saturates without panic
+    /// - `Some(0)` without reset → not expired (deadline only armed by reset)
+    #[rstest]
+    #[case::none_never_expires(None, true, false)]
+    #[case::zero_expires_immediately(Some(0), true, true)]
+    #[case::large_not_expired_immediately(Some(60), true, false)]
+    #[case::huge_secs_saturates(Some(u64::MAX), true, false)]
+    #[case::not_armed_before_reset(Some(0), false, false)]
+    fn deadline_config(
+        #[case] wall_clock: Option<u64>,
+        #[case] do_reset: bool,
+        #[case] expected_expired: bool,
+    ) {
         let mut c = cfg();
-        c.max_wall_clock_secs_per_root = None;
+        c.max_wall_clock_secs_per_root = wall_clock;
         let mut b = ArchiveBudgets::new(&c);
-        b.reset();
-        assert!(!b.is_deadline_expired());
-    }
-
-    /// `Some(0)` is below the production validation minimum but is used here
-    /// to test safe degradation: when the deadline fires immediately, the
-    /// scanner should still terminate gracefully rather than looping or panicking.
-    /// Tests construct `ArchiveConfig` directly, bypassing validation.
-    #[test]
-    fn deadline_zero_expires_immediately() {
-        let mut c = cfg();
-        c.max_wall_clock_secs_per_root = Some(0);
-        let mut b = ArchiveBudgets::new(&c);
-        b.reset();
-        assert!(b.is_deadline_expired());
-    }
-
-    #[test]
-    fn deadline_large_not_expired_immediately() {
-        let mut c = cfg();
-        c.max_wall_clock_secs_per_root = Some(60);
-        let mut b = ArchiveBudgets::new(&c);
-        b.reset();
-        assert!(!b.is_deadline_expired());
-    }
-
-    /// Huge `max_wall_clock_secs` values must not panic on `Instant` overflow.
-    /// `reset()` computes `Instant::now() + Duration::from_secs(s)` — when `s`
-    /// exceeds the platform's representable range, the addition must saturate
-    /// rather than panic.
-    #[test]
-    fn reset_saturates_on_huge_wall_clock_secs() {
-        let mut c = cfg();
-        c.max_wall_clock_secs_per_root = Some(u64::MAX);
-        let mut b = ArchiveBudgets::new(&c);
-        // Must not panic.
-        b.reset();
-        // The deadline should exist and not be expired (it's far in the future).
-        assert!(!b.is_deadline_expired());
-    }
-
-    /// `Some(0)` config must not cause `is_deadline_expired()` to return true
-    /// before `reset()` is called — the deadline is only armed during `reset`.
-    #[test]
-    fn deadline_not_armed_before_reset() {
-        let mut c = cfg();
-        c.max_wall_clock_secs_per_root = Some(0);
-        let b = ArchiveBudgets::new(&c);
-        // Before reset, deadline is None regardless of config.
-        assert!(!b.is_deadline_expired());
+        if do_reset {
+            b.reset();
+        }
+        assert_eq!(b.is_deadline_expired(), expected_expired);
     }
 
     /// `enter_archive()` must not clear or re-arm the deadline — nested
@@ -1425,6 +1395,204 @@ mod tests {
             !b.is_deadline_expired(),
             "second reset should re-arm a fresh, non-expired deadline"
         );
+    }
+}
+
+#[cfg(all(test, feature = "stdx-proptest"))]
+mod proptests {
+    use super::*;
+    use crate::archive::ArchiveConfig;
+    use proptest::prelude::*;
+
+    /// Operations that exercise the full budget protocol surface.
+    /// Byte amounts are kept small (u16) to make cap interactions frequent
+    /// without needing astronomically large configs.
+    #[derive(Debug, Clone)]
+    enum Op {
+        EnterArchive,
+        ExitArchive,
+        BeginEntry,
+        EndEntry(bool),
+        ChargeCompressedIn(u16),
+        ChargeDecompressedOut(u16),
+        ChargeDiscardedOut(u16),
+        ChargeMetadata(u16),
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            2 => Just(Op::EnterArchive),
+            1 => Just(Op::ExitArchive),
+            3 => Just(Op::BeginEntry),
+            2 => any::<bool>().prop_map(Op::EndEntry),
+            3 => (1u16..=512).prop_map(Op::ChargeCompressedIn),
+            4 => (1u16..=512).prop_map(Op::ChargeDecompressedOut),
+            2 => (1u16..=512).prop_map(Op::ChargeDiscardedOut),
+            1 => (1u16..=128).prop_map(Op::ChargeMetadata),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Verify budget charging invariants hold for arbitrary operation sequences.
+        ///
+        /// Invariants checked after every charge:
+        /// 1. Monotonicity: `root_decompressed_out` never decreases.
+        /// 2. Conservation: after `charge_decompressed_out(n)`, the root counter
+        ///    increased by exactly `n` (Ok) or `allowed` (Clamp), and `allowed <= n`.
+        /// 3. Bound: `root_decompressed_out` never exceeds the configured root cap.
+        /// 4. Sentinel safety: `entry_decompressed_out` never reaches `ENTRY_NOT_OPEN`.
+        #[test]
+        fn budget_charging_invariants(ops in prop::collection::vec(op_strategy(), 1..80)) {
+            let c = ArchiveConfig {
+                enabled: true,
+                max_archive_depth: 3,
+                max_entries_per_archive: 16,
+                max_uncompressed_bytes_per_entry: 1024,
+                max_total_uncompressed_bytes_per_archive: 4096,
+                max_total_uncompressed_bytes_per_root: 8192,
+                max_archive_metadata_bytes: 256,
+                max_inflation_ratio: 4,
+                ..ArchiveConfig::default()
+            };
+            let mut b = ArchiveBudgets::new(&c);
+            let mut prev_root = 0u64;
+
+            for op in &ops {
+                match op {
+                    Op::EnterArchive => { let _ = b.enter_archive(); }
+                    Op::ExitArchive => b.exit_archive(),
+                    Op::BeginEntry => { let _ = b.begin_entry(); }
+                    Op::EndEntry(scanned) => b.end_entry(*scanned),
+                    Op::ChargeCompressedIn(n) => b.charge_compressed_in(*n as u64),
+                    Op::ChargeDecompressedOut(n) => {
+                        let n = *n as u64;
+                        let before = b.root_decompressed_out();
+                        let result = b.charge_decompressed_out(n);
+
+                        let after = b.root_decompressed_out();
+
+                        // Invariant 1: monotonicity.
+                        prop_assert!(after >= before, "root_decompressed_out decreased");
+
+                        // Invariant 2: conservation + clamp bound.
+                        match result {
+                            ChargeResult::Ok => {
+                                prop_assert_eq!(after, before + n,
+                                    "Ok must advance root counter by exactly n");
+                            }
+                            ChargeResult::Clamp { allowed, .. } => {
+                                prop_assert!(allowed <= n,
+                                    "allowed ({}) > requested ({})", allowed, n);
+                                prop_assert_eq!(after, before + allowed,
+                                    "Clamp must advance root counter by exactly allowed");
+                            }
+                        }
+
+                        // Invariant 3: root bound.
+                        prop_assert!(after <= c.max_total_uncompressed_bytes_per_root,
+                            "root_decompressed_out ({}) exceeds root cap ({})",
+                            after, c.max_total_uncompressed_bytes_per_root);
+
+                        prev_root = after;
+                    }
+                    Op::ChargeDiscardedOut(n) => {
+                        let n = *n as u64;
+                        let before = b.root_decompressed_out();
+                        let result = b.charge_discarded_out(n);
+
+                        let after = b.root_decompressed_out();
+
+                        // Monotonicity.
+                        prop_assert!(after >= before, "root_decompressed_out decreased");
+
+                        // Conservation + clamp bound.
+                        match result {
+                            ChargeResult::Ok => {
+                                prop_assert_eq!(after, before + n,
+                                    "Ok must advance root counter by exactly n");
+                            }
+                            ChargeResult::Clamp { allowed, .. } => {
+                                prop_assert!(allowed <= n,
+                                    "allowed ({}) > requested ({})", allowed, n);
+                                prop_assert_eq!(after, before + allowed,
+                                    "Clamp must advance root counter by exactly allowed");
+                            }
+                        }
+
+                        // Root bound.
+                        prop_assert!(after <= c.max_total_uncompressed_bytes_per_root,
+                            "root_decompressed_out ({}) exceeds root cap ({})",
+                            after, c.max_total_uncompressed_bytes_per_root);
+
+                        prev_root = after;
+                    }
+                    Op::ChargeMetadata(n) => {
+                        let _ = b.charge_metadata(*n as u64);
+                    }
+                }
+
+                // Invariant 4: sentinel safety — if an entry is open, its
+                // decompressed counter must not have reached the sentinel value.
+                if b.has_active_frame() {
+                    let f = b.cur();
+                    if entry_is_open(f) {
+                        prop_assert_ne!(f.entry_decompressed_out, ENTRY_NOT_OPEN,
+                            "entry_decompressed_out reached ENTRY_NOT_OPEN sentinel");
+                    }
+                }
+
+                // Re-check monotonicity across all operations (not just charges).
+                let current = b.root_decompressed_out();
+                prop_assert!(current >= prev_root,
+                    "root_decompressed_out decreased across operations");
+                prev_root = current;
+            }
+        }
+
+        /// Allowance consistency: `charge_decompressed_out(n)` returns `Ok` when
+        /// `n <= remaining_decompressed_allowance()`.
+        #[test]
+        fn allowance_predicts_charge_result(
+            ops in prop::collection::vec(op_strategy(), 1..40),
+            probe in 1u16..=256,
+        ) {
+            let c = ArchiveConfig {
+                enabled: true,
+                max_archive_depth: 3,
+                max_entries_per_archive: 16,
+                max_uncompressed_bytes_per_entry: 1024,
+                max_total_uncompressed_bytes_per_archive: 4096,
+                max_total_uncompressed_bytes_per_root: 8192,
+                max_archive_metadata_bytes: 256,
+                max_inflation_ratio: 0, // disable ratio to isolate byte-cap behavior
+                ..ArchiveConfig::default()
+            };
+            let mut b = ArchiveBudgets::new(&c);
+
+            // Run the prefix sequence to reach an arbitrary state.
+            for op in &ops {
+                match op {
+                    Op::EnterArchive => { let _ = b.enter_archive(); }
+                    Op::ExitArchive => b.exit_archive(),
+                    Op::BeginEntry => { let _ = b.begin_entry(); }
+                    Op::EndEntry(scanned) => b.end_entry(*scanned),
+                    Op::ChargeCompressedIn(n) => b.charge_compressed_in(*n as u64),
+                    Op::ChargeDecompressedOut(n) => { b.charge_decompressed_out(*n as u64); }
+                    Op::ChargeDiscardedOut(n) => { b.charge_discarded_out(*n as u64); }
+                    Op::ChargeMetadata(n) => { b.charge_metadata(*n as u64); }
+                }
+            }
+
+            let allowance = b.remaining_decompressed_allowance();
+            let n = probe as u64;
+            if n <= allowance {
+                let result = b.charge_decompressed_out(n);
+                prop_assert_eq!(result, ChargeResult::Ok,
+                    "charge of {} should succeed with allowance {}", n, allowance);
+            }
+        }
     }
 }
 
