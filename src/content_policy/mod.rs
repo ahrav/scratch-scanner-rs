@@ -2,7 +2,7 @@
 //!
 //! Provides a unified policy for deciding whether file content should be
 //! scanned as text, skipped as binary, or have text extracted from a known
-//! binary format (`.ipynb`, `.class`, `.jar`/`.war`, `.pyc`).
+//! extractable format (`.ipynb`, `.class`, `.jar`/`.war`, `.pyc`, `.env`).
 //!
 //! The primary entry point is [`classify_content`], which combines a NUL-byte
 //! heuristic with extension matching to produce a [`ContentVerdict`].
@@ -15,6 +15,7 @@
 //!   technique, different check length: 8192 vs Git's 8000) and uses
 //!   `memchr` for SIMD-accelerated scanning.
 
+pub mod dotenv;
 pub mod extract;
 pub mod ipynb;
 pub mod jar_war;
@@ -38,6 +39,8 @@ pub enum ContentVerdict {
 /// Binary formats that have a known text-extraction strategy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtractableFormat {
+    /// Dotenv environment files (`.env`, `.env.*`).
+    DotEnv,
     /// Jupyter Notebook (JSON with code cells).
     Ipynb,
     /// Compiled Java class file.
@@ -69,23 +72,28 @@ pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
 /// 2. If no NUL bytes:
 ///    - `.ipynb` is [`ContentVerdict::BinaryExtractable`] so code/markdown
 ///      cells can be extracted.
+///    - `.env` / `.env.*` are [`ContentVerdict::BinaryExtractable`] so
+///      structured `KEY=VALUE` lines can be extracted.
 ///    - otherwise classify as [`ContentVerdict::Text`].
 /// 3. If NUL bytes are present: check extension for extractable formats →
 ///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Binary`].
 ///
-/// Empty data returns [`ContentVerdict::Text`] unless the path has an
-/// extractable extension (e.g. `.ipynb`).
+/// Empty data returns [`ContentVerdict::Text`] unless the path is `.ipynb`,
+/// `.env`, or `.env.*`.
 #[inline]
 pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVerdict {
     if !is_likely_binary(data, check_len) {
         // .ipynb files are JSON (text) but we still want to classify them as
         // extractable so the extractor can pull code cells only (ignoring
-        // output blobs). Other extractable extensions (.class, .jar, .war,
-        // .pyc) should only trigger extraction when the data actually
-        // contains NUL bytes — otherwise a misnamed text file would be
-        // silently skipped instead of scanned.
-        if let Some(ExtractableFormat::Ipynb) = match_extractable_extension(path) {
-            return ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb);
+        // output blobs). .env files are also text but benefit from structured
+        // extraction (comment stripping + quote handling). Other extractable
+        // extensions (.class, .jar, .war, .pyc) should only trigger
+        // extraction when the data actually contains NUL bytes — otherwise a
+        // misnamed text file would be silently skipped instead of scanned.
+        if let Some(fmt) = match_extractable_extension(path) {
+            if matches!(fmt, ExtractableFormat::Ipynb | ExtractableFormat::DotEnv) {
+                return ContentVerdict::BinaryExtractable(fmt);
+            }
         }
         return ContentVerdict::Text;
     }
@@ -97,8 +105,14 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
     }
 }
 
-/// Match a file path's extension against known extractable binary formats.
+/// Match a file path against known extractable formats.
+///
+/// Dotenv is matched by basename first (`.env`, `.env.*`), then other formats
+/// are matched by extension.
 fn match_extractable_extension(path: &[u8]) -> Option<ExtractableFormat> {
+    if is_dotenv_basename(path) {
+        return Some(ExtractableFormat::DotEnv);
+    }
     let ext = file_extension(path)?;
     if eq_ignore_ascii_case(ext, b"ipynb") {
         return Some(ExtractableFormat::Ipynb);
@@ -115,12 +129,32 @@ fn match_extractable_extension(path: &[u8]) -> Option<ExtractableFormat> {
     None
 }
 
+/// Extract the filename component from a byte path.
+///
+/// Path splitting is POSIX-style (`/`); backslashes are treated as ordinary
+/// bytes.
+#[inline]
+fn file_name(path: &[u8]) -> &[u8] {
+    let name_start = memchr::memrchr(b'/', path).map(|idx| idx + 1).unwrap_or(0);
+    &path[name_start..]
+}
+
+/// Returns `true` for dotenv basenames (`.env` and `.env.*`).
+///
+/// Similar names like `.envrc` intentionally do not match.
+fn is_dotenv_basename(path: &[u8]) -> bool {
+    let name = file_name(path);
+    if name.len() < 4 || !eq_ignore_ascii_case(&name[..4], b".env") {
+        return false;
+    }
+    name.len() == 4 || name[4] == b'.'
+}
+
 /// Extract the file extension from a byte path (after the last `.` in the filename).
 ///
 /// Returns `None` for dotfiles, paths ending in `.`, or paths with no extension.
 fn file_extension(path: &[u8]) -> Option<&[u8]> {
-    let name_start = memchr::memrchr(b'/', path).map(|idx| idx + 1).unwrap_or(0);
-    let name = &path[name_start..];
+    let name = file_name(path);
     let dot = memchr::memrchr(b'.', name)?;
     if dot == 0 {
         return None;
@@ -236,6 +270,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dotenv_text_content_classified_as_extractable() {
+        let data = b"API_KEY=abc123";
+        assert_eq!(
+            classify_content(data, b".env", CHECK_LEN),
+            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+        );
+    }
+
+    #[test]
+    fn dotenv_suffix_content_classified_as_extractable() {
+        let data = b"DB_PASSWORD=supersecret";
+        assert_eq!(
+            classify_content(data, b"config/.env.local", CHECK_LEN),
+            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+        );
+    }
+
+    #[test]
+    fn non_dotenv_dotfile_is_not_extractable() {
+        let data = b"SECRET in plain text";
+        assert_eq!(
+            classify_content(data, b".envrc", CHECK_LEN),
+            ContentVerdict::Text
+        );
+    }
+
     // ---- file_extension helper ----
 
     #[test]
@@ -283,6 +344,7 @@ mod tests {
             (b"app.WAR", ExtractableFormat::JarWar),
             (b"mod.PYC", ExtractableFormat::Pyc),
             (b"nb.IPYNB", ExtractableFormat::Ipynb),
+            (b".ENV", ExtractableFormat::DotEnv),
         ] {
             assert_eq!(
                 classify_content(bin, path, CHECK_LEN),
