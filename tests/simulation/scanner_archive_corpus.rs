@@ -52,6 +52,7 @@ fn archive_corpus_smoke() {
         scan_utf16_variants: true,
         archive: archive_cfg,
         stability_runs: 1,
+        archive_deadline_countdown: None,
     };
 
     let engine = build_engine_from_suite(&scenario.rule_suite, &run_cfg).expect("build engine");
@@ -892,4 +893,100 @@ fn archive_wall_clock_timeout_skips_later_entries() {
     let scenario =
         build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
     run_archive_scenario_with_countdown(scenario, archive_cfg, 0xC0FF_EE20, 2);
+}
+
+/// Same as `archive_wall_clock_timeout_skips_later_entries` but for zip
+/// format.  Zip scan calls `is_deadline_expired()` at the outer loop top
+/// and inside the decompression read loop.  The countdown fires before
+/// entry 1 starts, so only entry 0's secret is found.
+#[test]
+fn archive_zip_wall_clock_timeout_skips_later_entries() {
+    let archive_cfg = base_archive_config();
+
+    let (payload_a, span_a) = payload_with_secret(2, 9);
+    let (payload_b, _span_b) = payload_with_secret(2, 9);
+    let filler = vec![b'x'; 20];
+
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"timeout.zip".to_vec()),
+        kind: ArchiveKindSpec::Zip,
+        entries: vec![
+            ArchiveEntrySpec {
+                name_bytes: b"first.txt".to_vec(),
+                payload: payload_a,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+            ArchiveEntrySpec {
+                name_bytes: b"filler.txt".to_vec(),
+                payload: filler,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+            ArchiveEntrySpec {
+                name_bytes: b"third.txt".to_vec(),
+                payload: payload_b,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+        ],
+        corruption: None,
+    };
+
+    let scenario =
+        build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
+    run_archive_scenario_with_countdown(scenario, archive_cfg, 0xC0FF_EE21, 2);
+}
+
+/// Same for tar.gz (gzip-compressed tar).  The gzip outer scan calls
+/// `is_deadline_expired()` twice (outer + inner read), then the tar
+/// nested scan inherits the countdown state.  With a small payload and
+/// countdown=2, the timeout fires after the first tar entry is fully
+/// delivered through the gzip→tar pipeline.
+#[test]
+fn archive_targz_wall_clock_timeout_skips_later_entries() {
+    let archive_cfg = base_archive_config();
+
+    let (payload_a, span_a) = payload_with_secret(2, 9);
+    let (payload_b, _span_b) = payload_with_secret(2, 9);
+    let filler = vec![b'x'; 20];
+
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"timeout.tar.gz".to_vec()),
+        kind: ArchiveKindSpec::TarGz,
+        entries: vec![
+            ArchiveEntrySpec {
+                name_bytes: b"first.txt".to_vec(),
+                payload: payload_a,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+            ArchiveEntrySpec {
+                name_bytes: b"filler.txt".to_vec(),
+                payload: filler,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+            ArchiveEntrySpec {
+                name_bytes: b"third.txt".to_vec(),
+                payload: payload_b,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+        ],
+        corruption: None,
+    };
+
+    // tar.gz has extra deadline checks from the gzip decompression layer,
+    // so the countdown needs to be higher to reach the tar inner scan.
+    // Use a generous value that fires after the first entry completes.
+    let scenario =
+        build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
+    run_archive_scenario_with_countdown(scenario, archive_cfg, 0xC0FF_EE22, 2);
 }
