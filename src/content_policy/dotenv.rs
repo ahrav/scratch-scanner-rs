@@ -41,14 +41,13 @@
 //! # Performance
 //!
 //! The parser is byte-oriented and allocation-free beyond the caller-provided
-//! output buffer. The `=` separator and single-quote delimiter searches use
-//! `memchr` for SIMD-accelerated matching. Line scanning and double-quote
-//! parsing use byte-at-a-time loops (the latter because escape processing is
-//! interleaved). Malformed lines are skipped without panicking.
+//! output buffer. Line scanning, delimiter searches (`=`, `'`, `"`, `#`), and
+//! plain-text spans inside double-quoted values all use `memchr`/`memchr2` for
+//! SIMD-accelerated matching. Malformed lines are skipped without panicking.
 //!
 //! [`EXTRACT_OUTPUT_CAP`]: super::extract::EXTRACT_OUTPUT_CAP
 
-use memchr::memchr;
+use memchr::{memchr, memchr2};
 
 use super::extract::{ExtractResult, Extractor, EXTRACT_OUTPUT_CAP};
 
@@ -149,6 +148,7 @@ fn append_entry(
         return LineResult::CapReached;
     }
 
+    let value_start = out.len();
     let resume_pos = *pos;
     let value = trim_ascii_start(value);
     let value_result = match value.first().copied() {
@@ -159,6 +159,23 @@ fn append_entry(
 
     match value_result {
         ValueResult::Ok => {
+            // Normalize the value to match what an unquoted re-parse would
+            // produce, making the output a true fixed point. Unquoted values
+            // are already trimmed by `parse_unquoted` and `trim_ascii_start`
+            // in the caller; this catches quoted values whose content has
+            // leading or trailing whitespace (e.g. `A=" x "` normalizes to
+            // `A=x\n`, matching what a bare `A= x ` would produce).
+            let leading_ws = out[value_start..]
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+            if leading_ws > 0 {
+                out.copy_within(value_start + leading_ws.., value_start);
+                out.truncate(out.len() - leading_ws);
+            }
+            while out.len() > value_start && out.last().is_some_and(|b| b.is_ascii_whitespace()) {
+                out.pop();
+            }
             if push_byte(out, b'\n') {
                 LineResult::Appended
             } else {
@@ -245,46 +262,50 @@ fn parse_double_quoted<'a>(
 ) -> ValueResult {
     loop {
         let mut idx = 0usize;
-        let mut escaped = false;
         while idx < segment.len() {
-            let b = segment[idx];
-            if escaped {
-                let unescaped = match b {
-                    b'n' => b'\n',
-                    b'r' => b'\r',
-                    b't' => b'\t',
-                    b'\\' => b'\\',
-                    b'"' => b'"',
-                    other => other,
-                };
-                if !push_byte(out, unescaped) {
-                    return ValueResult::CapReached;
-                }
-                escaped = false;
-                idx += 1;
-                continue;
-            }
-
-            match b {
-                b'\\' => {
-                    escaped = true;
-                    idx += 1;
-                }
-                b'"' => return ValueResult::Ok,
-                _ => {
-                    if !push_byte(out, b) {
+            let rest = &segment[idx..];
+            match memchr2(b'\\', b'"', rest) {
+                Some(offset) => {
+                    // Bulk-copy plain text before the special byte.
+                    if offset > 0 && !push_bytes(out, &rest[..offset]) {
                         return ValueResult::CapReached;
                     }
+                    idx += offset;
+                    if segment[idx] == b'"' {
+                        return ValueResult::Ok;
+                    }
+                    // Backslash: consume escape pair.
                     idx += 1;
+                    if idx < segment.len() {
+                        let unescaped = match segment[idx] {
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'\\' => b'\\',
+                            b'"' => b'"',
+                            other => other,
+                        };
+                        if !push_byte(out, unescaped) {
+                            return ValueResult::CapReached;
+                        }
+                        idx += 1;
+                    } else {
+                        // Trailing `\` at segment end — emit as literal.
+                        if !push_byte(out, b'\\') {
+                            return ValueResult::CapReached;
+                        }
+                    }
+                }
+                None => {
+                    // No special bytes remain — bulk-copy the rest.
+                    if !push_bytes(out, rest) {
+                        return ValueResult::CapReached;
+                    }
+                    idx = segment.len();
                 }
             }
         }
 
-        // A trailing `\` at the end of a segment has no character to escape.
-        // Emit it as a literal backslash rather than silently dropping it.
-        if escaped && !push_byte(out, b'\\') {
-            return ValueResult::CapReached;
-        }
         if *pos >= data.len() {
             return ValueResult::Skip;
         }
@@ -302,8 +323,15 @@ fn parse_double_quoted<'a>(
 /// as part of the value, matching the behavior common among dotenv
 /// implementations.
 fn unquoted_comment_start(value: &[u8]) -> Option<usize> {
-    (0..value.len())
-        .find(|&idx| value[idx] == b'#' && (idx == 0 || value[idx - 1].is_ascii_whitespace()))
+    let mut start = 0;
+    while let Some(offset) = memchr(b'#', &value[start..]) {
+        let idx = start + offset;
+        if idx == 0 || value[idx - 1].is_ascii_whitespace() {
+            return Some(idx);
+        }
+        start = idx + 1;
+    }
+    None
 }
 
 /// Strip a lowercase `export` prefix followed by at least one ASCII
@@ -326,9 +354,9 @@ fn strip_export_prefix(line: &[u8]) -> &[u8] {
 /// `data.len()`, so the caller's `while pos < data.len()` naturally exits.
 fn next_line<'a>(data: &'a [u8], pos: &mut usize) -> &'a [u8] {
     let start = *pos;
-    while *pos < data.len() && data[*pos] != b'\n' {
-        *pos += 1;
-    }
+    let remaining = &data[start..];
+    let rel = memchr(b'\n', remaining).unwrap_or(remaining.len());
+    *pos = start + rel;
     let mut end = *pos;
     if *pos < data.len() {
         *pos += 1;
@@ -450,6 +478,18 @@ mod tests {
         ExtractResult::Empty,
         b"" as &[u8],
     )]
+    #[case::double_quoted_trailing_whitespace_trimmed(b"A=\" \"\n", ExtractResult::Ok, b"A=\n")]
+    #[case::single_quoted_trailing_whitespace_trimmed(
+        b"A='value  '\n",
+        ExtractResult::Ok,
+        b"A=value\n"
+    )]
+    #[case::quoted_leading_whitespace_trimmed(b"A=' hello'\n", ExtractResult::Ok, b"A=hello\n")]
+    #[case::quoted_both_sides_whitespace_trimmed(
+        b"A=\" hello \"\n",
+        ExtractResult::Ok,
+        b"A=hello\n"
+    )]
     fn extract_cases(
         #[case] input: &[u8],
         #[case] expected_result: ExtractResult,
@@ -526,26 +566,21 @@ mod proptests {
             }
         }
 
-        /// Normalization converges after two passes.
+        /// The output is a fixed point: re-extracting produces identical bytes.
         ///
-        /// A single extraction can strip quoting while preserving interior
-        /// whitespace that an unquoted re-parse would trim (e.g. `A=" "` →
-        /// `A= ` → `A=`). The correct invariant is therefore that a second
-        /// extraction produces a fixed point: `extract(extract(x))` ==
-        /// `extract(extract(extract(x)))`.
+        /// This is the defining property of normalization. If it breaks, the
+        /// output format has a quoting/trimming asymmetry (e.g. quoted
+        /// whitespace surviving the first pass but being trimmed on re-parse
+        /// as an unquoted value).
         #[test]
-        fn normalization_converges(lines in prop::collection::vec(dotenv_line(), 1..20)) {
+        fn extraction_is_idempotent(lines in prop::collection::vec(dotenv_line(), 1..20)) {
             let input: Vec<u8> = lines.into_iter().flatten().collect();
-            let mut pass1 = Vec::new();
-            let _ = DotEnvExtractor.extract(&input, &mut pass1, &mut Vec::new());
-            if pass1.is_empty() { return Ok(()); }
-            let mut pass2 = Vec::new();
-            let _ = DotEnvExtractor.extract(&pass1, &mut pass2, &mut Vec::new());
-            if pass2.is_empty() { return Ok(()); }
-            let mut pass3 = Vec::new();
-            let _ = DotEnvExtractor.extract(&pass2, &mut pass3, &mut Vec::new());
-            prop_assert_eq!(&pass2, &pass3,
-                "normalization did not converge after two passes");
+            let mut out1 = Vec::new();
+            let _ = DotEnvExtractor.extract(&input, &mut out1, &mut Vec::new());
+            if out1.is_empty() { return Ok(()); }
+            let mut out2 = Vec::new();
+            let _ = DotEnvExtractor.extract(&out1, &mut out2, &mut Vec::new());
+            prop_assert_eq!(&out1, &out2, "extraction is not idempotent");
         }
 
         /// The extractor must never panic on arbitrary byte sequences.
