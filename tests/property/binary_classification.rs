@@ -59,6 +59,8 @@ proptest! {
             Just(&b"file.war"[..]),
             Just(&b"file.pyc"[..]),
             Just(&b"file.ipynb"[..]),
+            Just(&b".env"[..]),
+            Just(&b".env.prod"[..]),
         ]
     ) {
         // Binary data (contains NUL) with a known extension must be BinaryExtractable.
@@ -84,6 +86,7 @@ mod with_extraction {
         fn extract_content_never_panics(
             data in proptest::collection::vec(any::<u8>(), 0..4096),
             format in prop_oneof![
+                Just(ExtractableFormat::DotEnv),
                 Just(ExtractableFormat::Ipynb),
                 Just(ExtractableFormat::JavaClass),
                 Just(ExtractableFormat::JarWar),

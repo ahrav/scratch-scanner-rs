@@ -1,11 +1,11 @@
-//! Binary content extraction framework.
+//! Content extraction framework.
 //!
 //! Defines the [`Extractor`] trait and a format-aware dispatcher that routes
 //! [`ExtractableFormat`] variants to the appropriate extractor implementation.
 //!
 //! # Architecture
 //!
-//! Each supported binary format has a dedicated [`Extractor`] implementation
+//! Each supported format has a dedicated [`Extractor`] implementation
 //! that knows how to parse the format and emit any embedded text (string
 //! literals, code cells, constant pool entries, etc.) that a secret-scanning
 //! engine can then match against.
@@ -34,9 +34,9 @@ pub const EXTRACT_OUTPUT_CAP: usize = 32 * 1024;
 /// Pre-allocation hint for JAR entry scratch buffers.
 pub const JAR_ENTRY_CAP: usize = 32 * 1024;
 
-/// Trait for extracting scannable text from a known binary format.
+/// Trait for extracting scannable text from a known format.
 ///
-/// Implementors parse a single format (e.g. `.class`, `.pyc`) and append
+/// Implementors parse a single format (e.g. `.class`, `.pyc`, `.env`) and append
 /// any human-readable strings to the output buffer. The extracted text
 /// need not be valid UTF-8 — the scan engine treats it as raw bytes.
 ///
@@ -47,7 +47,9 @@ pub const JAR_ENTRY_CAP: usize = 32 * 1024;
 /// - On [`ExtractResult::ParseError`] or [`ExtractResult::Empty`], `out`
 ///   must be left unchanged from its state at entry.
 /// - Implementations must not panic on arbitrary input. Malformed data
-///   should yield `ParseError`, not a crash.
+///   must not crash. Extractors may return [`ExtractResult::ParseError`] when
+///   they can confidently reject a format, or [`ExtractResult::Empty`] for
+///   best-effort early bails on truncated/unknown content.
 /// - `scratch` is a caller-provided temporary workspace that extractors
 ///   may use for intermediate allocations (e.g. decompressing JAR entries).
 ///   Callers should pass a pre-allocated buffer; extractors that don't
@@ -56,8 +58,9 @@ pub trait Extractor {
     /// Append scannable text extracted from `data` to `out`.
     ///
     /// Returns [`ExtractResult::Ok`] when at least one byte was appended,
-    /// [`ExtractResult::Empty`] when the format was valid but contained no
-    /// text, or [`ExtractResult::ParseError`] when `data` is not valid for
+    /// [`ExtractResult::Empty`] when no bytes were appended (including valid
+    /// no-text inputs and best-effort parse bail-outs), or
+    /// [`ExtractResult::ParseError`] when `data` is definitively rejected for
     /// this format.
     fn extract(&self, data: &[u8], out: &mut Vec<u8>, scratch: &mut Vec<u8>) -> ExtractResult;
 }
@@ -77,6 +80,7 @@ pub fn extract_content(
 ) -> ExtractResult {
     out.clear();
     match format {
+        ExtractableFormat::DotEnv => super::dotenv::DotEnvExtractor.extract(data, out, scratch),
         ExtractableFormat::Ipynb => super::ipynb::IpynbExtractor.extract(data, out, scratch),
         ExtractableFormat::JavaClass => {
             super::java_class::JavaClassExtractor.extract(data, out, scratch)
@@ -132,5 +136,21 @@ mod tests {
             ),
             ExtractResult::ParseError
         );
+    }
+
+    #[test]
+    fn dotenv_dispatches_correctly() {
+        let mut out = Vec::new();
+        let mut scratch = Vec::new();
+        assert_eq!(
+            extract_content(
+                ExtractableFormat::DotEnv,
+                b"export API_KEY=\"abc\\n123\"\n",
+                &mut out,
+                &mut scratch
+            ),
+            ExtractResult::Ok
+        );
+        assert_eq!(out, b"API_KEY=abc\n123\n");
     }
 }

@@ -191,6 +191,34 @@ fn fs_scan_ipynb_extraction() {
     );
 }
 
+/// .env files should be parsed as structured extractable content.
+#[test]
+fn fs_scan_dotenv_extraction() {
+    let dir = TempDir::new().unwrap();
+
+    let env_path = dir.path().join(".env");
+    std::fs::write(
+        &env_path,
+        b"# comment\nexport API_KEY=\"SECRET\"\nIGNORED_LINE\n",
+    )
+    .unwrap();
+    let size = std::fs::metadata(&env_path).unwrap().len();
+
+    let files = vec![lf(env_path, size)];
+    let (output, report) = run_scan_with_config(files, default_cfg());
+    let paths = finding_paths(&output);
+
+    assert!(
+        paths.iter().any(|p| p.contains(".env")),
+        "dotenv extraction should find secret: {output}"
+    );
+    assert!(
+        report.metrics.binary_extracted > 0,
+        "expected binary_extracted > 0, got {}",
+        report.metrics.binary_extracted
+    );
+}
+
 /// .class files should be detected as extractable and have their constant pool strings scanned.
 #[test]
 fn fs_scan_java_class_extraction() {

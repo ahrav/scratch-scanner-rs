@@ -161,3 +161,10 @@ path = "fuzz_targets/fuzz_offline_validators.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_dotenv_extract"
+path = "fuzz_targets/fuzz_dotenv_extract.rs"
+test = false
+doc = false
+bench = false
