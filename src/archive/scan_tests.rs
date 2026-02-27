@@ -210,6 +210,106 @@ fn gzip_compress(data: &[u8]) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
+// ── Zip helpers ───────────────────────────────────────────────────
+
+/// Build a minimal zip archive (Store-only, no compression) from `(name, payload)` pairs.
+///
+/// Produces: Local File Header + payload per entry → Central Directory → EOCD.
+/// This is intentionally minimal — no deflate, no data descriptors, no Zip64.
+/// For tests requiring compression or encryption, use `sim_archive::build_zip_bytes`.
+fn build_zip(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut cd_entries: Vec<(u32, &[u8], u32)> = Vec::new(); // (lfh_offset, name, size)
+
+    for &(name, payload) in entries {
+        let lfh_offset = out.len() as u32;
+        let size = payload.len() as u32;
+
+        // Local File Header (30 bytes + name).
+        out.extend_from_slice(b"PK\x03\x04"); // signature
+        out.extend_from_slice(&10u16.to_le_bytes()); // version needed (1.0)
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Store
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc32 (unchecked in scanner)
+        out.extend_from_slice(&size.to_le_bytes()); // compressed size
+        out.extend_from_slice(&size.to_le_bytes()); // uncompressed size
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name len
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra field len
+        out.extend_from_slice(name);
+        out.extend_from_slice(payload);
+
+        cd_entries.push((lfh_offset, name, size));
+    }
+
+    let cd_offset = out.len() as u32;
+    let mut cd_size = 0u32;
+
+    for &(lfh_offset, name, size) in &cd_entries {
+        let start = out.len();
+        // Central Directory File Header (46 bytes + name).
+        out.extend_from_slice(b"PK\x01\x02"); // signature
+        out.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        out.extend_from_slice(&10u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Store
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc32
+        out.extend_from_slice(&size.to_le_bytes()); // compressed size
+        out.extend_from_slice(&size.to_le_bytes()); // uncompressed size
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name len
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra field len
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&lfh_offset.to_le_bytes()); // relative offset of LFH
+        out.extend_from_slice(name);
+        cd_size += (out.len() - start) as u32;
+    }
+
+    // End of Central Directory Record (22 bytes).
+    let entry_count = entries.len() as u16;
+    out.extend_from_slice(b"PK\x05\x06"); // signature
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk with CD
+    out.extend_from_slice(&entry_count.to_le_bytes()); // entries on this disk
+    out.extend_from_slice(&entry_count.to_le_bytes()); // total entries
+    out.extend_from_slice(&cd_size.to_le_bytes()); // CD size
+    out.extend_from_slice(&cd_offset.to_le_bytes()); // CD offset
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+
+    out
+}
+
+/// Run scan_zip_source on raw zip bytes and return (outcome, sink, budgets_depth).
+fn scan_zip_bytes(
+    zip_bytes: &[u8],
+    cfg: &ArchiveConfig,
+    chunk_size: usize,
+    overlap: usize,
+) -> (ArchiveEnd, RecordingSink, u8) {
+    let mut scratch: TestScratch = ArchiveScratch::new(cfg, chunk_size, overlap);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let cursor = Cursor::new(zip_bytes.to_vec());
+
+    let outcome = scan_zip_source(
+        cursor,
+        b"test.zip",
+        cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+    )
+    .unwrap();
+
+    let depth = scratch.budgets.depth();
+    (outcome, sink, depth)
+}
+
 // ── Gap 1: Carry overlap boundary conditions ───────────────────────
 
 #[test]
@@ -725,6 +825,34 @@ fn gzip_wall_clock_timeout_yields_partial() {
     cfg.max_total_uncompressed_bytes_per_root = 10_000;
 
     let (outcome, _, depth) = scan_gz_bytes(&gz, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}
+
+/// A zip archive with payload should yield `Partial(WallClockTimeout)`
+/// when the deadline is already expired, and budget depth must return to 0.
+#[test]
+fn zip_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'Z'; 256];
+    let zip = build_zip(&[(b"big.txt", &payload)]);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+    cfg.max_uncompressed_bytes_per_entry = 10_000;
+    cfg.max_total_uncompressed_bytes_per_archive = 10_000;
+    cfg.max_total_uncompressed_bytes_per_root = 10_000;
+
+    let (outcome, _, depth) = scan_zip_bytes(&zip, &cfg, 64, 4);
 
     assert_eq!(
         depth, 0,
