@@ -68,8 +68,15 @@ fn bounded_random_mutation_scanner_sims() {
         // Initial build to discover required overlap.
         let mut scenario_rng = SimRng::new(seed);
         let (scenario, _, _) = build_mutation_scenario(&plans, 64, &mut scenario_rng);
-        let engine =
-            build_mutation_engine(&scenario.rule_suite, &base_run_cfg).expect("build engine");
+        let engine = match build_mutation_engine(&scenario.rule_suite, &base_run_cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                if std::env::var_os("SCANNER_SIM_WRITE_FAIL").is_some() {
+                    write_mutation_failure(seed, &plans, &base_run_cfg, &[]);
+                }
+                panic!("build engine failed (seed {seed}): {e}");
+            }
+        };
         let required = engine.required_overlap() as u32;
         let mut run_cfg = base_run_cfg.clone();
         run_cfg.adjust_for_overlap(required);

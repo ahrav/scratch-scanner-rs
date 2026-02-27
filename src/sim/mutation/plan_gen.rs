@@ -37,6 +37,11 @@ use super::op::{MutOp, MutOpKind};
 use super::plan::{ContextWrap, MutationPlan};
 use crate::sim::rng::SimRng;
 
+/// Upper bound (exclusive) on the number of mutation operators per plan.
+/// Zero operators test the baseline (unmutated token must be detected);
+/// higher counts exercise multi-operator composition paths.
+const MAX_MUTATION_OPS: u32 = 5;
+
 /// Generate a single random [`MutationPlan`] for a uniformly chosen family.
 ///
 /// Consumes RNG state for family selection plus all draws needed by
@@ -86,7 +91,7 @@ pub fn random_mutation_plans_all_families(
 /// (e.g. `Extend` then `Truncate`).
 fn random_plan_for_family(rng: &mut SimRng, family: TokenFamily, case_id: u64) -> MutationPlan {
     let base_seed = rng.next_u64();
-    let op_count = rng.gen_range(0, 5) as usize;
+    let op_count = rng.gen_range(0, MAX_MUTATION_OPS) as usize;
     let bound = family.param_bound();
     let allowed = family.allowed_ops();
 
@@ -192,11 +197,12 @@ mod proptests {
 
     /// Assert all structural invariants on a single [`MutationPlan`].
     fn assert_plan_invariants(plan: &MutationPlan) {
-        // Op count: random_plan_for_family draws 0..=4.
+        // Op count: random_plan_for_family draws 0..MAX_MUTATION_OPS.
         assert!(
-            plan.ops.len() <= 4,
-            "ops.len()={} exceeds maximum of 4",
+            plan.ops.len() < MAX_MUTATION_OPS as usize,
+            "ops.len()={} exceeds maximum of {}",
             plan.ops.len(),
+            MAX_MUTATION_OPS - 1,
         );
 
         // Context must be one of the known wrappers.

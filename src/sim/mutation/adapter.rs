@@ -43,6 +43,14 @@ use crate::sim_scanner::scenario::{
 };
 use crate::{Engine, FindingRec};
 
+/// Byte stride between consecutive [`MayMiss`] point-span sentinels scattered
+/// through the wrapped-token region. Any real finding >= this many bytes wide
+/// is guaranteed to contain at least one sentinel, satisfying the ground-truth
+/// oracle's containment check.
+///
+/// [`MayMiss`]: ExpectedDisposition::MayMiss
+const SENTINEL_STRIDE: usize = 8;
+
 /// Aggregate result of [`check_mutation_expectations`].
 ///
 /// [`passed()`](MutationCheckResult::passed) returns `true` when every case's
@@ -116,7 +124,7 @@ struct FamilyRule {
 /// The scenario contains one simulated file per plan, each with the
 /// noise-token-noise layout described in the module docs. The `expected`
 /// field is populated with [`MayMiss`] point-span sentinels (1-byte spans
-/// every 8 bytes through the token region, for every rule ID) that satisfy
+/// every [`SENTINEL_STRIDE`] bytes through the token region, for every rule ID) that satisfy
 /// the ground-truth oracle's containment check without causing false
 /// failures. The mutation oracle ([`check_mutation_expectations`]) uses the
 /// returned `cases` and `noise_len_used` to compute token spans independently.
@@ -131,7 +139,6 @@ struct FamilyRule {
 pub fn build_mutation_scenario(
     plans: &[MutationPlan],
     noise_len: usize,
-    _rng: &mut SimRng,
 ) -> (Scenario, Vec<GeneratedCase>, usize) {
     let cases: Vec<GeneratedCase> = plans.iter().map(execute_plan).collect();
 
@@ -148,6 +155,7 @@ pub fn build_mutation_scenario(
         .collect();
 
     let noise = vec![b'\n'; noise_len];
+    let sentinel_reason = "mutation: deferred to mutation oracle".to_string();
 
     let mut nodes = Vec::new();
     let mut expected = Vec::new();
@@ -170,10 +178,11 @@ pub fn build_mutation_scenario(
             type_hint: SimTypeHint::File,
         });
 
-        // Scatter 1-byte MayMiss point spans every 8 bytes through the
-        // wrapped-token region, for every rule_id. The ground-truth oracle
-        // requires expected.span ⊆ finding.span, so any real finding >=8
-        // bytes wide is guaranteed to contain at least one sentinel. We
+        // Scatter 1-byte MayMiss point spans every SENTINEL_STRIDE bytes
+        // through the wrapped-token region, for every rule_id. The
+        // ground-truth oracle requires expected.span ⊆ finding.span, so
+        // any real finding >= SENTINEL_STRIDE bytes wide is guaranteed to
+        // contain at least one sentinel. We
         // register all rule_ids (not just the case's own family) because the
         // ground-truth oracle would flag an unexpected finding for a rule_id
         // that has no expected entry at all.
@@ -190,10 +199,10 @@ pub fn build_mutation_scenario(
                     root_span: SpanU32::new(pos as u32, end as u32),
                     repr: SecretRepr::Raw,
                     disposition: ExpectedDisposition::MayMiss {
-                        reason: "mutation: deferred to mutation oracle".to_string(),
+                        reason: sentinel_reason.clone(),
                     },
                 });
-                pos += 8;
+                pos += SENTINEL_STRIDE;
             }
         }
     }
@@ -438,6 +447,11 @@ fn all_canonical_prefixes(
         // single-family unit tests). Deterministic but may differ from
         // case-derived anchors; callers needing anchor stability should
         // ensure every family has at least one case.
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "all_canonical_prefixes: no case for {family:?}, falling back to seed-0 token"
+            );
+        }
         let token = family.gen_valid(&mut SimRng::new(0));
         prefixes.push(token[..len.min(token.len())].to_vec());
     }
@@ -479,10 +493,8 @@ mod tests {
     fn build_mutation_scenario_determinism() {
         let mut rng1 = SimRng::new(7);
         let plans = super::super::plan_gen::random_mutation_plans_all_families(&mut rng1, 1);
-        let mut rng2 = SimRng::new(100);
-        let mut rng3 = SimRng::new(100);
-        let (s1, _, _) = build_mutation_scenario(&plans, 64, &mut rng2);
-        let (s2, _, _) = build_mutation_scenario(&plans, 64, &mut rng3);
+        let (s1, _, _) = build_mutation_scenario(&plans, 64);
+        let (s2, _, _) = build_mutation_scenario(&plans, 64);
         let json1 = serde_json::to_string(&s1).unwrap();
         let json2 = serde_json::to_string(&s2).unwrap();
         assert_eq!(json1, json2);
@@ -511,8 +523,7 @@ mod tests {
         };
 
         let plans = vec![plan0, plan1];
-        let mut rng = SimRng::new(0);
-        let (_scenario, cases, noise_len) = build_mutation_scenario(&plans, 64, &mut rng);
+        let (_scenario, cases, noise_len) = build_mutation_scenario(&plans, 64);
 
         // Both unmutated → MustMatch.
         assert_eq!(cases[0].expectation, Outcome::MustMatch);
@@ -562,8 +573,7 @@ mod tests {
             context: ContextWrap::EnvAssignment,
         };
         let plans = vec![plan];
-        let mut rng = SimRng::new(0);
-        let (_scenario, cases, noise_len) = build_mutation_scenario(&plans, 16, &mut rng);
+        let (_scenario, cases, noise_len) = build_mutation_scenario(&plans, 16);
 
         let case = &cases[0];
         let expected_start = noise_len + case.wrapped.token_offset;
@@ -573,6 +583,127 @@ mod tests {
         // For EnvAssignment, token_offset > 0.
         assert!(case.wrapped.token_offset > 0);
         assert!(expected_end > expected_start);
+    }
+
+    // -- Direct unit tests for check_mutation_expectations --
+
+    fn make_case(
+        family: TokenFamily,
+        expectation: Outcome,
+        token_offset: usize,
+        token_len: usize,
+    ) -> GeneratedCase {
+        use super::super::plan::{ContextWrap, MutationPlan, WrappedToken};
+
+        let canonical = family.gen_valid(&mut SimRng::new(0));
+        let mutated = canonical.clone();
+        let total_len = token_offset + token_len + 4; // 4 bytes trailing context
+        let bytes = vec![b'x'; total_len];
+
+        GeneratedCase {
+            canonical,
+            mutated,
+            wrapped: WrappedToken {
+                bytes,
+                token_offset,
+                token_len,
+            },
+            expectation,
+            plan: MutationPlan {
+                family,
+                base_seed: 0,
+                case_id: 0,
+                ops: vec![],
+                context: ContextWrap::Raw,
+            },
+        }
+    }
+
+    fn make_finding(rule_id: u32, start: u64, end: u64) -> FindingRec {
+        FindingRec {
+            file_id: crate::api::FileId(0),
+            rule_id,
+            span_start: 0,
+            span_end: 0,
+            root_hint_start: start,
+            root_hint_end: end,
+            dedupe_with_span: false,
+            step_id: Default::default(),
+            confidence_score: 0,
+        }
+    }
+
+    #[test]
+    fn must_match_with_overlapping_finding_passes() {
+        let noise = 16;
+        let case = make_case(TokenFamily::AwsAccessKey, Outcome::MustMatch, 4, 20);
+        let rule_id = TokenFamily::AwsAccessKey.rule_id();
+        // Token span: noise+4 .. noise+4+20 = 20..44
+        let finding = make_finding(rule_id, 20, 44);
+        let result = check_mutation_expectations(&[case], noise, &[finding]);
+        assert!(result.passed());
+        assert!(result.violations().is_empty());
+    }
+
+    #[test]
+    fn must_match_no_finding_is_violation() {
+        let noise = 16;
+        let case = make_case(TokenFamily::AwsAccessKey, Outcome::MustMatch, 4, 20);
+        let result = check_mutation_expectations(&[case], noise, &[]);
+        assert!(!result.passed());
+        assert_eq!(result.violations().len(), 1);
+        assert_eq!(result.violations()[0].case_index, 0);
+        assert_eq!(
+            result.violations()[0].rule_id,
+            TokenFamily::AwsAccessKey.rule_id()
+        );
+        assert_eq!(result.violations()[0].expected_span, (20, 40));
+    }
+
+    #[test]
+    fn must_match_adjacent_but_not_overlapping_is_violation() {
+        let noise = 16;
+        let case = make_case(TokenFamily::AwsAccessKey, Outcome::MustMatch, 4, 20);
+        let rule_id = TokenFamily::AwsAccessKey.rule_id();
+        // Token span: 20..44. Finding ends exactly at span start (no overlap).
+        let finding = make_finding(rule_id, 10, 20);
+        let result = check_mutation_expectations(&[case], noise, &[finding]);
+        assert!(
+            !result.passed(),
+            "adjacent finding (end == span.start) must not satisfy MustMatch"
+        );
+    }
+
+    #[test]
+    fn must_not_match_but_found_is_tolerated() {
+        let noise = 16;
+        let case = make_case(TokenFamily::AwsAccessKey, Outcome::MustNotMatch, 4, 20);
+        let rule_id = TokenFamily::AwsAccessKey.rule_id();
+        let finding = make_finding(rule_id, 20, 44);
+        let result = check_mutation_expectations(&[case], noise, &[finding]);
+        assert!(result.passed(), "MustNotMatch + found should be tolerated");
+    }
+
+    #[test]
+    fn may_match_either_outcome_accepted() {
+        let noise = 16;
+        let case_with = make_case(TokenFamily::AwsAccessKey, Outcome::MayMatch, 4, 20);
+        let case_without = make_case(TokenFamily::AwsAccessKey, Outcome::MayMatch, 4, 20);
+        let rule_id = TokenFamily::AwsAccessKey.rule_id();
+        let finding = make_finding(rule_id, 20, 44);
+
+        let result_with = check_mutation_expectations(&[case_with], noise, &[finding]);
+        assert!(result_with.passed(), "MayMatch + found should pass");
+
+        let result_without = check_mutation_expectations(&[case_without], noise, &[]);
+        assert!(result_without.passed(), "MayMatch + not found should pass");
+    }
+
+    #[test]
+    fn empty_cases_passes() {
+        let result = check_mutation_expectations(&[], 16, &[]);
+        assert!(result.passed());
+        assert!(result.violations().is_empty());
     }
 }
 
@@ -625,10 +756,8 @@ mod adapter_proptests {
         fn prop_build_mutation_scenario_determinism(seed: u64) {
             let mut rng = SimRng::new(seed);
             let plans = super::super::plan_gen::random_mutation_plans_all_families(&mut rng, 1);
-            let mut rng2 = SimRng::new(seed.wrapping_add(100));
-            let mut rng3 = SimRng::new(seed.wrapping_add(100));
-            let (s1, _, _) = build_mutation_scenario(&plans, 64, &mut rng2);
-            let (s2, _, _) = build_mutation_scenario(&plans, 64, &mut rng3);
+            let (s1, _, _) = build_mutation_scenario(&plans, 64);
+            let (s2, _, _) = build_mutation_scenario(&plans, 64);
             let json1 = serde_json::to_string(&s1).unwrap();
             let json2 = serde_json::to_string(&s2).unwrap();
             prop_assert!(
@@ -659,8 +788,7 @@ mod adapter_proptests {
                 context,
             };
             let plans = vec![plan];
-            let mut rng = SimRng::new(seed);
-            let (_scenario, cases, nl) = build_mutation_scenario(&plans, noise_len, &mut rng);
+            let (_scenario, cases, nl) = build_mutation_scenario(&plans, noise_len);
 
             let case = &cases[0];
             prop_assert!(
