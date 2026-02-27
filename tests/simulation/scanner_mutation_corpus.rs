@@ -6,11 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use scanner_rs::sim::fault::FaultPlan;
-use scanner_rs::sim::mutation::{
-    build_mutation_engine, build_mutation_scenario, check_mutation_expectations, MutationPlan,
-};
-use scanner_rs::sim::SimRng;
+use scanner_rs::sim::mutation::{check_mutation_expectations, MutationPlan};
 use scanner_rs::sim_scanner::{RunConfig, RunOutcome, ScannerSimRunner};
+
+use super::scanner_mutation_random::build_mutation_sim;
 
 #[derive(serde::Deserialize)]
 struct MutationCorpusEntry {
@@ -66,20 +65,8 @@ fn replay_mutation_corpus_cases() {
         let entry: MutationCorpusEntry = serde_json::from_slice(&bytes).expect("parse corpus case");
         assert!(!entry.plans.is_empty(), "corpus case {path:?} has no plans");
 
-        // Initial build to discover required overlap.
-        let mut scenario_rng = SimRng::new(entry.seed);
-        let (scenario, _, _) = build_mutation_scenario(&entry.plans, 64, &mut scenario_rng);
-        let engine = build_mutation_engine(&scenario.rule_suite, &entry.run_config)
-            .expect("build mutation engine");
-        let mut run_config = entry.run_config.clone();
-        let required = engine.required_overlap() as u32;
-        run_config.adjust_for_overlap(required);
-
-        // Rebuild scenario with overlap-adjusted noise; reuse the engine since
-        // rules are identical regardless of noise_len.
-        let mut scenario_rng = SimRng::new(entry.seed);
-        let (scenario, gen_cases, noise_len) =
-            build_mutation_scenario(&entry.plans, required as usize, &mut scenario_rng);
+        let (scenario, gen_cases, noise_len, engine, run_config) =
+            build_mutation_sim(&entry.plans, &entry.run_config);
 
         let schedule_seed = entry.seed.wrapping_add(0xC0FF_EE00);
         let runner = ScannerSimRunner::new(run_config, schedule_seed);

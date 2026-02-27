@@ -8,10 +8,11 @@ use scanner_rs::archive::ArchiveConfig;
 use scanner_rs::sim::fault::FaultPlan;
 use scanner_rs::sim::mutation::{
     build_mutation_engine, build_mutation_scenario, check_mutation_expectations,
-    random_mutation_plans_all_families, MutationPlan, MutationViolation,
+    random_mutation_plans_all_families, GeneratedCase, MutationPlan, MutationViolation,
 };
 use scanner_rs::sim::SimRng;
-use scanner_rs::sim_scanner::{RunConfig, RunOutcome, ScannerSimRunner};
+use scanner_rs::sim_scanner::{RunConfig, RunOutcome, ScannerSimRunner, Scenario};
+use scanner_rs::Engine;
 
 const DEFAULT_SEED_COUNT: u64 = 25;
 
@@ -34,6 +35,31 @@ fn env_bool(name: &str, default: bool) -> bool {
         Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
         Err(_) => default,
     }
+}
+
+/// Two-pass build: probe for required overlap, adjust run config, then rebuild
+/// the scenario with noise padding equal to the engine's required overlap.
+///
+/// Returns `(scenario, cases, noise_len, engine, run_cfg)` ready for scanning.
+pub(super) fn build_mutation_sim(
+    plans: &[MutationPlan],
+    base_run_cfg: &RunConfig,
+) -> (Scenario, Vec<GeneratedCase>, usize, Engine, RunConfig) {
+    // First pass: discover required_overlap from a probe scenario.
+    let (probe_scenario, _, _) = build_mutation_scenario(plans, 64);
+    let probe_engine =
+        build_mutation_engine(&probe_scenario.rule_suite, base_run_cfg).expect("build engine");
+    let required = probe_engine.required_overlap() as u32;
+    let mut run_cfg = base_run_cfg.clone();
+    run_cfg.adjust_for_overlap(required);
+
+    // Second pass: rebuild with noise_len = required_overlap so padding is
+    // wide enough for the engine's search radius. The engine is reused since
+    // rules are identical regardless of noise_len and synthetic_tuning does
+    // not depend on overlap/chunk_size.
+    let noise_len = required as usize;
+    let (scenario, cases, actual_noise) = build_mutation_scenario(plans, noise_len);
+    (scenario, cases, actual_noise, probe_engine, run_cfg)
 }
 
 #[test]
@@ -65,33 +91,8 @@ fn bounded_random_mutation_scanner_sims() {
         let mut rng = SimRng::new(seed.wrapping_add(0xA1B2_CAFE));
         let plans = random_mutation_plans_all_families(&mut rng, plans_per_family);
 
-        // Initial build to discover required overlap.
-        let mut scenario_rng = SimRng::new(seed);
-        let (scenario, _, _) = build_mutation_scenario(&plans, 64, &mut scenario_rng);
-        let engine = match build_mutation_engine(&scenario.rule_suite, &base_run_cfg) {
-            Ok(e) => e,
-            Err(e) => {
-                if std::env::var_os("SCANNER_SIM_WRITE_FAIL").is_some() {
-                    write_mutation_failure(seed, &plans, &base_run_cfg, &[]);
-                }
-                panic!("build engine failed (seed {seed}): {e}");
-            }
-        };
-        let required = engine.required_overlap() as u32;
-        let mut run_cfg = base_run_cfg.clone();
-        run_cfg.adjust_for_overlap(required);
-
-        let noise_len = match std::env::var("SIM_MUTATION_NOISE_LEN") {
-            Ok(v) => v.parse().unwrap_or(required as usize),
-            Err(_) => required as usize,
-        };
-
-        // Rebuild scenario with correct noise_len; the engine is reused since
-        // rules are identical regardless of noise_len and synthetic_tuning does
-        // not depend on overlap/chunk_size.
-        let mut scenario_rng = SimRng::new(seed);
-        let (scenario, cases, actual_noise_len) =
-            build_mutation_scenario(&plans, noise_len, &mut scenario_rng);
+        let (scenario, cases, noise_len, engine, run_cfg) =
+            build_mutation_sim(&plans, &base_run_cfg);
 
         let schedule_seed = seed.wrapping_add(0xC0FF_EE00);
         let runner = ScannerSimRunner::new(run_cfg.clone(), schedule_seed);
@@ -99,7 +100,7 @@ fn bounded_random_mutation_scanner_sims() {
 
         match outcome {
             RunOutcome::Ok { findings } => {
-                let check = check_mutation_expectations(&cases, actual_noise_len, &findings);
+                let check = check_mutation_expectations(&cases, noise_len, &findings);
                 if !check.passed() {
                     if std::env::var_os("SCANNER_SIM_WRITE_FAIL").is_some() {
                         write_mutation_failure(seed, &plans, &run_cfg, check.violations());
