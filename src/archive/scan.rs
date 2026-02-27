@@ -1383,12 +1383,15 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
         scan.sink.on_entry_end()?;
 
-        // If the read loop exited early (budget, I/O error, or deadline),
-        // drain unconsumed payload bytes to keep the tar stream aligned.
-        // Skip the drain when entry_partial_reason is already set — a deadline
-        // or budget hit in the read loop means we should not issue unbounded
-        // I/O to drain the remainder.
-        if entry_partial_reason.is_none() && remaining > 0 {
+        // Drain unconsumed payload bytes to keep the tar stream aligned for
+        // the next header.  The drain runs when:
+        //   - The read loop consumed all bytes normally (no partial reason), OR
+        //   - The budget hit was entry-scoped (SkipEntry), because the archive
+        //     must continue scanning subsequent entries.
+        // The drain is skipped for archive/root-level budget hits and
+        // deadline/IO errors, where further I/O is either unsafe or pointless.
+        let entry_scoped_hit = entry_skip_reason.is_some();
+        if (entry_partial_reason.is_none() || entry_scoped_hit) && remaining > 0 {
             if let Err(r) =
                 discard_remaining_payload(input, budgets, scan.stream_buf.as_mut_slice(), remaining)
             {
