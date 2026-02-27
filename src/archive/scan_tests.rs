@@ -866,3 +866,118 @@ fn zip_wall_clock_timeout_yields_partial() {
         "expected WallClockTimeout, got {outcome:?}"
     );
 }
+
+// ── Deterministic mid-scan timeout (countdown, no real clock) ──────
+
+/// Timeout fires after entry 1 is fully processed but before entry 2
+/// begins.  Uses the test-only countdown override so no real time elapses.
+///
+/// The countdown is calibrated by counting `is_deadline_expired()` calls
+/// in `scan_tar_stream_nested`:
+///   - 1 call at the outer-loop top (before entry header parsing)
+///   - 1 call per inner-loop iteration (per read chunk)
+///
+///   For a small payload that fits in one chunk, entry 1 consumes 2 checks.
+///   Setting the countdown to 2 causes the 3rd call (entry 2's outer-loop
+///   check) to fire, terminating the scan with exactly 1 entry delivered.
+#[test]
+fn tar_timeout_mid_scan_delivers_only_first_entry() {
+    let tar = build_tar(&[
+        (b"first.txt", b"AAAA"),
+        (b"second.txt", b"BBBB"),
+        (b"third.txt", b"CCCC"),
+    ]);
+
+    // No real deadline — the countdown handles everything.
+    let cfg = default_config();
+    let mut scratch: TestScratch = ArchiveScratch::new(&cfg, 64, 4);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let mut cursor = Cursor::new(tar.clone());
+
+    // After 2 checks (entry 1 outer + entry 1 inner), the 3rd check fires.
+    scratch.budgets.set_deadline_check_countdown(Some(2));
+
+    let outcome = scan_tar_stream(
+        &mut cursor,
+        b"test.tar",
+        &cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(scratch.budgets.depth(), 0, "depth must return to 0");
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+
+    // Entry 1 was fully delivered; entries 2 and 3 were never started.
+    assert_eq!(
+        sink.entries.len(),
+        1,
+        "expected exactly 1 entry delivered before timeout, got {}",
+        sink.entries.len()
+    );
+    // Verify the delivered entry is the first one (payload = "AAAA").
+    assert_eq!(sink.concat_new_bytes(0), b"AAAA");
+}
+
+/// Same as above but the countdown fires inside entry 2's read loop,
+/// proving mid-entry timeout also works.  Entry 1 is fully delivered;
+/// entry 2 is started (on_entry_start called) but receives no chunks.
+#[test]
+fn tar_timeout_mid_entry_delivers_partial() {
+    // Use a larger payload so the inner loop has multiple iterations.
+    let payload_a = vec![b'X'; 16];
+    let payload_b = vec![b'Y'; 256];
+    let tar = build_tar(&[(b"a.txt", &payload_a), (b"b.txt", &payload_b)]);
+
+    let cfg = default_config();
+    let mut scratch: TestScratch = ArchiveScratch::new(&cfg, 64, 4);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let mut cursor = Cursor::new(tar.clone());
+
+    // Entry 1: 1 outer + 1 inner = 2 checks.
+    // Entry 2: 1 outer + 1 inner (first chunk) = 2 more checks.
+    // Set countdown=3 → fires on the 4th call (entry 2's first inner check).
+    scratch.budgets.set_deadline_check_countdown(Some(3));
+
+    let outcome = scan_tar_stream(
+        &mut cursor,
+        b"test.tar",
+        &cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(scratch.budgets.depth(), 0, "depth must return to 0");
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+
+    // Entry 1 fully delivered, entry 2 started but timed out during its
+    // read loop — on_entry_start was called, but the timeout broke before
+    // or during chunk delivery.
+    assert!(
+        !sink.entries.is_empty(),
+        "at least entry 1 must be delivered, got {}",
+        sink.entries.len()
+    );
+    // Entry 1 payload intact.
+    assert_eq!(sink.concat_new_bytes(0), payload_a);
+}

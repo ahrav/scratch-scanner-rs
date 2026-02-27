@@ -155,6 +155,14 @@ pub struct ArchiveBudgets {
     max_wall_clock_secs: Option<u64>,
     deadline: Option<Instant>,
 
+    // -- Test-only countdown for deterministic deadline testing ----------------
+    // When set to Some(n), `is_deadline_expired()` decrements n on each call
+    // and returns `true` when it reaches 0 — without any `Instant::now()`.
+    // This allows tests to trigger a timeout after exactly N checks,
+    // exercising the mid-scan timeout path deterministically.
+    #[cfg(test)]
+    deadline_check_countdown: std::cell::Cell<Option<u32>>,
+
     // -- Mutable root-level counter -------------------------------------------
     root_decompressed_out: u64,
 
@@ -267,6 +275,9 @@ impl ArchiveBudgets {
             max_wall_clock_secs: cfg.max_wall_clock_secs_per_root,
             deadline: None,
 
+            #[cfg(test)]
+            deadline_check_countdown: std::cell::Cell::new(None),
+
             root_decompressed_out: 0,
             frames: vec![ArchiveFrame::default(); frames_cap].into_boxed_slice(),
             depth: 0,
@@ -318,9 +329,37 @@ impl ArchiveBudgets {
     ///
     /// When `max_wall_clock_secs` is `None`, this always returns `false`
     /// without calling `Instant::now()`.
+    ///
+    /// In test builds, if a countdown has been armed via
+    /// [`set_deadline_check_countdown`](Self::set_deadline_check_countdown),
+    /// each call decrements the counter instead of reading the clock.
+    /// The method returns `true` when the counter reaches zero, giving
+    /// tests deterministic control over when the timeout fires.
     #[inline(always)]
     pub fn is_deadline_expired(&self) -> bool {
+        #[cfg(test)]
+        if let Some(n) = self.deadline_check_countdown.get() {
+            if n == 0 {
+                return true;
+            }
+            self.deadline_check_countdown.set(Some(n - 1));
+            return false;
+        }
         self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    /// Arm a deterministic countdown that overrides `is_deadline_expired()`.
+    ///
+    /// After `n` calls to `is_deadline_expired()`, the method returns `true`
+    /// regardless of the real clock. This allows tests to trigger a timeout
+    /// at an exact point in the scan loop (e.g., after the first entry is
+    /// fully processed but before the second entry begins).
+    ///
+    /// Pass `None` to disable the countdown and fall back to the real
+    /// deadline.
+    #[cfg(test)]
+    pub(crate) fn set_deadline_check_countdown(&self, n: Option<u32>) {
+        self.deadline_check_countdown.set(n);
     }
 
     /// Current archive nesting depth (0 = no archive open).

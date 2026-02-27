@@ -619,16 +619,16 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
     loop {
-        // Slide the overlap window: copy the last `carry` bytes of the
-        // previous chunk to the buffer front for pattern-matcher look-behind.
-        if carry > 0 && have > 0 {
-            buf.copy_within(have - carry..have, 0);
-        }
-
         if budgets.is_deadline_expired() {
             outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
             entry_partial_reason = Some(PartialReason::WallClockTimeout);
             break;
+        }
+
+        // Slide the overlap window: copy the last `carry` bytes of the
+        // previous chunk to the buffer front for pattern-matcher look-behind.
+        if carry > 0 && have > 0 {
+            buf.copy_within(have - carry..have, 0);
         }
 
         // Pre-clamp: probe remaining budget *before* issuing the read so we
@@ -1266,14 +1266,14 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
         let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
         while remaining > 0 {
-            if carry > 0 && have > 0 {
-                scan.stream_buf.copy_within(have - carry..have, 0);
-            }
-
             if budgets.is_deadline_expired() {
                 outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
                 entry_partial_reason = Some(PartialReason::WallClockTimeout);
                 break;
+            }
+
+            if carry > 0 && have > 0 {
+                scan.stream_buf.copy_within(have - carry..have, 0);
             }
 
             let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(ratio_active);
@@ -1720,14 +1720,14 @@ pub fn scan_zip_source<S: ArchiveEntrySink, Z: ZipSource>(
         let mut entry_skip_reason: Option<EntrySkipReason> = None;
 
         loop {
-            if carry > 0 && have > 0 {
-                buf.copy_within(have - carry..have, 0);
-            }
-
             if scratch.budgets.is_deadline_expired() {
                 outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
                 entry_partial_reason = Some(PartialReason::WallClockTimeout);
                 break;
+            }
+
+            if carry > 0 && have > 0 {
+                buf.copy_within(have - carry..have, 0);
             }
 
             let allowance = scratch
