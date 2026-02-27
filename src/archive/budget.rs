@@ -1,10 +1,11 @@
-//! Deterministic budget tracking for archive expansion/scanning.
+//! Budget tracking for archive expansion/scanning.
 //!
 //! Prevents resource exhaustion from zip bombs and deeply nested archives by
 //! enforcing hard caps on entry counts, decompressed output, metadata, nesting
 //! depth, and inflation ratio.  An optional wall-clock deadline can be configured
-//! via `max_wall_clock_secs` for CPU-exhaustion defense; when `None`, the struct
-//! remains purely deterministic and `is_deadline_expired()` is a no-op.
+//! via [`ArchiveConfig::max_wall_clock_secs_per_root`] for CPU-exhaustion
+//! defense; when `None`, the struct remains purely deterministic and
+//! `is_deadline_expired()` is a no-op.
 //!
 //! # Budget Hierarchy
 //!
@@ -47,10 +48,11 @@
 //!
 //! # Invariants
 //!
-//! - Budget accounting is deterministic (counts/bytes only). The wall-clock
-//!   deadline is a separate, opt-in mechanism that does not affect byte/count
-//!   accounting — it only provides an `is_deadline_expired()` predicate that
-//!   callers poll at natural loop boundaries.
+//! - All byte/count accounting is deterministic and reproducible. The
+//!   wall-clock deadline is a separate, opt-in layer: only the
+//!   `is_deadline_expired()` predicate introduces non-determinism (it reads
+//!   `Instant::now()`). It does not affect byte or count accounting — callers
+//!   poll it at natural loop boundaries as an early-exit check.
 //! - All accounting is saturating; overflows are treated as budget hits.
 //! - If no archive frame is active, charge methods clamp to 0 and remaining
 //!   allowance is 0.
@@ -276,13 +278,25 @@ impl ArchiveBudgets {
     /// When `max_wall_clock_secs` is configured, this is the **only** place
     /// that calls `Instant::now()` to arm the deadline.  Nested archives share
     /// the root's deadline (they call `enter_archive`, not `reset`).
+    ///
+    /// If the configured duration is too large to represent as an `Instant`,
+    /// `checked_add` returns `None` and the deadline is effectively disabled
+    /// (equivalent to no wall-clock limit).
     #[inline]
     pub fn reset(&mut self) {
+        debug_assert_eq!(
+            self.depth, 0,
+            "reset() must only be called at root level (depth 0)"
+        );
         self.root_decompressed_out = 0;
         self.depth = 0;
         self.deadline = self
             .max_wall_clock_secs
-            .map(|s| Instant::now() + Duration::from_secs(s));
+            .and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
+        debug_assert!(
+            self.deadline.is_none() || self.max_wall_clock_secs.is_some(),
+            "deadline armed without max_wall_clock_secs configured"
+        );
         self.debug_assert_no_growth();
     }
 
@@ -1287,6 +1301,10 @@ mod tests {
         assert!(!b.is_deadline_expired());
     }
 
+    /// `Some(0)` is below the production validation minimum but is used here
+    /// to test safe degradation: when the deadline fires immediately, the
+    /// scanner should still terminate gracefully rather than looping or panicking.
+    /// Tests construct `ArchiveConfig` directly, bypassing validation.
     #[test]
     fn deadline_zero_expires_immediately() {
         let mut c = cfg();
@@ -1302,6 +1320,50 @@ mod tests {
         c.max_wall_clock_secs_per_root = Some(60);
         let mut b = ArchiveBudgets::new(&c);
         b.reset();
+        assert!(!b.is_deadline_expired());
+    }
+
+    /// Huge `max_wall_clock_secs` values must not panic on `Instant` overflow.
+    /// `reset()` computes `Instant::now() + Duration::from_secs(s)` — when `s`
+    /// exceeds the platform's representable range, the addition must saturate
+    /// rather than panic.
+    #[test]
+    fn reset_saturates_on_huge_wall_clock_secs() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = Some(u64::MAX);
+        let mut b = ArchiveBudgets::new(&c);
+        // Must not panic.
+        b.reset();
+        // The deadline should exist and not be expired (it's far in the future).
+        assert!(!b.is_deadline_expired());
+    }
+
+    /// `Some(0)` config must not cause `is_deadline_expired()` to return true
+    /// before `reset()` is called — the deadline is only armed during `reset`.
+    #[test]
+    fn deadline_not_armed_before_reset() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = Some(0);
+        let b = ArchiveBudgets::new(&c);
+        // Before reset, deadline is None regardless of config.
+        assert!(!b.is_deadline_expired());
+    }
+
+    /// `enter_archive()` must not clear or re-arm the deadline — nested
+    /// archives share the root's deadline set by `reset()`.
+    #[test]
+    fn enter_archive_preserves_deadline() {
+        let mut c = cfg();
+        c.max_wall_clock_secs_per_root = Some(3600);
+        let mut b = ArchiveBudgets::new(&c);
+        b.reset();
+        assert!(!b.is_deadline_expired());
+
+        b.enter_archive().unwrap();
+        // Deadline must still be set and not expired after entering a nested frame.
+        assert!(!b.is_deadline_expired());
+
+        b.enter_archive().unwrap();
         assert!(!b.is_deadline_expired());
     }
 }

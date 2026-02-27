@@ -647,3 +647,94 @@ fn nested_tar_entry_start_end_paired() {
     // outer_file.txt + inner.txt (from nested tar) = 2 scanned entries.
     assert!(sink.entries.len() >= 2);
 }
+
+// ── Wall-clock deadline in discard path ────────────────────────────
+
+/// `discard_remaining_payload` must check the wall-clock deadline so that
+/// a timeout during the scan read loop does not silently drain a large
+/// entry payload.  With an already-expired deadline, the discard should
+/// return `WallClockTimeout` without reading any bytes.
+#[test]
+fn discard_payload_exits_on_expired_deadline() {
+    use crate::archive::budget::ArchiveBudgets;
+
+    // Build budgets with an immediately-expiring deadline and generous byte
+    // budgets so that the drain would succeed if the deadline were not checked.
+    let cfg = ArchiveConfig {
+        max_wall_clock_secs_per_root: Some(0),
+        max_total_uncompressed_bytes_per_archive: u64::MAX,
+        max_total_uncompressed_bytes_per_root: u64::MAX,
+        ..ArchiveConfig::default()
+    };
+    let mut budgets = ArchiveBudgets::new(&cfg);
+    budgets.reset(); // Arms deadline at Instant::now() + 0s → already expired.
+    budgets.enter_archive().unwrap();
+    budgets.begin_entry().unwrap();
+
+    // Large payload available for draining.
+    let data = vec![0xAA; 64 * 1024];
+    let mut cursor = Cursor::new(data);
+    let mut buf = vec![0u8; 4096];
+
+    let result = discard_remaining_payload(&mut cursor, &mut budgets, &mut buf, 64 * 1024);
+    assert_eq!(result, Err(PartialReason::WallClockTimeout));
+
+    // No bytes should have been read — the deadline check fires before
+    // the first `input.read()`.
+    assert_eq!(cursor.position(), 0);
+}
+
+// ── Scan-level wall-clock timeout integration tests ────────────────
+
+/// A tar archive with payload should yield `Partial(WallClockTimeout)`
+/// when the deadline is already expired, and budget depth must return to 0.
+#[test]
+fn tar_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'X'; 256];
+    let tar = build_tar(&[(b"big.txt", &payload)]);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+
+    let (outcome, _, depth) = scan_tar_bytes(&tar, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}
+
+/// A gzip stream with payload should yield `Partial(WallClockTimeout)`
+/// when the deadline is already expired, and budget depth must return to 0.
+#[test]
+fn gzip_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'Y'; 256];
+    let gz = gzip_compress(&payload);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+    cfg.max_uncompressed_bytes_per_entry = 10_000;
+    cfg.max_total_uncompressed_bytes_per_archive = 10_000;
+    cfg.max_total_uncompressed_bytes_per_root = 10_000;
+
+    let (outcome, _, depth) = scan_gz_bytes(&gz, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}

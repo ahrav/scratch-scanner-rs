@@ -390,7 +390,11 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                             ArchiveEnd::Scanned => None,
                         };
                         if let Some(r) = stop_reason {
-                            if matches!(r, PartialReason::RootOutputBudgetExceeded) {
+                            if matches!(
+                                r,
+                                PartialReason::RootOutputBudgetExceeded
+                                    | PartialReason::WallClockTimeout
+                            ) {
                                 outcome = ArchiveEnd::Partial(r);
                                 stop_archive = true;
                             }
@@ -459,6 +463,7 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
 
             if budgets.is_deadline_expired() {
                 outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+                entry_partial_reason = Some(PartialReason::WallClockTimeout);
                 stop_archive = true;
                 break;
             }

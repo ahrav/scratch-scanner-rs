@@ -309,6 +309,7 @@ pub(super) fn process_zip_file<E: ScanEngine>(
 
             if budgets.is_deadline_expired() {
                 outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+                entry_partial_reason = Some(PartialReason::WallClockTimeout);
                 stop_archive = true;
                 break;
             }

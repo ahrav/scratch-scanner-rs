@@ -419,6 +419,9 @@ pub(super) fn discard_remaining_payload(
     mut remaining: u64,
 ) -> Result<(), PartialReason> {
     while remaining > 0 {
+        if budgets.is_deadline_expired() {
+            return Err(PartialReason::WallClockTimeout);
+        }
         let step = buf.len().min(remaining as usize);
         let n = match input.read(&mut buf[..step]) {
             Ok(n) => n,

@@ -2,34 +2,57 @@
 //!
 //! Every archive encounter produces one of three outcomes:
 //!
-//! 1. **Skipped** — policy/format gating prevented scanning an archive or entry
-//!    to completion. Tracked by [`ArchiveSkipReason`] and [`EntrySkipReason`].
-//! 2. **Partial** — scanning stopped before completion after the archive was
-//!    accepted (budget/integrity/path limits). Any bytes already produced were
-//!    still scanned. Tracked by [`PartialReason`].
-//! 3. **Scanned** — the archive (or entry) was fully decompressed and scanned.
+//! 1. **Skipped** — the archive or entry was rejected *before* any payload bytes
+//!    were scanned. This covers policy gates (disabled, encrypted, unsupported
+//!    format) and pre-scan budget checks (depth, entry count, metadata cap).
+//!    Tracked by [`ArchiveSkipReason`] (whole archive) and [`EntrySkipReason`]
+//!    (single entry within an archive).
+//! 2. **Partial** — scanning *began* and some decompressed bytes were produced
+//!    and scanned, but a limit or integrity error stopped further progress.
+//!    Already-scanned bytes are **not** discarded — the scan results for those
+//!    bytes are retained. Tracked by [`PartialReason`].
+//! 3. **Scanned** — the archive (or entry) was fully decompressed and scanned
+//!    without hitting any limit.
+//!
+//! The distinction between Skip and Partial matters because Partial archives
+//! still contribute scan results for the bytes they did process, while Skipped
+//! archives contribute nothing.
 //!
 //! [`ArchiveStats`] aggregates per-reason counters and a bounded sample buffer
 //! ([`ArchiveSampleRing`]) across all three tiers.  Stats are accumulated
-//! per-worker and merged upward, so all operations are `Copy`-friendly and
-//! allocation-free.
+//! per-worker and merged upward via [`ArchiveStats::merge_from`], so all
+//! operations are `Copy`-friendly and allocation-free.
 //!
 //! # Invariants
-//! - Enums are `#[repr(u8)]` with stable discriminants; new variants must be appended.
-//! - `COUNT` constants must match the last variant + 1.
-//! - Counters are fixed arrays indexed by the enum discriminant.
+//!
+//! - Enums are `#[repr(u8)]` with explicit discriminants; new variants must be
+//!   appended at the end with the next sequential discriminant.
+//! - Each enum's `COUNT` constant must equal the last variant's discriminant + 1.
+//! - Per-reason counter arrays are indexed by casting the discriminant to `usize`,
+//!   so discriminant order and array layout must stay in sync.
+//! - The module-level iteration tables (`ARCHIVE_SKIP_REASONS`, etc.) must list
+//!   variants in discriminant order; tests assert this alignment.
 //! - Samples are bounded and store only a path prefix (never unbounded strings).
 //!
-//! # Design Notes
-//! - This module is intentionally allocation-free on hot paths.
-//! - Bounded samples make skip/partial behavior observable without log spam.
-//! - Reasons are part of the public surface; changing them is a semver-ish event.
+//! # Design
+//!
+//! - Allocation-free on hot paths: all types are `Copy` and fixed-size.
+//! - Bounded samples make skip/partial behavior observable in diagnostics
+//!   without log spam or unbounded memory growth.
+//! - All `record_*` methods compile to no-ops in release builds (gated behind
+//!   `cfg!(all(feature = "perf-stats", debug_assertions))`), so the overhead
+//!   on production scan throughput is zero.
 
-// -----------------------------
-// Reasons (stable taxonomy)
-// -----------------------------
+// -- Reason enums (stable taxonomy) --
 
-/// Why an entire archive was skipped.
+/// Why an entire archive container was skipped before any entry payload was scanned.
+///
+/// Each variant maps to a specific policy gate or pre-scan budget check in
+/// [`ArchiveConfig`](super::ArchiveConfig). Discriminants are stable `u8`
+/// values used as indices into the per-reason counter array in [`ArchiveStats`].
+///
+/// The [`BudgetHit::SkipArchive`](super::BudgetHit::SkipArchive) variant wraps
+/// this enum when a budget check triggers an archive-level skip.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArchiveSkipReason {
@@ -64,13 +87,17 @@ pub enum ArchiveSkipReason {
 }
 
 impl ArchiveSkipReason {
+    /// Total number of variants. Must equal the last discriminant + 1.
+    /// Used to size the per-reason counter array in [`ArchiveStats`].
     pub const COUNT: usize = 14;
 
+    /// Cast to `usize` for use as an array index into per-reason counters.
     #[inline(always)]
     pub const fn as_usize(self) -> usize {
         self as usize
     }
 
+    /// Stable snake_case identifier for telemetry and diagnostic output.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
@@ -91,7 +118,15 @@ impl ArchiveSkipReason {
     }
 }
 
-/// Why a specific archive entry was skipped.
+/// Why a specific entry within an archive was skipped (no payload bytes scanned).
+///
+/// Entry-level skips do not abort the archive — remaining entries continue to
+/// be processed. The [`BudgetHit::SkipEntry`](super::BudgetHit::SkipEntry)
+/// variant wraps this enum when a budget or format check triggers an entry skip.
+///
+/// [`to_partial`](Self::to_partial) provides a lossy mapping into
+/// [`PartialReason`] for cases where an entry skip needs to be promoted to
+/// an archive-level partial outcome in telemetry.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntrySkipReason {
@@ -118,13 +153,16 @@ pub enum EntrySkipReason {
 }
 
 impl EntrySkipReason {
+    /// Total number of variants. Must equal the last discriminant + 1.
     pub const COUNT: usize = 10;
 
+    /// Cast to `usize` for use as an array index into per-reason counters.
     #[inline(always)]
     pub const fn as_usize(self) -> usize {
         self as usize
     }
 
+    /// Stable snake_case identifier for telemetry and diagnostic output.
     pub const fn name(self) -> &'static str {
         match self {
             Self::NonRegular => "non_regular",
@@ -163,7 +201,18 @@ impl EntrySkipReason {
     }
 }
 
-/// Why an archive was only partially scanned.
+/// Why an archive was only partially scanned (some bytes were produced and
+/// scanned before a limit or integrity error stopped further progress).
+///
+/// Unlike skip reasons, a partial outcome means the scanner *did* decompress
+/// and scan some entry payloads — those results are retained. The partial
+/// reason records *why* scanning stopped early.
+///
+/// Partial reasons appear in two budget-hit variants:
+/// - [`BudgetHit::PartialArchive`](super::BudgetHit::PartialArchive) — the
+///   archive itself hit a mid-scan limit.
+/// - [`BudgetHit::StopRoot`](super::BudgetHit::StopRoot) — a root-level cap
+///   was exhausted, stopping all further archive scanning for this source file.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PartialReason {
@@ -195,13 +244,16 @@ pub enum PartialReason {
 }
 
 impl PartialReason {
+    /// Total number of variants. Must equal the last discriminant + 1.
     pub const COUNT: usize = 12;
 
+    /// Cast to `usize` for use as an array index into per-reason counters.
     #[inline(always)]
     pub const fn as_usize(self) -> usize {
         self as usize
     }
 
+    /// Stable snake_case identifier for telemetry and diagnostic output.
     pub const fn name(self) -> &'static str {
         match self {
             Self::MetadataBudgetExceeded => "metadata_budget_exceeded",
@@ -220,10 +272,14 @@ impl PartialReason {
     }
 }
 
-// Iteration tables — `merge_from` and formatting code iterate these rather than
-// hard-coding discriminant ranges, so adding a new variant only requires
-// appending here (plus the enum itself).  Tests assert alignment with
-// discriminant order.
+// -- Iteration tables --
+//
+// Canonical variant lists in discriminant order.  `merge_from` iterates these
+// to merge per-reason counter arrays element-by-element, so adding a new
+// variant only requires appending here (plus the enum itself and bumping COUNT).
+// Tests (`reason_arrays_match_discriminants`) assert that each element's
+// discriminant matches its position, catching ordering mistakes at compile-test
+// time.
 const ARCHIVE_SKIP_REASONS: [ArchiveSkipReason; ArchiveSkipReason::COUNT] = [
     ArchiveSkipReason::Disabled,
     ArchiveSkipReason::UnsupportedFormat,
@@ -269,9 +325,7 @@ const PARTIAL_REASONS: [PartialReason; PartialReason::COUNT] = [
     PartialReason::WallClockTimeout,
 ];
 
-// -----------------------------
-// Bounded samples (optional)
-// -----------------------------
+// -- Bounded samples --
 
 /// Classifies a bounded sample along two axes:
 ///
@@ -297,11 +351,14 @@ pub const ARCHIVE_SAMPLE_MAX: usize = 32;
 /// Maximum path prefix bytes stored per sample (truncated beyond this).
 pub const ARCHIVE_SAMPLE_PATH_PREFIX_MAX: usize = 192;
 
-/// Bounded sample of a skip/partial outcome with a path prefix.
+/// Bounded sample of a skip/partial outcome, capturing the affected path prefix.
 ///
 /// Fixed-size (`Copy`) so it can live in stack-allocated arrays without heap
 /// allocation on the hot path.  Path bytes beyond [`ARCHIVE_SAMPLE_PATH_PREFIX_MAX`]
 /// are silently truncated.
+///
+/// The `reason` field stores a raw `u8` discriminant whose interpretation
+/// depends on [`kind`](Self::kind) — see the field-level doc for the mapping.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveSample {
     pub kind: SampleKind,
@@ -334,14 +391,26 @@ impl ArchiveSample {
     }
 }
 
-/// Fixed-size sample buffer for skipped/partial outcomes.
+/// Fixed-capacity sample buffer for skipped/partial outcomes.
+///
+/// Despite the name, this is a **bounded append buffer**, not a circular ring:
+/// once `len` reaches [`ARCHIVE_SAMPLE_MAX`] (32), subsequent pushes increment
+/// `dropped` instead of overwriting earlier samples. This preserves the *first*
+/// N samples, which are typically the most diagnostic (they show the initial
+/// reason scanning stopped, before cascading failures pile up).
 ///
 /// # Guarantees
-/// - Stores at most `ARCHIVE_SAMPLE_MAX` samples.
-/// - Never allocates; path bytes are truncated to `ARCHIVE_SAMPLE_PATH_PREFIX_MAX`.
+///
+/// - Stores at most [`ARCHIVE_SAMPLE_MAX`] samples; never allocates.
+/// - Path bytes per sample are truncated to [`ARCHIVE_SAMPLE_PATH_PREFIX_MAX`].
+/// - `dropped` tracks overflow count so callers know whether the buffer
+///   captured all events or was saturated.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveSampleRing {
+    /// Number of valid samples in `items[..len]`.
     pub len: u8,
+    /// Number of samples that could not be stored because the buffer was full.
+    /// Incremented via `saturating_add` on push overflow, `wrapping_add` on merge.
     pub dropped: u64,
     pub items: [ArchiveSample; ARCHIVE_SAMPLE_MAX],
 }
@@ -357,12 +426,17 @@ impl Default for ArchiveSampleRing {
 }
 
 impl ArchiveSampleRing {
+    /// Iterate over the valid samples (the first `len` entries).
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, ArchiveSample> {
         self.items[..self.len as usize].iter()
     }
 
-    /// Insert a sample if capacity remains; otherwise increments `dropped`.
+    /// Append a sample if capacity remains; otherwise increment `dropped`.
+    ///
+    /// `path` is truncated to [`ARCHIVE_SAMPLE_PATH_PREFIX_MAX`] bytes.
+    /// The `reason` is the raw `u8` discriminant of the corresponding reason
+    /// enum — its interpretation depends on `kind`.
     #[inline]
     pub fn push(&mut self, kind: SampleKind, reason: u8, path: &[u8]) {
         let idx = self.len as usize;
@@ -383,7 +457,11 @@ impl ArchiveSampleRing {
         self.len = self.len.wrapping_add(1);
     }
 
-    /// Merge samples from another ring, preserving the local capacity cap.
+    /// Merge samples from another buffer into this one.
+    ///
+    /// Copies as many of `other`'s samples as local capacity allows, then
+    /// folds `other.dropped` into `self.dropped` (wrapping).  Any samples
+    /// from `other` that do not fit are counted as dropped.
     pub fn merge_from(&mut self, other: &ArchiveSampleRing) {
         for s in other.iter() {
             self.push(s.kind, s.reason, s.path_bytes());
@@ -392,31 +470,53 @@ impl ArchiveSampleRing {
     }
 }
 
-// -----------------------------
-// Aggregate stats
-// -----------------------------
+// -- Aggregate stats --
 
-/// Aggregate archive outcomes + bounded samples.
+/// Per-worker aggregate of archive scanning outcomes.
 ///
-/// # Guarantees
-/// - Counters are monotonic (wrapping on overflow).
-/// - Arrays are indexed by the stable reason discriminants.
-/// - Recording/merge operations mutate counters only when
-///   `all(feature = "perf-stats", debug_assertions)` is enabled.
+/// Accumulates scalar counters, per-reason breakdowns, and a bounded sample
+/// buffer across all archives processed by a single worker thread.  Workers
+/// own their `ArchiveStats` without synchronization; after a scan pass the
+/// scheduler merges them upward via [`merge_from`](Self::merge_from).
+///
+/// # Recording gate
+///
+/// All `record_*` methods are gated behind
+/// `cfg!(all(feature = "perf-stats", debug_assertions))`.  In release builds
+/// the gate is a compile-time `false` and the compiler eliminates every
+/// method body entirely (verified via `cargo asm`).  This means production
+/// builds pay zero runtime cost for carrying these stats, while debug/test
+/// builds get full observability.
+///
+/// # Arithmetic
+///
+/// All counters use wrapping arithmetic.  Overflow is benign because these
+/// counters are diagnostic only — they are never used for correctness
+/// decisions.  Wrapping avoids panics without needing checked arithmetic on
+/// every hot-path increment.
 #[derive(Clone, Copy, Debug)]
 pub struct ArchiveStats {
+    // -- Top-level archive counters --
     pub archives_seen: u64,
     pub archives_scanned: u64,
     pub archives_skipped: u64,
     pub archives_partial: u64,
+
+    // -- Entry counters --
     pub entries_scanned: u64,
     pub entries_skipped: u64,
+
+    // -- Path anomaly counters --
     pub paths_truncated: u64,
     pub paths_had_traversal: u64,
     pub paths_component_cap_exceeded: u64,
 
+    // -- Per-reason breakdowns (indexed by discriminant via `as_usize()`) --
     pub archive_skip_reasons: [u64; ArchiveSkipReason::COUNT],
     pub entry_skip_reasons: [u64; EntrySkipReason::COUNT],
+    /// Shared across archive-partial and entry-partial recordings.
+    /// A single partial_reasons counter is bumped regardless of whether the
+    /// partial event originated at the archive or entry level.
     pub partial_reasons: [u64; PartialReason::COUNT],
 
     pub samples: ArchiveSampleRing,
@@ -512,6 +612,9 @@ impl ArchiveStats {
         }
     }
 
+    /// Record an archive-level partial outcome (scanning began but stopped early).
+    ///
+    /// Increments `archives_partial` and the per-reason `partial_reasons` counter.
     #[inline]
     pub fn record_archive_partial(
         &mut self,
@@ -541,6 +644,9 @@ impl ArchiveStats {
         self.entries_scanned = self.entries_scanned.wrapping_add(1);
     }
 
+    /// Record an entry-level skip (entry rejected before any payload bytes were scanned).
+    ///
+    /// Increments `entries_skipped` and the per-reason `entry_skip_reasons` counter.
     #[inline]
     pub fn record_entry_skipped(
         &mut self,
@@ -562,6 +668,12 @@ impl ArchiveStats {
         }
     }
 
+    /// Record an entry-level partial outcome (entry scanning began but stopped early).
+    ///
+    /// Bumps the per-reason `partial_reasons` counter and optionally captures
+    /// a sample, but does **not** increment `entries_skipped` or any
+    /// archive-level counter.  The entry was not "skipped" — it was partially
+    /// scanned, so the top-level skip counter is not touched.
     #[inline]
     pub fn record_entry_partial(
         &mut self,
