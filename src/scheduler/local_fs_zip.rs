@@ -15,9 +15,9 @@ use super::local_fs_archive_ctx::{
     alloc_virtual_file_id, budget_hit_to_archive_end, budget_hit_to_partial_reason, build_locator,
     charge_discarded_bytes, ArchiveEnd, ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
 };
-use super::local_fs_owner::{
+use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
+use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
-    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Scan a ZIP file using file-backed random access.
