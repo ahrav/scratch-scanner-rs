@@ -1,7 +1,8 @@
 //! Deterministic archive materializers for the simulation harness.
 //!
-//! These builders produce stable bytes for gzip, tar, tar.gz, and zip archives
-//! without relying on OS state. They are intended for test harness usage only.
+//! These builders produce stable bytes for bzip2, gzip, tar, tar.gz, tar.bz2,
+//! and zip archives without relying on OS state. They are intended for test
+//! harness usage only.
 //!
 //! Invariants:
 //! - Output bytes are deterministic for the same `ArchiveFileSpec`.
@@ -9,6 +10,8 @@
 //! - Zip uses fixed timestamps and explicit sizes (no data descriptors).
 //! - Gzip header names are only emitted for valid UTF-8; invalid bytes fall back
 //!   to the default `<gunzip>` entry name during path computation.
+//! - Single-stream kinds (`Gzip`, `Bzip2`) materialize exactly one logical
+//!   entry path regardless of extra entries in `ArchiveFileSpec.entries`.
 //! - Entry paths are computed via `EntryPathCanonicalizer` + `VirtualPathBuilder`
 //!   using `ArchiveConfig` limits so expected paths match production behavior.
 
@@ -21,21 +24,29 @@ use crate::sim_scanner::scenario::{
     ArchiveCorruptionSpec, ArchiveEntrySpec, ArchiveFileSpec, ArchiveKindSpec, EntryKindSpec,
 };
 
+mod build_bzip2;
 mod build_gzip;
 mod build_tar;
 mod build_zip;
 
+pub use build_bzip2::build_bzip2_bytes;
 pub use build_gzip::build_gzip_bytes;
 pub use build_tar::build_tar_bytes;
 pub use build_zip::build_zip_bytes;
 
 const LOCATOR_LEN: usize = 18;
 
-/// Locator metadata for archive entries (aligned with `ArchiveFileSpec.entries`).
+/// Locator metadata for archive entries.
+///
+/// For multi-entry containers (tar/zip), locators align 1:1 with
+/// `ArchiveFileSpec.entries`. For single-stream kinds (gzip/bzip2), there is
+/// exactly one locator.
 #[derive(Clone, Debug)]
 pub enum EntryLocator {
     /// Single gzip stream (no locator suffix).
     Gzip,
+    /// Single bzip2 stream (no locator suffix).
+    Bzip2,
     /// Tar header block index for `@t<hex>` locators.
     Tar { header_block_index: u64 },
     /// Zip local header offset for `@z<hex>` locators.
@@ -44,7 +55,7 @@ pub enum EntryLocator {
 
 /// Materialized archive bytes plus entry locator metadata.
 ///
-/// `entry_locators` is ordered to match `ArchiveFileSpec.entries`.
+/// `entry_locators` is ordered to match emitted logical entries.
 #[derive(Clone, Debug)]
 pub struct ArchiveMaterialization {
     /// Final archive bytes (possibly corrupted if `corruption` was applied).
@@ -56,8 +67,8 @@ pub struct ArchiveMaterialization {
 /// Build deterministic archive bytes for the simulation harness.
 ///
 /// Returns a materialization that includes entry locator metadata used by
-/// `entry_paths`. Gzip archives use only the first entry (extra entries are
-/// silently ignored).
+/// `entry_paths`. Gzip and bzip2 archives use only the first entry (extra
+/// entries are silently ignored).
 pub fn materialize_archive(spec: &ArchiveFileSpec) -> Result<ArchiveMaterialization, String> {
     let mut out = match spec.kind {
         ArchiveKindSpec::Gzip => {
@@ -66,6 +77,14 @@ pub fn materialize_archive(spec: &ArchiveFileSpec) -> Result<ArchiveMaterializat
             ArchiveMaterialization {
                 bytes,
                 entry_locators: vec![EntryLocator::Gzip],
+            }
+        }
+        ArchiveKindSpec::Bzip2 => {
+            let entry = spec.entries.first().ok_or("bzip2 archive needs 1 entry")?;
+            let bytes = build_bzip2_bytes(entry)?;
+            ArchiveMaterialization {
+                bytes,
+                entry_locators: vec![EntryLocator::Bzip2],
             }
         }
         ArchiveKindSpec::Tar => {
@@ -90,6 +109,21 @@ pub fn materialize_archive(spec: &ArchiveFileSpec) -> Result<ArchiveMaterializat
                 entry_locators: locators,
             }
         }
+        ArchiveKindSpec::TarBz2 => {
+            let (tar_bytes, locators) = build_tar_bytes(&spec.entries)?;
+            let entry = ArchiveEntrySpec {
+                name_bytes: Vec::new(),
+                payload: tar_bytes,
+                compression: crate::sim_scanner::scenario::EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            };
+            let bytes = build_bzip2_bytes(&entry)?;
+            ArchiveMaterialization {
+                bytes,
+                entry_locators: locators,
+            }
+        }
         ArchiveKindSpec::Zip => {
             let (bytes, locators) = build_zip_bytes(&spec.entries)?;
             ArchiveMaterialization {
@@ -109,12 +143,16 @@ pub fn materialize_archive(spec: &ArchiveFileSpec) -> Result<ArchiveMaterializat
 /// Compute archive entry virtual paths for a materialized archive.
 ///
 /// The returned paths align with production virtual-path construction and are
-/// ordered the same as `ArchiveFileSpec.entries`.
+/// ordered by emitted logical entry. For single-stream kinds (gzip/bzip2),
+/// callers should provide exactly one entry in `spec.entries` so the
+/// cardinality matches `materialized.entry_locators`.
 pub fn entry_paths(
     spec: &ArchiveFileSpec,
     materialized: &ArchiveMaterialization,
     archive: &ArchiveConfig,
 ) -> Result<Vec<Vec<u8>>, String> {
+    // Cardinality must match what was actually materialized; this prevents
+    // silently inventing paths for entries that do not exist in the bytes.
     if spec.entries.len() != materialized.entry_locators.len() {
         return Err("entry locator length mismatch".to_string());
     }
@@ -139,7 +177,8 @@ pub fn entry_paths(
                 };
                 vpath.build(root_display, entry_bytes, max_len).bytes
             }
-            ArchiveKindSpec::Tar | ArchiveKindSpec::TarGz => {
+            ArchiveKindSpec::Bzip2 => vpath.build(root_display, b"<bunzip2>", max_len).bytes,
+            ArchiveKindSpec::Tar | ArchiveKindSpec::TarGz | ArchiveKindSpec::TarBz2 => {
                 let locator = match materialized.entry_locators[idx] {
                     EntryLocator::Tar { header_block_index } => {
                         build_locator(b't', header_block_index)
@@ -297,5 +336,25 @@ mod tests {
             kind: EntryKindSpec::RegularFile,
         };
         assert!(gzip_name_bytes(&entry).unwrap().is_none());
+    }
+
+    #[test]
+    fn bzip2_entry_path_uses_bunzip2_name() {
+        let spec = ArchiveFileSpec {
+            root_path: crate::sim::fs::SimPath::new(b"root.bz2".to_vec()),
+            kind: ArchiveKindSpec::Bzip2,
+            entries: vec![ArchiveEntrySpec {
+                name_bytes: b"ignored.txt".to_vec(),
+                payload: vec![1, 2, 3],
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            }],
+            corruption: None,
+        };
+        let materialized = materialize_archive(&spec).expect("materialize");
+        let cfg = ArchiveConfig::default();
+        let paths = entry_paths(&spec, &materialized, &cfg).expect("paths");
+        assert_eq!(paths, vec![b"root.bz2::<bunzip2>".to_vec()]);
     }
 }

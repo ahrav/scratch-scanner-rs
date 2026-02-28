@@ -46,8 +46,8 @@ use super::metrics::MetricsSnapshot;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
 use crate::archive::scan::{
-    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEntrySink,
-    ArchiveScratch, EntryChunk, EntryMeta,
+    scan_bzip2_stream, scan_gzip_stream, scan_tar_stream, scan_tarbz2_stream, scan_targz_stream,
+    scan_zip_source, ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
 };
 use crate::archive::{ArchiveConfig, ArchiveKind, ArchiveStats};
 use crate::content_policy::{self, ContentVerdict};
@@ -827,6 +827,14 @@ fn archive_worker_loop<E: ScanEngine>(
                 &mut sink,
                 &mut archive_stats,
             ),
+            ArchiveKind::Bzip2 => scan_bzip2_stream(
+                file,
+                display,
+                &cfg,
+                &mut archive_scratch,
+                &mut sink,
+                &mut archive_stats,
+            ),
             ArchiveKind::Tar => {
                 let mut file = file;
                 scan_tar_stream(
@@ -840,6 +848,14 @@ fn archive_worker_loop<E: ScanEngine>(
                 )
             }
             ArchiveKind::TarGz => scan_targz_stream(
+                file,
+                display,
+                &cfg,
+                &mut archive_scratch,
+                &mut sink,
+                &mut archive_stats,
+            ),
+            ArchiveKind::TarBz2 => scan_tarbz2_stream(
                 file,
                 display,
                 &cfg,

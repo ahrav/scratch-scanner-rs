@@ -1,7 +1,7 @@
 //! Deterministic scanner simulation runner.
 //!
 //! Scope:
-//! - Deterministic, single-threaded scheduling of discover + scan tasks.
+//! - Deterministic, single-threaded simulation of multi-worker discover + scan scheduling.
 //! - Chunked scanning with overlap deduplication using the real `Engine`.
 //! - Archive roots are expanded via `archive::scan` into virtual entry objects.
 //! - Fault injection, IO latency, and cancellations are modeled deterministically
@@ -38,8 +38,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::{DecodeStep, TransformId, STEP_ROOT};
 use crate::archive::formats::tar::TAR_BLOCK_LEN;
 use crate::archive::scan::{
-    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEnd,
-    ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
+    scan_bzip2_stream, scan_gzip_stream, scan_tar_stream, scan_tarbz2_stream, scan_targz_stream,
+    scan_zip_source, ArchiveEnd, ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
 };
 use crate::archive::{
     detect_kind_from_name_bytes, sniff_kind_from_header, ArchiveConfig, ArchiveKind,
@@ -1482,6 +1482,14 @@ impl ArchiveScanState {
                     &mut sink,
                     &mut stats,
                 )?,
+                ArchiveKind::Bzip2 => scan_bzip2_stream(
+                    std::io::Cursor::new(bytes.clone()),
+                    &self.path.bytes,
+                    archive_cfg,
+                    scratch,
+                    &mut sink,
+                    &mut stats,
+                )?,
                 ArchiveKind::Tar => {
                     let mut cursor = std::io::Cursor::new(bytes.clone());
                     scan_tar_stream(
@@ -1495,6 +1503,14 @@ impl ArchiveScanState {
                     )?
                 }
                 ArchiveKind::TarGz => scan_targz_stream(
+                    std::io::Cursor::new(bytes.clone()),
+                    &self.path.bytes,
+                    archive_cfg,
+                    scratch,
+                    &mut sink,
+                    &mut stats,
+                )?,
+                ArchiveKind::TarBz2 => scan_tarbz2_stream(
                     std::io::Cursor::new(bytes.clone()),
                     &self.path.bytes,
                     archive_cfg,
@@ -1701,9 +1717,11 @@ fn detect_archive_kind(fs: &SimFs, path: &SimPath) -> Option<ArchiveKind> {
 fn archive_kind_code(kind: ArchiveKind) -> u16 {
     match kind {
         ArchiveKind::Gzip => 1,
-        ArchiveKind::Tar => 2,
-        ArchiveKind::TarGz => 3,
-        ArchiveKind::Zip => 4,
+        ArchiveKind::Bzip2 => 2,
+        ArchiveKind::Tar => 3,
+        ArchiveKind::TarGz => 4,
+        ArchiveKind::TarBz2 => 5,
+        ArchiveKind::Zip => 6,
     }
 }
 
@@ -1914,9 +1932,11 @@ fn discover_file_paths(fs: &SimFs, spec: &SimFsSpec, max_file_size: u64) -> Vec<
 
 /// Check that observed findings match the scenario's expected secrets.
 ///
-/// Matches require the same `(file_id, rule_id)` and containment of the expected
-/// root span within the finding's `root_hint` range. Any extra finding is a
-/// ground-truth failure. Files marked `ground_truth_ok = false` are skipped.
+/// Matches require the same `(file_id, rule_id)` and a representation-aware
+/// span check against the finding's `root_hint` range:
+/// strict containment for raw/url-percent secrets, and bounded slack for
+/// base64/UTF-16 variants. Any extra finding is a ground-truth failure.
+/// Files marked `ground_truth_ok = false` are skipped.
 fn oracle_ground_truth(
     scenario: &Scenario,
     vpaths: &VirtualPathTable,
@@ -2357,6 +2377,12 @@ fn reference_findings_observed(
     })
 }
 
+/// Compare an observed finding span against expected encoded bounds.
+///
+/// Tolerances are representation-specific:
+/// - Base64 allows up to 2 trailing bytes to accommodate optional `=` padding.
+/// - UTF-16 variants allow +/-1 byte drift at each edge due to chunk boundary
+///   alignment when mapping between byte and code-unit views.
 fn span_matches_expected(span: SpanU32, start: u64, end: u64, repr: &SecretRepr) -> bool {
     let span_start = span.start as u64;
     let span_end = span.end as u64;

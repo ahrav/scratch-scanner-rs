@@ -230,6 +230,7 @@ pub mod worker_id;
 
 // I/O backends
 mod local_fs_archive_ctx;
+mod local_fs_bzip2;
 mod local_fs_extract;
 mod local_fs_gzip;
 pub mod local_fs_owner;

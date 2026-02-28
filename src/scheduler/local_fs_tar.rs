@@ -1,14 +1,14 @@
-//! TAR archive scanning (plain `.tar` and `.tar.gz`).
+//! TAR archive scanning (plain `.tar`, `.tar.gz`/`.tgz`, and `.tar.bz2`/`.tbz2`).
 //!
 //! Handles both top-level tar files and nested tar streams within other
-//! archives. Supports recursive expansion into nested gzip and tar archives
-//! up to the configured depth limit.
+//! archives. Supports recursive expansion into nested gzip, bzip2, and tar
+//! archives up to the configured depth limit.
 
 use std::fs::File;
 use std::sync::atomic::Ordering;
 
 use crate::archive::formats::zip::LimitedRead;
-use crate::archive::formats::{GzipStream, TarInput, TarNext, TarRead};
+use crate::archive::formats::{Bzip2Stream, GzipStream, TarInput, TarNext, TarRead};
 use crate::archive::{
     detect_kind_from_name_bytes, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult,
     EntrySkipReason, PartialReason, DEFAULT_MAX_COMPONENTS,
@@ -21,13 +21,15 @@ use super::local_fs_archive_ctx::{
     budget_hit_to_partial_reason, build_locator, discard_remaining_payload,
     map_archive_skip_to_partial, ArchiveEnd, ArchiveScanCtx, ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
 };
+use super::local_fs_bzip2::scan_bzip2_stream_nested;
 use super::local_fs_gzip::scan_gzip_stream_nested;
 use super::local_fs_owner::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
     emit_persistence_batch, FileTask, LocalScratch,
 };
 
-/// Scan a tar stream (plain or gzip-wrapped), optionally recursing into nested archives.
+/// Scan a tar stream (plain, gzip-wrapped, or bzip2-wrapped), optionally
+/// recursing into nested archives.
 ///
 /// # Invariants
 /// - Entry payloads are scanned with chunk+overlap semantics.
@@ -35,6 +37,8 @@ use super::local_fs_owner::{
 /// - Malformed headers or payload reads yield `PartialReason::MalformedTar`.
 /// - Caller has already entered the archive budget for this container.
 /// - `depth` is 1-based; nested expansion stops at `max_archive_depth`.
+/// - `ratio_active` should be `true` only when the tar byte stream is itself
+///   compressed (`tar.gz` / `tar.bz2`) so pre-read ratio probes reflect reality.
 pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
     scan: &mut ArchiveScanCtx<'_, E>,
     input: &mut dyn TarRead,
@@ -182,7 +186,11 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                         }
                     }
                 }
-                ArchiveKind::Gzip | ArchiveKind::Tar | ArchiveKind::TarGz => {
+                ArchiveKind::Gzip
+                | ArchiveKind::Bzip2
+                | ArchiveKind::Tar
+                | ArchiveKind::TarGz
+                | ArchiveKind::TarBz2 => {
                     if depth >= max_depth {
                         scan.metrics.archive.record_archive_skipped(
                             ArchiveSkipReason::DepthExceeded,
@@ -291,6 +299,59 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 *child.gzip_header_buf = hdr_buf;
                                 (out, entry_reader.remaining())
                             }
+                            ArchiveKind::Bzip2 => {
+                                let (bunzip_vpath, vpaths_tail) = rest_vpaths
+                                    .split_first_mut()
+                                    .expect("vpath scratch exhausted");
+                                let (bunzip_path_used, path_used_tail) = rest_path_used
+                                    .split_first_mut()
+                                    .expect("path budget scratch exhausted");
+                                let mut child = ArchiveScanCtx {
+                                    engine: scan.engine,
+                                    pool: scan.pool,
+                                    event_sink: scan.event_sink,
+                                    store_producer: scan.store_producer,
+                                    scan_scratch: scan.scan_scratch,
+                                    pending: scan.pending,
+                                    persist_batch: scan.persist_batch,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: vpaths_tail,
+                                    path_budget_used: path_used_tail,
+                                    tar_cursors: rest_cursors,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    next_virtual_file_id: scan.next_virtual_file_id,
+                                    metrics: scan.metrics,
+                                    archive: scan.archive,
+                                    chunk_size: scan.chunk_size,
+                                    abort_run: scan.abort_run,
+                                };
+
+                                let entry_name_bytes = b"<bunzip2>";
+                                let bunzip_display = bunzip_vpath
+                                    .build(entry_display, entry_name_bytes, max_len)
+                                    .bytes;
+                                *bunzip_path_used = 0;
+                                let need = bunzip_display.len();
+                                if bunzip_path_used.saturating_add(need)
+                                    > scan.archive.max_virtual_path_bytes_per_archive
+                                {
+                                    outcome =
+                                        ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+                                    budgets.exit_archive();
+                                    budgets.end_entry(true);
+                                    break;
+                                }
+                                *bunzip_path_used = bunzip_path_used.saturating_add(need);
+
+                                let entry_reader = LimitedRead::new(input, entry_size);
+                                let mut bz2 = Bzip2Stream::new(entry_reader);
+                                let out =
+                                    scan_bzip2_stream_nested(&mut child, &mut bz2, bunzip_display);
+                                let entry_reader = bz2.into_inner();
+                                (out, entry_reader.remaining())
+                            }
                             ArchiveKind::Tar => {
                                 let mut child = ArchiveScanCtx {
                                     engine: scan.engine,
@@ -355,6 +416,40 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                     true,
                                 );
                                 let entry_reader = gz.into_inner();
+                                (out, entry_reader.remaining())
+                            }
+                            ArchiveKind::TarBz2 => {
+                                let mut child = ArchiveScanCtx {
+                                    engine: scan.engine,
+                                    pool: scan.pool,
+                                    event_sink: scan.event_sink,
+                                    store_producer: scan.store_producer,
+                                    scan_scratch: scan.scan_scratch,
+                                    pending: scan.pending,
+                                    persist_batch: scan.persist_batch,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: rest_vpaths,
+                                    path_budget_used: rest_path_used,
+                                    tar_cursors: rest_cursors,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    next_virtual_file_id: scan.next_virtual_file_id,
+                                    metrics: scan.metrics,
+                                    archive: scan.archive,
+                                    chunk_size: scan.chunk_size,
+                                    abort_run: scan.abort_run,
+                                };
+                                let entry_reader = LimitedRead::new(input, entry_size);
+                                let mut bz2 = Bzip2Stream::new(entry_reader);
+                                let out = scan_tar_stream_nested(
+                                    &mut child,
+                                    &mut bz2,
+                                    entry_display,
+                                    depth + 1,
+                                    true,
+                                );
+                                let entry_reader = bz2.into_inner();
                                 (out, entry_reader.remaining())
                             }
                             ArchiveKind::Zip => unreachable!(),
@@ -623,14 +718,16 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
     outcome
 }
 
-/// Shared entry point for `.tar` and `.tar.gz` root files.
+/// Shared entry point for `.tar`, `.tar.gz`, and `.tar.bz2` root files.
 ///
 /// Wires up the [`ArchiveScanCtx`] from [`LocalScratch`], resets budgets,
 /// enters the archive scope, then delegates to [`scan_tar_stream_nested`]
-/// at depth 1. This avoids duplicating budget setup between the two formats.
+/// at depth 1. This avoids duplicating budget setup between compressed tar
+/// variants.
 ///
-/// The caller (`process_tar_file` / `process_targz_file`) is responsible for
-/// opening the file and wrapping it in the appropriate [`TarInput`] variant.
+/// The caller (`process_tar_file` / `process_targz_file` /
+/// `process_tarbz2_file`) is responsible for opening the file and wrapping it
+/// in the appropriate [`TarInput`] variant.
 fn process_tar_like<E: ScanEngine>(
     task: &FileTask,
     ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
@@ -652,7 +749,7 @@ fn process_tar_like<E: ScanEngine>(
         return budget_hit_to_archive_end(hit);
     }
 
-    let ratio_active = matches!(input, TarInput::Gzip(_));
+    let ratio_active = matches!(input, TarInput::Gzip(_) | TarInput::Bzip2(_));
     let outcome = scan_tar_stream_nested(&mut scan, &mut input, parent_bytes, 1, ratio_active);
 
     scan.budgets.exit_archive();
@@ -687,4 +784,19 @@ pub(super) fn process_targz_file<E: ScanEngine>(
         }
     };
     process_tar_like::<E>(task, ctx, TarInput::Gzip(GzipStream::new(file)))
+}
+
+/// Process a `.tar.bz2` / `.tbz2` file via bzip2+tar streaming.
+pub(super) fn process_tarbz2_file<E: ScanEngine>(
+    task: &FileTask,
+    ctx: &mut WorkerCtx<FileTask, LocalScratch<E>>,
+) -> ArchiveEnd {
+    let file = match File::open(&task.path) {
+        Ok(f) => f,
+        Err(_) => {
+            ctx.metrics.io_errors = ctx.metrics.io_errors.saturating_add(1);
+            return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
+        }
+    };
+    process_tar_like::<E>(task, ctx, TarInput::Bzip2(Bzip2Stream::new(file)))
 }

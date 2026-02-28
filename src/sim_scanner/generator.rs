@@ -10,6 +10,8 @@
 //! - Noise bytes are lowercase `x` to avoid accidental prefix matches.
 //! - `ExpectedSecret.root_span` refers to the encoded bytes within the file's content buffer.
 //! - Archive entry spans refer to uncompressed entry payload bytes.
+//! - Gzip/bzip2 scenarios are generated with exactly one entry so expected-path
+//!   cardinality matches the scanner's single-stream model.
 
 use regex::bytes::Regex;
 
@@ -82,8 +84,10 @@ impl Default for ScenarioGenConfig {
             archive_kinds: vec![
                 ArchiveKindSpec::Tar,
                 ArchiveKindSpec::TarGz,
+                ArchiveKindSpec::TarBz2,
                 ArchiveKindSpec::Zip,
                 ArchiveKindSpec::Gzip,
+                ArchiveKindSpec::Bzip2,
             ],
             archive: ArchiveConfig::default(),
         }
@@ -118,7 +122,9 @@ impl ScenarioGenConfig {
 /// Generate a deterministic scenario and rule suite from a seed.
 ///
 /// The returned `ExpectedSecret` spans refer to the encoded payload inserted
-/// into each file, not the decoded representation.
+/// into each file/entry payload, not the decoded representation.
+/// Archive expected paths are derived via `sim_archive::entry_paths`, which
+/// mirrors production canonicalization and locator formatting.
 pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario, String> {
     cfg.validate()?;
 
@@ -171,11 +177,14 @@ pub fn generate_scenario(seed: u64, cfg: &ScenarioGenConfig) -> Result<Scenario,
         for archive_idx in 0..cfg.archive_count {
             let kind = pick_archive_kind(&mut rng, &kinds);
             let root_path = SimPath::new(format_archive_name(archive_idx, kind).into_bytes());
-            let entries_per_archive = if kind == ArchiveKindSpec::Gzip {
-                1
-            } else {
-                cfg.archive_entries
-            };
+            // Gzip/bzip2 are modeled as single logical entries in the scanner,
+            // so we generate exactly one entry to keep oracle cardinality exact.
+            let entries_per_archive =
+                if matches!(kind, ArchiveKindSpec::Gzip | ArchiveKindSpec::Bzip2) {
+                    1
+                } else {
+                    cfg.archive_entries
+                };
 
             let mut entries = Vec::with_capacity(entries_per_archive as usize);
             let mut pending = Vec::new();
@@ -284,8 +293,10 @@ fn effective_archive_kinds(cfg: &ScenarioGenConfig) -> Vec<ArchiveKindSpec> {
         vec![
             ArchiveKindSpec::Tar,
             ArchiveKindSpec::TarGz,
+            ArchiveKindSpec::TarBz2,
             ArchiveKindSpec::Zip,
             ArchiveKindSpec::Gzip,
+            ArchiveKindSpec::Bzip2,
         ]
     } else {
         cfg.archive_kinds.clone()
@@ -304,12 +315,19 @@ fn pick_archive_kind(rng: &mut SimRng, kinds: &[ArchiveKindSpec]) -> ArchiveKind
 fn format_archive_name(idx: u32, kind: ArchiveKindSpec) -> String {
     match kind {
         ArchiveKindSpec::Gzip => format!("archive_{idx}.gz"),
+        ArchiveKindSpec::Bzip2 => format!("archive_{idx}.bz2"),
         ArchiveKindSpec::Tar => format!("archive_{idx}.tar"),
         ArchiveKindSpec::TarGz => format!("archive_{idx}.tar.gz"),
+        ArchiveKindSpec::TarBz2 => format!("archive_{idx}.tar.bz2"),
         ArchiveKindSpec::Zip => format!("archive_{idx}.zip"),
     }
 }
 
+/// Classify whether a generated secret is mandatory or best-effort.
+///
+/// This keeps oracle failures actionable: deterministic generation defects
+/// should fail hard, while expected scanner limitations (encryption,
+/// non-regular entries, intentional corruption) are marked `MayMiss`.
 fn disposition_for_entry(
     spec: &ArchiveFileSpec,
     entry_idx: u32,

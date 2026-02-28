@@ -22,6 +22,7 @@ crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
 crc32fast = "1.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
+bzip2 = { version = "0.5", default-features = false, features = ["libbz2-rs-sys"] }
 libc = "0.2"
 memchr = "2.8"
 memmap2 = "0.9"

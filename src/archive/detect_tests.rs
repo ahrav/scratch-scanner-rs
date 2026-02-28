@@ -17,6 +17,12 @@ fn reference_detect(name: &[u8]) -> Option<ArchiveKind> {
     let name = strip_trailing_slashes(name);
     if ends_with_ignore_ascii_case(name, b".tar.gz") || ends_with_ignore_ascii_case(name, b".tgz") {
         Some(ArchiveKind::TarGz)
+    } else if ends_with_ignore_ascii_case(name, b".tar.bz2")
+        || ends_with_ignore_ascii_case(name, b".tbz2")
+    {
+        Some(ArchiveKind::TarBz2)
+    } else if ends_with_ignore_ascii_case(name, b".bz2") {
+        Some(ArchiveKind::Bzip2)
     } else if ends_with_ignore_ascii_case(name, b".gz") {
         Some(ArchiveKind::Gzip)
     } else if ends_with_ignore_ascii_case(name, b".tar") {

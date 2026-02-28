@@ -700,10 +700,11 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     }
 }
 
-// Archive scanning (gzip, tar, zip) is in:
+// Archive scanning (gzip, bzip2, tar, zip) is in:
 //   local_fs_archive_ctx.rs — shared types, budget helpers, dispatch
+//   local_fs_bzip2.rs       — bzip2 scanning
 //   local_fs_gzip.rs        — gzip scanning
-//   local_fs_tar.rs         — tar/tar.gz scanning
+//   local_fs_tar.rs         — tar/tar.gz/tar.bz2 scanning
 //   local_fs_zip.rs         — zip scanning
 // Binary extraction is in:
 //   local_fs_extract.rs     — extract_and_scan_file

@@ -230,6 +230,29 @@ fn archive_targz_truncated_archive_is_handled() {
 }
 
 #[test]
+fn archive_tarbz2_smoke() {
+    let archive_cfg = base_archive_config();
+
+    let (payload, span) = payload_with_secret(4, 4);
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"smoke.tar.bz2".to_vec()),
+        kind: ArchiveKindSpec::TarBz2,
+        entries: vec![ArchiveEntrySpec {
+            name_bytes: b"inner.txt".to_vec(),
+            payload,
+            compression: EntryCompressionSpec::Store,
+            encrypted: false,
+            kind: EntryKindSpec::RegularFile,
+        }],
+        corruption: None,
+    };
+
+    let scenario =
+        build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span)]);
+    run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE15A);
+}
+
+#[test]
 fn archive_entry_cap_enforced() {
     let mut archive_cfg = base_archive_config();
     archive_cfg.max_entries_per_archive = 1;
@@ -361,6 +384,32 @@ fn archive_entry_byte_cap_limits_scan() {
     let scenario =
         build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
     run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE19);
+}
+
+#[test]
+fn archive_tarbz2_entry_byte_cap_limits_scan() {
+    let mut archive_cfg = base_archive_config();
+    archive_cfg.max_uncompressed_bytes_per_entry = 20;
+    archive_cfg.max_total_uncompressed_bytes_per_archive = 64;
+    archive_cfg.max_total_uncompressed_bytes_per_root = 64;
+
+    let (payload, span_a, _span_b) = payload_with_two_secrets(4, 16, 4);
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"entrycap-bytes.tar.bz2".to_vec()),
+        kind: ArchiveKindSpec::TarBz2,
+        entries: vec![ArchiveEntrySpec {
+            name_bytes: b"cap.txt".to_vec(),
+            payload,
+            compression: EntryCompressionSpec::Store,
+            encrypted: false,
+            kind: EntryKindSpec::RegularFile,
+        }],
+        corruption: None,
+    };
+
+    let scenario =
+        build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
+    run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE19A);
 }
 
 #[test]
@@ -989,4 +1038,48 @@ fn archive_targz_wall_clock_timeout_skips_later_entries() {
     let scenario =
         build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
     run_archive_scenario_with_countdown(scenario, archive_cfg, 0xC0FF_EE22, 2);
+}
+
+/// Same for tar.bz2 (bzip2-compressed tar). With deterministic countdown=2,
+/// the timeout fires before the third entry and only entry 0 is expected.
+#[test]
+fn archive_tarbz2_wall_clock_timeout_skips_later_entries() {
+    let archive_cfg = base_archive_config();
+
+    let (payload_a, span_a) = payload_with_secret(2, 9);
+    let (payload_b, _span_b) = payload_with_secret(2, 9);
+    let filler = vec![b'x'; 20];
+
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"timeout.tar.bz2".to_vec()),
+        kind: ArchiveKindSpec::TarBz2,
+        entries: vec![
+            ArchiveEntrySpec {
+                name_bytes: b"first.txt".to_vec(),
+                payload: payload_a,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+            ArchiveEntrySpec {
+                name_bytes: b"filler.txt".to_vec(),
+                payload: filler,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+            ArchiveEntrySpec {
+                name_bytes: b"third.txt".to_vec(),
+                payload: payload_b,
+                compression: EntryCompressionSpec::Store,
+                encrypted: false,
+                kind: EntryKindSpec::RegularFile,
+            },
+        ],
+        corruption: None,
+    };
+
+    let scenario =
+        build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
+    run_archive_scenario_with_countdown(scenario, archive_cfg, 0xC0FF_EE23, 2);
 }

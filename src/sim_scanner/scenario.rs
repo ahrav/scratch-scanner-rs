@@ -51,7 +51,7 @@ pub struct RunConfig {
     ///
     /// When set, `is_deadline_expired()` fires after exactly this many calls
     /// instead of consulting the real clock. See
-    /// [`ArchiveBudgets::set_deadline_check_countdown`] for semantics.
+    /// [`crate::archive::ArchiveBudgets::set_deadline_check_countdown`] for semantics.
     #[cfg(any(test, feature = "sim-harness"))]
     #[serde(skip)]
     pub archive_deadline_countdown: Option<u32>,
@@ -63,7 +63,8 @@ impl RunConfig {
     ///
     /// After calling this, `self.overlap >= required_overlap` and
     /// `self.chunk_size >= self.overlap`. This is the single source of truth
-    /// for the two-pass adjustment pattern used by mutation test harnesses.
+    /// for the two-pass adjustment pattern used by mutation test harnesses,
+    /// so scenario producers and replay code do not drift on boundary semantics.
     pub fn adjust_for_overlap(&mut self, required_overlap: u32) {
         if self.overlap < required_overlap {
             self.overlap = required_overlap;
@@ -101,6 +102,7 @@ pub enum ExpectedDisposition {
     #[default]
     MustFind,
     /// Secret may be missed for documented reasons (corruption, budgets, etc).
+    /// Oracles treat this as non-fatal when reporting coverage gaps.
     MayMiss { reason: String },
 }
 
@@ -164,8 +166,10 @@ fn default_rule_radius() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArchiveKindSpec {
     Gzip,
+    Bzip2,
     Tar,
     TarGz,
+    TarBz2,
     Zip,
 }
 

@@ -29,7 +29,7 @@
 //! - All I/O goes through [`TarRead`] so callers can supply plain files,
 //!   gzip-decoded streams, or in-memory cursors uniformly.
 
-use crate::archive::formats::GzipStream;
+use crate::archive::formats::{Bzip2Stream, GzipStream};
 use crate::archive::util;
 use crate::archive::{ArchiveBudgets, ArchiveConfig, ChargeResult, PartialReason};
 
@@ -53,7 +53,8 @@ pub fn is_ustar_header(header: &[u8]) -> bool {
     header.len() >= TAR_BLOCK_LEN && &header[USTAR_MAGIC_OFFSET..USTAR_MAGIC_OFFSET + 5] == b"ustar"
 }
 
-/// Input source for tar scanning: plain tar file or gzip-decoded tar stream.
+/// Input source for tar scanning: plain tar file, gzip-decoded tar stream,
+/// or bzip2-decoded tar stream.
 ///
 /// # Design Notes
 /// - Used by the scheduler to distinguish compressed input for ratio accounting.
@@ -61,14 +62,20 @@ pub fn is_ustar_header(header: &[u8]) -> bool {
 pub enum TarInput {
     Plain(File),
     Gzip(GzipStream<File>),
+    Bzip2(Bzip2Stream<File>),
 }
 
 impl TarInput {
+    /// Compressed-byte delta since the previous call.
+    ///
+    /// Returns `0` for plain tar so callers can charge budgets through one
+    /// uniform interface regardless of wrapping codec.
     #[inline(always)]
     pub fn take_compressed_delta(&mut self) -> u64 {
         match self {
             TarInput::Plain(_) => 0,
             TarInput::Gzip(gz) => gz.take_compressed_delta(),
+            TarInput::Bzip2(bz2) => bz2.take_compressed_delta(),
         }
     }
 }
@@ -79,6 +86,7 @@ impl Read for TarInput {
         match self {
             TarInput::Plain(f) => read_some(f, dst),
             TarInput::Gzip(gz) => gz.read(dst),
+            TarInput::Bzip2(bz2) => bz2.read(dst),
         }
     }
 }
@@ -105,6 +113,13 @@ impl TarRead for TarInput {
 impl TarRead for File {}
 
 impl<R: Read> TarRead for GzipStream<R> {
+    #[inline(always)]
+    fn take_compressed_delta(&mut self) -> u64 {
+        self.take_compressed_delta()
+    }
+}
+
+impl<R: Read> TarRead for Bzip2Stream<R> {
     #[inline(always)]
     fn take_compressed_delta(&mut self) -> u64 {
         self.take_compressed_delta()

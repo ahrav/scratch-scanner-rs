@@ -18,12 +18,13 @@ use crate::store::{FsFindingRecord, StoreProducer};
 
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
+use super::local_fs_bzip2::process_bzip2_file;
 use super::local_fs_gzip::process_gzip_file;
 use super::local_fs_owner::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
     emit_persistence_batch, FileTask, LocalScratch,
 };
-use super::local_fs_tar::{process_tar_file, process_targz_file};
+use super::local_fs_tar::{process_tar_file, process_tarbz2_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
 use super::metrics::WorkerMetricsLocal;
 use super::ts_buffer_pool::TsBufferPool;
@@ -69,8 +70,9 @@ pub(super) fn build_locator(out: &mut [u8; LOCATOR_LEN], kind: u8, value: u64) -
 
 /// Dispatch archive scanning by kind.
 ///
-/// Routes to `process_gzip_file`, `process_tar_file`, `process_targz_file`,
-/// or `process_zip_file` based on the detected [`ArchiveKind`].
+/// Routes to `process_gzip_file`, `process_bzip2_file`, `process_tar_file`,
+/// `process_targz_file`, `process_tarbz2_file`, or `process_zip_file`
+/// based on the detected [`ArchiveKind`].
 ///
 /// The caller is responsible for recording archive-level stats
 /// (`record_archive_scanned` / `record_archive_skipped` / `record_archive_partial`)
@@ -83,8 +85,10 @@ pub(super) fn dispatch_archive_scan<E: ScanEngine>(
 ) -> ArchiveEnd {
     match kind {
         ArchiveKind::Gzip => process_gzip_file(task, ctx),
+        ArchiveKind::Bzip2 => process_bzip2_file(task, ctx),
         ArchiveKind::Tar => process_tar_file(task, ctx),
         ArchiveKind::TarGz => process_targz_file(task, ctx),
+        ArchiveKind::TarBz2 => process_tarbz2_file(task, ctx),
         ArchiveKind::Zip => process_zip_file(task, ctx),
     }
 }
