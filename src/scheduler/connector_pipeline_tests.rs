@@ -489,7 +489,7 @@ fn token_drop_without_complete_releases_barrier() {
 }
 
 #[test]
-fn barrier_lock_or_propagate_panics_on_poisoned_mutex() {
+fn barrier_lock_or_recover_survives_poisoned_mutex() {
     let barrier = PageCompletionBarrier::new(0, 2);
 
     // Poison the mutex by panicking while holding the guard.
@@ -500,11 +500,12 @@ fn barrier_lock_or_propagate_panics_on_poisoned_mutex() {
     });
     let _ = handle.join();
 
-    // The mutex is now poisoned. lock_or_propagate should panic.
-    let result = std::panic::catch_unwind(|| {
+    // The mutex is now poisoned. lock_or_recover should recover, not panic.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         barrier.release_item();
-    });
-    assert!(result.is_err(), "expected panic on poisoned mutex");
+    }));
+    assert!(result.is_ok(), "expected recovery from poisoned mutex");
+    assert_eq!(barrier.outstanding_items(), 1);
 }
 
 // -- Integration: empty first page --
