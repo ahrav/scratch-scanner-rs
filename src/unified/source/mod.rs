@@ -5,14 +5,15 @@
 //!
 //! # Current Status
 //!
-//! Both source modes delegate to their existing execution backends:
+//! Source wiring is centralized in [`factory`](self::factory):
 //!
-//! - **FS** — `parallel_scan_dir()` with iterator-based walking and
-//!   the local filesystem scheduler.
+//! - **FS** — connector-backed execution via unified source factory.
 //!
 //! - **Git** — `run_git_scan()` with an `EventSink` threaded through
 //!   to `EngineAdapter`. Findings stream during pack/loose scanning.
 //!   Persistence metadata (`ScannedBlobs`) is still accumulated per-shard
 //!   and merged during finalize, unchanged from the pre-unified path.
 
+#[cfg(feature = "connector-pipeline")]
+pub mod factory;
 pub mod git;

@@ -3,8 +3,7 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → `scan_local_fs_uring` on Linux when available and persistence is off;
-//!   otherwise `parallel_scan_dir`
+//! - **FS** → connector pipeline (`scan_connector`) with source factory wiring
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -49,8 +48,9 @@ use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-use crate::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
-use crate::store::{RootKind, SqliteStoreConfig, SqliteStoreProducer, StoreKeys, StoreProducer};
+use crate::scheduler::local_fs_owner::LocalReport;
+#[cfg(feature = "connector-pipeline")]
+use crate::scheduler::local_fs_owner::LocalStats;
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::cli::TransformFilter;
@@ -59,6 +59,11 @@ use super::{
     EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, ScanConfig, SourceConfig,
     StoreCommand,
 };
+
+#[cfg(feature = "connector-pipeline")]
+use gossip_contracts::connector::Cursor;
+#[cfg(feature = "connector-pipeline")]
+use gossip_contracts::coordination::ShardSpec;
 
 /// Run a scan using the unified configuration.
 ///
@@ -97,49 +102,130 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FsBackend {
-    Blocking,
-    Uring,
+#[cfg(feature = "connector-pipeline")]
+#[derive(Debug)]
+struct FsProgressState {
+    shard: ShardSpec,
+    cursor: Cursor,
 }
 
-/// Select the filesystem backend from platform + runtime capabilities.
-///
-/// Linux can use io_uring only when:
-/// - persistence is not requested, and
-/// - io_uring initialization succeeds during preflight.
-#[cfg(any(test, target_os = "linux"))]
-#[inline]
-fn select_fs_backend(
-    is_linux: bool,
-    persist_findings: bool,
-    uring_backend_available: bool,
-) -> FsBackend {
-    if !is_linux || persist_findings || !uring_backend_available {
-        FsBackend::Blocking
-    } else {
-        FsBackend::Uring
+#[cfg(feature = "connector-pipeline")]
+impl FsProgressState {
+    fn new() -> Self {
+        Self {
+            shard: ShardSpec::unbounded(),
+            cursor: Cursor::initial(),
+        }
     }
 }
 
-/// Probe whether io_uring is usable on this kernel by attempting to
-/// create a ring with the given entry count. Returns `false` on older
-/// kernels or when seccomp blocks `io_uring_setup`.
-#[cfg(target_os = "linux")]
-#[inline]
-fn uring_backend_available(ring_entries: u32) -> bool {
-    io_uring::IoUring::new(ring_entries).is_ok()
+#[cfg(feature = "connector-pipeline")]
+impl crate::scheduler::ProgressSink for FsProgressState {
+    type Error = io::Error;
+
+    fn shard_spec(&self) -> &ShardSpec {
+        &self.shard
+    }
+
+    fn cursor(&self) -> Cursor {
+        self.cursor.clone()
+    }
+
+    fn checkpoint(&mut self, cursor: &Cursor) -> Result<(), Self::Error> {
+        self.cursor = cursor.clone();
+        Ok(())
+    }
+
+    fn complete(&mut self, final_cursor: &Cursor) -> Result<(), Self::Error> {
+        self.cursor = final_cursor.clone();
+        Ok(())
+    }
+
+    fn park(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn split_hint(
+        &mut self,
+        _key: &gossip_contracts::connector::ItemKey,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(any(test, feature = "connector-pipeline")), allow(dead_code))]
+fn fs_source_config(cfg: &FsScanConfig) -> SourceConfig {
+    SourceConfig::Fs(FsScanConfig {
+        root: cfg.root.clone(),
+        workers: cfg.workers,
+        decode_depth: cfg.decode_depth,
+        skip_archives: cfg.skip_archives,
+        anchor_mode: cfg.anchor_mode,
+        scan_binary: cfg.scan_binary,
+        persist_findings: cfg.persist_findings,
+    })
+}
+
+#[cfg(feature = "connector-pipeline")]
+fn run_fs_connector(
+    engine: Arc<Engine>,
+    cfg: &FsScanConfig,
+    event_sink: Arc<dyn super::events::EventSink>,
+) -> io::Result<LocalReport> {
+    if cfg.persist_findings {
+        return Err(io::Error::other(
+            "filesystem persistence is not yet supported in connector pipeline mode",
+        ));
+    }
+
+    let source_cfg = fs_source_config(cfg);
+    let mut connector = super::source::factory::build_connector(&source_cfg)?;
+
+    let connector_cfg = crate::scheduler::ConnectorConfig {
+        cpu_workers: cfg.workers.max(1),
+        split_hint_budgets: None,
+        ..Default::default()
+    };
+
+    let mut progress = FsProgressState::new();
+    let (connector_report, metrics) = crate::scheduler::scan_connector(
+        engine,
+        connector.as_mut(),
+        connector_cfg,
+        &mut progress,
+        event_sink,
+    )
+    .map_err(|err| io::Error::other(format!("filesystem connector pipeline failed: {err}")))?;
+
+    Ok(LocalReport {
+        stats: LocalStats {
+            files_enqueued: connector_report.enumerate.items_discovered,
+            bytes_enqueued: metrics.bytes_scanned,
+            io_errors: metrics.io_errors,
+            dropped_findings: metrics.findings_dropped,
+            persistence_emit_failures: metrics.persistence_emit_failures,
+            persistence_incomplete: false,
+        },
+        metrics,
+    })
+}
+
+#[cfg(not(feature = "connector-pipeline"))]
+fn run_fs_connector(
+    _engine: Arc<Engine>,
+    _cfg: &FsScanConfig,
+    _event_sink: Arc<dyn super::events::EventSink>,
+) -> io::Result<LocalReport> {
+    Err(io::Error::other(
+        "filesystem scans require the connector-pipeline feature",
+    ))
 }
 
 /// Filesystem scan path.
 ///
-/// Uses io_uring on Linux only when it is available and `--persist-findings`
-/// is disabled. Otherwise uses the blocking `parallel_scan_dir` path.
-///
-/// Findings are emitted as structured events to stdout via the
-/// [`EventSink`] (format per `--event-format`). Summary stats are written
-/// to stderr.
+/// Runs through the connector pipeline and emits findings as structured events
+/// to stdout via the [`EventSink`] (format per `--event-format`).
+/// Summary stats are written to stderr.
 fn run_fs(
     cfg: FsScanConfig,
     event_format: EventFormat,
@@ -153,41 +239,6 @@ fn run_fs(
 
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
-    let store_producer: Option<Arc<dyn StoreProducer>> = if cfg.persist_findings {
-        let store_dir = cfg.root.join(".scanner-store");
-        let keys = StoreKeys::bootstrap_from_env();
-        let root_id = crate::store::root_id::root_id(
-            &crate::store::RootIdInput {
-                kind: RootKind::Fs,
-                identity_scheme: "fs_path_v1",
-                canonical_identity: cfg.root.to_string_lossy().as_bytes(),
-            },
-            &keys,
-        );
-        let sqlite_config = SqliteStoreConfig {
-            db_path: store_dir.join("findings.db"),
-            root_id,
-            root_kind: RootKind::Fs,
-            identity_scheme: "fs_path_v1".to_string(),
-            canonical_identity: cfg.root.to_string_lossy().as_bytes().to_vec(),
-            display_name: Some(cfg.root.display().to_string()),
-            id_hash_mode: keys.id_hash_mode(),
-            scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        };
-        let producer = Arc::new(SqliteStoreProducer::open(sqlite_config).map_err(|err| {
-            io::Error::other(format!(
-                "failed to initialize SQLite persistence backend: {}",
-                err.detail()
-            ))
-        })?);
-        eprintln!(
-            "info: --persist-findings enabled; store: {}",
-            store_dir.join("findings.db").display()
-        );
-        Some(producer)
-    } else {
-        None
-    };
     let transforms = apply_transform_filter(demo_transforms(), transform_filter);
     let mut tuning = demo_tuning();
     if let Some(depth) = cfg.decode_depth {
@@ -213,109 +264,7 @@ fn run_fs(
         build_event_sink(event_format, verbose)
     };
 
-    let mut ps_config = ParallelScanConfig {
-        workers: cfg.workers,
-        skip_hidden: false,
-        respect_gitignore: false,
-        event_sink: Arc::clone(&event_sink),
-        ..Default::default()
-    };
-    if let Some(ref producer) = store_producer {
-        ps_config.store_producer = Some(Arc::clone(producer));
-    }
-    if cfg.skip_archives {
-        ps_config.archive.enabled = false;
-    }
-    if cfg.scan_binary {
-        ps_config.skip_binary = false;
-    }
-    #[cfg(target_os = "linux")]
-    let report = {
-        use crate::scheduler::local_fs_owner::{LocalReport, LocalStats};
-        use crate::scheduler::local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig};
-
-        let defaults = LocalFsUringConfig::default();
-        let backend = select_fs_backend(
-            true,
-            cfg.persist_findings,
-            uring_backend_available(defaults.ring_entries),
-        );
-
-        match backend {
-            FsBackend::Uring => {
-                let io_threads = (cfg.workers / 4).max(2);
-                let io_depth = defaults.io_depth;
-                // pool_buffers must be >= io_threads * io_depth (assertion floor), but
-                // the real requirement is headroom ABOVE that so completed I/O can sit
-                // in the CPU executor queue while I/O threads keep submitting.  Without
-                // headroom every buffer is in-flight and try_acquire() fails, stalling
-                // both I/O submission and the CPU pipeline.
-                let io_pool = io_threads * io_depth;
-                let cpu_headroom = cfg.workers * 4;
-                let pool_buffers = io_pool + cpu_headroom;
-
-                let uring_cfg = LocalFsUringConfig {
-                    cpu_workers: cfg.workers,
-                    io_threads,
-                    io_depth,
-                    chunk_size: ps_config.chunk_size,
-                    pool_buffers,
-                    max_in_flight_files: ps_config.max_in_flight_objects,
-                    max_file_size: Some(ps_config.max_file_size),
-                    dedupe_within_chunk: true,
-                    seed: ps_config.seed,
-                    skip_binary: ps_config.skip_binary,
-                    archive: ps_config.archive.clone(),
-                    ..defaults
-                };
-
-                let (summary, io_stats, cpu_metrics) = scan_local_fs_uring(
-                    Arc::clone(&engine),
-                    std::slice::from_ref(&cfg.root),
-                    uring_cfg,
-                    Arc::clone(&event_sink),
-                )?;
-
-                let io_errors = summary
-                    .walk_errors
-                    .saturating_add(summary.open_errors)
-                    .saturating_add(summary.read_errors);
-
-                LocalReport {
-                    stats: LocalStats {
-                        files_enqueued: summary.files_enqueued,
-                        bytes_enqueued: io_stats.bytes_enqueued,
-                        io_errors,
-                        dropped_findings: cpu_metrics.findings_dropped,
-                        persistence_emit_failures: cpu_metrics.persistence_emit_failures,
-                        persistence_incomplete: false,
-                    },
-                    metrics: cpu_metrics,
-                }
-            }
-            FsBackend::Blocking => {
-                if cfg.persist_findings {
-                    eprintln!(
-                        "info: using blocking FS backend on Linux because --persist-findings is enabled"
-                    );
-                } else {
-                    eprintln!(
-                        "info: io_uring backend unavailable; falling back to blocking FS backend"
-                    );
-                }
-                parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?
-            }
-        }
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let report = parallel_scan_dir(&cfg.root, Arc::clone(&engine), ps_config)?;
-
-    if let Some(ref store) = store_producer {
-        store
-            .end_run(false)
-            .map_err(|err| io::Error::other(format!("failed to finalize run: {}", err.detail())))?;
-    }
+    let report = run_fs_connector(Arc::clone(&engine), &cfg, Arc::clone(&event_sink))?;
 
     let scan_elapsed = scan_start.elapsed();
     let total_elapsed = t0.elapsed();

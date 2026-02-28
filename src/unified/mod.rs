@@ -15,7 +15,7 @@
 //! | [`sarif_sink`] | SARIF 2.1.0 event sink (findings only) |
 //! | [`text_sink`] | Human-readable text sink (compact / verbose) |
 //! | [`orchestrator`] | Top-level dispatch: engine build → source driver → event sink |
-//! | [`source`] | Source driver helpers (currently Git-only; FS scan uses `crate::scheduler` directly) |
+//! | [`source`] | Source driver helpers and source-to-connector factory wiring |
 
 pub mod cli;
 pub mod events;

@@ -203,32 +203,75 @@ fn filter_none_on_empty_input() {
 }
 
 #[test]
-fn fs_backend_non_linux_is_blocking() {
-    assert_eq!(select_fs_backend(false, false, true), FsBackend::Blocking);
-    assert_eq!(select_fs_backend(false, true, false), FsBackend::Blocking);
+fn fs_source_config_round_trips_fields() {
+    let cfg = FsScanConfig {
+        root: PathBuf::from("/tmp/x"),
+        workers: 8,
+        decode_depth: Some(2),
+        skip_archives: true,
+        anchor_mode: AnchorMode::Derived,
+        scan_binary: true,
+        persist_findings: false,
+    };
+    let source = fs_source_config(&cfg);
+    let SourceConfig::Fs(fs) = source else {
+        panic!("expected fs source config");
+    };
+    assert_eq!(fs.root, cfg.root);
+    assert_eq!(fs.workers, cfg.workers);
+    assert_eq!(fs.decode_depth, cfg.decode_depth);
+    assert_eq!(fs.skip_archives, cfg.skip_archives);
+    assert_eq!(fs.anchor_mode, cfg.anchor_mode);
+    assert_eq!(fs.scan_binary, cfg.scan_binary);
+    assert_eq!(fs.persist_findings, cfg.persist_findings);
 }
 
+#[cfg(feature = "connector-pipeline")]
 #[test]
-fn fs_backend_linux_with_persistence_uses_blocking() {
-    assert_eq!(
-        select_fs_backend(true, true, true),
-        FsBackend::Blocking,
-        "persistence path must use blocking backend until io_uring persistence is wired"
-    );
+fn run_fs_connector_rejects_persistence_until_wired() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a.txt"), b"alpha").unwrap();
+    let cfg = FsScanConfig {
+        root: temp.path().to_path_buf(),
+        workers: 2,
+        decode_depth: None,
+        skip_archives: false,
+        anchor_mode: AnchorMode::Manual,
+        scan_binary: false,
+        persist_findings: true,
+    };
+    let err = run_fs_connector(
+        Arc::new(crate::demo_engine()),
+        &cfg,
+        Arc::new(crate::unified::events::NullEventSink),
+    )
+    .expect_err("persist_findings should be rejected");
+    assert!(err.to_string().contains("not yet supported"));
 }
 
+#[cfg(feature = "connector-pipeline")]
 #[test]
-fn fs_backend_linux_without_uring_falls_back_to_blocking() {
-    assert_eq!(
-        select_fs_backend(true, false, false),
-        FsBackend::Blocking,
-        "io_uring unavailability must fall back to blocking backend"
-    );
-}
-
-#[test]
-fn fs_backend_linux_uring_when_available_and_no_persistence() {
-    assert_eq!(select_fs_backend(true, false, true), FsBackend::Uring);
+fn run_fs_connector_scans_files_through_connector_pipeline() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a.txt"), b"alpha").unwrap();
+    std::fs::write(temp.path().join("b.txt"), b"beta").unwrap();
+    let cfg = FsScanConfig {
+        root: temp.path().to_path_buf(),
+        workers: 2,
+        decode_depth: None,
+        skip_archives: false,
+        anchor_mode: AnchorMode::Manual,
+        scan_binary: false,
+        persist_findings: false,
+    };
+    let report = run_fs_connector(
+        Arc::new(crate::demo_engine()),
+        &cfg,
+        Arc::new(crate::unified::events::NullEventSink),
+    )
+    .expect("connector scan should succeed");
+    assert_eq!(report.stats.files_enqueued, 2);
+    assert!(report.metrics.bytes_scanned >= 9);
 }
 
 #[test]
@@ -251,39 +294,4 @@ fn parse_in_pack_object_count_extracts_value() {
 fn parse_in_pack_object_count_handles_missing_or_invalid_value() {
     assert_eq!(parse_in_pack_object_count("count: 0\npacks: 1\n"), None);
     assert_eq!(parse_in_pack_object_count("in-pack: not-a-number\n"), None);
-}
-
-/// The pool buffer sizing formula must satisfy the assertion floor
-/// (pool_buffers >= io_threads * io_depth) across a range of worker
-/// counts, including edge cases. This prevents runtime panics from
-/// the LocalFsUringConfig::validate() assertion.
-#[test]
-fn buffer_pool_sizing_satisfies_assertion_floor() {
-    let io_depth: usize = 128; // Default from LocalFsUringConfig
-
-    for workers in [1, 2, 3, 4, 8, 16, 32, 64, 128, 256] {
-        let io_threads = (workers / 4).max(2);
-        let io_pool = io_threads * io_depth;
-        let cpu_headroom = workers * 4;
-        let pool_buffers = io_pool + cpu_headroom;
-
-        // Must satisfy the assertion floor.
-        assert!(
-            pool_buffers >= io_threads * io_depth,
-            "pool_buffers ({pool_buffers}) < io_threads * io_depth ({}) for workers={workers}",
-            io_threads * io_depth
-        );
-
-        // Must not overflow u16 range when registered buffers are in
-        // use (io_uring registered buffers are indexed by u16).
-        // For very high worker counts the formula can exceed u16::MAX.
-        // This test documents the boundary rather than asserting a hard
-        // limit, since registered buffers are optional.
-        if workers <= 64 {
-            assert!(
-                pool_buffers <= u16::MAX as usize,
-                "pool_buffers ({pool_buffers}) exceeds u16::MAX for workers={workers}"
-            );
-        }
-    }
 }
