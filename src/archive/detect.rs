@@ -5,9 +5,11 @@
 //!
 //! # Invariants
 //! - Detection is case-insensitive and suffix-based.
-//! - `.tar.gz` and `.tgz` are treated as the chain kind [`ArchiveKind::TarGz`].
+//! - `.tar.gz` / `.tgz` are treated as [`ArchiveKind::TarGz`].
+//! - `.tar.bz2` / `.tbz2` are treated as [`ArchiveKind::TarBz2`].
 //! - Extension-based detection has strict precedence over magic-byte sniffing;
-//!   this is the only way to distinguish `.tar.gz` from plain `.gz`.
+//!   this is the only way to distinguish `.tar.gz` from plain `.gz` and
+//!   `.tar.bz2` from plain `.bz2`.
 //!
 //! # Algorithm
 //! 1. Try extension-based detection ([`detect_kind_from_path`] / [`detect_kind_from_name_bytes`]).
@@ -25,7 +27,7 @@
 
 use std::path::Path;
 
-use super::formats::{is_gzip_magic, is_ustar_header, is_zip_magic};
+use super::formats::{is_bzip2_magic, is_gzip_magic, is_ustar_header, is_zip_magic};
 
 /// Archive container kind.
 ///
@@ -38,11 +40,14 @@ use super::formats::{is_gzip_magic, is_ustar_header, is_zip_magic};
 /// | `Tar`  | many        | sequential (512-B blocks)|
 /// | `Zip`  | many        | random-access via EOCD   |
 /// | `TarGz`| many (chain)| sequential gzip → tar    |
+/// | `TarBz2`| many (chain)| sequential bzip2 → tar  |
 /// | `Gzip` | one         | sequential decompression |
+/// | `Bzip2`| one         | sequential decompression |
 ///
 /// `TarGz` represents a gzip-compressed tar stream (container semantics),
 /// while `Gzip` represents a standalone gzip stream. Both start with the
 /// same `1f 8b` magic bytes — only the filename extension distinguishes them.
+/// `TarBz2` and `Bzip2` follow the same distinction for `BZh` streams.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArchiveKind {
@@ -54,11 +59,16 @@ pub enum ArchiveKind {
     Zip = 2,
     /// Gzip-compressed tar (`.tar.gz` / `.tgz`) — decompress then iterate.
     TarGz = 3,
+    /// Standalone bzip2 stream — single decompressed blob, no entry iteration.
+    Bzip2 = 4,
+    /// Bzip2-compressed tar (`.tar.bz2` / `.tbz2`) — decompress then iterate.
+    TarBz2 = 5,
 }
 
 impl ArchiveKind {
     /// Returns `true` for kinds that contain multiple named entries
-    /// (`Tar`, `Zip`, `TarGz`), `false` for single-stream `Gzip`.
+    /// (`Tar`, `Zip`, `TarGz`, `TarBz2`), `false` for single-stream
+    /// `Gzip`/`Bzip2`.
     ///
     /// Callers use this to decide whether to iterate entries or treat the
     /// decompressed output as one anonymous blob.
@@ -66,7 +76,7 @@ impl ArchiveKind {
     pub const fn is_container(self) -> bool {
         matches!(
             self,
-            ArchiveKind::Tar | ArchiveKind::Zip | ArchiveKind::TarGz
+            ArchiveKind::Tar | ArchiveKind::Zip | ArchiveKind::TarGz | ArchiveKind::TarBz2
         )
     }
 }
@@ -109,18 +119,22 @@ pub fn detect_kind_from_name(name: &str) -> Option<ArchiveKind> {
 /// Minimum buffer sizes for each format:
 /// - **gzip**: 2 bytes (`1f 8b`)
 /// - **zip**: 4 bytes (`PK` prefix + one of four signature pairs; see [`is_zip_magic`])
+/// - **bzip2**: 4 bytes (`BZh` + block-size digit `'1'`–`'9'`)
 /// - **tar (ustar)**: 512 bytes (magic at offset 257)
 ///
 /// Returns `Gzip` for any gzip stream — callers must rely on the filename
 /// extension (via [`detect_kind`]) to distinguish `.tar.gz` from plain `.gz`.
 ///
-/// Probe order is gzip → zip → tar; first match wins.
+/// Probe order is gzip → zip → bzip2 → tar; first match wins.
 pub fn sniff_kind_from_header(header: &[u8]) -> Option<ArchiveKind> {
     if is_gzip_magic(header) {
         return Some(ArchiveKind::Gzip);
     }
     if is_zip_magic(header) {
         return Some(ArchiveKind::Zip);
+    }
+    if is_bzip2_magic(header) {
+        return Some(ArchiveKind::Bzip2);
     }
     if is_ustar_header(header) {
         return Some(ArchiveKind::Tar);
@@ -159,6 +173,7 @@ pub fn detect_kind(path: &Path, header_opt: Option<&[u8]>) -> Option<ArchiveKind
 /// | Last byte | Candidates               | Checks          |
 /// |-----------|--------------------------|-----------------|
 /// | `'z'`     | `.tar.gz`, `.tgz`, `.gz` | penultimate `g` |
+/// | `'2'`     | `.tar.bz2`, `.tbz2`, `.bz2` | penultimate `z` |
 /// | `'r'`     | `.tar`                   | 4-byte check    |
 /// | `'p'`     | `.zip`                   | 4-byte check    |
 /// | anything  | —                        | return `None`   |
@@ -177,6 +192,7 @@ pub fn detect_kind_from_name_bytes(name: &[u8]) -> Option<ArchiveKind> {
     // Dispatch on last byte, case-folded.
     match name[len - 1] | 0x20 {
         b'z' => detect_z_suffix(name, len),
+        b'2' => detect_2_suffix(name, len),
         b'r' => detect_r_suffix(name, len),
         b'p' => detect_p_suffix(name, len),
         _ => None,
@@ -210,6 +226,42 @@ fn detect_z_suffix(name: &[u8], len: usize) -> Option<ArchiveKind> {
     // Check `.gz` (3 chars): ...'.''g''z'
     if name[len - 3] == b'.' {
         return Some(ArchiveKind::Gzip);
+    }
+
+    None
+}
+
+/// Last byte is `2` — check for `.tar.bz2`, `.tbz2`, `.bz2` (longest match first).
+#[inline]
+fn detect_2_suffix(name: &[u8], len: usize) -> Option<ArchiveKind> {
+    // Need at least `.bz2` (4 chars), and penultimate must be 'z'/'Z'.
+    if len < 4 || name[len - 2] | 0x20 != b'z' {
+        return None;
+    }
+    // Next must be 'b'/'B' for bzip2-derived suffixes.
+    if name[len - 3] | 0x20 != b'b' {
+        return None;
+    }
+
+    // Check `.tar.bz2` (8 chars): ...'.''t''a''r''.''b''z''2'
+    if len >= 8
+        && name[len - 4] == b'.'
+        && name[len - 5] | 0x20 == b'r'
+        && name[len - 6] | 0x20 == b'a'
+        && name[len - 7] | 0x20 == b't'
+        && name[len - 8] == b'.'
+    {
+        return Some(ArchiveKind::TarBz2);
+    }
+
+    // Check `.tbz2` (5 chars): ...'.''t''b''z''2'
+    if len >= 5 && name[len - 4] | 0x20 == b't' && name[len - 5] == b'.' {
+        return Some(ArchiveKind::TarBz2);
+    }
+
+    // Check `.bz2` (4 chars): ...'.''b''z''2'
+    if name[len - 4] == b'.' {
+        return Some(ArchiveKind::Bzip2);
     }
 
     None
@@ -268,6 +320,12 @@ mod tests {
         assert_eq!(detect_kind_from_name("a.tar.gz"), Some(ArchiveKind::TarGz));
         assert_eq!(detect_kind_from_name("a.TGZ"), Some(ArchiveKind::TarGz));
         assert_eq!(detect_kind_from_name("a.gz"), Some(ArchiveKind::Gzip));
+        assert_eq!(
+            detect_kind_from_name("a.tar.bz2"),
+            Some(ArchiveKind::TarBz2)
+        );
+        assert_eq!(detect_kind_from_name("a.TBZ2"), Some(ArchiveKind::TarBz2));
+        assert_eq!(detect_kind_from_name("a.bz2"), Some(ArchiveKind::Bzip2));
         assert_eq!(detect_kind_from_name("a.tar"), Some(ArchiveKind::Tar));
         assert_eq!(detect_kind_from_name("a.zip"), Some(ArchiveKind::Zip));
         assert_eq!(detect_kind_from_name("a.bin"), None);
@@ -278,6 +336,10 @@ mod tests {
         assert_eq!(
             sniff_kind_from_header(&[0x1f, 0x8b, 0x08, 0x00]),
             Some(ArchiveKind::Gzip)
+        );
+        assert_eq!(
+            sniff_kind_from_header(&[0x42, 0x5A, 0x68, 0x39]),
+            Some(ArchiveKind::Bzip2)
         );
         assert_eq!(
             sniff_kind_from_header(b"PK\x03\x04xxxx"),
@@ -305,9 +367,11 @@ mod tests {
     #[test]
     fn is_container_classification() {
         assert!(!ArchiveKind::Gzip.is_container());
+        assert!(!ArchiveKind::Bzip2.is_container());
         assert!(ArchiveKind::Tar.is_container());
         assert!(ArchiveKind::Zip.is_container());
         assert!(ArchiveKind::TarGz.is_container());
+        assert!(ArchiveKind::TarBz2.is_container());
     }
 
     #[test]
@@ -345,14 +409,33 @@ mod tests {
     }
 
     #[test]
+    fn extension_wins_over_sniff_for_tarbz2() {
+        use std::path::PathBuf;
+        let p = PathBuf::from("x.tar.bz2");
+        // header indicates bzip2; combined detection should still return TarBz2.
+        assert_eq!(
+            detect_kind(&p, Some(&[0x42, 0x5A, 0x68, 0x39])),
+            Some(ArchiveKind::TarBz2)
+        );
+    }
+
+    #[test]
     fn detect_from_name_bytes_handles_case_and_trailing_slash() {
         assert_eq!(
             detect_kind_from_name_bytes(b"foo.TAR.GZ"),
             Some(ArchiveKind::TarGz)
         );
         assert_eq!(
+            detect_kind_from_name_bytes(b"foo.TAR.BZ2"),
+            Some(ArchiveKind::TarBz2)
+        );
+        assert_eq!(
             detect_kind_from_name_bytes(b"bar.tgz/"),
             Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(
+            detect_kind_from_name_bytes(b"bar.tbz2/"),
+            Some(ArchiveKind::TarBz2)
         );
         assert_eq!(
             detect_kind_from_name_bytes(b"/path/inner.TAR"),
@@ -361,6 +444,10 @@ mod tests {
         assert_eq!(
             detect_kind_from_name_bytes(b"data.GZ"),
             Some(ArchiveKind::Gzip)
+        );
+        assert_eq!(
+            detect_kind_from_name_bytes(b"data.BZ2"),
+            Some(ArchiveKind::Bzip2)
         );
         assert_eq!(
             detect_kind_from_name_bytes(b"bundle.zip"),
@@ -384,6 +471,16 @@ mod tests {
         assert_eq!(detect_kind_from_name_bytes(b".tar"), Some(ArchiveKind::Tar));
         assert_eq!(detect_kind_from_name_bytes(b"zip"), None);
         assert_eq!(detect_kind_from_name_bytes(b".zip"), Some(ArchiveKind::Zip));
+        assert_eq!(detect_kind_from_name_bytes(b"bz2"), None);
+        assert_eq!(
+            detect_kind_from_name_bytes(b".bz2"),
+            Some(ArchiveKind::Bzip2)
+        );
+        assert_eq!(detect_kind_from_name_bytes(b"tbz2"), None);
+        assert_eq!(
+            detect_kind_from_name_bytes(b".tbz2"),
+            Some(ArchiveKind::TarBz2)
+        );
     }
 
     #[test]
@@ -393,11 +490,23 @@ mod tests {
             Some(ArchiveKind::TarGz)
         );
         assert_eq!(
+            detect_kind_from_name_bytes(b".tar.bz2"),
+            Some(ArchiveKind::TarBz2)
+        );
+        assert_eq!(
             detect_kind_from_name_bytes(b".tgz"),
             Some(ArchiveKind::TarGz)
         );
+        assert_eq!(
+            detect_kind_from_name_bytes(b".tbz2"),
+            Some(ArchiveKind::TarBz2)
+        );
         assert_eq!(detect_kind_from_name_bytes(b".tar"), Some(ArchiveKind::Tar));
         assert_eq!(detect_kind_from_name_bytes(b".gz"), Some(ArchiveKind::Gzip));
+        assert_eq!(
+            detect_kind_from_name_bytes(b".bz2"),
+            Some(ArchiveKind::Bzip2)
+        );
         assert_eq!(detect_kind_from_name_bytes(b".zip"), Some(ArchiveKind::Zip));
     }
 
@@ -454,6 +563,38 @@ mod tests {
                 std::str::from_utf8(input)
             );
         }
+        // .tar.bz2 mixed case
+        for &input in &[
+            &b".Tar.Bz2"[..],
+            &b".TAR.bz2"[..],
+            &b".tar.BZ2"[..],
+            &b".TAR.BZ2"[..],
+        ] {
+            assert_eq!(
+                detect_kind_from_name_bytes(input),
+                Some(ArchiveKind::TarBz2),
+                "failed for {:?}",
+                std::str::from_utf8(input)
+            );
+        }
+        // .tbz2 mixed case
+        for &input in &[&b".Tbz2"[..], &b".tBz2"[..], &b".tbZ2"[..], &b".TBZ2"[..]] {
+            assert_eq!(
+                detect_kind_from_name_bytes(input),
+                Some(ArchiveKind::TarBz2),
+                "failed for {:?}",
+                std::str::from_utf8(input)
+            );
+        }
+        // .bz2 mixed case
+        for &input in &[&b".Bz2"[..], &b".bZ2"[..], &b".BZ2"[..]] {
+            assert_eq!(
+                detect_kind_from_name_bytes(input),
+                Some(ArchiveKind::Bzip2),
+                "failed for {:?}",
+                std::str::from_utf8(input)
+            );
+        }
     }
 
     #[test]
@@ -462,6 +603,9 @@ mod tests {
         assert_eq!(detect_kind_from_name_bytes(b"file.bz"), None);
         assert_eq!(detect_kind_from_name_bytes(b"file.xz"), None);
         assert_eq!(detect_kind_from_name_bytes(b"file.7z"), None);
+        // Ends in '2' but not a recognized bzip2 extension.
+        assert_eq!(detect_kind_from_name_bytes(b"file.z2"), None);
+        assert_eq!(detect_kind_from_name_bytes(b"file.abz2"), None);
         // Ends in 'r' but not .tar
         assert_eq!(detect_kind_from_name_bytes(b"file.jar"), None);
         assert_eq!(detect_kind_from_name_bytes(b"file.bar"), None);
@@ -515,12 +659,17 @@ mod tests {
             "",
             "a",
             ".gz",
+            ".bz2",
+            ".tbz2",
+            ".tar.bz2",
             "file.bz",
             "file.jar",
             "file.bmp",
             ".tar.gz",
             ".Tar.Gz",
+            ".Tar.Bz2",
             "archive.TAR.GZ/",
+            "archive.TAR.BZ2/",
         ];
         for &s in cases {
             assert_eq!(
@@ -603,5 +752,20 @@ mod kani_proofs {
         let slice = &name[..len];
 
         let _ = detect_p_suffix(slice, len);
+    }
+
+    /// Prove `detect_2_suffix` never panics for any `(name, len)` pair.
+    ///
+    /// Intentionally unconstrained — see `verify_detect_z_suffix_no_panic`.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn verify_detect_2_suffix_no_panic() {
+        let len: usize = kani::any();
+        kani::assume(len <= 32);
+
+        let name: [u8; 32] = kani::any();
+        let slice = &name[..len];
+
+        let _ = detect_2_suffix(slice, len);
     }
 }

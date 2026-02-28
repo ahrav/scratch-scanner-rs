@@ -1,7 +1,7 @@
 //! Archive scanning core with a sink-driven entry interface.
 //!
 //! # Scope
-//! - Streaming archive parsing (gzip/tar/tar.gz/zip) with deterministic budgets.
+//! - Streaming archive parsing (gzip/bzip2/tar/tar.gz/tar.bz2/zip) with deterministic budgets.
 //! - Virtual path construction + path budget enforcement.
 //! - Entry scanning is delegated to an [`ArchiveEntrySink`] to avoid coupling
 //!   to the pipeline or simulation harness.
@@ -11,14 +11,16 @@
 //! | Function | Format | Access pattern |
 //! |---|---|---|
 //! | [`scan_gzip_stream`] | `.gz` | Sequential (`Read`) |
+//! | [`scan_bzip2_stream`] | `.bz2` | Sequential (`Read`) |
 //! | [`scan_tar_stream`] | `.tar` (plain or wrapped) | Sequential (`TarRead`) |
-//! | [`scan_targz_stream`] | `.tar.gz` | Sequential (`Read`) |
+//! | [`scan_targz_stream`] | `.tar.gz` / `.tgz` | Sequential (`Read`) |
+//! | [`scan_tarbz2_stream`] | `.tar.bz2` / `.tbz2` | Sequential (`Read`) |
 //! | [`scan_zip_source`] | `.zip` | Random access (`ZipSource`) |
 //!
 //! # Sliding-window read loop
 //!
 //! Every entry payload is read using the same pattern (shared across gzip,
-//! tar, and zip code paths):
+//! bzip2, tar, and zip code paths):
 //!
 //! ```text
 //! stream_buf layout on each iteration:
@@ -67,8 +69,9 @@
 //!
 //! # Nested archive handling
 //!
-//! Tar entries whose names match a known archive extension (`.gz`, `.tar`,
-//! `.tar.gz`) are recursively descended up to `max_archive_depth`. Zip
+//! Tar entries whose names match a known archive extension (`.gz`, `.bz2`,
+//! `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`) are recursively descended up to
+//! `max_archive_depth`. Zip
 //! entries inside a tar stream cannot be recursed (no random access) and
 //! are handled according to [`UnsupportedPolicy`](crate::archive::UnsupportedPolicy).
 //! Recursion uses `split_first_mut` to peel per-depth scratch slices
@@ -79,12 +82,20 @@
 //! - All hot-path buffers live in [`ArchiveScratch`] and are reused.
 //! - Chunk overlap is configured once at [`ArchiveScratch::new`] time and
 //!   applied uniformly to every entry read loop.
+//! - **bzip2 CPU exhaustion**: bzip2 block decompression can buffer up to
+//!   900 KiB internally per `read()` call. The `is_deadline_expired()` check
+//!   fires between read iterations, not during a single decompression call,
+//!   so a single block decode can run uninterrupted for a noticeable wall-clock
+//!   interval. Production deployments should set `max_wall_clock_secs_per_root`
+//!   to bound total CPU time per source file.
 
 use std::io::Read;
 
 use crate::archive::detect_kind_from_name_bytes;
 use crate::archive::formats::zip::LimitedRead;
-use crate::archive::formats::{GzipStream, TarCursor, TarNext, TarRead, ZipCursor, ZipEntryMeta};
+use crate::archive::formats::{
+    Bzip2Stream, CompressedStream, GzipStream, TarCursor, TarNext, TarRead, ZipCursor, ZipEntryMeta,
+};
 use crate::archive::formats::{ZipNext, ZipOpen, ZipSource};
 use crate::archive::path::apply_hash_suffix_truncation;
 use crate::archive::util;
@@ -564,7 +575,13 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     // immediately after the call returns.
     let display_buf = std::mem::take(scan.entry_display_buf);
     let display = display_buf.as_slice();
-    let outcome = scan_gzip_entry_stream(&mut scan, &mut gz, display, chunk_size);
+    let outcome = scan_compressed_entry_stream(
+        &mut scan,
+        &mut gz,
+        display,
+        chunk_size,
+        PartialReason::CompressedStreamCorrupt,
+    );
     *scan.entry_display_buf = display_buf;
     let outcome = outcome?;
     scan.budgets.exit_archive();
@@ -576,7 +593,7 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
-/// Inner read loop for a single gzip entry.
+/// Inner read loop for a single compressed-stream entry (gzip or bzip2).
 ///
 /// Implements the sliding-window pattern described in the module docs:
 /// reads up to `chunk_size` decompressed bytes per iteration, charges
@@ -587,8 +604,8 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 ///
 /// - `on_entry_end` is always delivered, even on truncation or I/O error.
 /// - An entry that yields zero decompressed bytes is treated as corrupt
-///   (`GzipCorrupt`), unless a budget limit was hit first (in which case
-///   the budget-derived reason takes precedence).
+///   (`corruption_reason`) by policy, unless a budget limit was hit first
+///   (in which case the budget-derived reason takes precedence).
 ///
 /// # Read loop structure
 ///
@@ -598,13 +615,14 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 /// 3. Probe remaining budget allowance (pre-clamp before issuing the read).
 /// 4. Read up to `min(chunk_size, allowance, buf capacity)` bytes.
 /// 5. Charge compressed-in and decompressed-out budgets post-read.
-/// 6. Deliver the window `[carry..carry+allowed]` to the sink.
+/// 6. Deliver the full window (`overlap prefix + allowed new bytes`) to the sink.
 /// 7. If the budget truncated the read (`allowed < n`), exit.
-fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
+fn scan_compressed_entry_stream<C: CompressedStream, S: ArchiveEntrySink, Z: ZipSource>(
     scan: &mut ArchiveScanCtx<'_, S, Z>,
-    gz: &mut GzipStream<R>,
+    stream: &mut C,
     display: &[u8],
     chunk_size: usize,
+    corruption_reason: PartialReason,
 ) -> Result<ArchiveEnd, S::Error> {
     let budgets = &mut *scan.budgets;
     let overlap = scan.overlap;
@@ -652,7 +670,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
                 if let BudgetHit::SkipEntry(reason) = hit {
                     entry_skip_reason = Some(reason);
                 }
-                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
+                let r = util::budget_hit_to_partial(hit, corruption_reason);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -670,7 +688,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
                 if let BudgetHit::SkipEntry(reason) = hit {
                     entry_skip_reason = Some(reason);
                 }
-                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
+                let r = util::budget_hit_to_partial(hit, corruption_reason);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -678,11 +696,11 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         }
 
         let dst = &mut buf[carry..carry + read_max];
-        let n = match gz.read(dst) {
+        let n = match stream.read(dst) {
             Ok(n) => n,
             Err(_) => {
-                outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
-                entry_partial_reason = Some(PartialReason::GzipCorrupt);
+                outcome = ArchiveEnd::Partial(corruption_reason);
+                entry_partial_reason = Some(corruption_reason);
                 break;
             }
         };
@@ -691,7 +709,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
             break;
         }
 
-        budgets.charge_compressed_in(gz.take_compressed_delta());
+        budgets.charge_compressed_in(stream.take_compressed_delta());
 
         // Post-read charge: if the budget is now exhausted the charge returns
         // a clamped `allowed` count — we deliver only that many bytes and exit.
@@ -700,7 +718,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
             if let BudgetHit::SkipEntry(reason) = hit {
                 entry_skip_reason = Some(reason);
             }
-            let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
+            let r = util::budget_hit_to_partial(hit, corruption_reason);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
             entry_partial_reason = Some(r);
@@ -740,12 +758,13 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
     scan.sink.on_entry_end()?;
     budgets.end_entry(offset > 0);
-    // A gzip entry that produced zero decompressed bytes (and was not
-    // budget-limited) is treated as corrupt — a valid gzip stream always
-    // decompresses to at least one byte.
+    // A compressed entry that produced zero decompressed bytes (and was not
+    // budget-limited) is treated as corrupt by scanner policy. This is
+    // intentionally stricter than the format specs to avoid silently accepting
+    // empty/truncated payloads in archive telemetry.
     if !entry_scanned && outcome == ArchiveEnd::Scanned {
-        outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
-        entry_partial_reason = Some(PartialReason::GzipCorrupt);
+        outcome = ArchiveEnd::Partial(corruption_reason);
+        entry_partial_reason = Some(corruption_reason);
     }
     if let Some(reason) = entry_skip_reason {
         scan.stats.record_entry_skipped(reason, display, false);
@@ -757,9 +776,61 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
+/// Scan a bzip2 stream as a single virtual entry (root-level entry point).
+///
+/// The sink sees exactly one entry named `<bunzip2>`.
+pub fn scan_bzip2_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
+    reader: R,
+    root_display: &[u8],
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch<Z>,
+    sink: &mut S,
+    stats: &mut ArchiveStats,
+) -> Result<ArchiveEnd, S::Error> {
+    let mut scan = ArchiveScanCtx::new(sink, stats, archive, scratch);
+    let chunk_size = scan.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let max_len = archive.max_virtual_path_len_per_entry;
+
+    debug_assert!(scan.vpaths.len() > 1);
+    debug_assert!(scan.path_budget_used.len() > 1);
+    scan.path_budget_used[1] = 0;
+
+    let entry_name_bytes = b"<bunzip2>";
+    let need;
+    {
+        let built = scan.vpaths[1].build(root_display, entry_name_bytes, max_len);
+        need = built.bytes.len();
+        scan.entry_display_buf.clear();
+        scan.entry_display_buf.extend_from_slice(built.bytes);
+    }
+    if scan.path_budget_used[1].saturating_add(need) > archive.max_virtual_path_bytes_per_archive {
+        return Ok(ArchiveEnd::Partial(PartialReason::PathBudgetExceeded));
+    }
+    scan.path_budget_used[1] = scan.path_budget_used[1].saturating_add(need);
+
+    scan.budgets.reset();
+    if let Err(hit) = scan.budgets.enter_archive() {
+        return Ok(budget_hit_to_archive_end(hit));
+    }
+
+    let mut bz2 = Bzip2Stream::new(reader);
+    let display_buf = std::mem::take(scan.entry_display_buf);
+    let display = display_buf.as_slice();
+    let outcome = scan_compressed_entry_stream(
+        &mut scan,
+        &mut bz2,
+        display,
+        chunk_size,
+        PartialReason::CompressedStreamCorrupt,
+    )?;
+    *scan.entry_display_buf = display_buf;
+    scan.budgets.exit_archive();
+    Ok(outcome)
+}
+
 /// Scan a tar stream (plain or gzip-wrapped) as sequential entries.
 ///
-/// This is the top-level entry point for `.tar` and `.tar.gz` archives.
+/// This is the top-level entry point for `.tar`, `.tar.gz`, and `.tar.bz2` archives.
 /// It resets budgets, pushes an archive frame, delegates to the recursive
 /// [`scan_tar_stream_nested`] for actual entry iteration, and pops the
 /// frame on return.
@@ -767,11 +838,11 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 /// # Parameters
 ///
 /// - `ratio_active` — enables inflation-ratio pre-clamping before each
-///   payload read. Set `true` when the tar stream is wrapped in gzip so
-///   that the ratio budget is enforced against decompressed output. Ratio
-///   enforcement also runs inside `charge_decompressed_out` regardless of
-///   this flag, but the pre-clamp avoids decompressing bytes that would
-///   be immediately discarded.
+///   payload read. Set `true` when the tar stream is wrapped in a compressed
+///   stream (gzip or bzip2) so that the ratio budget is enforced against
+///   decompressed output. Ratio enforcement also runs inside
+///   `charge_decompressed_out` regardless of this flag, but the pre-clamp
+///   avoids decompressing bytes that would be immediately discarded.
 ///
 /// # Errors
 ///
@@ -807,7 +878,7 @@ pub fn scan_tar_stream<R: TarRead, S: ArchiveEntrySink, Z: ZipSource>(
 /// 2. Skips non-regular entries (directories, symlinks, etc.).
 /// 3. Checks whether the entry name matches a known archive extension.
 ///    If so — and the depth limit has not been reached — the entry is
-///    recursively descended as a nested archive (gzip, tar, or tar.gz).
+///    recursively descended as a nested archive (gzip/bzip2/tar/tar.gz/tar.bz2).
 ///    Zip entries inside tar cannot be descended (no random access) and
 ///    fall through to raw-byte scanning unless the policy aborts.
 /// 4. Otherwise, runs the sliding-window read loop to deliver payload
@@ -984,7 +1055,11 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                         }
                     }
                 }
-                ArchiveKind::Gzip | ArchiveKind::Tar | ArchiveKind::TarGz => {
+                ArchiveKind::Gzip
+                | ArchiveKind::Bzip2
+                | ArchiveKind::Tar
+                | ArchiveKind::TarGz
+                | ArchiveKind::TarBz2 => {
                     if depth >= max_depth {
                         scan.stats.record_archive_skipped(
                             ArchiveSkipReason::DepthExceeded,
@@ -1092,14 +1167,78 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                                 }
                                 *gunzip_path_used = gunzip_path_used.saturating_add(need);
 
-                                let out = scan_gzip_entry_stream(
+                                let out = scan_compressed_entry_stream(
                                     &mut child,
                                     &mut gz,
                                     gunzip_display,
                                     chunk_size,
+                                    PartialReason::CompressedStreamCorrupt,
                                 )?;
                                 let (entry_reader, hdr_buf) = gz.into_inner().into_parts();
                                 *child.gzip_header_buf = hdr_buf;
+                                (out, entry_reader.remaining())
+                            }
+                            ArchiveKind::Bzip2 => {
+                                debug_assert!(
+                                    !rest_vpaths.is_empty(),
+                                    "vpaths exhausted for nested archive at depth {depth}"
+                                );
+                                debug_assert!(
+                                    !rest_path_used.is_empty(),
+                                    "path_budget_used exhausted for nested archive at depth {depth}"
+                                );
+                                let (bunzip_vpath, vpaths_tail) = rest_vpaths
+                                    .split_first_mut()
+                                    .expect("vpath scratch exhausted");
+                                let (bunzip_path_used, path_used_tail) = rest_path_used
+                                    .split_first_mut()
+                                    .expect("path budget scratch exhausted");
+                                let mut child = ArchiveScanCtx {
+                                    sink: scan.sink,
+                                    stats: scan.stats,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: vpaths_tail,
+                                    path_budget_used: path_used_tail,
+                                    tar_cursors: rest_cursors,
+                                    zip_cursor: scan.zip_cursor,
+                                    entry_display_buf: scan.entry_display_buf,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    stream_buf: scan.stream_buf,
+                                    archive: scan.archive,
+                                    chunk_size: scan.chunk_size,
+                                    overlap: scan.overlap,
+                                    abort_run: scan.abort_run,
+                                };
+
+                                let entry_name_bytes = b"<bunzip2>";
+                                let bunzip_display = bunzip_vpath
+                                    .build(entry_display, entry_name_bytes, max_len)
+                                    .bytes;
+                                *bunzip_path_used = 0;
+                                let need = bunzip_display.len();
+                                if bunzip_path_used.saturating_add(need)
+                                    > scan.archive.max_virtual_path_bytes_per_archive
+                                {
+                                    outcome =
+                                        ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);
+                                    budgets.exit_archive();
+                                    budgets.end_entry(true);
+                                    break;
+                                }
+                                *bunzip_path_used = bunzip_path_used.saturating_add(need);
+
+                                let entry_reader = LimitedRead::new(input, entry_size);
+                                let mut bz2 = Bzip2Stream::new(entry_reader);
+                                let out = scan_compressed_entry_stream(
+                                    &mut child,
+                                    &mut bz2,
+                                    bunzip_display,
+                                    chunk_size,
+                                    PartialReason::CompressedStreamCorrupt,
+                                )?;
+                                let entry_reader = bz2.into_inner();
                                 (out, entry_reader.remaining())
                             }
                             ArchiveKind::Tar => {
@@ -1160,6 +1299,37 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                                     true,
                                 )?;
                                 let entry_reader = gz.into_inner();
+                                (out, entry_reader.remaining())
+                            }
+                            ArchiveKind::TarBz2 => {
+                                let mut child = ArchiveScanCtx {
+                                    sink: scan.sink,
+                                    stats: scan.stats,
+                                    budgets,
+                                    canon: scan.canon,
+                                    vpaths: rest_vpaths,
+                                    path_budget_used: rest_path_used,
+                                    tar_cursors: rest_cursors,
+                                    zip_cursor: scan.zip_cursor,
+                                    entry_display_buf: scan.entry_display_buf,
+                                    gzip_header_buf: scan.gzip_header_buf,
+                                    gzip_name_buf: scan.gzip_name_buf,
+                                    stream_buf: scan.stream_buf,
+                                    archive: scan.archive,
+                                    chunk_size: scan.chunk_size,
+                                    overlap: scan.overlap,
+                                    abort_run: scan.abort_run,
+                                };
+                                let entry_reader = LimitedRead::new(input, entry_size);
+                                let mut bz2 = Bzip2Stream::new(entry_reader);
+                                let out = scan_tar_stream_nested(
+                                    &mut child,
+                                    &mut bz2,
+                                    entry_display,
+                                    depth + 1,
+                                    true,
+                                )?;
+                                let entry_reader = bz2.into_inner();
                                 (out, entry_reader.remaining())
                             }
                             ArchiveKind::Zip => unreachable!(),
@@ -1443,6 +1613,23 @@ pub fn scan_targz_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 ) -> Result<ArchiveEnd, S::Error> {
     let mut gz = GzipStream::new(reader);
     scan_tar_stream(&mut gz, root_display, archive, scratch, sink, stats, true)
+}
+
+/// Scan a bzip2-compressed tar stream (`.tar.bz2` / `.tbz2`).
+///
+/// Thin wrapper: wraps the reader in a [`Bzip2Stream`] decoder and delegates
+/// to [`scan_tar_stream`] with `ratio_active = true` so that inflation-ratio
+/// enforcement applies to the decompressed tar payload.
+pub fn scan_tarbz2_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
+    reader: R,
+    root_display: &[u8],
+    archive: &ArchiveConfig,
+    scratch: &mut ArchiveScratch<Z>,
+    sink: &mut S,
+    stats: &mut ArchiveStats,
+) -> Result<ArchiveEnd, S::Error> {
+    let mut bz2 = Bzip2Stream::new(reader);
+    scan_tar_stream(&mut bz2, root_display, archive, scratch, sink, stats, true)
 }
 
 /// Scan a zip archive via random access.

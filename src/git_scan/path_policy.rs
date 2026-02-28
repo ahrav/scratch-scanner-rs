@@ -214,7 +214,6 @@ static SKIP_EXTS: &[u64] = {
         pack_ext(b"blend"), // Blender
         pack_ext(b"bmp"),
         pack_ext(b"br"), // Brotli
-        pack_ext(b"bz2"),
         // ---- Archives / other ----
         pack_ext(b"cab"), // Windows cabinet
         pack_ext(b"caf"), // Core Audio Format
@@ -345,7 +344,6 @@ static SKIP_EXTS: &[u64] = {
         pack_ext(b"sys"),    // Windows system
         // ---- Archives (T) ----
         pack_ext(b"tar"),
-        pack_ext(b"tbz2"),
         pack_ext(b"tga"), // Truevision TGA
         pack_ext(b"tgz"),
         pack_ext(b"tif"),
@@ -763,8 +761,8 @@ mod tests {
     // ------------------------------------------------------------------
     const BINARY_EXTS_SAMPLE: &[&[u8]] = &[
         b"png", b"jpg", b"jpeg", b"gif", b"bmp", b"ico", b"tiff", b"webp", b"zip", b"gz", b"tgz",
-        b"xz", b"bz2", b"7z", b"rar", b"tar", b"zst", b"pdf", b"doc", b"docx", b"ppt", b"pptx",
-        b"xls", b"xlsx", b"mp3", b"wav", b"flac", b"ogg", b"mp4", b"mov", b"avi", b"mkv", b"woff",
+        b"xz", b"7z", b"rar", b"tar", b"zst", b"pdf", b"doc", b"docx", b"ppt", b"pptx", b"xls",
+        b"xlsx", b"mp3", b"wav", b"flac", b"ogg", b"mp4", b"mov", b"avi", b"mkv", b"woff",
         b"woff2", b"ttf", b"otf", b"exe", b"dll", b"so", b"dylib", b"bin", b"dat", b"wasm",
     ];
 
@@ -789,6 +787,8 @@ mod tests {
             b"jar",
             b"war",
             b"ear",
+            b"bz2",
+            b"tbz2",
             b"pyc",
             b"pyo",
             b"ipynb",

@@ -229,8 +229,8 @@ pub enum PartialReason {
     /// Scanning stopped due to inflation ratio (archive-level or promoted
     /// entry-level ratio hit).
     InflationRatioExceeded = 5,
-    /// gzip stream corrupted mid-stream (bytes already produced were scanned).
-    GzipCorrupt = 6,
+    /// Compressed stream corrupted mid-stream (bytes already produced were scanned).
+    CompressedStreamCorrupt = 6,
     /// tar container malformed mid-stream.
     MalformedTar = 7,
     /// zip container malformed mid-scan.
@@ -262,7 +262,7 @@ impl PartialReason {
             Self::ArchiveOutputBudgetExceeded => "archive_output_budget_exceeded",
             Self::RootOutputBudgetExceeded => "root_output_budget_exceeded",
             Self::InflationRatioExceeded => "inflation_ratio_exceeded",
-            Self::GzipCorrupt => "gzip_corrupt",
+            Self::CompressedStreamCorrupt => "compressed_stream_corrupt",
             Self::MalformedTar => "malformed_tar",
             Self::MalformedZip => "malformed_zip",
             Self::EntryCountExceeded => "entry_count_exceeded",
@@ -317,7 +317,7 @@ const PARTIAL_REASONS: [PartialReason; PartialReason::COUNT] = [
     PartialReason::ArchiveOutputBudgetExceeded,
     PartialReason::RootOutputBudgetExceeded,
     PartialReason::InflationRatioExceeded,
-    PartialReason::GzipCorrupt,
+    PartialReason::CompressedStreamCorrupt,
     PartialReason::MalformedTar,
     PartialReason::MalformedZip,
     PartialReason::EntryCountExceeded,

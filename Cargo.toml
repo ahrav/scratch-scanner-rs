@@ -21,7 +21,11 @@ crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
 crc32fast = "1.4"
+# Both use C backends for throughput (C toolchain already required by
+# vectorscan-rs-sys and aegis). Benchmarked: C libbzip2 is ~13-15% faster
+# than pure-Rust libbz2-rs-sys across all workloads.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
+bzip2 = "0.5"
 libc = "0.2"
 memchr = "2.8"
 memmap2 = "0.9"

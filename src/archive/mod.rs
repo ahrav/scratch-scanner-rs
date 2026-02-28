@@ -35,6 +35,6 @@ pub use path::{
     CanonicalPath, EntryPathCanonicalizer, VirtualPath, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
 };
 pub use scan::{
-    scan_gzip_stream, scan_tar_stream, scan_targz_stream, scan_zip_source, ArchiveEnd,
-    ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
+    scan_bzip2_stream, scan_gzip_stream, scan_tar_stream, scan_tarbz2_stream, scan_targz_stream,
+    scan_zip_source, ArchiveEnd, ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
 };
