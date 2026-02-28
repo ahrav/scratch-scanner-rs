@@ -48,7 +48,7 @@ runs:
           if [ ! -d "${dir}" ]; then
             mkdir -p "${dir}/src"
             printf '[package]\nname = "%s"\nversion = "0.0.0"\nedition = "2021"\n' "${crate}" > "${dir}/Cargo.toml"
-            touch "${dir}/src/lib.rs"
+            printf '\n' > "${dir}/src/lib.rs"
           fi
         done
 
