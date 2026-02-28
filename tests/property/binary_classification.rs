@@ -44,10 +44,12 @@ proptest! {
             Just(&b"file.pyc"[..]),
         ]
     ) {
-        // Empty data has no NUL bytes, so should be Text (or Extractable
-        // for known extensions since ipynb/class/pyc match on extension even for text).
+        // Empty data has no NUL bytes, so classify_content returns Text for
+        // most extensions (including .class and .pyc, since those only extract
+        // from binary content). Only .ipynb and .env would return Extractable
+        // for NUL-free data, but neither is in this test set.
         let verdict = classify_content(b"", ext, CHECK_LEN);
-        // Empty data is never Binary.
+        // The assertion simply verifies empty data is never Binary.
         prop_assert_ne!(verdict, ContentVerdict::Binary);
     }
 
