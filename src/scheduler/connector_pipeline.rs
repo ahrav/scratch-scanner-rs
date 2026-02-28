@@ -31,6 +31,9 @@
 //! └──────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! On error at any step, the loop exits immediately. Checkpoints already
+//! persisted are durable; no terminal transition (complete/park) is called.
+//!
 //! # Core invariant
 //!
 //! **Checkpoint advancement is strictly page-gated.** The cursor is never
@@ -109,47 +112,42 @@ impl Default for ConnectorConfig {
 }
 
 impl ConnectorConfig {
-    /// Assert that every field satisfies scheduler invariants.
+    /// Validate that every field satisfies scheduler invariants.
     ///
     /// Checks that all counts are positive, budget fields are positive, and
     /// `chunk_size + required_overlap <= BUFFER_LEN_MAX` (the engine's hard
     /// buffer cap). `required_overlap` comes from the engine and represents
     /// the minimum overlap needed for cross-chunk pattern matching.
-    ///
-    /// # Panics
-    ///
-    /// Panics immediately on the first violated invariant.
-    pub fn validate(&self, required_overlap: usize) {
-        assert!(self.cpu_workers > 0, "cpu_workers must be > 0");
-        assert!(self.chunk_size > 0, "chunk_size must be > 0");
-        assert!(
-            self.page_budgets.max_items() > 0,
-            "page_budgets.max_items must be > 0"
-        );
-        assert!(
-            self.page_budgets.max_bytes() > 0,
-            "page_budgets.max_bytes must be > 0"
-        );
+    pub fn validate(&self, required_overlap: usize) -> Result<(), String> {
+        if self.cpu_workers == 0 {
+            return Err("cpu_workers must be > 0".into());
+        }
+        if self.chunk_size == 0 {
+            return Err("chunk_size must be > 0".into());
+        }
+        if self.page_budgets.max_items() == 0 {
+            return Err("page_budgets.max_items must be > 0".into());
+        }
+        if self.page_budgets.max_bytes() == 0 {
+            return Err("page_budgets.max_bytes must be > 0".into());
+        }
         if let Some(split) = self.split_hint_budgets {
-            assert!(
-                split.max_items() > 0,
-                "split_hint_budgets.max_items must be > 0"
-            );
-            assert!(
-                split.max_bytes() > 0,
-                "split_hint_budgets.max_bytes must be > 0"
-            );
+            if split.max_items() == 0 {
+                return Err("split_hint_budgets.max_items must be > 0".into());
+            }
+            if split.max_bytes() == 0 {
+                return Err("split_hint_budgets.max_bytes must be > 0".into());
+            }
         }
 
         let buf_len = required_overlap.saturating_add(self.chunk_size);
-        assert!(
-            buf_len <= BUFFER_LEN_MAX,
-            "chunk_size ({}) + overlap ({}) = {} exceeds BUFFER_LEN_MAX ({})",
-            self.chunk_size,
-            required_overlap,
-            buf_len,
-            BUFFER_LEN_MAX
-        );
+        if buf_len > BUFFER_LEN_MAX {
+            return Err(format!(
+                "chunk_size ({}) + overlap ({}) = {} exceeds BUFFER_LEN_MAX ({})",
+                self.chunk_size, required_overlap, buf_len, BUFFER_LEN_MAX
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -161,11 +159,17 @@ impl ConnectorConfig {
 ///    at scan start to establish the shard boundaries and resume point.
 /// 2. [`checkpoint`](Self::checkpoint) — called after every page-completion
 ///    barrier, persisting the cursor that marks the *end* of the completed page.
-/// 3. Exactly one terminal transition:
+/// 3. Exactly one terminal transition on success:
 ///    - [`complete`](Self::complete) — the connector returned an empty terminal
 ///      page; the shard is fully scanned.
 ///    - [`park`](Self::park) — the scan yields ownership (e.g., timeout or
 ///      graceful shutdown) without completing the shard.
+///
+///    **On error:** If the pipeline returns `Err`, no terminal transition is
+///    called. The progress sink may have received zero or more `checkpoint`
+///    calls before the error. The coordinator must treat the absence of a
+///    terminal transition as an implicit failure and handle accordingly
+///    (e.g., re-assign the shard from the last-checkpointed cursor).
 /// 4. [`split_hint`](Self::split_hint) — optionally called between checkpoint
 ///    and the next enumerate, suggesting a key at which the coordinator could
 ///    split this shard for parallelism.
@@ -232,6 +236,12 @@ pub struct ConnectorRunReport {
 ///
 /// The generic parameter `E` is the [`ProgressSink::Error`] associated type,
 /// so callers see a fully concrete error when the progress backend is known.
+///
+/// **Partial progress:** When the pipeline returns any of these errors,
+/// zero or more pages may have been successfully checkpointed before the
+/// failure. The [`ProgressSink`] cursor reflects the last successful
+/// checkpoint. No terminal lifecycle transition ([`ProgressSink::complete`]
+/// or [`ProgressSink::park`]) is called on error paths.
 #[derive(Debug)]
 pub enum ConnectorRunError<E> {
     /// Connector enumeration or split-hint selection failed.
@@ -254,6 +264,8 @@ pub enum ConnectorRunError<E> {
         /// Maximum allowed by [`Budgets::max_items`].
         limit: usize,
     },
+    /// The [`ConnectorConfig`] failed validation.
+    Config(String),
 }
 
 /// Monotonically increasing page identifier within a single scan run.
@@ -476,7 +488,8 @@ where
     P: ProgressSink + ?Sized,
     D: FnMut(PageId, &[ScanItem], Vec<PageItemToken>) -> Result<(), ConnectorRunError<P::Error>>,
 {
-    cfg.validate(engine.required_overlap());
+    cfg.validate(engine.required_overlap())
+        .map_err(ConnectorRunError::Config)?;
 
     let mut report = ConnectorRunReport::default();
     let mut cursor = progress.cursor();
@@ -1016,32 +1029,32 @@ mod tests {
     // -- ConnectorConfig::validate() coverage --
 
     #[rstest]
-    #[case::cpu_workers_zero("cpu_workers")]
-    #[case::chunk_size_zero("chunk_size")]
-    #[should_panic]
-    fn validate_rejects_zero_field(#[case] field: &str) {
+    #[case::cpu_workers_zero("cpu_workers", "cpu_workers must be > 0")]
+    #[case::chunk_size_zero("chunk_size", "chunk_size must be > 0")]
+    fn validate_rejects_zero_field(#[case] field: &str, #[case] expected_msg: &str) {
         let mut cfg = ConnectorConfig::default();
         match field {
             "cpu_workers" => cfg.cpu_workers = 0,
             "chunk_size" => cfg.chunk_size = 0,
             _ => unreachable!(),
         }
-        cfg.validate(16);
+        let err = cfg.validate(16).unwrap_err();
+        assert_eq!(err, expected_msg);
     }
 
     #[test]
-    #[should_panic(expected = "exceeds BUFFER_LEN_MAX")]
     fn validate_rejects_chunk_plus_overlap_exceeding_max() {
         let cfg = ConnectorConfig {
             chunk_size: BUFFER_LEN_MAX,
             ..ConnectorConfig::default()
         };
-        cfg.validate(16);
+        let err = cfg.validate(16).unwrap_err();
+        assert!(err.contains("exceeds BUFFER_LEN_MAX"), "got: {err}");
     }
 
     #[test]
     fn validate_accepts_default_config() {
-        ConnectorConfig::default().validate(16);
+        ConnectorConfig::default().validate(16).unwrap();
     }
 
     // -- PageCompletionBarrier edge cases --
