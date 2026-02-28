@@ -32,7 +32,9 @@ pub enum ContentVerdict {
     Text,
     /// Content appears to be binary — skip unless `--scan-binary` is set.
     Binary,
-    /// Content is a known format from which text can be extracted.
+    /// Content is a known format from which text can be extracted,
+    /// including binary containers (`.class`, `.jar`, `.war`, `.pyc`)
+    /// and text formats with structured extraction (`.ipynb`, `.env`).
     Extractable(ExtractableFormat),
 }
 

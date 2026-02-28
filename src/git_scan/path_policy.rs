@@ -178,8 +178,9 @@ const MAX_LONG_EXTS: usize = 16;
 
 /// Sorted packed-u64 table of binary extensions that are safe to skip.
 ///
-/// **Not included** (Extractable — must reach content classifier):
-/// `.class`, `.ear`, `.ipynb`, `.jar`, `.pyc`, `.pyo`, `.war`
+/// **Not included** (must reach content classifier):
+/// `.class`, `.ipynb`, `.jar`, `.pyc`, `.war` (currently `Extractable`);
+/// `.ear`, `.pyo` (similar formats, excluded defensively)
 ///
 /// **Not included** (ambiguous/text-based):
 /// `.db`, `.sqlite`, `.sqlitedb`, `.accdb`, `.mdb`, `.pb`, `.rtf`, `.svg`,
