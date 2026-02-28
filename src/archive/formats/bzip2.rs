@@ -2,6 +2,7 @@
 //!
 //! # Invariants
 //! - The stream is read sequentially; no seeking.
+//! - `MultiBzDecoder` treats concatenated members as a single stream.
 //! - Compressed-byte accounting is sourced from [`CountedRead`].
 //!
 //! # Design Notes
@@ -10,7 +11,7 @@
 
 use std::io::{self, Read};
 
-use bzip2::read::BzDecoder;
+use bzip2::read::MultiBzDecoder;
 
 use crate::archive::util::CountedRead;
 
@@ -26,8 +27,11 @@ pub fn is_bzip2_magic(header: &[u8]) -> bool {
 }
 
 /// Streaming bzip2 decoder with compressed-byte delta reporting.
+///
+/// Uses `MultiBzDecoder` to transparently decode concatenated bzip2 members
+/// as a single stream, matching `GzipStream`'s use of `MultiGzDecoder`.
 pub struct Bzip2Stream<R: Read> {
-    dec: BzDecoder<CountedRead<R>>,
+    dec: MultiBzDecoder<CountedRead<R>>,
     last_bytes: u64,
 }
 
@@ -35,7 +39,7 @@ impl<R: Read> Bzip2Stream<R> {
     #[inline]
     pub fn new(reader: R) -> Self {
         Self {
-            dec: BzDecoder::new(CountedRead::new(reader)),
+            dec: MultiBzDecoder::new(CountedRead::new(reader)),
             last_bytes: 0,
         }
     }
@@ -85,5 +89,135 @@ mod tests {
         assert!(is_bzip2_magic(b"BZh9"));
         assert!(!is_bzip2_magic(b"BZ"));
         assert!(!is_bzip2_magic(b"PK\x03\x04"));
+    }
+
+    /// Exact 3-byte boundary: `"BZh"` is the minimum valid magic prefix.
+    #[test]
+    fn magic_exact_three_byte_boundary() {
+        assert!(is_bzip2_magic(b"BZh"));
+    }
+
+    /// Compress → decompress via `Bzip2Stream`, verify byte-exact round-trip.
+    #[test]
+    fn read_round_trip() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let original = b"deterministic round-trip payload 0123456789";
+        let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(original).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let mut stream = Bzip2Stream::new(std::io::Cursor::new(&compressed));
+        let mut output = Vec::new();
+        let mut buf = [0u8; 16];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(output, original);
+    }
+
+    /// Read in 16-byte chunks, accumulating deltas; the sum must equal
+    /// `total_compressed()` which must equal the compressed input length.
+    #[test]
+    fn take_compressed_delta_accounting() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let original: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+        let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&original).unwrap();
+        let compressed = enc.finish().unwrap();
+        let compressed_len = compressed.len() as u64;
+
+        let mut stream = Bzip2Stream::new(std::io::Cursor::new(compressed));
+        let mut buf = [0u8; 16];
+        let mut delta_sum: u64 = 0;
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            delta_sum += stream.take_compressed_delta();
+        }
+        // Final delta after EOF read.
+        delta_sum += stream.take_compressed_delta();
+
+        assert_eq!(delta_sum, compressed_len);
+        assert_eq!(stream.total_compressed(), compressed_len);
+    }
+
+    /// After EOF, `into_inner` recovers the underlying reader at its final
+    /// position (all compressed bytes consumed).
+    #[test]
+    fn into_inner_recovers_reader() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let original = b"recover inner reader";
+        let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(original).unwrap();
+        let compressed = enc.finish().unwrap();
+        let compressed_len = compressed.len() as u64;
+
+        let mut stream = Bzip2Stream::new(std::io::Cursor::new(compressed));
+        let mut buf = [0u8; 64];
+        while stream.read(&mut buf).unwrap() > 0 {}
+
+        let cursor = stream.into_inner();
+        assert_eq!(cursor.position(), compressed_len);
+    }
+
+    #[test]
+    fn decodes_all_concatenated_members() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        // Create two independently-compressed bzip2 members and concatenate them.
+        let part_a = b"FIRST_MEMBER_DATA_AAA";
+        let part_b = b"SECOND_MEMBER_DATA_BBB";
+
+        let mut compressed = Vec::new();
+        {
+            let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(part_a).unwrap();
+            compressed.extend(enc.finish().unwrap());
+        }
+        {
+            let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(part_b).unwrap();
+            compressed.extend(enc.finish().unwrap());
+        }
+
+        // Decode through Bzip2Stream — should yield both members.
+        let mut stream = Bzip2Stream::new(std::io::Cursor::new(&compressed));
+        let mut output = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..n]);
+        }
+
+        let expected_len = part_a.len() + part_b.len();
+        assert_eq!(
+            output.len(),
+            expected_len,
+            "expected {expected_len} decompressed bytes but got {}; \
+             only the first member was decoded",
+            output.len()
+        );
+        assert_eq!(&output[..part_a.len()], part_a.as_slice());
+        assert_eq!(&output[part_a.len()..], part_b.as_slice());
     }
 }

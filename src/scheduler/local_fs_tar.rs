@@ -19,10 +19,9 @@ use super::executor::WorkerCtx;
 use super::local_fs_archive_ctx::{
     alloc_virtual_file_id, apply_entry_budget_clamp, budget_hit_to_archive_end,
     budget_hit_to_partial_reason, build_locator, discard_remaining_payload,
-    map_archive_skip_to_partial, ArchiveEnd, ArchiveScanCtx, ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
+    map_archive_skip_to_partial, scan_compressed_stream_nested, ArchiveEnd, ArchiveScanCtx,
+    ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
 };
-use super::local_fs_bzip2::scan_bzip2_stream_nested;
-use super::local_fs_gzip::scan_gzip_stream_nested;
 use super::local_fs_owner::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
     emit_persistence_batch, FileTask, LocalScratch,
@@ -293,8 +292,12 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 }
                                 *gunzip_path_used = gunzip_path_used.saturating_add(need);
 
-                                let out =
-                                    scan_gzip_stream_nested(&mut child, &mut gz, gunzip_display);
+                                let out = scan_compressed_stream_nested(
+                                    &mut child,
+                                    &mut gz,
+                                    gunzip_display,
+                                    PartialReason::CompressedStreamCorrupt,
+                                );
                                 let (entry_reader, hdr_buf) = gz.into_inner().into_parts();
                                 *child.gzip_header_buf = hdr_buf;
                                 (out, entry_reader.remaining())
@@ -347,8 +350,12 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
 
                                 let entry_reader = LimitedRead::new(input, entry_size);
                                 let mut bz2 = Bzip2Stream::new(entry_reader);
-                                let out =
-                                    scan_bzip2_stream_nested(&mut child, &mut bz2, bunzip_display);
+                                let out = scan_compressed_stream_nested(
+                                    &mut child,
+                                    &mut bz2,
+                                    bunzip_display,
+                                    PartialReason::CompressedStreamCorrupt,
+                                );
                                 let entry_reader = bz2.into_inner();
                                 (out, entry_reader.remaining())
                             }
@@ -798,5 +805,6 @@ pub(super) fn process_tarbz2_file<E: ScanEngine>(
             return ArchiveEnd::Skipped(ArchiveSkipReason::IoError);
         }
     };
-    process_tar_like::<E>(task, ctx, TarInput::Bzip2(Bzip2Stream::new(file)))
+    let reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    process_tar_like::<E>(task, ctx, TarInput::Bzip2(Bzip2Stream::new(reader)))
 }

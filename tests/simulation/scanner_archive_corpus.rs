@@ -1083,3 +1083,113 @@ fn archive_tarbz2_wall_clock_timeout_skips_later_entries() {
         build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span_a)]);
     run_archive_scenario_with_countdown(scenario, archive_cfg, 0xC0FF_EE23, 2);
 }
+
+/// Truncated `.tar.bz2` must not panic and must not surface findings for
+/// entries that were never fully decompressed.
+#[test]
+fn archive_tarbz2_truncated_archive_is_handled() {
+    let archive_cfg = base_archive_config();
+
+    let (payload, _span) = payload_with_secret(4, 4);
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"truncated.tar.bz2".to_vec()),
+        kind: ArchiveKindSpec::TarBz2,
+        entries: vec![ArchiveEntrySpec {
+            name_bytes: b"inner.txt".to_vec(),
+            payload,
+            compression: EntryCompressionSpec::Store,
+            encrypted: false,
+            kind: EntryKindSpec::RegularFile,
+        }],
+        corruption: Some(ArchiveCorruptionSpec::TruncateTo { len: 8 }),
+    };
+
+    let scenario = build_archive_scenario(&archive_cfg, spec, Vec::new());
+    run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE24);
+}
+
+/// Truncated standalone `.bz2` must not panic and must not surface findings
+/// for entries that were never fully decompressed.
+#[test]
+fn archive_bzip2_truncated_is_handled() {
+    let archive_cfg = base_archive_config();
+
+    let (payload, _span) = payload_with_secret(4, 4);
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"truncated.bz2".to_vec()),
+        kind: ArchiveKindSpec::Bzip2,
+        entries: vec![ArchiveEntrySpec {
+            name_bytes: b"<bunzip2>".to_vec(),
+            payload,
+            compression: EntryCompressionSpec::Store,
+            encrypted: false,
+            kind: EntryKindSpec::RegularFile,
+        }],
+        corruption: Some(ArchiveCorruptionSpec::TruncateTo { len: 8 }),
+    };
+
+    let scenario = build_archive_scenario(&archive_cfg, spec, Vec::new());
+    run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE27);
+}
+
+/// Standalone `.bz2` smoke test: exercises the `scan_bzip2_stream()` path
+/// with a single payload containing a detectable secret.
+#[test]
+fn archive_bzip2_smoke() {
+    let archive_cfg = base_archive_config();
+
+    let (payload, span) = payload_with_secret(4, 4);
+    let spec = ArchiveFileSpec {
+        root_path: SimPath::new(b"smoke.bz2".to_vec()),
+        kind: ArchiveKindSpec::Bzip2,
+        entries: vec![ArchiveEntrySpec {
+            name_bytes: b"<bunzip2>".to_vec(),
+            payload,
+            compression: EntryCompressionSpec::Store,
+            encrypted: false,
+            kind: EntryKindSpec::RegularFile,
+        }],
+        corruption: None,
+    };
+
+    let scenario =
+        build_archive_scenario(&archive_cfg, spec, vec![ExpectedSpec::must_find(0, span)]);
+    run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE25);
+}
+
+/// Nested bzip2-in-tar: a `.bz2` file as an entry inside a `.tar`,
+/// exercising the `ArchiveKind::Bzip2` nesting branch in `local_fs_tar.rs`.
+#[test]
+fn archive_nested_bzip2_in_tar() {
+    let archive_cfg = base_archive_config();
+
+    let (payload, span) = payload_with_secret(4, 4);
+    let inner_entries = vec![ArchiveEntrySpec {
+        name_bytes: b"<bunzip2>".to_vec(),
+        payload,
+        compression: EntryCompressionSpec::Store,
+        encrypted: false,
+        kind: EntryKindSpec::RegularFile,
+    }];
+
+    let nested = build_nested_archive_case(
+        &archive_cfg,
+        b"outer.tar",
+        ArchiveKindSpec::Tar,
+        b"inner.bz2",
+        ArchiveKindSpec::Bzip2,
+        inner_entries,
+    );
+
+    let expected = vec![ExpectedSecret {
+        path: SimPath::new(nested.inner_entry_paths[0].clone()),
+        rule_id: 0,
+        root_span: span,
+        repr: SecretRepr::Raw,
+        disposition: ExpectedDisposition::MustFind,
+    }];
+
+    let scenario =
+        build_scenario_with_archives(vec![(nested.outer_spec, nested.outer_bytes)], expected);
+    run_archive_scenario(scenario, archive_cfg, 0xC0FF_EE26);
+}

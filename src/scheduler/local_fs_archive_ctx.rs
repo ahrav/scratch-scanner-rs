@@ -7,12 +7,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::api::FileId;
+use crate::archive::formats::CompressedStream;
 use crate::archive::formats::TarCursor;
 use crate::archive::formats::TarRead;
 use crate::archive::util::write_u64_hex_lower;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult,
-    EntryPathCanonicalizer, PartialReason, VirtualPathBuilder,
+    EntryPathCanonicalizer, EntrySkipReason, PartialReason, VirtualPathBuilder,
 };
 use crate::store::{FsFindingRecord, StoreProducer};
 
@@ -252,7 +253,7 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
     /// Scan a buffer chunk, drain/dedupe findings, emit events + persistence,
     /// and update chunk metrics.
     ///
-    /// Shared core used by archive entry scanning loops (currently gzip).
+    /// Shared core used by compressed-stream archive entry scanning loops.
     /// The caller is responsible for reading bytes, charging budgets, and
     /// managing the outer loop condition — this method handles everything
     /// from `scan_chunk_into` through carry/offset bookkeeping.
@@ -439,6 +440,153 @@ pub(super) fn discard_remaining_payload(
         remaining = remaining.saturating_sub(n as u64);
     }
     Ok(())
+}
+
+/// Scan a compressed stream (gzip or bzip2) as a single virtual entry.
+///
+/// Unified inner loop for nested compressed streams within tar archives.
+/// Both gzip and bzip2 formats use the same sliding-window + budget protocol;
+/// the only difference is the stream type, abstracted via [`CompressedStream`].
+///
+/// # Invariants
+/// - Offsets are decompressed byte offsets.
+/// - Budget clamps stop scanning deterministically.
+/// - Decode failures map to `corruption_reason`.
+pub(super) fn scan_compressed_stream_nested<E: ScanEngine, C: CompressedStream>(
+    scan: &mut ArchiveScanCtx<'_, E>,
+    stream: &mut C,
+    display: &[u8],
+    corruption_reason: PartialReason,
+) -> ArchiveEnd {
+    let chunk_size = scan.chunk_size.min(ARCHIVE_STREAM_READ_MAX);
+    let overlap = scan.engine.required_overlap();
+    let file_id = alloc_virtual_file_id(scan.next_virtual_file_id);
+
+    if let Err(hit) = scan.budgets.begin_entry() {
+        return budget_hit_to_archive_end(hit);
+    }
+
+    let mut buf = scan.pool.acquire();
+
+    let mut offset: u64 = 0;
+    let mut carry: usize = 0;
+    let mut have: usize = 0;
+    let mut outcome = ArchiveEnd::Scanned;
+    let mut entry_scanned = false;
+    let mut entry_partial_reason: Option<PartialReason> = None;
+    let mut entry_skip_reason: Option<EntrySkipReason> = None;
+
+    loop {
+        if scan.budgets.is_deadline_expired() {
+            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
+            entry_partial_reason = Some(PartialReason::WallClockTimeout);
+            break;
+        }
+
+        if carry > 0 && have > 0 {
+            buf.as_mut_slice().copy_within(have - carry..have, 0);
+        }
+
+        let allowance = scan
+            .budgets
+            .remaining_decompressed_allowance_with_ratio_probe(true);
+        if allowance == 0 {
+            if let ChargeResult::Clamp { hit, .. } = scan.budgets.charge_decompressed_out(1) {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let read_max = chunk_size
+            .min(buf.len().saturating_sub(carry))
+            .min(allowance.min(u64::from(u32::MAX)) as usize);
+
+        if read_max == 0 {
+            if let ChargeResult::Clamp { hit, .. } = scan.budgets.charge_decompressed_out(1) {
+                if let BudgetHit::SkipEntry(reason) = hit {
+                    entry_skip_reason = Some(reason);
+                }
+                let r = budget_hit_to_partial_reason(hit);
+                outcome = ArchiveEnd::Partial(r);
+                entry_partial_reason = Some(r);
+            }
+            break;
+        }
+
+        let dst = &mut buf.as_mut_slice()[carry..carry + read_max];
+
+        let n = match stream.read(dst) {
+            Ok(n) => n,
+            Err(_) => {
+                outcome = ArchiveEnd::Partial(corruption_reason);
+                entry_partial_reason = Some(corruption_reason);
+                break;
+            }
+        };
+
+        if n == 0 {
+            break;
+        }
+
+        scan.budgets
+            .charge_compressed_in(stream.take_compressed_delta());
+
+        let mut allowed = n as u64;
+        if let ChargeResult::Clamp { allowed: a, hit } =
+            scan.budgets.charge_decompressed_out(allowed)
+        {
+            if let BudgetHit::SkipEntry(reason) = hit {
+                entry_skip_reason = Some(reason);
+            }
+            let r = budget_hit_to_partial_reason(hit);
+            allowed = a;
+            outcome = ArchiveEnd::Partial(r);
+            entry_partial_reason = Some(r);
+        }
+
+        if allowed == 0 {
+            break;
+        }
+
+        let result = scan.scan_and_emit_chunk(
+            buf.as_slice(),
+            carry,
+            offset,
+            allowed,
+            overlap,
+            file_id,
+            display,
+            &mut entry_scanned,
+        );
+        offset = result.offset;
+        have = result.have;
+        carry = result.carry;
+
+        if (allowed as usize) < n {
+            break;
+        }
+    }
+
+    scan.budgets.end_entry(offset > 0);
+    if !entry_scanned && outcome == ArchiveEnd::Scanned {
+        outcome = ArchiveEnd::Partial(corruption_reason);
+        entry_partial_reason = Some(corruption_reason);
+    }
+    if let Some(reason) = entry_skip_reason {
+        scan.metrics
+            .archive
+            .record_entry_skipped(reason, display, false);
+    }
+    if let Some(r) = entry_partial_reason {
+        scan.metrics.archive.record_entry_partial(r, display, false);
+    }
+
+    outcome
 }
 
 #[cfg(test)]

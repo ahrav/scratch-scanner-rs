@@ -753,4 +753,19 @@ mod kani_proofs {
 
         let _ = detect_p_suffix(slice, len);
     }
+
+    /// Prove `detect_2_suffix` never panics for any `(name, len)` pair.
+    ///
+    /// Intentionally unconstrained — see `verify_detect_z_suffix_no_panic`.
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn verify_detect_2_suffix_no_panic() {
+        let len: usize = kani::any();
+        kani::assume(len <= 32);
+
+        let name: [u8; 32] = kani::any();
+        let slice = &name[..len];
+
+        let _ = detect_2_suffix(slice, len);
+    }
 }

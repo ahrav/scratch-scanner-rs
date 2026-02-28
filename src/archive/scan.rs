@@ -20,7 +20,7 @@
 //! # Sliding-window read loop
 //!
 //! Every entry payload is read using the same pattern (shared across gzip,
-//! tar, and zip code paths):
+//! bzip2, tar, and zip code paths):
 //!
 //! ```text
 //! stream_buf layout on each iteration:
@@ -88,7 +88,7 @@ use std::io::Read;
 use crate::archive::detect_kind_from_name_bytes;
 use crate::archive::formats::zip::LimitedRead;
 use crate::archive::formats::{
-    Bzip2Stream, GzipStream, TarCursor, TarNext, TarRead, ZipCursor, ZipEntryMeta,
+    Bzip2Stream, CompressedStream, GzipStream, TarCursor, TarNext, TarRead, ZipCursor, ZipEntryMeta,
 };
 use crate::archive::formats::{ZipNext, ZipOpen, ZipSource};
 use crate::archive::path::apply_hash_suffix_truncation;
@@ -569,7 +569,13 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     // immediately after the call returns.
     let display_buf = std::mem::take(scan.entry_display_buf);
     let display = display_buf.as_slice();
-    let outcome = scan_gzip_entry_stream(&mut scan, &mut gz, display, chunk_size);
+    let outcome = scan_compressed_entry_stream(
+        &mut scan,
+        &mut gz,
+        display,
+        chunk_size,
+        PartialReason::CompressedStreamCorrupt,
+    );
     *scan.entry_display_buf = display_buf;
     let outcome = outcome?;
     scan.budgets.exit_archive();
@@ -581,7 +587,7 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     Ok(outcome)
 }
 
-/// Inner read loop for a single gzip entry.
+/// Inner read loop for a single compressed-stream entry (gzip or bzip2).
 ///
 /// Implements the sliding-window pattern described in the module docs:
 /// reads up to `chunk_size` decompressed bytes per iteration, charges
@@ -592,8 +598,8 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 ///
 /// - `on_entry_end` is always delivered, even on truncation or I/O error.
 /// - An entry that yields zero decompressed bytes is treated as corrupt
-///   (`GzipCorrupt`) by policy, unless a budget limit was hit first (in which
-///   case the budget-derived reason takes precedence).
+///   (`corruption_reason`) by policy, unless a budget limit was hit first
+///   (in which case the budget-derived reason takes precedence).
 ///
 /// # Read loop structure
 ///
@@ -605,11 +611,12 @@ pub fn scan_gzip_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 /// 5. Charge compressed-in and decompressed-out budgets post-read.
 /// 6. Deliver the full window (`overlap prefix + allowed new bytes`) to the sink.
 /// 7. If the budget truncated the read (`allowed < n`), exit.
-fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
+fn scan_compressed_entry_stream<C: CompressedStream, S: ArchiveEntrySink, Z: ZipSource>(
     scan: &mut ArchiveScanCtx<'_, S, Z>,
-    gz: &mut GzipStream<R>,
+    stream: &mut C,
     display: &[u8],
     chunk_size: usize,
+    corruption_reason: PartialReason,
 ) -> Result<ArchiveEnd, S::Error> {
     let budgets = &mut *scan.budgets;
     let overlap = scan.overlap;
@@ -657,7 +664,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
                 if let BudgetHit::SkipEntry(reason) = hit {
                     entry_skip_reason = Some(reason);
                 }
-                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
+                let r = util::budget_hit_to_partial(hit, corruption_reason);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -675,7 +682,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
                 if let BudgetHit::SkipEntry(reason) = hit {
                     entry_skip_reason = Some(reason);
                 }
-                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
+                let r = util::budget_hit_to_partial(hit, corruption_reason);
                 outcome = ArchiveEnd::Partial(r);
                 entry_partial_reason = Some(r);
             }
@@ -683,11 +690,11 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
         }
 
         let dst = &mut buf[carry..carry + read_max];
-        let n = match gz.read(dst) {
+        let n = match stream.read(dst) {
             Ok(n) => n,
             Err(_) => {
-                outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
-                entry_partial_reason = Some(PartialReason::GzipCorrupt);
+                outcome = ArchiveEnd::Partial(corruption_reason);
+                entry_partial_reason = Some(corruption_reason);
                 break;
             }
         };
@@ -696,7 +703,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
             break;
         }
 
-        budgets.charge_compressed_in(gz.take_compressed_delta());
+        budgets.charge_compressed_in(stream.take_compressed_delta());
 
         // Post-read charge: if the budget is now exhausted the charge returns
         // a clamped `allowed` count — we deliver only that many bytes and exit.
@@ -705,7 +712,7 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
             if let BudgetHit::SkipEntry(reason) = hit {
                 entry_skip_reason = Some(reason);
             }
-            let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
+            let r = util::budget_hit_to_partial(hit, corruption_reason);
             allowed = a;
             outcome = ArchiveEnd::Partial(r);
             entry_partial_reason = Some(r);
@@ -745,13 +752,13 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 
     scan.sink.on_entry_end()?;
     budgets.end_entry(offset > 0);
-    // A gzip entry that produced zero decompressed bytes (and was not
+    // A compressed entry that produced zero decompressed bytes (and was not
     // budget-limited) is treated as corrupt by scanner policy. This is
-    // intentionally stricter than the gzip spec to avoid silently accepting
+    // intentionally stricter than the format specs to avoid silently accepting
     // empty/truncated payloads in archive telemetry.
     if !entry_scanned && outcome == ArchiveEnd::Scanned {
-        outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
-        entry_partial_reason = Some(PartialReason::GzipCorrupt);
+        outcome = ArchiveEnd::Partial(corruption_reason);
+        entry_partial_reason = Some(corruption_reason);
     }
     if let Some(reason) = entry_skip_reason {
         scan.stats.record_entry_skipped(reason, display, false);
@@ -766,8 +773,6 @@ fn scan_gzip_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
 /// Scan a bzip2 stream as a single virtual entry (root-level entry point).
 ///
 /// The sink sees exactly one entry named `<bunzip2>`.
-/// Decode failures are currently recorded as [`PartialReason::GzipCorrupt`]
-/// because compressed-stream corruption uses a shared telemetry bucket.
 pub fn scan_bzip2_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     reader: R,
     root_display: &[u8],
@@ -805,158 +810,15 @@ pub fn scan_bzip2_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
     let mut bz2 = Bzip2Stream::new(reader);
     let display_buf = std::mem::take(scan.entry_display_buf);
     let display = display_buf.as_slice();
-    let outcome = scan_bzip2_entry_stream(&mut scan, &mut bz2, display, chunk_size)?;
+    let outcome = scan_compressed_entry_stream(
+        &mut scan,
+        &mut bz2,
+        display,
+        chunk_size,
+        PartialReason::CompressedStreamCorrupt,
+    )?;
     *scan.entry_display_buf = display_buf;
     scan.budgets.exit_archive();
-    Ok(outcome)
-}
-
-/// Inner read loop for a single bzip2 entry.
-///
-/// Uses the same chunk/overlap budget protocol as gzip entry scanning. Decode
-/// failures map to [`PartialReason::GzipCorrupt`] for compatibility with the
-/// shared compressed-stream corruption reason bucket.
-fn scan_bzip2_entry_stream<R: Read, S: ArchiveEntrySink, Z: ZipSource>(
-    scan: &mut ArchiveScanCtx<'_, S, Z>,
-    bz2: &mut Bzip2Stream<R>,
-    display: &[u8],
-    chunk_size: usize,
-) -> Result<ArchiveEnd, S::Error> {
-    let budgets = &mut *scan.budgets;
-    let overlap = scan.overlap;
-
-    if let Err(hit) = budgets.begin_entry() {
-        return Ok(budget_hit_to_archive_end(hit));
-    }
-
-    let meta = EntryMeta {
-        display_path: display,
-        size_hint: 0,
-        flags: 0,
-    };
-    scan.sink.on_entry_start(&meta)?;
-
-    let buf = &mut scan.stream_buf;
-
-    let mut offset: u64 = 0;
-    let mut carry: usize = 0;
-    let mut have: usize = 0;
-    let mut outcome = ArchiveEnd::Scanned;
-    let mut entry_scanned = false;
-    let mut entry_partial_reason: Option<PartialReason> = None;
-    let mut entry_skip_reason: Option<EntrySkipReason> = None;
-
-    loop {
-        if budgets.is_deadline_expired() {
-            outcome = ArchiveEnd::Partial(PartialReason::WallClockTimeout);
-            entry_partial_reason = Some(PartialReason::WallClockTimeout);
-            break;
-        }
-
-        if carry > 0 && have > 0 {
-            buf.copy_within(have - carry..have, 0);
-        }
-
-        let allowance = budgets.remaining_decompressed_allowance_with_ratio_probe(true);
-        if allowance == 0 {
-            if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                if let BudgetHit::SkipEntry(reason) = hit {
-                    entry_skip_reason = Some(reason);
-                }
-                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
-                outcome = ArchiveEnd::Partial(r);
-                entry_partial_reason = Some(r);
-            }
-            break;
-        }
-
-        let read_max = chunk_size
-            .min(buf.len().saturating_sub(carry))
-            .min(allowance.min(u64::from(u32::MAX)) as usize);
-
-        if read_max == 0 {
-            if let ChargeResult::Clamp { hit, .. } = budgets.charge_decompressed_out(1) {
-                if let BudgetHit::SkipEntry(reason) = hit {
-                    entry_skip_reason = Some(reason);
-                }
-                let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
-                outcome = ArchiveEnd::Partial(r);
-                entry_partial_reason = Some(r);
-            }
-            break;
-        }
-
-        let dst = &mut buf[carry..carry + read_max];
-        let n = match bz2.read(dst) {
-            Ok(n) => n,
-            Err(_) => {
-                // Shared compressed-stream corruption bucket (gzip+bzip2).
-                outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
-                entry_partial_reason = Some(PartialReason::GzipCorrupt);
-                break;
-            }
-        };
-
-        if n == 0 {
-            break;
-        }
-
-        budgets.charge_compressed_in(bz2.take_compressed_delta());
-
-        let mut allowed = n as u64;
-        if let ChargeResult::Clamp { allowed: a, hit } = budgets.charge_decompressed_out(allowed) {
-            if let BudgetHit::SkipEntry(reason) = hit {
-                entry_skip_reason = Some(reason);
-            }
-            let r = util::budget_hit_to_partial(hit, PartialReason::GzipCorrupt);
-            allowed = a;
-            outcome = ArchiveEnd::Partial(r);
-            entry_partial_reason = Some(r);
-        }
-
-        if allowed == 0 {
-            break;
-        }
-
-        let allowed_usize = allowed as usize;
-        let read_len = carry + allowed_usize;
-
-        let base_offset = offset.saturating_sub(carry as u64);
-        let data = &buf[..read_len];
-        let chunk = EntryChunk {
-            data,
-            base_offset,
-            new_bytes_start: offset,
-            new_bytes_len: allowed_usize,
-        };
-        scan.sink.on_entry_chunk(chunk)?;
-        if !entry_scanned {
-            scan.stats.record_entry_scanned();
-            entry_scanned = true;
-        }
-
-        offset = offset.saturating_add(allowed);
-        have = read_len;
-        carry = overlap.min(read_len);
-
-        if allowed_usize < n {
-            break;
-        }
-    }
-
-    scan.sink.on_entry_end()?;
-    budgets.end_entry(offset > 0);
-    if !entry_scanned && outcome == ArchiveEnd::Scanned {
-        outcome = ArchiveEnd::Partial(PartialReason::GzipCorrupt);
-        entry_partial_reason = Some(PartialReason::GzipCorrupt);
-    }
-    if let Some(reason) = entry_skip_reason {
-        scan.stats.record_entry_skipped(reason, display, false);
-    }
-    if let Some(r) = entry_partial_reason {
-        scan.stats.record_entry_partial(r, display, false);
-    }
-
     Ok(outcome)
 }
 
@@ -1299,11 +1161,12 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
                                 }
                                 *gunzip_path_used = gunzip_path_used.saturating_add(need);
 
-                                let out = scan_gzip_entry_stream(
+                                let out = scan_compressed_entry_stream(
                                     &mut child,
                                     &mut gz,
                                     gunzip_display,
                                     chunk_size,
+                                    PartialReason::CompressedStreamCorrupt,
                                 )?;
                                 let (entry_reader, hdr_buf) = gz.into_inner().into_parts();
                                 *child.gzip_header_buf = hdr_buf;
@@ -1362,11 +1225,12 @@ fn scan_tar_stream_nested<S: ArchiveEntrySink, Z: ZipSource>(
 
                                 let entry_reader = LimitedRead::new(input, entry_size);
                                 let mut bz2 = Bzip2Stream::new(entry_reader);
-                                let out = scan_bzip2_entry_stream(
+                                let out = scan_compressed_entry_stream(
                                     &mut child,
                                     &mut bz2,
                                     bunzip_display,
                                     chunk_size,
+                                    PartialReason::CompressedStreamCorrupt,
                                 )?;
                                 let entry_reader = bz2.into_inner();
                                 (out, entry_reader.remaining())

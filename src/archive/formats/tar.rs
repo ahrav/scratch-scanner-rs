@@ -62,7 +62,7 @@ pub fn is_ustar_header(header: &[u8]) -> bool {
 pub enum TarInput {
     Plain(File),
     Gzip(GzipStream<File>),
-    Bzip2(Bzip2Stream<File>),
+    Bzip2(Bzip2Stream<std::io::BufReader<File>>),
 }
 
 impl TarInput {

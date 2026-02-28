@@ -7,8 +7,8 @@
 //! - **`targz_scan`** — end-to-end gzip throughput across a matrix of entry
 //!   counts and sizes, revealing per-entry overhead vs. bulk-copy throughput.
 //! - **`tarbz2_scan`** — matching bzip2 throughput sweep for direct comparison
-//!   against gzip. Useful for quantifying the `libbz2-rs-sys` (pure Rust) vs.
-//!   `zlib-ng` (C) backend asymmetry.
+//!   against gzip. Useful for quantifying bzip2 (`bzip2-sys`, C libbzip2) vs.
+//!   gzip (`zlib-ng`, C) decompression throughput differences.
 //! - **`budget_overhead`** — worst-case per-entry cost with 10 000 × 64 B
 //!   entries, where header parsing and budget charging dominate wall time.
 //!
@@ -20,8 +20,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::io::{self, Cursor, Read, Write};
 
 use scanner_rs::archive::{
-    scan_tarbz2_stream, scan_targz_stream, ArchiveConfig, ArchiveEnd, ArchiveEntrySink,
-    ArchiveScratch, ArchiveStats, EntryChunk, EntryMeta,
+    scan_bzip2_stream, scan_tarbz2_stream, scan_targz_stream, ArchiveConfig, ArchiveEnd,
+    ArchiveEntrySink, ArchiveScratch, ArchiveStats, EntryChunk, EntryMeta,
 };
 
 /// Discards all entry data, accumulating only a byte count.
@@ -236,6 +236,14 @@ fn build_tarbz2(entry_count: usize, entry_size: usize, seed: u64) -> Vec<u8> {
     bzip2_compress(&tar)
 }
 
+/// Build a standalone bzip2-compressed blob (no tar wrapper).
+fn build_bzip2_standalone(size: usize, seed: u64) -> Vec<u8> {
+    let mut rng = XorShift64::new(seed);
+    let mut payload = vec![0u8; size];
+    rng.fill_bytes(&mut payload);
+    bzip2_compress(&payload)
+}
+
 /// Compute total decompressed payload bytes for verification.
 fn expected_decompressed(entry_count: usize, entry_size: usize) -> u64 {
     (entry_count as u64) * (entry_size as u64)
@@ -419,6 +427,73 @@ fn bench_tarbz2_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Standalone bzip2 throughput (no tar layer).
+///
+/// Measures raw bzip2 decompression + scan-loop overhead without tar header
+/// parsing. Three sizes span the range from L2-resident to main-memory:
+///
+/// - **64 KB**: fits in L2; measures decode + budget overhead at small scale.
+/// - **1 MB**: moderate working set; typical single-file decompression.
+/// - **10 MB**: large blob; bulk throughput measurement.
+fn bench_bzip2_throughput(c: &mut Criterion) {
+    let configs: &[(usize, &str)] = &[
+        (64 * 1024, "64KB"),
+        (1024 * 1024, "1MB"),
+        (10 * 1024 * 1024, "10MB"),
+    ];
+
+    let archive_cfg = ArchiveConfig {
+        enabled: true,
+        max_archive_depth: 4,
+        max_entries_per_archive: 100_000,
+        max_uncompressed_bytes_per_entry: 256 * 1024 * 1024,
+        max_total_uncompressed_bytes_per_archive: 1024 * 1024 * 1024,
+        max_total_uncompressed_bytes_per_root: 2048 * 1024 * 1024,
+        max_archive_metadata_bytes: 64 * 1024 * 1024,
+        max_inflation_ratio: 1000,
+        ..ArchiveConfig::default()
+    };
+
+    let chunk_size = 256 * 1024;
+    let overlap = 0;
+
+    let mut group = c.benchmark_group("bzip2_scan");
+
+    for &(size, label) in configs {
+        let bz2 = build_bzip2_standalone(size, 0xDEAD_BEEF_CAFE_B220);
+        let decompressed_total = size as u64;
+
+        group.throughput(Throughput::Bytes(decompressed_total));
+        group.bench_with_input(BenchmarkId::new("throughput", label), &bz2, |b, bz2| {
+            let mut scratch: ArchiveScratch<NullZipSource> =
+                ArchiveScratch::new(&archive_cfg, chunk_size, overlap);
+            let mut sink = NullSink::new();
+            let mut stats = ArchiveStats::default();
+
+            b.iter(|| {
+                sink.total_bytes = 0;
+                let reader = Cursor::new(black_box(bz2.as_slice()));
+                let result: Result<ArchiveEnd, io::Error> = scan_bzip2_stream(
+                    reader,
+                    b"/bench/test.bz2",
+                    &archive_cfg,
+                    &mut scratch,
+                    &mut sink,
+                    &mut stats,
+                );
+                black_box(result.unwrap());
+                black_box(sink.total_bytes);
+                debug_assert_eq!(
+                    sink.total_bytes, decompressed_total,
+                    "sink byte count mismatch: scan may have dropped data"
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
 /// Worst-case per-entry budget-charging overhead.
 ///
 /// 10 000 entries × 64 B each: the payload is negligible so nearly all time
@@ -477,6 +552,7 @@ criterion_group!(
     benches,
     bench_targz_throughput,
     bench_tarbz2_throughput,
+    bench_bzip2_throughput,
     bench_budget_overhead,
 );
 criterion_main!(benches);

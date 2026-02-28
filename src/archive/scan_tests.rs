@@ -634,7 +634,7 @@ fn gzip_zero_entry_budget_yields_entry_budget_exceeded() {
 
 #[test]
 fn gzip_valid_header_empty_deflate_is_corrupt() {
-    // Valid gzip wrapping zero-length content → GzipCorrupt.
+    // Valid gzip wrapping zero-length content → CompressedStreamCorrupt.
     let gz = gzip_compress(b"");
 
     let mut cfg = default_config();
@@ -647,8 +647,11 @@ fn gzip_valid_header_empty_deflate_is_corrupt() {
     assert_eq!(depth, 0);
     assert_eq!(sink.entries.len(), 1);
     assert!(
-        matches!(outcome, ArchiveEnd::Partial(PartialReason::GzipCorrupt)),
-        "expected GzipCorrupt for empty deflate, got {outcome:?}"
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::CompressedStreamCorrupt)
+        ),
+        "expected CompressedStreamCorrupt for empty deflate, got {outcome:?}"
     );
 }
 
@@ -980,4 +983,148 @@ fn tar_timeout_mid_entry_delivers_partial() {
     );
     // Entry 1 payload intact.
     assert_eq!(sink.concat_new_bytes(0), payload_a);
+}
+
+// ── Bzip2 helpers ────────────────────────────────────────────────
+
+fn bzip2_compress(data: &[u8]) -> Vec<u8> {
+    use bzip2::write::BzEncoder;
+    use bzip2::Compression;
+    use std::io::Write;
+    let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn scan_bz2_bytes(
+    bz2_bytes: &[u8],
+    cfg: &ArchiveConfig,
+    chunk_size: usize,
+    overlap: usize,
+) -> (ArchiveEnd, RecordingSink, u8) {
+    let mut scratch: TestScratch = ArchiveScratch::new(cfg, chunk_size, overlap);
+    let mut sink = RecordingSink::new();
+    let mut stats = ArchiveStats::default();
+    let reader = Cursor::new(bz2_bytes.to_vec());
+
+    let outcome = scan_bzip2_stream(
+        reader,
+        b"test.bz2",
+        cfg,
+        &mut scratch,
+        &mut sink,
+        &mut stats,
+    )
+    .unwrap();
+
+    let depth = scratch.budgets.depth();
+    (outcome, sink, depth)
+}
+
+// ── Bzip2 unit tests ────────────────────────────────────────────
+
+#[test]
+fn bzip2_multi_chunk_overlap_correctness() {
+    let payload: Vec<u8> = (0u8..40).collect();
+    let bz2 = bzip2_compress(&payload);
+    let mut cfg = default_config();
+    cfg.max_uncompressed_bytes_per_entry = 1000;
+    cfg.max_total_uncompressed_bytes_per_archive = 1000;
+    cfg.max_total_uncompressed_bytes_per_root = 1000;
+
+    let (outcome, sink, depth) = scan_bz2_bytes(&bz2, &cfg, 8, 4);
+
+    assert_eq!(outcome, ArchiveEnd::Scanned);
+    assert_eq!(depth, 0);
+    assert_eq!(sink.entries.len(), 1);
+
+    let chunks = &sink.entries[0].chunks;
+    for i in 1..chunks.len() {
+        let prev = &chunks[i - 1];
+        let cur = &chunks[i];
+        let carry = cur.data.len() - cur.new_bytes_len;
+        if carry > 0 {
+            let prev_suffix = &prev.data[prev.data.len() - carry..];
+            let cur_prefix = &cur.data[..carry];
+            assert_eq!(
+                prev_suffix, cur_prefix,
+                "bzip2 overlap mismatch at chunk {i}"
+            );
+        }
+    }
+
+    let concat = sink.concat_new_bytes(0);
+    assert_eq!(concat, payload);
+}
+
+#[test]
+fn bzip2_valid_header_empty_content_is_corrupt() {
+    let bz2 = bzip2_compress(b"");
+
+    let mut cfg = default_config();
+    cfg.max_uncompressed_bytes_per_entry = 1000;
+    cfg.max_total_uncompressed_bytes_per_archive = 1000;
+    cfg.max_total_uncompressed_bytes_per_root = 1000;
+
+    let (outcome, sink, depth) = scan_bz2_bytes(&bz2, &cfg, 64, 4);
+
+    assert_eq!(depth, 0);
+    assert_eq!(sink.entries.len(), 1);
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::CompressedStreamCorrupt)
+        ),
+        "expected CompressedStreamCorrupt for empty bzip2, got {outcome:?}"
+    );
+}
+
+#[test]
+fn bzip2_wall_clock_timeout_yields_partial() {
+    let payload = vec![b'Y'; 256];
+    let bz2 = bzip2_compress(&payload);
+
+    let mut cfg = default_config();
+    cfg.max_wall_clock_secs_per_root = Some(0);
+    cfg.max_uncompressed_bytes_per_entry = 10_000;
+    cfg.max_total_uncompressed_bytes_per_archive = 10_000;
+    cfg.max_total_uncompressed_bytes_per_root = 10_000;
+
+    let (outcome, _, depth) = scan_bz2_bytes(&bz2, &cfg, 64, 4);
+
+    assert_eq!(
+        depth, 0,
+        "budget depth not restored after wall-clock timeout"
+    );
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::WallClockTimeout)
+        ),
+        "expected WallClockTimeout, got {outcome:?}"
+    );
+}
+
+#[test]
+fn bzip2_zero_entry_budget_yields_entry_budget_exceeded() {
+    let payload = b"hello world";
+    let bz2 = bzip2_compress(payload);
+
+    let mut cfg = default_config();
+    cfg.max_uncompressed_bytes_per_entry = 0;
+    cfg.max_total_uncompressed_bytes_per_archive = 1000;
+    cfg.max_total_uncompressed_bytes_per_root = 1000;
+
+    let (outcome, sink, depth) = scan_bz2_bytes(&bz2, &cfg, 64, 4);
+
+    assert_eq!(depth, 0);
+    assert_eq!(sink.entries.len(), 1);
+    assert_eq!(sink.entries[0].chunks.len(), 0);
+    assert!(
+        matches!(
+            outcome,
+            ArchiveEnd::Partial(PartialReason::EntryOutputBudgetExceeded)
+        ),
+        "expected EntryOutputBudgetExceeded, got {outcome:?}"
+    );
 }
