@@ -4,7 +4,7 @@
 //! streams within tar archives.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read};
 
 use crate::archive::formats::Bzip2Stream;
 use crate::archive::{ArchiveSkipReason, BudgetHit, ChargeResult, EntrySkipReason, PartialReason};
@@ -21,6 +21,11 @@ use super::local_fs_owner::{
 };
 
 /// Scan a `.bz2` file as a single virtual entry (`<bunzip2>`).
+///
+/// The raw [`File`] is wrapped in a 64 KB [`BufReader`] to increase the I/O
+/// batch size. `BzDecoder` has an internal 8 KB buffer, but the larger outer
+/// buffer reduces `read(2)` syscall frequency against the file descriptor
+/// (~8x fewer syscalls for cached files).
 ///
 /// # Invariants
 /// - Offsets are decompressed byte offsets.
@@ -71,7 +76,8 @@ pub(super) fn process_bzip2_file<E: ScanEngine>(
         return budget_hit_to_archive_end(hit);
     }
 
-    let mut bz2 = Bzip2Stream::new(file);
+    let reader = BufReader::with_capacity(64 * 1024, file);
+    let mut bz2 = Bzip2Stream::new(reader);
     let mut buf = scratch.pool.acquire();
 
     let entry_file_id = alloc_virtual_file_id(&mut scratch.next_virtual_file_id);
