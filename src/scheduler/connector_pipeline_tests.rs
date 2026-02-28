@@ -1,0 +1,794 @@
+use super::*;
+use crate::scheduler::engine_stub::{MockEngine, MockRule};
+use crate::unified::events::VecEventSink;
+
+use gossip_contracts::connector::{
+    ConnectorCapabilities, EnumerationConnector, EnumerationPage, ItemRef, ReadConnector,
+    ReadError, ScanItem, VersionId,
+};
+use gossip_contracts::coordination::ShardSpec;
+use gossip_contracts::identity::{ObjectVersionId, StableItemId};
+
+use rstest::rstest;
+
+use std::collections::VecDeque;
+use std::io;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgressCall {
+    Checkpoint(Cursor),
+    SplitHint(ItemKey),
+    Complete(Cursor),
+}
+
+struct MockProgress {
+    shard: ShardSpec,
+    cursor: Cursor,
+    calls: Vec<ProgressCall>,
+    fail_checkpoint: bool,
+    fail_complete: bool,
+    fail_split_hint: bool,
+    checkpoint_notifier: Option<mpsc::Sender<Cursor>>,
+}
+
+impl MockProgress {
+    fn new(shard: ShardSpec, cursor: Cursor) -> Self {
+        Self {
+            shard,
+            cursor,
+            calls: Vec::new(),
+            fail_checkpoint: false,
+            fail_complete: false,
+            fail_split_hint: false,
+            checkpoint_notifier: None,
+        }
+    }
+
+    fn with_checkpoint_failure(mut self) -> Self {
+        self.fail_checkpoint = true;
+        self
+    }
+
+    fn with_complete_failure(mut self) -> Self {
+        self.fail_complete = true;
+        self
+    }
+
+    fn with_split_hint_failure(mut self) -> Self {
+        self.fail_split_hint = true;
+        self
+    }
+
+    fn with_checkpoint_notifier(mut self, notifier: mpsc::Sender<Cursor>) -> Self {
+        self.checkpoint_notifier = Some(notifier);
+        self
+    }
+}
+
+impl ProgressSink for MockProgress {
+    type Error = &'static str;
+
+    fn shard_spec(&self) -> &ShardSpec {
+        &self.shard
+    }
+
+    fn cursor(&self) -> Cursor {
+        self.cursor.clone()
+    }
+
+    fn checkpoint(&mut self, cursor: &Cursor) -> Result<(), Self::Error> {
+        if self.fail_checkpoint {
+            return Err("checkpoint failed");
+        }
+        self.cursor = cursor.clone();
+        self.calls.push(ProgressCall::Checkpoint(cursor.clone()));
+        if let Some(notifier) = &self.checkpoint_notifier {
+            let _ = notifier.send(cursor.clone());
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, final_cursor: &Cursor) -> Result<(), Self::Error> {
+        if self.fail_complete {
+            return Err("complete failed");
+        }
+        self.cursor = final_cursor.clone();
+        self.calls
+            .push(ProgressCall::Complete(final_cursor.clone()));
+        Ok(())
+    }
+
+    fn park(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn split_hint(&mut self, key: &ItemKey) -> Result<(), Self::Error> {
+        if self.fail_split_hint {
+            return Err("split_hint failed");
+        }
+        self.calls.push(ProgressCall::SplitHint(key.clone()));
+        Ok(())
+    }
+}
+
+struct MockConnector {
+    pages: VecDeque<Result<EnumerationPage, EnumerateError>>,
+    split_hints: VecDeque<Result<Option<ItemKey>, EnumerateError>>,
+}
+
+impl MockConnector {
+    fn new(pages: Vec<EnumerationPage>) -> Self {
+        Self {
+            pages: pages.into_iter().map(Ok).collect(),
+            split_hints: VecDeque::new(),
+        }
+    }
+
+    fn with_split_hints(mut self, hints: Vec<Option<ItemKey>>) -> Self {
+        self.split_hints = hints.into_iter().map(Ok).collect();
+        self
+    }
+}
+
+impl EnumerationConnector for MockConnector {
+    fn caps(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities::default()
+    }
+
+    fn enumerate_page(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+        _budgets: Budgets,
+    ) -> Result<EnumerationPage, EnumerateError> {
+        self.pages
+            .pop_front()
+            .unwrap_or_else(|| Ok(EnumerationPage::new(Vec::new(), Cursor::initial())))
+    }
+
+    fn choose_split_point(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+        _budgets: Budgets,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        self.split_hints.pop_front().unwrap_or(Ok(None))
+    }
+}
+
+impl ReadConnector for MockConnector {
+    fn open(
+        &mut self,
+        _item_ref: &ItemRef,
+        _budgets: Budgets,
+    ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+        Err(ReadError::unsupported("open"))
+    }
+}
+
+fn test_engine(overlap: usize) -> MockEngine {
+    MockEngine::new(
+        vec![MockRule {
+            name: "secret".to_string(),
+            pattern: b"SECRET".to_vec(),
+        }],
+        overlap,
+    )
+}
+
+fn item(key: &[u8], stable_fill: u8, version: &[u8]) -> ScanItem {
+    ScanItem::new(
+        ItemKey::try_from_slice(key).unwrap(),
+        ItemRef::try_from_slice(key).unwrap(),
+        StableItemId::from_bytes([stable_fill; 32]),
+        VersionId::Strong(ObjectVersionId::from_version_bytes(version)),
+    )
+}
+
+#[test]
+fn scan_connector_enumerates_validates_checkpoints_and_completes() {
+    let shard = ShardSpec::unbounded();
+    let k2 = ItemKey::try_from_slice(b"k2").unwrap();
+    let k3 = ItemKey::try_from_slice(b"k3").unwrap();
+
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1"), item(b"k2", 2, b"v2")],
+            Cursor::with_last_key(k2.clone()),
+        ),
+        EnumerationPage::new(
+            vec![item(b"k3", 3, b"v3")],
+            Cursor::with_last_key(k3.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k3.clone())),
+    ];
+    let mut connector = MockConnector::new(pages).with_split_hints(vec![
+        Some(ItemKey::try_from_slice(b"split-a").unwrap()),
+        Some(ItemKey::try_from_slice(b"split-b").unwrap()),
+    ]);
+    let mut progress = MockProgress::new(shard.clone(), Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: Some(Budgets::try_new(1, 1024, None).unwrap()),
+        ..ConnectorConfig::default()
+    };
+    let (report, metrics) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink,
+    )
+    .unwrap();
+
+    assert_eq!(report.enumerate.pages_enumerated, 2);
+    assert_eq!(report.enumerate.items_discovered, 3);
+    assert_eq!(report.enumerate.items_enqueued, 3);
+    assert_eq!(report.enumerate.checkpoints_committed, 2);
+    assert_eq!(report.enumerate.split_hints_emitted, 2);
+    assert_eq!(metrics.tasks_executed, 0);
+
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k2)),
+            ProgressCall::SplitHint(ItemKey::try_from_slice(b"split-a").unwrap()),
+            ProgressCall::Checkpoint(Cursor::with_last_key(k3.clone())),
+            ProgressCall::SplitHint(ItemKey::try_from_slice(b"split-b").unwrap()),
+            ProgressCall::Complete(Cursor::with_last_key(k3)),
+        ]
+    );
+}
+
+#[test]
+fn scan_connector_rejects_invalid_page_before_checkpointing() {
+    let shard = ShardSpec::with_range(b"a", b"z");
+    let bad_page = EnumerationPage::new(vec![item(b"b", 1, b"v1")], Cursor::initial());
+    let mut connector = MockConnector::new(vec![bad_page]);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        ConnectorConfig::default(),
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, ConnectorRunError::PageValidation(_)));
+    assert!(progress.calls.is_empty());
+}
+
+#[test]
+fn scan_connector_maps_checkpoint_error_to_progress_error() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(vec![item(b"k1", 1, b"v1")], Cursor::with_last_key(k1)),
+        EnumerationPage::new(
+            Vec::new(),
+            Cursor::with_last_key(ItemKey::try_from_slice(b"k1").unwrap()),
+        ),
+    ];
+    let mut connector = MockConnector::new(pages);
+    let mut progress = MockProgress::new(shard, Cursor::initial()).with_checkpoint_failure();
+    let sink = Arc::new(VecEventSink::new());
+
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        ConnectorConfig::default(),
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConnectorRunError::Progress("checkpoint failed")
+    ));
+    assert!(progress.calls.is_empty());
+}
+
+#[test]
+fn page_tokens_track_page_id_and_outstanding_items() {
+    let (barrier, tokens) = track_page_items(7, 2);
+    assert_eq!(barrier.page_id, 7);
+    assert_eq!(barrier.outstanding_items(), 2);
+    assert!(tokens.iter().all(|token| token.barrier.page_id == 7));
+
+    let mut tokens = tokens.into_iter();
+    tokens.next().unwrap().complete();
+    assert_eq!(barrier.outstanding_items(), 1);
+
+    tokens.next().unwrap().complete();
+    assert_eq!(barrier.outstanding_items(), 0);
+}
+
+#[test]
+fn scan_connector_waits_for_page_completion_before_checkpoint() {
+    let shard = ShardSpec::unbounded();
+    let page_key = ItemKey::try_from_slice(b"k1").unwrap();
+    let checkpoint_cursor = Cursor::with_last_key(page_key.clone());
+
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(page_key.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), checkpoint_cursor.clone()),
+    ];
+
+    let (dispatch_started_tx, dispatch_started_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (checkpoint_tx, checkpoint_rx) = mpsc::channel::<Cursor>();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let _scan_worker = thread::spawn(move || {
+        let mut connector = MockConnector::new(pages);
+        let mut progress =
+            MockProgress::new(shard, Cursor::initial()).with_checkpoint_notifier(checkpoint_tx);
+        let sink = Arc::new(VecEventSink::new());
+        let mut release_rx = Some(release_rx);
+
+        let result = scan_connector_with_page_dispatch(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            ConnectorConfig::default(),
+            &mut progress,
+            sink,
+            move |page_id, items, tokens| {
+                assert_eq!(page_id, 0);
+                assert_eq!(items.len(), tokens.len());
+                assert!(tokens.iter().all(|token| token.barrier.page_id == page_id));
+                dispatch_started_tx.send(()).unwrap();
+
+                let release_rx = release_rx.take().expect("single non-empty page expected");
+                let _token_worker = thread::spawn(move || {
+                    release_rx.recv().expect("release signal dropped");
+                    for token in tokens {
+                        token.complete();
+                    }
+                });
+                Ok(())
+            },
+        )
+        .map(|_| progress.calls);
+        done_tx.send(result).unwrap();
+    });
+
+    dispatch_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("page dispatch did not start");
+    assert!(matches!(
+        checkpoint_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    release_tx.send(()).expect("failed to release page tokens");
+    let calls = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("scan_connector did not finish (possible barrier deadlock)")
+        .expect("scan_connector returned error");
+    let observed_checkpoint = checkpoint_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("checkpoint not emitted");
+
+    assert_eq!(observed_checkpoint, checkpoint_cursor);
+    assert_eq!(
+        calls,
+        vec![
+            ProgressCall::Checkpoint(checkpoint_cursor.clone()),
+            ProgressCall::Complete(checkpoint_cursor),
+        ]
+    );
+}
+
+#[test]
+fn scan_connector_releases_page_barrier_on_terminal_failure() {
+    let shard = ShardSpec::unbounded();
+    let last_key = ItemKey::try_from_slice(b"k2").unwrap();
+    let checkpoint_cursor = Cursor::with_last_key(last_key);
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1"), item(b"k2", 2, b"v2")],
+            checkpoint_cursor.clone(),
+        ),
+        EnumerationPage::new(Vec::new(), checkpoint_cursor.clone()),
+    ];
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let _scan_worker = thread::spawn(move || {
+        let mut connector = MockConnector::new(pages);
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let result = scan_connector_with_page_dispatch(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            ConnectorConfig::default(),
+            &mut progress,
+            sink,
+            |_page_id, _items, tokens| {
+                let mut tokens = tokens.into_iter();
+                tokens.next().unwrap().complete();
+                tokens.next().unwrap().complete();
+                Ok(())
+            },
+        )
+        .map(|_| progress.calls);
+
+        done_tx.send(result).unwrap();
+    });
+
+    let calls = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("scan_connector did not finish (possible failure-path deadlock)")
+        .expect("scan_connector returned error");
+    assert_eq!(
+        calls,
+        vec![
+            ProgressCall::Checkpoint(checkpoint_cursor.clone()),
+            ProgressCall::Complete(checkpoint_cursor),
+        ]
+    );
+}
+
+// -- ConnectorConfig::validate() coverage --
+
+#[rstest]
+#[case::cpu_workers_zero("cpu_workers", "cpu_workers must be > 0")]
+#[case::chunk_size_zero("chunk_size", "chunk_size must be > 0")]
+fn validate_rejects_zero_field(#[case] field: &str, #[case] expected_msg: &str) {
+    let mut cfg = ConnectorConfig::default();
+    match field {
+        "cpu_workers" => cfg.cpu_workers = 0,
+        "chunk_size" => cfg.chunk_size = 0,
+        _ => unreachable!(),
+    }
+    let err = cfg.validate(16).unwrap_err();
+    assert_eq!(err, expected_msg);
+}
+
+#[test]
+fn validate_rejects_chunk_plus_overlap_exceeding_max() {
+    let cfg = ConnectorConfig {
+        chunk_size: BUFFER_LEN_MAX,
+        ..ConnectorConfig::default()
+    };
+    let err = cfg.validate(16).unwrap_err();
+    assert!(err.contains("exceeds BUFFER_LEN_MAX"), "got: {err}");
+}
+
+#[test]
+fn validate_accepts_default_config() {
+    ConnectorConfig::default().validate(16).unwrap();
+}
+
+// -- PageCompletionBarrier edge cases --
+
+#[test]
+fn barrier_zero_items_completes_immediately() {
+    let barrier = PageCompletionBarrier::new(0, 0);
+    barrier.wait_until_complete();
+    assert_eq!(barrier.outstanding_items(), 0);
+}
+
+#[test]
+fn token_drop_without_complete_releases_barrier() {
+    let (barrier, tokens) = track_page_items(1, 2);
+    assert_eq!(barrier.outstanding_items(), 2);
+    drop(tokens);
+    assert_eq!(barrier.outstanding_items(), 0);
+}
+
+#[test]
+fn barrier_lock_or_recover_survives_poisoned_mutex() {
+    let barrier = PageCompletionBarrier::new(0, 2);
+
+    // Poison the mutex by panicking while holding the guard.
+    let b = Arc::clone(&barrier);
+    let handle = thread::spawn(move || {
+        let _guard = b.state.lock().unwrap();
+        panic!("intentional poison");
+    });
+    let _ = handle.join();
+
+    // The mutex is now poisoned. lock_or_recover should recover, not panic.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        barrier.release_item();
+    }));
+    assert!(result.is_ok(), "expected recovery from poisoned mutex");
+    assert_eq!(barrier.outstanding_items(), 1);
+}
+
+// -- Integration: empty first page --
+
+#[test]
+fn scan_connector_handles_empty_first_page() {
+    let shard = ShardSpec::unbounded();
+    let pages = vec![EnumerationPage::new(Vec::new(), Cursor::initial())];
+    let mut connector = MockConnector::new(pages);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let (report, _) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        ConnectorConfig::default(),
+        &mut progress,
+        sink,
+    )
+    .unwrap();
+
+    assert_eq!(report.enumerate.pages_enumerated, 0);
+    assert_eq!(report.enumerate.items_discovered, 0);
+    assert_eq!(report.enumerate.checkpoints_committed, 0);
+    assert_eq!(
+        progress.calls,
+        vec![ProgressCall::Complete(Cursor::initial())]
+    );
+}
+
+// -- Integration: split hints disabled --
+
+#[test]
+fn scan_connector_skips_split_hints_when_disabled() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector::new(pages);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (report, _) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink,
+    )
+    .unwrap();
+
+    assert_eq!(report.enumerate.split_hints_emitted, 0);
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k1)),
+        ]
+    );
+}
+
+// -- Error propagation: enumeration failure --
+
+#[test]
+fn scan_connector_returns_enumerate_error_on_first_page() {
+    let shard = ShardSpec::unbounded();
+    let mut connector = MockConnector {
+        pages: vec![Err(EnumerateError::permanent("simulated failure"))].into(),
+        split_hints: VecDeque::new(),
+    };
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        ConnectorConfig::default(),
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, ConnectorRunError::Enumerate(_)));
+    assert!(progress.calls.is_empty());
+}
+
+// -- Error propagation: split-hint failure --
+
+#[test]
+fn scan_connector_returns_error_on_split_hint_failure() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector {
+        pages: pages.into_iter().map(Ok).collect(),
+        split_hints: vec![Err(EnumerateError::permanent("split failed"))].into(),
+    };
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: Some(Budgets::try_new(1, 1024, None).unwrap()),
+        ..ConnectorConfig::default()
+    };
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, ConnectorRunError::Enumerate(_)));
+    // Checkpoint was committed before the split-hint error.
+    assert_eq!(
+        progress.calls,
+        vec![ProgressCall::Checkpoint(Cursor::with_last_key(k1))]
+    );
+}
+
+// -- Budget enforcement --
+
+#[test]
+fn scan_connector_rejects_page_exceeding_budget() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    // Budget allows max 2 items, but page returns 3.
+    let oversized_page = EnumerationPage::new(
+        vec![
+            item(b"k1", 1, b"v1"),
+            item(b"k2", 2, b"v2"),
+            item(b"k3", 3, b"v3"),
+        ],
+        Cursor::with_last_key(k1),
+    );
+    let mut connector = MockConnector::new(vec![oversized_page]);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let cfg = ConnectorConfig {
+        page_budgets: Budgets::try_new(2, 16 * 1024 * 1024, None).unwrap(),
+        ..ConnectorConfig::default()
+    };
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ConnectorRunError::BudgetExceeded {
+                returned: 3,
+                limit: 2
+            }
+        ),
+        "expected BudgetExceeded, got: {err:?}"
+    );
+    assert!(progress.calls.is_empty(), "no checkpoint should occur");
+}
+
+// -- Error propagation: dispatch failure --
+
+#[test]
+fn scan_connector_dispatch_error_prevents_checkpoint() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(vec![item(b"k1", 1, b"v1")], Cursor::with_last_key(k1)),
+        EnumerationPage::new(Vec::new(), Cursor::initial()),
+    ];
+    let mut connector = MockConnector::new(pages);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    let err = scan_connector_with_page_dispatch(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        ConnectorConfig::default(),
+        &mut progress,
+        sink,
+        |_page_id, _items, _tokens| Err(ConnectorRunError::Dispatch("dispatch failed".into())),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ConnectorRunError::Dispatch(ref msg) if msg == "dispatch failed"),
+        "expected Dispatch error, got: {err:?}"
+    );
+    assert!(
+        progress.calls.is_empty(),
+        "no checkpoint should be committed after dispatch failure"
+    );
+}
+
+// -- Error propagation: progress.complete() failure --
+
+#[test]
+fn scan_connector_maps_complete_error_to_progress_error() {
+    let shard = ShardSpec::unbounded();
+    // Single empty page triggers `complete()` immediately.
+    let pages = vec![EnumerationPage::new(Vec::new(), Cursor::initial())];
+    let mut connector = MockConnector::new(pages);
+    let mut progress = MockProgress::new(shard, Cursor::initial()).with_complete_failure();
+    let sink = Arc::new(VecEventSink::new());
+
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        ConnectorConfig::default(),
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ConnectorRunError::Progress("complete failed")),
+        "expected Progress(complete failed), got: {err:?}"
+    );
+    assert!(
+        progress.calls.is_empty(),
+        "no calls should be recorded when complete fails"
+    );
+}
+
+// -- Error propagation: progress.split_hint() failure --
+
+#[test]
+fn scan_connector_maps_split_hint_persistence_error_to_progress_error() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    // Connector returns a split key so split_hint() is called.
+    let mut connector = MockConnector::new(pages).with_split_hints(vec![Some(k1.clone())]);
+    let mut progress = MockProgress::new(shard, Cursor::initial()).with_split_hint_failure();
+    let sink = Arc::new(VecEventSink::new());
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: Some(Budgets::try_new(1, 1024, None).unwrap()),
+        ..ConnectorConfig::default()
+    };
+    let err = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ConnectorRunError::Progress("split_hint failed")),
+        "expected Progress(split_hint failed), got: {err:?}"
+    );
+    // Checkpoint was committed before the split-hint persistence failure.
+    assert_eq!(
+        progress.calls,
+        vec![ProgressCall::Checkpoint(Cursor::with_last_key(k1))]
+    );
+}

@@ -12,7 +12,7 @@
 
 use base64::Engine as _;
 use regex::bytes::Regex;
-use scanner_rs::scheduler::{parallel_scan_dir, ParallelScanConfig};
+use scanner_rs::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
 use scanner_rs::store::log::{LogRecord, LogRecordReader};
 use scanner_rs::store::{
     list_finalized_segment_files, AppendLogStoreProducer, LogWriterConfig, StoreProducer,

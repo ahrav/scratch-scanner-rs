@@ -331,7 +331,7 @@ impl<Z: ZipSource> ArchiveScratch<Z> {
     /// This forwarding method exists so that simulation tests can reach the
     /// budget countdown through the `ArchiveScratch` without exposing the
     /// `budgets` field.
-    #[cfg(any(test, feature = "sim-harness"))]
+    #[cfg(feature = "sim-harness")]
     pub(crate) fn set_deadline_check_countdown(&self, n: Option<u32>) {
         self.budgets.set_deadline_check_countdown(n);
     }

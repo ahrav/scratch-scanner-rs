@@ -68,6 +68,20 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
+
+      # Cargo resolves path deps at manifest parse time even when optional.
+      # Stub Gossip-rs so cargo fmt can parse Cargo.toml in CI.
+      - name: Stub Gossip-rs path deps
+        run: |
+          for crate in gossip-contracts gossip-connectors; do
+            dir="../Gossip-rs/crates/${crate}"
+            if [ ! -d "${dir}" ]; then
+              mkdir -p "${dir}/src"
+              printf '[package]\nname = "%s"\nversion = "0.0.0"\nedition = "2021"\n' "${crate}" > "${dir}/Cargo.toml"
+              printf '\n' > "${dir}/src/lib.rs"
+            fi
+          done
+
       # No cache needed — fmt does not compile
       - run: cargo fmt --all -- --check
 
@@ -84,7 +98,12 @@ jobs:
           components: clippy
           shared-key: stable-linux
 
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Note: --all-features is not used because connector-pipeline requires
+      # a local path dep (Gossip-rs) not available in CI. List all other features.
+      - run: >-
+          cargo clippy --all-targets
+          --features stdx-proptest,kgram-gate,perf-stats,stats,b64-stats,bench,tiger-harness,sim-harness,kani,scheduler-sim,integration-tests,property-tests,smoke-tests,diagnostic-tests,rocksdb,aegis-pure-rust,git-perf,real-rules-harness
+          -- -D warnings
 
   test:
     name: Test
@@ -141,7 +160,12 @@ jobs:
           toolchain: stable
           components: clippy
           shared-key: stable-macos
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Note: --all-features is not used because connector-pipeline requires
+      # a local path dep (Gossip-rs) not available in CI. List all other features.
+      - run: >-
+          cargo clippy --all-targets
+          --features stdx-proptest,kgram-gate,perf-stats,stats,b64-stats,bench,tiger-harness,sim-harness,kani,scheduler-sim,integration-tests,property-tests,smoke-tests,diagnostic-tests,rocksdb,aegis-pure-rust,git-perf,real-rules-harness
+          -- -D warnings
 
   test-aarch64:
     name: Test (aarch64)
