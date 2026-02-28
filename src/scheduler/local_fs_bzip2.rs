@@ -48,9 +48,7 @@ pub(super) fn process_bzip2_file<E: ScanEngine>(
     let (head_pb, rest_pb) = scratch.path_budget_used.as_mut_slice().split_at_mut(2);
 
     head_pb[1] = 0;
-    let path_bytes = head_vp[1]
-        .build(parent_bytes, b"<bunzip2>", max_len)
-        .bytes;
+    let path_bytes = head_vp[1].build(parent_bytes, b"<bunzip2>", max_len).bytes;
     let need = path_bytes.len();
     if head_pb[1].saturating_add(need) > scratch.archive.max_virtual_path_bytes_per_archive {
         return ArchiveEnd::Partial(PartialReason::PathBudgetExceeded);

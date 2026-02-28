@@ -27,6 +27,40 @@ use super::local_fs_owner::{
     emit_persistence_batch, FileTask, LocalScratch,
 };
 
+/// Build a child [`ArchiveScanCtx`] from the parent's individually-reborrowed
+/// fields plus the caller's per-depth slices. This avoids repeating the
+/// 16-field struct literal for every nesting branch.
+///
+/// A method on `ArchiveScanCtx` cannot be used because `budgets` is
+/// reborrowed separately (`let budgets = &mut *scan.budgets;`) before
+/// the match, so `&mut self` would conflict. A macro expands in-place
+/// with disjoint field borrows, which the borrow checker accepts.
+macro_rules! child_archive_ctx {
+    ($scan:expr, $budgets:expr, $vpaths:expr, $path_budget_used:expr, $tar_cursors:expr) => {
+        ArchiveScanCtx {
+            engine: $scan.engine,
+            pool: $scan.pool,
+            event_sink: $scan.event_sink,
+            store_producer: $scan.store_producer,
+            scan_scratch: $scan.scan_scratch,
+            pending: $scan.pending,
+            persist_batch: $scan.persist_batch,
+            budgets: $budgets,
+            canon: $scan.canon,
+            vpaths: $vpaths,
+            path_budget_used: $path_budget_used,
+            tar_cursors: $tar_cursors,
+            gzip_header_buf: $scan.gzip_header_buf,
+            gzip_name_buf: $scan.gzip_name_buf,
+            next_virtual_file_id: $scan.next_virtual_file_id,
+            metrics: $scan.metrics,
+            archive: $scan.archive,
+            chunk_size: $scan.chunk_size,
+            abort_run: $scan.abort_run,
+        }
+    };
+}
+
 /// Scan a tar stream (plain, gzip-wrapped, or bzip2-wrapped), optionally
 /// recursing into nested archives.
 ///
@@ -221,27 +255,13 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 let (gunzip_path_used, path_used_tail) = rest_path_used
                                     .split_first_mut()
                                     .expect("path budget scratch exhausted");
-                                let mut child = ArchiveScanCtx {
-                                    engine: scan.engine,
-                                    pool: scan.pool,
-                                    event_sink: scan.event_sink,
-                                    store_producer: scan.store_producer,
-                                    scan_scratch: scan.scan_scratch,
-                                    pending: scan.pending,
-                                    persist_batch: scan.persist_batch,
+                                let mut child = child_archive_ctx!(
+                                    scan,
                                     budgets,
-                                    canon: scan.canon,
-                                    vpaths: vpaths_tail,
-                                    path_budget_used: path_used_tail,
-                                    tar_cursors: rest_cursors,
-                                    gzip_header_buf: scan.gzip_header_buf,
-                                    gzip_name_buf: scan.gzip_name_buf,
-                                    next_virtual_file_id: scan.next_virtual_file_id,
-                                    metrics: scan.metrics,
-                                    archive: scan.archive,
-                                    chunk_size: scan.chunk_size,
-                                    abort_run: scan.abort_run,
-                                };
+                                    vpaths_tail,
+                                    path_used_tail,
+                                    rest_cursors
+                                );
 
                                 let (mut gz, name_len) = match GzipStream::new_with_header(
                                     LimitedRead::new(input, entry_size),
@@ -309,27 +329,13 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 let (bunzip_path_used, path_used_tail) = rest_path_used
                                     .split_first_mut()
                                     .expect("path budget scratch exhausted");
-                                let mut child = ArchiveScanCtx {
-                                    engine: scan.engine,
-                                    pool: scan.pool,
-                                    event_sink: scan.event_sink,
-                                    store_producer: scan.store_producer,
-                                    scan_scratch: scan.scan_scratch,
-                                    pending: scan.pending,
-                                    persist_batch: scan.persist_batch,
+                                let mut child = child_archive_ctx!(
+                                    scan,
                                     budgets,
-                                    canon: scan.canon,
-                                    vpaths: vpaths_tail,
-                                    path_budget_used: path_used_tail,
-                                    tar_cursors: rest_cursors,
-                                    gzip_header_buf: scan.gzip_header_buf,
-                                    gzip_name_buf: scan.gzip_name_buf,
-                                    next_virtual_file_id: scan.next_virtual_file_id,
-                                    metrics: scan.metrics,
-                                    archive: scan.archive,
-                                    chunk_size: scan.chunk_size,
-                                    abort_run: scan.abort_run,
-                                };
+                                    vpaths_tail,
+                                    path_used_tail,
+                                    rest_cursors
+                                );
 
                                 let entry_name_bytes = b"<bunzip2>";
                                 let bunzip_display = bunzip_vpath
@@ -360,27 +366,13 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 (out, entry_reader.remaining())
                             }
                             ArchiveKind::Tar => {
-                                let mut child = ArchiveScanCtx {
-                                    engine: scan.engine,
-                                    pool: scan.pool,
-                                    event_sink: scan.event_sink,
-                                    store_producer: scan.store_producer,
-                                    scan_scratch: scan.scan_scratch,
-                                    pending: scan.pending,
-                                    persist_batch: scan.persist_batch,
+                                let mut child = child_archive_ctx!(
+                                    scan,
                                     budgets,
-                                    canon: scan.canon,
-                                    vpaths: rest_vpaths,
-                                    path_budget_used: rest_path_used,
-                                    tar_cursors: rest_cursors,
-                                    gzip_header_buf: scan.gzip_header_buf,
-                                    gzip_name_buf: scan.gzip_name_buf,
-                                    next_virtual_file_id: scan.next_virtual_file_id,
-                                    metrics: scan.metrics,
-                                    archive: scan.archive,
-                                    chunk_size: scan.chunk_size,
-                                    abort_run: scan.abort_run,
-                                };
+                                    rest_vpaths,
+                                    rest_path_used,
+                                    rest_cursors
+                                );
                                 let mut entry_reader = LimitedRead::new(input, entry_size);
                                 let out = scan_tar_stream_nested(
                                     &mut child,
@@ -392,27 +384,13 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 (out, entry_reader.remaining())
                             }
                             ArchiveKind::TarGz => {
-                                let mut child = ArchiveScanCtx {
-                                    engine: scan.engine,
-                                    pool: scan.pool,
-                                    event_sink: scan.event_sink,
-                                    store_producer: scan.store_producer,
-                                    scan_scratch: scan.scan_scratch,
-                                    pending: scan.pending,
-                                    persist_batch: scan.persist_batch,
+                                let mut child = child_archive_ctx!(
+                                    scan,
                                     budgets,
-                                    canon: scan.canon,
-                                    vpaths: rest_vpaths,
-                                    path_budget_used: rest_path_used,
-                                    tar_cursors: rest_cursors,
-                                    gzip_header_buf: scan.gzip_header_buf,
-                                    gzip_name_buf: scan.gzip_name_buf,
-                                    next_virtual_file_id: scan.next_virtual_file_id,
-                                    metrics: scan.metrics,
-                                    archive: scan.archive,
-                                    chunk_size: scan.chunk_size,
-                                    abort_run: scan.abort_run,
-                                };
+                                    rest_vpaths,
+                                    rest_path_used,
+                                    rest_cursors
+                                );
                                 let entry_reader = LimitedRead::new(input, entry_size);
                                 let mut gz = GzipStream::new(entry_reader);
                                 let out = scan_tar_stream_nested(
@@ -426,27 +404,13 @@ pub(super) fn scan_tar_stream_nested<E: ScanEngine>(
                                 (out, entry_reader.remaining())
                             }
                             ArchiveKind::TarBz2 => {
-                                let mut child = ArchiveScanCtx {
-                                    engine: scan.engine,
-                                    pool: scan.pool,
-                                    event_sink: scan.event_sink,
-                                    store_producer: scan.store_producer,
-                                    scan_scratch: scan.scan_scratch,
-                                    pending: scan.pending,
-                                    persist_batch: scan.persist_batch,
+                                let mut child = child_archive_ctx!(
+                                    scan,
                                     budgets,
-                                    canon: scan.canon,
-                                    vpaths: rest_vpaths,
-                                    path_budget_used: rest_path_used,
-                                    tar_cursors: rest_cursors,
-                                    gzip_header_buf: scan.gzip_header_buf,
-                                    gzip_name_buf: scan.gzip_name_buf,
-                                    next_virtual_file_id: scan.next_virtual_file_id,
-                                    metrics: scan.metrics,
-                                    archive: scan.archive,
-                                    chunk_size: scan.chunk_size,
-                                    abort_run: scan.abort_run,
-                                };
+                                    rest_vpaths,
+                                    rest_path_used,
+                                    rest_cursors
+                                );
                                 let entry_reader = LimitedRead::new(input, entry_size);
                                 let mut bz2 = Bzip2Stream::new(entry_reader);
                                 let out = scan_tar_stream_nested(
