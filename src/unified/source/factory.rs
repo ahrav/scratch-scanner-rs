@@ -692,7 +692,7 @@ mod tests {
         // exclude "a.txt" and "d.txt".
         assert_eq!(keys.len(), 2, "shard [b, d) should yield 2 items: {keys:?}");
         assert!(
-            keys.iter().all(|k| k >= "b" && k < "d"),
+            keys.iter().all(|k| k.as_str() >= "b" && k.as_str() < "d"),
             "all keys should be in [b, d): {keys:?}",
         );
     }
@@ -716,10 +716,10 @@ mod tests {
         assert_eq!(page.items().len(), 1);
 
         let item = &page.items()[0];
-        let item_ref = ItemRef::try_from_slice(item.item_ref().as_bytes()).unwrap();
+        let item_ref = item.item_ref();
         let budget = Budgets::try_new(10, u64::MAX, None).unwrap();
 
-        let mut reader = conn.open(&item_ref, budget).unwrap();
+        let mut reader = conn.open(item_ref, budget).unwrap();
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"world");
@@ -738,12 +738,15 @@ mod tests {
             .unwrap();
         assert_eq!(page.items().len(), 1);
 
-        let item = &page.items()[0];
-        let item_ref = ItemRef::try_from_slice(item.item_ref().as_bytes()).unwrap();
+        let item_ref_bytes = page.items()[0].item_ref().as_bytes().to_vec();
+        let item_ref = ItemRef::try_from_slice(&item_ref_bytes).unwrap();
 
         // Budget smaller than the file size.
         let budget = Budgets::try_new(10, 100, None).unwrap();
-        let err = conn.open(&item_ref, budget).unwrap_err();
+        let err = match conn.open(&item_ref, budget) {
+            Ok(_) => panic!("open should fail when budget is exceeded"),
+            Err(e) => e,
+        };
         assert!(
             !err.is_retryable(),
             "budget exceeded should be a permanent error",
@@ -763,7 +766,10 @@ mod tests {
         let bad_ref = ItemRef::try_from_slice(b"bad").unwrap();
         let budget = Budgets::try_new(10, u64::MAX, None).unwrap();
 
-        let err = conn.open(&bad_ref, budget).unwrap_err();
+        let err = match conn.open(&bad_ref, budget) {
+            Ok(_) => panic!("open should fail with invalid item_ref"),
+            Err(e) => e,
+        };
         assert!(
             !err.is_retryable(),
             "invalid item_ref should be a permanent error",
