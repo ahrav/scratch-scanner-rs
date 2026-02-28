@@ -82,6 +82,12 @@
 //! - All hot-path buffers live in [`ArchiveScratch`] and are reused.
 //! - Chunk overlap is configured once at [`ArchiveScratch::new`] time and
 //!   applied uniformly to every entry read loop.
+//! - **bzip2 CPU exhaustion**: bzip2 block decompression can buffer up to
+//!   900 KiB internally per `read()` call. The `is_deadline_expired()` check
+//!   fires between read iterations, not during a single decompression call,
+//!   so a single block decode can run uninterrupted for a noticeable wall-clock
+//!   interval. Production deployments should set `max_wall_clock_secs_per_root`
+//!   to bound total CPU time per source file.
 
 use std::io::Read;
 

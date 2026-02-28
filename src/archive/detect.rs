@@ -119,7 +119,7 @@ pub fn detect_kind_from_name(name: &str) -> Option<ArchiveKind> {
 /// Minimum buffer sizes for each format:
 /// - **gzip**: 2 bytes (`1f 8b`)
 /// - **zip**: 4 bytes (`PK` prefix + one of four signature pairs; see [`is_zip_magic`])
-/// - **bzip2**: 3 bytes (`BZh`)
+/// - **bzip2**: 4 bytes (`BZh` + block-size digit `'1'`–`'9'`)
 /// - **tar (ustar)**: 512 bytes (magic at offset 257)
 ///
 /// Returns `Gzip` for any gzip stream — callers must rely on the filename

@@ -20,10 +20,12 @@ pub const BZIP2_MAGIC: [u8; 3] = [0x42, 0x5A, 0x68];
 
 #[inline(always)]
 pub fn is_bzip2_magic(header: &[u8]) -> bool {
-    header.len() >= 3
+    header.len() >= 4
         && header[0] == BZIP2_MAGIC[0]
         && header[1] == BZIP2_MAGIC[1]
         && header[2] == BZIP2_MAGIC[2]
+        && header[3] >= b'1'
+        && header[3] <= b'9'
 }
 
 /// Streaming bzip2 decoder with compressed-byte delta reporting.
@@ -91,10 +93,15 @@ mod tests {
         assert!(!is_bzip2_magic(b"PK\x03\x04"));
     }
 
-    /// Exact 3-byte boundary: `"BZh"` is the minimum valid magic prefix.
+    /// 4-byte check: `"BZh"` alone is insufficient — the block-size digit
+    /// (`'1'`–`'9'`) is required.
     #[test]
-    fn magic_exact_three_byte_boundary() {
-        assert!(is_bzip2_magic(b"BZh"));
+    fn magic_requires_block_size_digit() {
+        assert!(!is_bzip2_magic(b"BZh"));
+        assert!(is_bzip2_magic(b"BZh1"));
+        assert!(is_bzip2_magic(b"BZh9"));
+        assert!(!is_bzip2_magic(b"BZh0"));
+        assert!(!is_bzip2_magic(b"BZha"));
     }
 
     /// Compress → decompress via `Bzip2Stream`, verify byte-exact round-trip.
