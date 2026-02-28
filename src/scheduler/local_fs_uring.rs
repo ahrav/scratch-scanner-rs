@@ -526,7 +526,7 @@ struct ArchiveWork {
 /// Work item sent to binary-extraction worker threads.
 ///
 /// Routed from I/O threads when `skip_binary` is true and the first chunk
-/// is classified as `BinaryExtractable` (e.g., `.ipynb`, `.class`, `.jar`,
+/// is classified as `Extractable` (e.g., `.ipynb`, `.class`, `.jar`,
 /// `.war`, `.pyc`). The already-open file descriptor is transferred so
 /// extraction avoids an extra open syscall and preserves open-time snapshot
 /// semantics.
@@ -1036,7 +1036,7 @@ enum FilePhase {
 /// the next read's buffer can be prefixed without re-reading from disk.
 struct ReadState {
     /// Open file descriptor for this slot. `None` only after ownership is
-    /// transferred to extraction workers for `BinaryExtractable` files.
+    /// transferred to extraction workers for `Extractable` files.
     file: Option<File>,
     /// Authoritative file size from fstat/statx at open time.
     size: u64,
@@ -1968,7 +1968,7 @@ fn io_worker_loop<E: ScanEngine>(
                                             }
                                             continue;
                                         }
-                                        ContentVerdict::BinaryExtractable(fmt) => {
+                                        ContentVerdict::Extractable(fmt) => {
                                             if let Some(ref etx) = extract_tx {
                                                 // Transfer the already-open fd to extraction
                                                 // workers. This avoids a second open syscall and

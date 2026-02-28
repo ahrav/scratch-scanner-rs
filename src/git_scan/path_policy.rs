@@ -178,8 +178,9 @@ const MAX_LONG_EXTS: usize = 16;
 
 /// Sorted packed-u64 table of binary extensions that are safe to skip.
 ///
-/// **Not included** (BinaryExtractable — must reach content classifier):
-/// `.class`, `.ear`, `.ipynb`, `.jar`, `.pyc`, `.pyo`, `.war`
+/// **Not included** (must reach content classifier):
+/// `.class`, `.ipynb`, `.jar`, `.pyc`, `.war` (currently `Extractable`);
+/// `.ear`, `.pyo` (similar formats, excluded defensively)
 ///
 /// **Not included** (ambiguous/text-based):
 /// `.db`, `.sqlite`, `.sqlitedb`, `.accdb`, `.mdb`, `.pb`, `.rtf`, `.svg`,
@@ -780,7 +781,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // BinaryExtractable formats must NOT be in the skip set
+    // Extractable formats must NOT be in the skip set
     // ------------------------------------------------------------------
     #[test]
     fn extractable_formats_not_in_skip_set() {
@@ -795,7 +796,7 @@ mod tests {
         ] {
             assert!(
                 !ext_in_skip_set(ext),
-                "BinaryExtractable ext {:?} must NOT be in skip set",
+                "Extractable ext {:?} must NOT be in skip set",
                 core::str::from_utf8(ext).unwrap_or("??"),
             );
         }
