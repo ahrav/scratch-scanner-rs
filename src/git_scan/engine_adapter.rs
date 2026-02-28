@@ -134,14 +134,14 @@ impl Default for EngineAdapterConfig {
 /// long-lived persistence structures.
 ///
 /// Identity key is `(start, end, rule_id, norm_hash)`.
-/// `confidence_score` is carried for reporting, but does not participate in
-/// dedup identity. When multiple equivalent findings differ only by
-/// confidence, dedupe keeps the highest score.
+/// `PartialEq`, `Eq`, and `Hash` are implemented manually over the identity
+/// key only; `Ord`/`PartialOrd` are deliberately absent to force callers
+/// through `sort_and_dedupe_findings`.
 ///
 /// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
 /// a *best-effort root match span* in blob coordinates. For transform-derived
 /// findings, these spans map back to the encoded bytes that produced the match.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Clone, Copy, Debug)]
 pub struct FindingKey {
     /// Inclusive start offset within the blob.
     pub start: u32,
@@ -153,21 +153,16 @@ pub struct FindingKey {
     /// secret, so raw secret bytes never appear in scan output structures.
     pub norm_hash: NormHash,
     /// Additive confidence score from engine gate evaluation.
+    ///
+    /// **Not part of identity.** This field is excluded from `PartialEq`,
+    /// `Hash`, and `Ord` so that findings differing only in confidence are
+    /// treated as duplicates by standard collections and sort/dedup.
     pub confidence_score: i8,
 }
 
-impl FindingKey {
-    #[inline(always)]
-    fn identity_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.start
-            .cmp(&other.start)
-            .then_with(|| self.end.cmp(&other.end))
-            .then_with(|| self.rule_id.cmp(&other.rule_id))
-            .then_with(|| self.norm_hash.cmp(&other.norm_hash))
-    }
-
-    #[inline(always)]
-    fn same_identity(&self, other: &Self) -> bool {
+impl PartialEq for FindingKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
         self.start == other.start
             && self.end == other.end
             && self.rule_id == other.rule_id
@@ -175,17 +170,45 @@ impl FindingKey {
     }
 }
 
+impl Eq for FindingKey {}
+
+impl std::hash::Hash for FindingKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.start.hash(state);
+        self.end.hash(state);
+        self.rule_id.hash(state);
+        self.norm_hash.hash(state);
+    }
+}
+
+impl FindingKey {
+    /// Compare two keys by identity fields only (start, end, rule_id,
+    /// norm_hash). Confidence is excluded so that callers must go through
+    /// [`sort_and_dedupe_findings`] to get the correct confidence tie-breaker.
+    #[inline]
+    fn identity_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start
+            .cmp(&other.start)
+            .then_with(|| self.end.cmp(&other.end))
+            .then_with(|| self.rule_id.cmp(&other.rule_id))
+            .then_with(|| self.norm_hash.cmp(&other.norm_hash))
+    }
+}
+
 /// Sort findings by identity and dedupe equal identities in place.
 ///
 /// Tie-breaker inside an identity group is descending confidence, so dedupe
-/// keeps the most informative score.
+/// keeps the most informative score. `dedup()` uses the manual `Eq` impl
+/// which excludes `confidence_score`, so the first (highest-confidence)
+/// entry in each group survives.
 #[inline]
 pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<FindingKey>) {
     findings.sort_unstable_by(|a, b| {
         a.identity_cmp(b)
             .then_with(|| b.confidence_score.cmp(&a.confidence_score))
     });
-    findings.dedup_by(|a, b| a.same_identity(b));
+    findings.dedup();
 }
 
 /// Range into the adapter findings arena for a single blob.
