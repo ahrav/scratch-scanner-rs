@@ -59,6 +59,7 @@
 //! | [`ConnectorSource`] | Blanket trait alias for `ConnectorInstance + Send + 'static` |
 //! | [`PageCompletionBarrier`] | Mutex+condvar barrier tracking outstanding items per page |
 //! | [`PageItemToken`] | RAII guard tying one item's lifecycle to its page barrier |
+//! | [`PageId`] | Monotonically increasing newtype page counter within a scan run |
 //! | [`ConnectorRunReport`] | End-of-run statistics (enumeration counters) |
 //! | [`ConnectorRunError`] | Error taxonomy covering enumeration, validation, and persistence failures |
 
@@ -78,14 +79,15 @@ use gossip_contracts::connector::{
 };
 use gossip_contracts::coordination::ShardSpec;
 
+use std::fmt;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Tuning knobs for a connector pipeline scan.
 ///
-/// Controls chunk geometry, page enumeration budgets, and optional split-hint
-/// behavior. All fields have sensible defaults via [`Default`]; callers
+/// Controls chunk geometry, page enumeration budgets, per-item byte limits,
+/// and optional split-hint behavior. All fields have sensible defaults via [`Default`]; callers
 /// typically override only the fields relevant to their workload profile.
 ///
 /// Call [`validate`](Self::validate) before use to assert scheduler invariants
@@ -109,6 +111,10 @@ pub struct ConnectorConfig {
     /// When `Some`, a split-hint request is issued after each checkpoint.
     /// When `None`, split-hint logic is skipped entirely.
     pub split_hint_budgets: Option<Budgets>,
+    /// Maximum bytes read per item before the read is terminated as a
+    /// permanent error. Prevents a single oversized object from exhausting
+    /// memory. Defaults to 256 MiB.
+    pub max_item_bytes: u64,
 }
 
 impl Default for ConnectorConfig {
@@ -121,6 +127,7 @@ impl Default for ConnectorConfig {
             split_hint_budgets: Some(
                 Budgets::try_new(32, 1024 * 1024, None).expect("valid default split-hint budgets"),
             ),
+            max_item_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -129,11 +136,12 @@ impl ConnectorConfig {
     /// Validate that every field satisfies scheduler invariants.
     ///
     /// Checks that all counts are positive, budget fields are positive,
-    /// `chunk_size > required_overlap` (so carry bytes fully satisfy the
-    /// engine's cross-chunk overlap requirement), and
-    /// `chunk_size + required_overlap <= BUFFER_LEN_MAX` (the engine's hard
-    /// buffer cap). `required_overlap` comes from the engine and represents
-    /// the minimum overlap needed for cross-chunk pattern matching.
+    /// `max_item_bytes > 0`, `chunk_size > required_overlap` (so carry
+    /// bytes fully satisfy the engine's cross-chunk overlap requirement),
+    /// and `chunk_size + required_overlap <= BUFFER_LEN_MAX` (the engine's
+    /// hard buffer cap). `required_overlap` comes from the engine and
+    /// represents the minimum overlap needed for cross-chunk pattern
+    /// matching.
     pub fn validate(&self, required_overlap: usize) -> Result<(), String> {
         if self.cpu_workers == 0 {
             return Err("cpu_workers must be > 0".into());
@@ -160,6 +168,10 @@ impl ConnectorConfig {
             if split.max_bytes() == 0 {
                 return Err("split_hint_budgets.max_bytes must be > 0".into());
             }
+        }
+
+        if self.max_item_bytes == 0 {
+            return Err("max_item_bytes must be > 0".into());
         }
 
         let buf_len = required_overlap.saturating_add(self.chunk_size);
@@ -299,6 +311,36 @@ pub enum ConnectorRunError<E> {
     FileIdOverflow,
 }
 
+impl<E: fmt::Debug> fmt::Display for ConnectorRunError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Enumerate(e) => write!(f, "enumeration failed: {e}"),
+            Self::PageValidation(e) => write!(f, "page validation failed: {e}"),
+            Self::Progress(e) => write!(f, "progress sink failed: {e:?}"),
+            Self::Dispatch(msg) => write!(f, "item dispatch failed: {msg}"),
+            Self::PageIdOverflow => write!(f, "page ID counter exceeded u64::MAX"),
+            Self::BudgetExceeded { returned, limit } => {
+                write!(
+                    f,
+                    "page returned {returned} items, exceeding budget limit of {limit}"
+                )
+            }
+            Self::Config(msg) => write!(f, "invalid configuration: {msg}"),
+            Self::FileIdOverflow => write!(f, "file ID allocation exceeded u32::MAX"),
+        }
+    }
+}
+
+impl<E: fmt::Debug + Send + Sync + 'static> std::error::Error for ConnectorRunError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Enumerate(e) => Some(e),
+            Self::PageValidation(e) => Some(e.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 /// Shared CPU-side chunk runner used by both `open()` and `read_range()` paths.
 ///
 /// Reuses one engine scratch, one temporary findings buffer, and one I/O buffer
@@ -312,6 +354,7 @@ struct ConnectorCpuRunner<E: ScanEngine> {
     buf: Vec<u8>,
     overlap: usize,
     chunk_size: usize,
+    max_item_bytes: u64,
 }
 
 impl<E: ScanEngine> ConnectorCpuRunner<E> {
@@ -320,6 +363,7 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
         event_sink: Arc<dyn EventSink>,
         overlap: usize,
         chunk_size: usize,
+        max_item_bytes: u64,
     ) -> Self {
         Self {
             scratch: engine.new_scratch(),
@@ -329,6 +373,7 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
             event_sink,
             overlap,
             chunk_size,
+            max_item_bytes,
         }
     }
 
@@ -390,8 +435,9 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
     /// Unified overlap-aware chunking loop, parameterized by an I/O closure.
     ///
     /// `read_fn(offset, dst)` fills `dst` with payload bytes starting at
-    /// the given absolute offset and returns the byte count. Returning 0
-    /// signals EOF. The loop preserves `self.overlap` bytes from the tail
+    /// the given absolute offset and returns `Ok(n)` with the byte count.
+    /// Returning `Ok(0)` signals EOF. The loop preserves `self.overlap`
+    /// bytes from the tail
     /// of each chunk as a prefix for the next, so cross-chunk pattern matches
     /// are visible to the scan engine.
     fn stream_chunks<F>(
@@ -441,6 +487,12 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
             );
 
             offset = offset.saturating_add(n as u64);
+            if offset > self.max_item_bytes {
+                return Err(ReadError::permanent(format!(
+                    "item exceeded max_item_bytes ({} > {})",
+                    offset, self.max_item_bytes
+                )));
+            }
             have = len;
             carry = overlap.min(len);
         }
@@ -555,10 +607,37 @@ fn emit_read_error_diagnostic(event_sink: &dyn EventSink, item: &ScanItem, err: 
 }
 
 /// Monotonically increasing page identifier within a single scan run.
-#[cfg(feature = "bench")]
-pub(super) type PageId = u64;
-#[cfg(not(feature = "bench"))]
-type PageId = u64;
+///
+/// Wraps a `u64` counter to prevent accidental confusion with other numeric
+/// identifiers. Provides [`checked_next`](Self::checked_next) to enforce
+/// overflow safety at the call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bench", allow(dead_code))]
+pub(super) struct PageId(u64);
+
+impl PageId {
+    /// The first page in a scan run.
+    pub(super) const ZERO: Self = Self(0);
+
+    /// Wrap a raw `u64` as a `PageId`.
+    ///
+    /// Intended for benchmark and test code that needs to construct
+    /// arbitrary page identifiers.
+    pub(super) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Return the next page id, or `None` on overflow.
+    pub(super) fn checked_next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl fmt::Display for PageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Barrier that blocks checkpoint advancement until every item on a page
 /// reaches a terminal state (success or handled item failure).
@@ -768,6 +847,7 @@ where
         Arc::clone(&dispatch_sink),
         overlap,
         cfg.chunk_size,
+        cfg.max_item_bytes,
     );
     let mut worker_metrics = WorkerMetricsLocal::new();
     let mut next_file_id: u32 = 0;
@@ -779,11 +859,19 @@ where
         progress,
         event_sink,
         |_page_id, connector, items, item_tokens| {
+            // Pre-validate that we have enough FileId headroom for every item
+            // on this page. This avoids partial processing: either all items
+            // get IDs or the page fails atomically before any work starts.
+            let count =
+                u32::try_from(items.len()).map_err(|_| ConnectorRunError::FileIdOverflow)?;
+            next_file_id
+                .checked_add(count)
+                .ok_or(ConnectorRunError::FileIdOverflow)?;
+
             for (item, token) in items.iter().zip(item_tokens) {
                 let file_id = FileId(next_file_id);
-                next_file_id = next_file_id
-                    .checked_add(1)
-                    .ok_or(ConnectorRunError::FileIdOverflow)?;
+                // Safe: pre-validated above.
+                next_file_id += 1;
 
                 if let Err(read_err) =
                     cpu_runner.stream_item(connector, item, file_id, &mut worker_metrics)
@@ -847,7 +935,7 @@ where
     let mut report = ConnectorRunReport::default();
     let mut cursor = progress.cursor();
     let shard = progress.shard_spec().clone();
-    let mut next_page_id: PageId = 0;
+    let mut next_page_id = PageId::ZERO;
 
     let result = (|| {
         loop {
@@ -880,7 +968,7 @@ where
 
             let page_id = next_page_id;
             next_page_id = next_page_id
-                .checked_add(1)
+                .checked_next()
                 .ok_or(ConnectorRunError::PageIdOverflow)?;
 
             // Step 4-5: create barrier + tokens and hand items to the dispatch strategy.

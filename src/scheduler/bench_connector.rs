@@ -51,7 +51,10 @@ impl Drop for BenchToken {
 /// Returns `(barrier, tokens)` where each token holds one outstanding count
 /// on the barrier. The barrier unblocks when all tokens are released.
 pub fn bench_track_page_items(page_id: u64, item_count: usize) -> (BenchBarrier, Vec<BenchToken>) {
-    let (barrier, tokens) = connector_pipeline::track_page_items(page_id, item_count);
+    let (barrier, tokens) = connector_pipeline::track_page_items(
+        connector_pipeline::PageId::from_raw(page_id),
+        item_count,
+    );
     let bench_tokens = tokens
         .into_iter()
         .map(|t| BenchToken { inner: Some(t) })

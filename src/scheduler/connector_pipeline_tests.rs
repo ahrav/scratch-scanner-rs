@@ -286,6 +286,19 @@ fn item(key: &[u8], stable_fill: u8, version: &[u8]) -> ScanItem {
     )
 }
 
+/// Create a [`ScanItem`] with distinct `item_key` and `item_ref`.
+///
+/// This tests the contract that read paths use `item_ref` (the storage
+/// address) rather than `item_key` (the logical identifier).
+fn item_with_ref(key: &[u8], item_ref: &[u8], stable_fill: u8, version: &[u8]) -> ScanItem {
+    ScanItem::new(
+        ItemKey::try_from_slice(key).unwrap(),
+        ItemRef::try_from_slice(item_ref).unwrap(),
+        StableItemId::from_bytes([stable_fill; 32]),
+        VersionId::Strong(ObjectVersionId::from_version_bytes(version)),
+    )
+}
+
 #[test]
 fn scan_connector_enumerates_validates_checkpoints_and_completes() {
     let shard = ShardSpec::unbounded();
@@ -398,10 +411,12 @@ fn scan_connector_maps_checkpoint_error_to_progress_error() {
 
 #[test]
 fn page_tokens_track_page_id_and_outstanding_items() {
-    let (barrier, tokens) = track_page_items(7, 2);
-    assert_eq!(barrier.page_id, 7);
+    let (barrier, tokens) = track_page_items(PageId(7), 2);
+    assert_eq!(barrier.page_id, PageId(7));
     assert_eq!(barrier.outstanding_items(), 2);
-    assert!(tokens.iter().all(|token| token.barrier.page_id == 7));
+    assert!(tokens
+        .iter()
+        .all(|token| token.barrier.page_id == PageId(7)));
 
     let mut tokens = tokens.into_iter();
     tokens.next().unwrap().complete();
@@ -444,7 +459,7 @@ fn scan_connector_waits_for_page_completion_before_checkpoint() {
             &mut progress,
             sink,
             move |page_id, _connector, items, tokens| {
-                assert_eq!(page_id, 0);
+                assert_eq!(page_id, PageId::ZERO);
                 assert_eq!(items.len(), tokens.len());
                 assert!(tokens.iter().all(|token| token.barrier.page_id == page_id));
                 dispatch_started_tx.send(()).unwrap();
@@ -679,14 +694,14 @@ fn read_some_fails_after_max_eintr_retries() {
 
 #[test]
 fn barrier_zero_items_completes_immediately() {
-    let barrier = PageCompletionBarrier::new(0, 0);
+    let barrier = PageCompletionBarrier::new(PageId::ZERO, 0);
     barrier.wait_until_complete();
     assert_eq!(barrier.outstanding_items(), 0);
 }
 
 #[test]
 fn token_drop_without_complete_releases_barrier() {
-    let (barrier, tokens) = track_page_items(1, 2);
+    let (barrier, tokens) = track_page_items(PageId(1), 2);
     assert_eq!(barrier.outstanding_items(), 2);
     drop(tokens);
     assert_eq!(barrier.outstanding_items(), 0);
@@ -694,7 +709,7 @@ fn token_drop_without_complete_releases_barrier() {
 
 #[test]
 fn barrier_lock_or_recover_survives_poisoned_mutex() {
-    let barrier = PageCompletionBarrier::new(0, 2);
+    let barrier = PageCompletionBarrier::new(PageId::ZERO, 2);
 
     // Poison the mutex by panicking while holding the guard.
     let b = Arc::clone(&barrier);
@@ -1049,7 +1064,10 @@ fn scan_connector_maps_split_hint_persistence_error_to_progress_error() {
 }
 
 fn count_jsonl_findings(encoded: &str) -> usize {
-    encoded.matches("\"type\":\"finding\"").count()
+    encoded
+        .lines()
+        .filter(|line| line.contains("\"type\"") && line.contains("\"finding\""))
+        .count()
 }
 
 #[test]
@@ -1365,4 +1383,230 @@ fn scan_connector_read_range_overflow_is_permanent_error() {
             ProgressCall::Complete(Cursor::with_last_key(k1)),
         ]
     );
+}
+
+// -- ConnectorRunError Display/Error --
+
+#[test]
+fn connector_run_error_display_formats_all_variants() {
+    let err: ConnectorRunError<&str> = ConnectorRunError::FileIdOverflow;
+    assert!(err.to_string().contains("u32::MAX"), "got: {err}");
+
+    let err: ConnectorRunError<&str> = ConnectorRunError::BudgetExceeded {
+        returned: 10,
+        limit: 5,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("10") && msg.contains("5"), "got: {msg}");
+
+    let err: ConnectorRunError<&str> = ConnectorRunError::PageIdOverflow;
+    assert!(err.to_string().contains("u64::MAX"), "got: {err}");
+
+    let err: ConnectorRunError<&str> = ConnectorRunError::Config("bad".into());
+    assert!(err.to_string().contains("bad"), "got: {err}");
+
+    let err: ConnectorRunError<&str> = ConnectorRunError::Dispatch("queue full".into());
+    assert!(err.to_string().contains("queue full"), "got: {err}");
+
+    let err: ConnectorRunError<&str> = ConnectorRunError::Progress("sink broke");
+    assert!(err.to_string().contains("sink broke"), "got: {err}");
+}
+
+#[test]
+fn connector_run_error_source_delegates_for_enumerate_and_page_validation() {
+    use std::error::Error;
+
+    let enumerate_err = EnumerateError::permanent("enum fail");
+    let err: ConnectorRunError<&str> = ConnectorRunError::Enumerate(enumerate_err);
+    assert!(err.source().is_some(), "Enumerate should have a source");
+
+    let page_err = validate_page(
+        &ShardSpec::with_range(b"a", b"z"),
+        &Cursor::initial(),
+        &[item(b"b", 1, b"v1")],
+        &Cursor::initial(),
+    )
+    .unwrap_err();
+    let err: ConnectorRunError<&str> = ConnectorRunError::PageValidation(Box::new(page_err));
+    assert!(
+        err.source().is_some(),
+        "PageValidation should have a source"
+    );
+
+    let err: ConnectorRunError<&str> = ConnectorRunError::FileIdOverflow;
+    assert!(err.source().is_none(), "FileIdOverflow has no source");
+}
+
+// -- PageId newtype --
+
+#[test]
+fn page_id_checked_next_increments_and_detects_overflow() {
+    assert_eq!(PageId::ZERO.checked_next(), Some(PageId(1)));
+    assert_eq!(PageId(u64::MAX).checked_next(), None);
+}
+
+#[test]
+fn page_id_display_shows_inner_value() {
+    assert_eq!(format!("{}", PageId::ZERO), "0");
+    assert_eq!(format!("{}", PageId(42)), "42");
+}
+
+// -- Per-item byte limit (max_item_bytes) --
+
+#[test]
+fn scan_connector_enforces_max_item_bytes() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let payload = vec![0xAA; 128];
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector::new(pages).with_item_payload(b"k1", &payload);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        chunk_size: 32,
+        max_item_bytes: 64,
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (report, metrics) = scan_connector(
+        Arc::new(test_engine(8)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(metrics.io_errors, 1);
+    assert_eq!(report.enumerate.items_failed_permanent, 1);
+    let encoded = String::from_utf8(sink.bytes()).unwrap();
+    assert!(
+        encoded.contains("max_item_bytes"),
+        "diagnostic should mention max_item_bytes, got: {encoded}"
+    );
+}
+
+#[test]
+fn validate_rejects_zero_max_item_bytes() {
+    let cfg = ConnectorConfig {
+        max_item_bytes: 0,
+        ..ConnectorConfig::default()
+    };
+    let err = cfg.validate(16).unwrap_err();
+    assert!(
+        err.contains("max_item_bytes"),
+        "expected max_item_bytes rejection, got: {err}"
+    );
+}
+
+// -- FileId pre-validation --
+
+#[test]
+fn scan_connector_file_id_overflow_at_page_start_prevents_partial_processing() {
+    let shard = ShardSpec::unbounded();
+    let k2 = ItemKey::try_from_slice(b"k2").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1"), item(b"k2", 2, b"v2")],
+            Cursor::with_last_key(k2.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k2.clone())),
+    ];
+    let mut connector = MockConnector::new(pages);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+
+    // Start file_id at u32::MAX so the 2-item page overflows.
+    let engine = Arc::new(test_engine(16));
+    let dispatch_sink = Arc::clone(&sink) as Arc<dyn EventSink>;
+    let cfg = ConnectorConfig {
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let next_file_id: u32 = u32::MAX;
+
+    let err = scan_connector_with_page_dispatch(
+        engine,
+        &mut connector,
+        cfg,
+        &mut progress,
+        dispatch_sink,
+        |_page_id, _connector, items, _tokens| {
+            let count =
+                u32::try_from(items.len()).map_err(|_| ConnectorRunError::FileIdOverflow)?;
+            next_file_id
+                .checked_add(count)
+                .ok_or(ConnectorRunError::FileIdOverflow)?;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ConnectorRunError::FileIdOverflow),
+        "expected FileIdOverflow, got: {err:?}"
+    );
+    assert!(
+        progress.calls.is_empty(),
+        "no checkpoints should occur on FileIdOverflow"
+    );
+}
+
+// -- F9: reads use item_ref, not item_key --
+
+#[rstest]
+#[case::open_path(false)]
+#[case::range_read_path(true)]
+fn scan_connector_reads_from_item_ref_not_item_key(#[case] use_range_read: bool) {
+    let shard = ShardSpec::unbounded();
+    // item_key is "k1", item_ref is "ref1": payload is keyed by "ref1".
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let payload = b"payload with SECRET inside";
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item_with_ref(b"k1", b"ref1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector::new(Vec::new());
+    connector.pages = pages.into_iter().map(Ok).collect();
+    connector
+        .payloads
+        .insert(b"ref1".to_vec(), payload.to_vec());
+    if use_range_read {
+        connector.caps.range_read = true;
+    }
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        chunk_size: 256,
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (_report, metrics) = scan_connector(
+        Arc::new(test_engine(6)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(
+        metrics.bytes_scanned,
+        payload.len() as u64,
+        "reads should use item_ref (ref1) to find the payload, not item_key (k1)"
+    );
+    assert_eq!(metrics.findings_emitted, 1);
 }
