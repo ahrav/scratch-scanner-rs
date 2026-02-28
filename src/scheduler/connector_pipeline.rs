@@ -1,4 +1,4 @@
-//! Connector-first scheduler entrypoints.
+//! Connector-first scheduler entrypoint for enumerate/read/scan workflows.
 //!
 //! This module defines the connector-native API boundary for scheduler execution.
 //! It currently runs page-level orchestration (enumerate -> validate -> barrier -> checkpoint)
@@ -30,26 +30,30 @@ pub struct ConnectorScanConfig {
     /// Payload bytes per chunk (excluding overlap).
     pub chunk_size: usize,
     /// Hard cap on discovered-but-not-fully-processed items.
+    /// Acts as backpressure: enumeration stalls when this limit is reached.
     pub max_in_flight_items: usize,
     /// Bounded queue depth between enumeration and I/O workers.
     pub item_queue_cap: usize,
     /// Total buffers in the global pool.
     pub pool_buffers: usize,
-    /// Page budgets passed to connector enumeration.
+    /// Page budgets passed to [`EnumerationConnector::enumerate_page`].
+    /// Controls max items and max bytes per enumeration call.
     pub page_budgets: Budgets,
-    /// Optional budgets for split-hint requests.
+    /// Optional budgets for [`EnumerationConnector::choose_split_point`].
+    /// When `Some`, a split-hint request is issued after each checkpoint.
+    /// When `None`, split-hint logic is skipped entirely.
     pub split_hint_budgets: Option<Budgets>,
-    /// Abort an item if total time exceeds this (including retries).
+    /// Abort an item if total wall-clock time exceeds this (including retries).
     pub max_item_time: Option<Duration>,
     /// Seed for deterministic retry jitter and scheduling behavior.
     pub seed: u64,
-    /// If true, deduplicate findings within each chunk.
+    /// If true, deduplicate findings within each chunk's overlap window.
     pub dedupe_within_chunk: bool,
     /// Pin worker and I/O threads to CPU cores where supported.
     pub pin_threads: bool,
 }
 
-impl Default for ConnectorScanConfig {
+impl Default for ConnectorConfig {
     fn default() -> Self {
         Self {
             cpu_workers: 8,
@@ -71,12 +75,17 @@ impl Default for ConnectorScanConfig {
     }
 }
 
-impl ConnectorScanConfig {
-    /// Validate configuration against scheduler invariants.
+impl ConnectorConfig {
+    /// Assert that every field satisfies scheduler invariants.
+    ///
+    /// Checks that all counts are positive, budget fields are positive, and
+    /// `chunk_size + required_overlap <= BUFFER_LEN_MAX` (the engine's hard
+    /// buffer cap). `required_overlap` comes from the engine and represents
+    /// the minimum overlap needed for cross-chunk pattern matching.
     ///
     /// # Panics
     ///
-    /// Panics if configuration violates invariants.
+    /// Panics immediately on the first violated invariant.
     pub fn validate(&self, required_overlap: usize) {
         assert!(self.cpu_workers > 0, "cpu_workers must be > 0");
         assert!(self.io_threads > 0, "io_threads must be > 0");
@@ -118,78 +127,145 @@ impl ConnectorScanConfig {
     }
 }
 
-/// Back-compat alias while callers migrate to [`ConnectorScanConfig`].
-pub type ConnectorConfig = ConnectorScanConfig;
-
-/// Connector-native progress persistence contract.
+/// Persistence contract for shard progress during a connector scan.
+///
+/// The pipeline calls these methods in a strict lifecycle order:
+///
+/// 1. [`shard_spec`](Self::shard_spec) + [`cursor`](Self::cursor) — read once
+///    at scan start to establish the shard boundaries and resume point.
+/// 2. [`checkpoint`](Self::checkpoint) — called after every page-completion
+///    barrier, persisting the cursor that marks the *end* of the completed page.
+/// 3. Exactly one terminal transition:
+///    - [`complete`](Self::complete) — the connector returned an empty terminal
+///      page; the shard is fully scanned.
+///    - [`park`](Self::park) — the scan yields ownership (e.g., timeout or
+///      graceful shutdown) without completing the shard.
+/// 4. [`split_hint`](Self::split_hint) — optionally called between checkpoint
+///    and the next enumerate, suggesting a key at which the coordinator could
+///    split this shard for parallelism.
+///
+/// Implementations must be idempotent for `checkpoint` and `split_hint` in the
+/// presence of retries at the orchestration layer.
 pub trait ProgressSink: Send {
     /// Sink-specific persistence or coordination error.
     type Error: std::fmt::Debug + Send + Sync + 'static;
 
-    /// Shard currently owned by this scan attempt.
+    /// Shard key range owned by this scan attempt.
     fn shard_spec(&self) -> &ShardSpec;
-    /// Resume cursor to start this scan attempt.
+    /// Resume cursor for this scan attempt (initial or last-checkpointed).
     fn cursor(&self) -> Cursor;
-    /// Persist progress after a completed page barrier.
+    /// Persist progress after every completed page barrier.
+    ///
+    /// `cursor` is the `next_cursor` returned by the page whose barrier just
+    /// cleared. After this returns `Ok`, crash-recovery will resume from this
+    /// cursor rather than re-processing the completed page.
     fn checkpoint(&mut self, cursor: &Cursor) -> Result<(), Self::Error>;
-    /// Persist terminal completion state.
+    /// Persist terminal completion state (shard fully scanned).
     fn complete(&mut self, final_cursor: &Cursor) -> Result<(), Self::Error>;
-    /// Persist parked state when the run yields ownership.
+    /// Persist parked state when the run yields shard ownership without completing.
     fn park(&mut self) -> Result<(), Self::Error>;
-    /// Persist an optional split-point hint.
+    /// Persist a split-point hint for the coordinator.
+    ///
+    /// The coordinator may use this key to split the shard into two sub-shards
+    /// for increased parallelism. Advisory only — the coordinator is free to
+    /// ignore it.
     fn split_hint(&mut self, key: &ItemKey) -> Result<(), Self::Error>;
 }
 
-/// Connector runtime source contract for scheduler execution.
+/// Convenience bound: a [`ConnectorInstance`] that is `Send + 'static` so it
+/// can be moved into the scheduler's enumeration thread.
+///
+/// Automatically implemented for any type satisfying the bounds.
 pub trait ConnectorSource: ConnectorInstance + Send + 'static {}
 
 impl<T> ConnectorSource for T where T: ConnectorInstance + Send + 'static {}
 
-/// Enumeration-side run statistics.
+/// Enumeration-side run statistics accumulated during page-level orchestration.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnectorEnumerateStats {
+    /// Non-empty pages successfully enumerated and processed.
     pub pages_enumerated: u64,
+    /// Total items seen across all pages (before any filtering).
     pub items_discovered: u64,
+    /// Items dispatched for read/scan processing.
     pub items_enqueued: u64,
+    /// Successful [`ProgressSink::checkpoint`] calls.
     pub checkpoints_committed: u64,
+    /// Times the scan parked (yielded shard ownership without completing).
     pub parks: u64,
+    /// Split-hint keys persisted via [`ProgressSink::split_hint`].
     pub split_hints_emitted: u64,
 }
 
-/// I/O-side run statistics.
+/// I/O-side run statistics for item read/chunk processing.
+///
+/// These counters are currently zero because item-level execution is stubbed.
+/// They will be populated when the I/O worker pool is wired in.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnectorIoStats {
+    /// Items whose read was initiated.
     pub items_started: u64,
+    /// Items that completed successfully (all chunks scanned).
     pub items_completed: u64,
+    /// Items that reached a terminal failure state.
     pub items_failed: u64,
+    /// Individual chunk reads performed across all items.
     pub chunks_read: u64,
+    /// Total payload bytes read (excluding overlap).
     pub payload_bytes_read: u64,
+    /// Errors classified as [`ErrorClass::Retryable`].
     pub retryable_errors: u64,
+    /// Errors classified as [`ErrorClass::Permanent`].
     pub permanent_errors: u64,
+    /// Total retry attempts across all items.
     pub retries: u64,
 }
 
-/// End-of-run report for connector pipeline execution.
+/// End-of-run report combining enumeration and I/O statistics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnectorRunReport {
+    /// Page-level enumeration counters.
     pub enumerate: ConnectorEnumerateStats,
+    /// Item-level I/O counters (currently zeroed; see [`ConnectorIoStats`]).
     pub io: ConnectorIoStats,
 }
 
 /// Errors that can occur during connector-pipeline execution.
+///
+/// The generic parameter `E` is the [`ProgressSink::Error`] associated type,
+/// so callers see a fully concrete error when the progress backend is known.
 #[derive(Debug)]
 pub enum ConnectorRunError<E> {
+    /// Connector enumeration or split-hint selection failed.
     Enumerate(EnumerateError),
-    Read(ReadError),
+    /// A returned page violated shard/cursor invariants.
+    /// Boxed because [`PageValidationError`] carries diagnostic context.
     PageValidation(Box<PageValidationError>),
+    /// The [`ProgressSink`] returned an error from checkpoint, complete,
+    /// park, or split_hint.
     Progress(E),
-    IoThreadPanicked,
-    NotYetImplemented,
+    /// Page ID counter exceeded `u64::MAX`.
+    PageIdOverflow,
 }
 
+/// Monotonically increasing page identifier within a single scan run.
 type PageId = u64;
 
-/// Tracks completion state for a single enumerated page.
+/// Barrier that blocks checkpoint advancement until every item on a page
+/// reaches a terminal state (success or permanent failure).
+///
+/// The enumeration loop creates one barrier per non-empty page, seeded with
+/// `outstanding_items == item_count`. Each dispatched item holds a
+/// [`PageItemToken`] whose drop path decrements the counter. The enumeration
+/// thread calls [`wait_until_complete`](Self::wait_until_complete), which
+/// parks on the condvar until the counter hits zero.
+///
+/// # Poison recovery
+///
+/// All lock acquisitions use [`lock_or_recover`](Self::lock_or_recover),
+/// which absorbs mutex poison rather than propagating it. This is deliberate:
+/// a panic in one item's processing must not prevent the barrier from draining,
+/// because a stuck barrier would deadlock the entire enumeration loop.
 #[derive(Debug)]
 struct PageCompletionBarrier {
     page_id: PageId,
@@ -199,10 +275,15 @@ struct PageCompletionBarrier {
 
 #[derive(Debug)]
 struct PageCompletionState {
+    /// Count of items that have not yet reached a terminal state.
+    /// Monotonically decreases from `item_count` to 0.
     outstanding_items: usize,
 }
 
 impl PageCompletionBarrier {
+    /// Create a new barrier expecting `outstanding_items` releases before
+    /// `wait_until_complete` unblocks. Returned inside an `Arc` because
+    /// both the enumeration thread and item tokens share ownership.
     fn new(page_id: PageId, outstanding_items: usize) -> Arc<Self> {
         Arc::new(Self {
             page_id,
@@ -211,6 +292,7 @@ impl PageCompletionBarrier {
         })
     }
 
+    /// Acquire the inner mutex, absorbing poison to avoid cascading panics.
     fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, PageCompletionState> {
         match self.state.lock() {
             Ok(state) => state,
@@ -218,6 +300,8 @@ impl PageCompletionBarrier {
         }
     }
 
+    /// Block the calling thread until every item token has been released.
+    /// Called by the enumeration loop after dispatching a page's items.
     fn wait_until_complete(&self) {
         let mut state = self.lock_or_recover();
         while state.outstanding_items > 0 {
@@ -228,6 +312,11 @@ impl PageCompletionBarrier {
         }
     }
 
+    /// Decrement the outstanding counter by one. When it reaches zero, wake
+    /// the enumeration thread blocked in `wait_until_complete`.
+    ///
+    /// The `debug_assert` catches double-release bugs in tests; in release
+    /// builds the subtraction panics on underflow (overflow-checks=true).
     fn release_item(&self) {
         let mut state = self.lock_or_recover();
         debug_assert!(
@@ -235,9 +324,6 @@ impl PageCompletionBarrier {
             "page {} outstanding counter underflow",
             self.page_id
         );
-        if state.outstanding_items == 0 {
-            return;
-        }
         state.outstanding_items -= 1;
         if state.outstanding_items == 0 {
             self.cv.notify_all();
@@ -250,10 +336,18 @@ impl PageCompletionBarrier {
     }
 }
 
-/// Per-item lifecycle token tied to a specific page barrier.
+/// RAII guard tying one item's lifecycle to its page's completion barrier.
+///
+/// Holding a token keeps the barrier's outstanding count positive, which
+/// prevents the enumeration loop from advancing past this page. Calling
+/// [`complete`](Self::complete) or dropping the token releases the item.
+///
+/// The `active` flag ensures exactly-once release: explicit `complete()` sets
+/// it to `false`, so the subsequent `Drop` is a no-op.
 #[derive(Debug)]
 struct PageItemToken {
     barrier: Arc<PageCompletionBarrier>,
+    /// `true` until this token has been released (via `complete` or `drop`).
     active: bool,
 }
 
@@ -265,11 +359,9 @@ impl PageItemToken {
         }
     }
 
-    /// Mark item lifecycle completion.
-    ///
-    /// `terminal_failure == true` means the item exhausted retries or failed
-    /// permanently; both terminal outcomes release page outstanding accounting.
-    fn complete(mut self, _terminal_failure: bool) {
+    /// Mark this item as terminally resolved (success or permanent failure).
+    /// Releases the barrier's outstanding count.
+    fn complete(mut self) {
         self.release();
     }
 
@@ -282,6 +374,9 @@ impl PageItemToken {
     }
 }
 
+/// Safety net: if the token is dropped without an explicit `complete()` call
+/// (e.g., due to a panic in item processing), the barrier is still released.
+/// This prevents the enumeration loop from deadlocking on a stuck barrier.
 impl Drop for PageItemToken {
     fn drop(&mut self) {
         self.release();
@@ -310,7 +405,7 @@ impl Drop for PageItemToken {
 pub fn scan_connector<C, P>(
     engine: Arc<MockEngine>,
     connector: &mut C,
-    cfg: ConnectorScanConfig,
+    cfg: ConnectorConfig,
     progress: &mut P,
     event_sink: Arc<dyn EventSink>,
 ) -> Result<(ConnectorRunReport, MetricsSnapshot), ConnectorRunError<P::Error>>
@@ -328,16 +423,25 @@ where
             // Current page processing is synchronous; future connector read/chunk
             // work transfers these tokens to async item workers.
             for token in item_tokens {
-                token.complete(false);
+                token.complete();
             }
         },
     )
 }
 
+/// Inner loop parameterized by a page-dispatch strategy.
+///
+/// `dispatch_page_items` receives each page's items and their completion
+/// tokens. The public [`scan_connector`] passes a closure that immediately
+/// completes all tokens (synchronous stub). Tests inject custom dispatch
+/// logic to exercise the barrier under concurrent release patterns.
+///
+/// The loop body follows the flow documented in the module-level docs:
+/// enumerate -> validate -> dispatch -> barrier -> checkpoint -> split-hint.
 fn scan_connector_with_page_dispatch<C, P, D>(
     engine: Arc<MockEngine>,
     connector: &mut C,
-    cfg: ConnectorScanConfig,
+    cfg: ConnectorConfig,
     progress: &mut P,
     event_sink: Arc<dyn EventSink>,
     mut dispatch_page_items: D,
@@ -354,56 +458,76 @@ where
     let shard = progress.shard_spec().clone();
     let mut next_page_id: PageId = 0;
 
-    loop {
-        let page = connector
-            .enumerate_page(&shard, &cursor, cfg.page_budgets)
-            .map_err(ConnectorRunError::Enumerate)?;
-        let (items, next_cursor) = page.into_parts();
-
-        validate_page(&shard, &cursor, &items, &next_cursor)
-            .map_err(|err| ConnectorRunError::PageValidation(Box::new(err)))?;
-
-        if items.is_empty() {
-            progress
-                .complete(&next_cursor)
-                .map_err(ConnectorRunError::Progress)?;
-            break;
-        }
-
-        let page_id = next_page_id;
-        next_page_id = next_page_id.checked_add(1).expect("page id overflow");
-        let (page_barrier, page_tokens) = track_page_items(page_id, items.len());
-
-        record_page_enqueue_and_processing(&items, &mut report);
-        dispatch_page_items(page_id, &items, page_tokens);
-        wait_for_page_completion_barrier(page_barrier.as_ref());
-
-        progress
-            .checkpoint(&next_cursor)
-            .map_err(ConnectorRunError::Progress)?;
-        report.enumerate.checkpoints_committed =
-            report.enumerate.checkpoints_committed.saturating_add(1);
-
-        if let Some(split_budgets) = cfg.split_hint_budgets {
-            let split_key = connector
-                .choose_split_point(&shard, &next_cursor, split_budgets)
+    let result = (|| {
+        loop {
+            // Step 1: fetch one page of items from the connector.
+            let page = connector
+                .enumerate_page(&shard, &cursor, cfg.page_budgets)
                 .map_err(ConnectorRunError::Enumerate)?;
-            if let Some(split_key) = split_key {
+            let (items, next_cursor) = page.into_parts();
+
+            // Step 2: reject invalid pages *before* any state mutation.
+            validate_page(&shard, &cursor, &items, &next_cursor)
+                .map_err(|err| ConnectorRunError::PageValidation(Box::new(err)))?;
+
+            // Step 3: an empty page is the connector's terminal signal.
+            if items.is_empty() {
                 progress
-                    .split_hint(&split_key)
+                    .complete(&next_cursor)
                     .map_err(ConnectorRunError::Progress)?;
-                report.enumerate.split_hints_emitted =
-                    report.enumerate.split_hints_emitted.saturating_add(1);
+                break;
             }
+
+            let page_id = next_page_id;
+            next_page_id = next_page_id
+                .checked_add(1)
+                .ok_or(ConnectorRunError::PageIdOverflow)?;
+
+            // Step 4-5: create barrier + tokens and hand items to the dispatch strategy.
+            let (page_barrier, page_tokens) = track_page_items(page_id, items.len());
+            record_page_enqueue_and_processing(&items, &mut report);
+            dispatch_page_items(page_id, &items, page_tokens);
+
+            // Step 6: block until every token is released (the core invariant).
+            wait_for_page_completion_barrier(page_barrier.as_ref());
+
+            // Step 7: safe to persist — all items on this page are terminal.
+            progress
+                .checkpoint(&next_cursor)
+                .map_err(ConnectorRunError::Progress)?;
+            report.enumerate.checkpoints_committed =
+                report.enumerate.checkpoints_committed.saturating_add(1);
+
+            // Step 8: optionally ask the connector for a shard split suggestion.
+            if let Some(split_budgets) = cfg.split_hint_budgets {
+                let split_key = connector
+                    .choose_split_point(&shard, &next_cursor, split_budgets)
+                    .map_err(ConnectorRunError::Enumerate)?;
+                if let Some(split_key) = split_key {
+                    progress
+                        .split_hint(&split_key)
+                        .map_err(ConnectorRunError::Progress)?;
+                    report.enumerate.split_hints_emitted =
+                        report.enumerate.split_hints_emitted.saturating_add(1);
+                }
+            }
+
+            // Step 9: advance cursor for the next iteration.
+            cursor = next_cursor;
         }
+        Ok(())
+    })();
 
-        cursor = next_cursor;
-    }
-
+    // Flush buffered events regardless of success or failure so that
+    // events from completed pages are never silently dropped.
     event_sink.flush();
-    Ok((report, MetricsSnapshot::default()))
+
+    result.map(|()| (report, MetricsSnapshot::default()))
 }
 
+/// Create a barrier seeded with `item_count` and one token per item.
+/// The barrier and tokens share ownership via `Arc`, so either side can
+/// outlive the other without use-after-free.
 fn track_page_items(
     page_id: PageId,
     item_count: usize,
@@ -415,6 +539,7 @@ fn track_page_items(
     (barrier, tokens)
 }
 
+/// Bump enumeration counters for the items on this page.
 fn record_page_enqueue_and_processing(items: &[ScanItem], report: &mut ConnectorRunReport) {
     let item_count = items.len() as u64;
     report.enumerate.pages_enumerated = report.enumerate.pages_enumerated.saturating_add(1);
@@ -423,9 +548,10 @@ fn record_page_enqueue_and_processing(items: &[ScanItem], report: &mut Connector
     report.enumerate.items_enqueued = report.enumerate.items_enqueued.saturating_add(item_count);
 }
 
+/// Block until the page barrier drains. This is the enforcement point for
+/// the module's core invariant: checkpoint is never persisted until every
+/// item on the page has been resolved.
 fn wait_for_page_completion_barrier(page_barrier: &PageCompletionBarrier) {
-    // Checkpoint advancement is strictly page-gated: we do not persist
-    // next_cursor until every item for this page reaches a terminal state.
     page_barrier.wait_until_complete();
 }
 
@@ -437,10 +563,12 @@ mod tests {
 
     use gossip_contracts::connector::{
         ConnectorCapabilities, EnumerationConnector, EnumerationPage, ItemRef, ReadConnector,
-        ScanItem, VersionId,
+        ReadError, ScanItem, VersionId,
     };
     use gossip_contracts::coordination::ShardSpec;
     use gossip_contracts::identity::{ObjectVersionId, StableItemId};
+
+    use rstest::rstest;
 
     use std::collections::VecDeque;
     use std::io;
@@ -623,9 +751,9 @@ mod tests {
         let mut progress = MockProgress::new(shard.clone(), Cursor::initial());
         let sink = Arc::new(VecEventSink::new());
 
-        let cfg = ConnectorScanConfig {
+        let cfg = ConnectorConfig {
             split_hint_budgets: Some(Budgets::try_new(1, 1024, None).unwrap()),
-            ..ConnectorScanConfig::default()
+            ..ConnectorConfig::default()
         };
         let (report, metrics) = scan_connector(
             Arc::new(test_engine(16)),
@@ -666,7 +794,7 @@ mod tests {
         let err = scan_connector(
             Arc::new(test_engine(16)),
             &mut connector,
-            ConnectorScanConfig::default(),
+            ConnectorConfig::default(),
             &mut progress,
             sink,
         )
@@ -694,7 +822,7 @@ mod tests {
         let err = scan_connector(
             Arc::new(test_engine(16)),
             &mut connector,
-            ConnectorScanConfig::default(),
+            ConnectorConfig::default(),
             &mut progress,
             sink,
         )
@@ -715,10 +843,10 @@ mod tests {
         assert!(tokens.iter().all(|token| token.barrier.page_id == 7));
 
         let mut tokens = tokens.into_iter();
-        tokens.next().unwrap().complete(false);
+        tokens.next().unwrap().complete();
         assert_eq!(barrier.outstanding_items(), 1);
 
-        tokens.next().unwrap().complete(true);
+        tokens.next().unwrap().complete();
         assert_eq!(barrier.outstanding_items(), 0);
     }
 
@@ -751,7 +879,7 @@ mod tests {
             let result = scan_connector_with_page_dispatch(
                 Arc::new(test_engine(16)),
                 &mut connector,
-                ConnectorScanConfig::default(),
+                ConnectorConfig::default(),
                 &mut progress,
                 sink,
                 move |page_id, items, tokens| {
@@ -764,7 +892,7 @@ mod tests {
                     let _token_worker = thread::spawn(move || {
                         release_rx.recv().expect("release signal dropped");
                         for token in tokens {
-                            token.complete(false);
+                            token.complete();
                         }
                     });
                 },
@@ -822,13 +950,13 @@ mod tests {
             let result = scan_connector_with_page_dispatch(
                 Arc::new(test_engine(16)),
                 &mut connector,
-                ConnectorScanConfig::default(),
+                ConnectorConfig::default(),
                 &mut progress,
                 sink,
                 |_page_id, _items, tokens| {
                     let mut tokens = tokens.into_iter();
-                    tokens.next().unwrap().complete(false);
-                    tokens.next().unwrap().complete(true);
+                    tokens.next().unwrap().complete();
+                    tokens.next().unwrap().complete();
                 },
             )
             .map(|_| progress.calls);
@@ -846,6 +974,216 @@ mod tests {
                 ProgressCall::Checkpoint(checkpoint_cursor.clone()),
                 ProgressCall::Complete(checkpoint_cursor),
             ]
+        );
+    }
+
+    // -- ConnectorConfig::validate() coverage --
+
+    #[rstest]
+    #[case::cpu_workers_zero("cpu_workers")]
+    #[case::io_threads_zero("io_threads")]
+    #[case::chunk_size_zero("chunk_size")]
+    #[case::max_in_flight_zero("max_in_flight_items")]
+    #[case::queue_cap_zero("item_queue_cap")]
+    #[case::pool_buffers_zero("pool_buffers")]
+    #[should_panic]
+    fn validate_rejects_zero_field(#[case] field: &str) {
+        let mut cfg = ConnectorConfig::default();
+        match field {
+            "cpu_workers" => cfg.cpu_workers = 0,
+            "io_threads" => cfg.io_threads = 0,
+            "chunk_size" => cfg.chunk_size = 0,
+            "max_in_flight_items" => cfg.max_in_flight_items = 0,
+            "item_queue_cap" => cfg.item_queue_cap = 0,
+            "pool_buffers" => cfg.pool_buffers = 0,
+            _ => unreachable!(),
+        }
+        cfg.validate(16);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds BUFFER_LEN_MAX")]
+    fn validate_rejects_chunk_plus_overlap_exceeding_max() {
+        let cfg = ConnectorConfig {
+            chunk_size: BUFFER_LEN_MAX,
+            ..ConnectorConfig::default()
+        };
+        cfg.validate(16);
+    }
+
+    #[test]
+    fn validate_accepts_default_config() {
+        ConnectorConfig::default().validate(16);
+    }
+
+    // -- PageCompletionBarrier edge cases --
+
+    #[test]
+    fn barrier_zero_items_completes_immediately() {
+        let barrier = PageCompletionBarrier::new(0, 0);
+        barrier.wait_until_complete();
+        assert_eq!(barrier.outstanding_items(), 0);
+    }
+
+    #[test]
+    fn token_drop_without_complete_releases_barrier() {
+        let (barrier, tokens) = track_page_items(1, 2);
+        assert_eq!(barrier.outstanding_items(), 2);
+        drop(tokens);
+        assert_eq!(barrier.outstanding_items(), 0);
+    }
+
+    #[test]
+    fn barrier_lock_or_recover_absorbs_mutex_poison() {
+        let barrier = PageCompletionBarrier::new(0, 2);
+
+        // Poison the mutex by panicking while holding the guard.
+        let b = Arc::clone(&barrier);
+        let handle = thread::spawn(move || {
+            let _guard = b.state.lock().unwrap();
+            panic!("intentional poison");
+        });
+        let _ = handle.join();
+
+        // The mutex is now poisoned. lock_or_recover should absorb it.
+        assert_eq!(barrier.outstanding_items(), 2);
+        barrier.release_item();
+        assert_eq!(barrier.outstanding_items(), 1);
+        barrier.release_item();
+        assert_eq!(barrier.outstanding_items(), 0);
+    }
+
+    // -- Integration: empty first page --
+
+    #[test]
+    fn scan_connector_handles_empty_first_page() {
+        let shard = ShardSpec::unbounded();
+        let pages = vec![EnumerationPage::new(Vec::new(), Cursor::initial())];
+        let mut connector = MockConnector::new(pages);
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let (report, _) = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            ConnectorConfig::default(),
+            &mut progress,
+            sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.enumerate.pages_enumerated, 0);
+        assert_eq!(report.enumerate.items_discovered, 0);
+        assert_eq!(report.enumerate.checkpoints_committed, 0);
+        assert_eq!(
+            progress.calls,
+            vec![ProgressCall::Complete(Cursor::initial())]
+        );
+    }
+
+    // -- Integration: split hints disabled --
+
+    #[test]
+    fn scan_connector_skips_split_hints_when_disabled() {
+        let shard = ShardSpec::unbounded();
+        let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+        let pages = vec![
+            EnumerationPage::new(
+                vec![item(b"k1", 1, b"v1")],
+                Cursor::with_last_key(k1.clone()),
+            ),
+            EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+        ];
+        let mut connector = MockConnector::new(pages);
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let cfg = ConnectorConfig {
+            split_hint_budgets: None,
+            ..ConnectorConfig::default()
+        };
+        let (report, _) = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            cfg,
+            &mut progress,
+            sink,
+        )
+        .unwrap();
+
+        assert_eq!(report.enumerate.split_hints_emitted, 0);
+        assert_eq!(
+            progress.calls,
+            vec![
+                ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+                ProgressCall::Complete(Cursor::with_last_key(k1)),
+            ]
+        );
+    }
+
+    // -- Error propagation: enumeration failure --
+
+    #[test]
+    fn scan_connector_returns_enumerate_error_on_first_page() {
+        let shard = ShardSpec::unbounded();
+        let mut connector = MockConnector {
+            pages: vec![Err(EnumerateError::permanent("simulated failure"))].into(),
+            split_hints: VecDeque::new(),
+        };
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let err = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            ConnectorConfig::default(),
+            &mut progress,
+            sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectorRunError::Enumerate(_)));
+        assert!(progress.calls.is_empty());
+    }
+
+    // -- Error propagation: split-hint failure --
+
+    #[test]
+    fn scan_connector_returns_error_on_split_hint_failure() {
+        let shard = ShardSpec::unbounded();
+        let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+        let pages = vec![
+            EnumerationPage::new(
+                vec![item(b"k1", 1, b"v1")],
+                Cursor::with_last_key(k1.clone()),
+            ),
+            EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+        ];
+        let mut connector = MockConnector {
+            pages: pages.into_iter().map(Ok).collect(),
+            split_hints: vec![Err(EnumerateError::permanent("split failed"))].into(),
+        };
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let cfg = ConnectorConfig {
+            split_hint_budgets: Some(Budgets::try_new(1, 1024, None).unwrap()),
+            ..ConnectorConfig::default()
+        };
+        let err = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            cfg,
+            &mut progress,
+            sink,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectorRunError::Enumerate(_)));
+        // Checkpoint was committed before the split-hint error.
+        assert_eq!(
+            progress.calls,
+            vec![ProgressCall::Checkpoint(Cursor::with_last_key(k1))]
         );
     }
 }

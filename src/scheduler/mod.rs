@@ -204,7 +204,7 @@
 //! - **Core**: [`Executor`], [`ExecutorConfig`], [`WorkerCtx`], [`ByteBudget`],
 //!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
 //! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`WorkerFindingsBuffer`]
-//! - **Connector pipeline**: [`scan_connector`], [`ConnectorScanConfig`], [`ConnectorSource`], [`ProgressSink`]
+//! - **Connector pipeline**: [`scan_connector`], [`ConnectorConfig`], [`ConnectorSource`], [`ProgressSink`]
 //! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
 // Core scheduling
@@ -229,6 +229,7 @@ pub mod ts_chunk;
 pub mod worker_id;
 
 // I/O backends
+#[cfg(feature = "connector-pipeline")]
 pub mod connector_pipeline;
 mod local_fs_archive_ctx;
 mod local_fs_bzip2;
@@ -294,10 +295,10 @@ pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};
 
 // I/O backends
+#[cfg(feature = "connector-pipeline")]
 pub use connector_pipeline::{
-    scan_connector, ConnectorConfig, ConnectorEnumerateStats, ConnectorErrorClass,
-    ConnectorIoStats, ConnectorRunError, ConnectorRunReport, ConnectorScanConfig, ConnectorSource,
-    ProgressSink,
+    scan_connector, ConnectorEnumerateStats, ConnectorErrorClass, ConnectorIoStats,
+    ConnectorRunError, ConnectorRunReport, ConnectorConfig, ConnectorSource, ProgressSink,
 };
 
 // Observability
