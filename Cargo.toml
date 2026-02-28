@@ -41,6 +41,8 @@ serde_norway = "0.9.42"
 rusqlite = { version = "0.38", features = ["bundled"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 gix-commitgraph = "0.29"
+gossip-contracts = { path = "../Gossip-rs/crates/gossip-contracts" }
+gossip-connectors = { path = "../Gossip-rs/crates/gossip-connectors" }
 rocksdb = { version = "0.24", optional = true }
 
 # Directory walking and parallel scanning
@@ -70,6 +72,7 @@ rocksdb = ["dep:rocksdb"]
 aegis-pure-rust = ["aegis/pure-rust"]  # Use pure-Rust AEGIS on machines without SHA3 NEON (clang < 14)
 git-perf = ["perf-stats"]  # Git pack-exec timing probes (implies perf-stats)
 real-rules-harness = []  # Real-ruleset regression harness (simulation test)
+connector-pipeline = []
 
 [dev-dependencies]
 loom = "0.7"

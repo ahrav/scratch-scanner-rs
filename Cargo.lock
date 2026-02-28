@@ -679,6 +679,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-connectors"
+version = "0.1.0"
+dependencies = [
+ "gossip-contracts",
+]
+
+[[package]]
+name = "gossip-contracts"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "gossip-stdx",
+ "subtle",
+]
+
+[[package]]
+name = "gossip-stdx"
+version = "0.1.0"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1422,6 +1442,8 @@ dependencies = [
  "crossbeam-utils",
  "flate2",
  "gix-commitgraph",
+ "gossip-connectors",
+ "gossip-contracts",
  "ignore",
  "io-uring",
  "itoa",
@@ -1609,6 +1631,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
