@@ -247,6 +247,11 @@ name = "simd_classify"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "connector_barrier"
+harness = false
+required-features = ["bench", "connector-pipeline"]
+
 [profile.dev]
 opt-level = 1
 

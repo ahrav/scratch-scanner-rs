@@ -134,6 +134,9 @@ pub use git_scan::{
     bench_synthetic_plan,
 };
 
+#[cfg(all(feature = "bench", feature = "connector-pipeline"))]
+pub use scheduler::bench_connector::{bench_track_page_items, BenchBarrier, BenchToken};
+
 pub use runtime::{
     read_file_chunks, BufferHandle, BufferPool, Chunk, FileTable, ScannerConfig, ScannerRuntime,
     BUFFER_ALIGN, BUFFER_LEN_MAX, FILE_FLAG_BINARY, FILE_FLAG_SKIPPED,

@@ -191,7 +191,7 @@
 //!
 //! Unsafe code is used sparingly and only where performance requires it.
 //! Modules containing `unsafe` blocks: `metrics`, `alloc`, `affinity`,
-//! `chunking`, `engine_impl`, `rusage`, `local_fs_owner`, and
+//! `engine_impl`, `rusage`, `local_fs_owner`, and
 //! `local_fs_uring` (Linux). All unsafe blocks have documented invariants
 //! and are tested.
 //!
@@ -229,6 +229,8 @@ pub mod ts_chunk;
 pub mod worker_id;
 
 // I/O backends
+#[cfg(all(feature = "bench", feature = "connector-pipeline"))]
+pub mod bench_connector;
 #[cfg(feature = "connector-pipeline")]
 pub mod connector_pipeline;
 mod local_fs_archive_ctx;

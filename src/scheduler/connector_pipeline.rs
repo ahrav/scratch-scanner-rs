@@ -18,14 +18,15 @@
 //! ┌──────────────────────────────────────────────────────────────────────┐
 //! │  loop {                                                             │
 //! │    1. enumerate_page(shard, cursor, budgets)                        │
-//! │    2. validate_page(shard, cursor, items, next_cursor)              │
-//! │    3. if empty → complete(next_cursor), break                       │
-//! │    4. create PageCompletionBarrier(N items)                         │
-//! │    5. dispatch items (each holds a PageItemToken)                   │
-//! │    6. ── barrier.wait_until_complete() ──────────────────────       │
-//! │    7. checkpoint(next_cursor)                                       │
-//! │    8. optionally choose_split_point → split_hint                    │
-//! │    9. cursor ← next_cursor                                         │
+//! │    2. enforce page-size budget (hard cap on item count)             │
+//! │    3. validate_page(shard, cursor, items, next_cursor)              │
+//! │    4. if empty → complete(next_cursor), break                       │
+//! │    5. create PageCompletionBarrier(N items)                         │
+//! │    6. dispatch items (each holds a PageItemToken)                   │
+//! │    7. ── barrier.wait_until_complete() ──────────────────────       │
+//! │    8. checkpoint(next_cursor)                                       │
+//! │    9. optionally choose_split_point → split_hint                    │
+//! │   10. cursor ← next_cursor                                         │
 //! │  }                                                                  │
 //! │  flush event sink                                                   │
 //! └──────────────────────────────────────────────────────────────────────┘
@@ -269,6 +270,9 @@ pub enum ConnectorRunError<E> {
 }
 
 /// Monotonically increasing page identifier within a single scan run.
+#[cfg(feature = "bench")]
+pub(super) type PageId = u64;
+#[cfg(not(feature = "bench"))]
 type PageId = u64;
 
 /// Barrier that blocks checkpoint advancement until every item on a page
@@ -287,7 +291,8 @@ type PageId = u64;
 /// a panic in one item's processing must not prevent the barrier from draining,
 /// because a stuck barrier would deadlock the entire enumeration loop.
 #[derive(Debug)]
-struct PageCompletionBarrier {
+#[cfg_attr(feature = "bench", allow(dead_code))]
+pub(super) struct PageCompletionBarrier {
     page_id: PageId,
     state: Mutex<PageCompletionState>,
     cv: Condvar,
@@ -304,7 +309,7 @@ impl PageCompletionBarrier {
     /// Create a new barrier expecting `outstanding_items` releases before
     /// `wait_until_complete` unblocks. Returned inside an `Arc` because
     /// both the enumeration thread and item tokens share ownership.
-    fn new(page_id: PageId, outstanding_items: usize) -> Arc<Self> {
+    pub(super) fn new(page_id: PageId, outstanding_items: usize) -> Arc<Self> {
         Arc::new(Self {
             page_id,
             state: Mutex::new(PageCompletionState { outstanding_items }),
@@ -325,7 +330,7 @@ impl PageCompletionBarrier {
     ///
     /// Uses a 60-second diagnostic interval: if the barrier hasn't drained
     /// within that window, a warning is logged and the wait resumes.
-    fn wait_until_complete(&self) {
+    pub(super) fn wait_until_complete(&self) {
         let timeout = Duration::from_secs(60);
         let mut state = self.lock_or_recover();
         while state.outstanding_items > 0 {
@@ -351,7 +356,7 @@ impl PageCompletionBarrier {
     ///
     /// The `debug_assert` catches double-release bugs in tests; in release
     /// builds the subtraction panics on underflow (overflow-checks=true).
-    fn release_item(&self) {
+    pub(super) fn release_item(&self) {
         let mut state = self.lock_or_recover();
         debug_assert!(
             state.outstanding_items > 0,
@@ -379,14 +384,14 @@ impl PageCompletionBarrier {
 /// The `active` flag ensures exactly-once release: explicit `complete()` sets
 /// it to `false`, so the subsequent `Drop` is a no-op.
 #[derive(Debug)]
-struct PageItemToken {
+pub(super) struct PageItemToken {
     barrier: Arc<PageCompletionBarrier>,
     /// `true` until this token has been released (via `complete` or `drop`).
     active: bool,
 }
 
 impl PageItemToken {
-    fn new(barrier: &Arc<PageCompletionBarrier>) -> Self {
+    pub(super) fn new(barrier: &Arc<PageCompletionBarrier>) -> Self {
         Self {
             barrier: Arc::clone(barrier),
             active: true,
@@ -395,7 +400,7 @@ impl PageItemToken {
 
     /// Mark this item as terminally resolved (success or permanent failure).
     /// Releases the barrier's outstanding count.
-    fn complete(mut self) {
+    pub(super) fn complete(mut self) {
         self.release();
     }
 
@@ -433,9 +438,13 @@ impl Drop for PageItemToken {
 ///
 /// # Errors
 ///
+/// - [`ConnectorRunError::Config`] if [`ConnectorConfig::validate`] fails.
 /// - [`ConnectorRunError::Enumerate`] if enumeration or split-hint selection fails.
 /// - [`ConnectorRunError::PageValidation`] if a connector returns an invalid page.
+/// - [`ConnectorRunError::BudgetExceeded`] if a page returns more items than the budget allows.
+/// - [`ConnectorRunError::Dispatch`] if the item dispatch strategy fails.
 /// - [`ConnectorRunError::Progress`] if checkpoint/complete/split-hint persistence fails.
+/// - [`ConnectorRunError::PageIdOverflow`] if more than `u64::MAX` pages are enumerated.
 pub fn scan_connector<E, C, P>(
     engine: Arc<E>,
     connector: &mut C,
@@ -575,7 +584,7 @@ where
 /// Create a barrier seeded with `item_count` and one token per item.
 /// The barrier and tokens share ownership via `Arc`, so either side can
 /// outlive the other without use-after-free.
-fn track_page_items(
+pub(super) fn track_page_items(
     page_id: PageId,
     item_count: usize,
 ) -> (Arc<PageCompletionBarrier>, Vec<PageItemToken>) {
