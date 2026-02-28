@@ -1,8 +1,60 @@
 //! Connector-first scheduler entrypoint for enumerate/read/scan workflows.
 //!
-//! This module defines the connector-native API boundary for scheduler execution.
-//! It currently runs page-level orchestration (enumerate -> validate -> barrier -> checkpoint)
-//! while item-level read/chunk execution lands in follow-up tasks.
+//! # Purpose
+//!
+//! This module bridges the [`gossip_contracts`] connector API to the scanner-rs
+//! scheduler. It owns **page-level orchestration**: enumerating items from a
+//! connector shard, validating each page against shard and cursor invariants,
+//! gating progress behind a per-page completion barrier, and checkpointing the
+//! cursor only after every item on a page reaches a terminal state.
+//!
+//! Item-level read/chunk/scan execution is intentionally stubbed: the current
+//! [`scan_connector`] immediately completes every item token synchronously.
+//! Future work will hand tokens off to I/O and CPU worker pools.
+//!
+//! # High-level flow
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────────────┐
+//! │  loop {                                                             │
+//! │    1. enumerate_page(shard, cursor, budgets)                        │
+//! │    2. validate_page(shard, cursor, items, next_cursor)              │
+//! │    3. if empty → complete(next_cursor), break                       │
+//! │    4. create PageCompletionBarrier(N items)                         │
+//! │    5. dispatch items (each holds a PageItemToken)                   │
+//! │    6. ── barrier.wait_until_complete() ──────────────────────       │
+//! │    7. checkpoint(next_cursor)                                       │
+//! │    8. optionally choose_split_point → split_hint                    │
+//! │    9. cursor ← next_cursor                                         │
+//! │  }                                                                  │
+//! │  flush event sink                                                   │
+//! └──────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Core invariant
+//!
+//! **Checkpoint advancement is strictly page-gated.** The cursor is never
+//! persisted via [`ProgressSink::checkpoint`] until every item on the current
+//! page has been released (success or terminal failure). This prevents the
+//! coordinator from believing items are processed when they have not been,
+//! which would cause data loss on crash-recovery.
+//!
+//! The [`PageCompletionBarrier`] / [`PageItemToken`] pair enforces this:
+//! tokens are RAII guards that decrement the barrier on drop, so even panics
+//! in item processing release the barrier rather than deadlocking the
+//! enumeration loop.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`ConnectorConfig`] | Tuning knobs (workers, chunk size, budgets, timeouts) |
+//! | [`ProgressSink`] | Persistence contract for cursor checkpointing and shard lifecycle |
+//! | [`ConnectorSource`] | Blanket trait alias for `ConnectorInstance + Send + 'static` |
+//! | [`PageCompletionBarrier`] | Mutex+condvar barrier tracking outstanding items per page |
+//! | [`PageItemToken`] | RAII guard tying one item's lifecycle to its page barrier |
+//! | [`ConnectorRunReport`] | End-of-run statistics (enumeration + I/O counters) |
+//! | [`ConnectorRunError`] | Error taxonomy covering enumeration, validation, and persistence failures |
 
 use super::engine_stub::{MockEngine, BUFFER_LEN_MAX};
 use super::metrics::MetricsSnapshot;
@@ -10,24 +62,34 @@ use crate::unified::events::EventSink;
 
 use gossip_contracts::connector::{
     validate_page, Budgets, ConnectorInstance, Cursor, EnumerateError, ErrorClass, ItemKey,
-    PageValidationError, ReadError, ScanItem,
+    PageValidationError, ScanItem,
 };
 use gossip_contracts::coordination::ShardSpec;
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Connector-native alias for scheduler error classification.
+/// Re-export of [`ErrorClass`] under a scheduler-qualified name so callers
+/// importing from the scheduler module get an unambiguous type name.
 pub type ConnectorErrorClass = ErrorClass;
 
-/// Configuration for connector pipeline scanning.
+/// Tuning knobs for a connector pipeline scan.
+///
+/// Controls thread pool sizes, chunk geometry, backpressure limits, page
+/// enumeration budgets, and optional behaviors (dedup, core pinning, split
+/// hints). All fields have sensible defaults via [`Default`]; callers
+/// typically override only the fields relevant to their workload profile.
+///
+/// Call [`validate`](Self::validate) before use to assert scheduler invariants
+/// (positive counts, chunk+overlap within `BUFFER_LEN_MAX`, etc.).
 #[derive(Clone, Copy, Debug)]
-pub struct ConnectorScanConfig {
+pub struct ConnectorConfig {
     /// Number of CPU worker threads for scanning.
     pub cpu_workers: usize,
     /// Number of dedicated I/O threads for connector reads.
     pub io_threads: usize,
-    /// Payload bytes per chunk (excluding overlap).
+    /// Payload bytes per chunk (excluding overlap region).
+    /// The total buffer allocation per chunk is `chunk_size + required_overlap`.
     pub chunk_size: usize,
     /// Hard cap on discovered-but-not-fully-processed items.
     /// Acts as backpressure: enumeration stalls when this limit is reached.
@@ -246,6 +308,13 @@ pub enum ConnectorRunError<E> {
     Progress(E),
     /// Page ID counter exceeded `u64::MAX`.
     PageIdOverflow,
+    /// A connector returned more items than the configured page budget allows.
+    BudgetExceeded {
+        /// Number of items the connector actually returned.
+        returned: usize,
+        /// Maximum allowed by [`Budgets::max_items`].
+        limit: usize,
+    },
 }
 
 /// Monotonically increasing page identifier within a single scan run.
@@ -465,6 +534,15 @@ where
                 .enumerate_page(&shard, &cursor, cfg.page_budgets)
                 .map_err(ConnectorRunError::Enumerate)?;
             let (items, next_cursor) = page.into_parts();
+
+            // Step 1b: enforce hard page-size limit (budgets are advisory).
+            let budget_limit = cfg.page_budgets.max_items();
+            if items.len() > budget_limit {
+                return Err(ConnectorRunError::BudgetExceeded {
+                    returned: items.len(),
+                    limit: budget_limit,
+                });
+            }
 
             // Step 2: reject invalid pages *before* any state mutation.
             validate_page(&shard, &cursor, &items, &next_cursor)
@@ -1185,5 +1263,50 @@ mod tests {
             progress.calls,
             vec![ProgressCall::Checkpoint(Cursor::with_last_key(k1))]
         );
+    }
+
+    // -- Budget enforcement --
+
+    #[test]
+    fn scan_connector_rejects_page_exceeding_budget() {
+        let shard = ShardSpec::unbounded();
+        let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+        // Budget allows max 2 items, but page returns 3.
+        let oversized_page = EnumerationPage::new(
+            vec![
+                item(b"k1", 1, b"v1"),
+                item(b"k2", 2, b"v2"),
+                item(b"k3", 3, b"v3"),
+            ],
+            Cursor::with_last_key(k1),
+        );
+        let mut connector = MockConnector::new(vec![oversized_page]);
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let cfg = ConnectorConfig {
+            page_budgets: Budgets::try_new(2, 16 * 1024 * 1024, None).unwrap(),
+            ..ConnectorConfig::default()
+        };
+        let err = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            cfg,
+            &mut progress,
+            sink,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                ConnectorRunError::BudgetExceeded {
+                    returned: 3,
+                    limit: 2
+                }
+            ),
+            "expected BudgetExceeded, got: {err:?}"
+        );
+        assert!(progress.calls.is_empty(), "no checkpoint should occur");
     }
 }
