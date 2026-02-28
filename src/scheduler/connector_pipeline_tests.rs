@@ -121,6 +121,9 @@ struct MockConnector {
     payloads: HashMap<Vec<u8>, Vec<u8>>,
     open_error: Option<ReadError>,
     read_range_error: Option<ReadError>,
+    per_item_open_errors: HashMap<Vec<u8>, ReadError>,
+    /// When true, read_range returns n > dst.len() to simulate a contract violation.
+    read_range_overflow: bool,
     open_calls: u64,
     read_range_calls: u64,
 }
@@ -142,6 +145,8 @@ impl MockConnector {
             payloads,
             open_error: None,
             read_range_error: None,
+            per_item_open_errors: HashMap::new(),
+            read_range_overflow: false,
             open_calls: 0,
             read_range_calls: 0,
         }
@@ -164,6 +169,21 @@ impl MockConnector {
 
     fn with_open_error(mut self, err: ReadError) -> Self {
         self.open_error = Some(err);
+        self
+    }
+
+    fn with_item_open_error(mut self, key: &[u8], err: ReadError) -> Self {
+        self.per_item_open_errors.insert(key.to_vec(), err);
+        self
+    }
+
+    fn with_read_range_error(mut self, err: ReadError) -> Self {
+        self.read_range_error = Some(err);
+        self
+    }
+
+    fn with_read_range_overflow(mut self) -> Self {
+        self.read_range_overflow = true;
         self
     }
 }
@@ -201,6 +221,9 @@ impl ReadConnector for MockConnector {
         _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
         self.open_calls = self.open_calls.saturating_add(1);
+        if let Some(err) = self.per_item_open_errors.get(item_ref.as_bytes()).cloned() {
+            return Err(err);
+        }
         if let Some(err) = self.open_error.clone() {
             return Err(err);
         }
@@ -222,6 +245,10 @@ impl ReadConnector for MockConnector {
         self.read_range_calls = self.read_range_calls.saturating_add(1);
         if let Some(err) = self.read_range_error.clone() {
             return Err(err);
+        }
+        if self.read_range_overflow {
+            // Simulate a contract violation: report more bytes than buffer.
+            return Ok(dst.len() + 1);
         }
         let payload = self
             .payloads
@@ -301,6 +328,8 @@ fn scan_connector_enumerates_validates_checkpoints_and_completes() {
     assert_eq!(report.enumerate.items_enqueued, 3);
     assert_eq!(report.enumerate.checkpoints_committed, 2);
     assert_eq!(report.enumerate.split_hints_emitted, 2);
+    assert_eq!(report.enumerate.items_failed_retryable, 0);
+    assert_eq!(report.enumerate.items_failed_permanent, 0);
     assert_eq!(metrics.tasks_executed, 0);
 
     assert_eq!(
@@ -562,6 +591,88 @@ fn validate_rejects_overlap_ge_chunk_size() {
 #[test]
 fn validate_accepts_default_config() {
     ConnectorConfig::default().validate(16).unwrap();
+}
+
+// -- read_error_from_io classification --
+
+#[rstest]
+#[case::not_found(io::ErrorKind::NotFound, false)]
+#[case::permission_denied(io::ErrorKind::PermissionDenied, false)]
+#[case::invalid_input(io::ErrorKind::InvalidInput, false)]
+#[case::invalid_data(io::ErrorKind::InvalidData, false)]
+#[case::unsupported(io::ErrorKind::Unsupported, false)]
+#[case::connection_reset(io::ErrorKind::ConnectionReset, true)]
+#[case::timed_out(io::ErrorKind::TimedOut, true)]
+#[case::other(io::ErrorKind::Other, true)]
+fn read_error_from_io_classifies_error_kinds(
+    #[case] kind: io::ErrorKind,
+    #[case] expected_retryable: bool,
+) {
+    let io_err = io::Error::new(kind, "test error");
+    let read_err = read_error_from_io(io_err);
+    assert_eq!(
+        read_err.is_retryable(),
+        expected_retryable,
+        "{kind:?} should be {}",
+        if expected_retryable {
+            "retryable"
+        } else {
+            "permanent"
+        }
+    );
+}
+
+// -- read_some EINTR retry bound --
+
+/// Mock reader that returns `Interrupted` a configurable number of times
+/// before succeeding.
+struct InterruptReader {
+    remaining_interrupts: usize,
+    payload: Vec<u8>,
+    pos: usize,
+}
+
+impl io::Read for InterruptReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining_interrupts > 0 {
+            self.remaining_interrupts -= 1;
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "EINTR"));
+        }
+        let n = buf.len().min(self.payload.len() - self.pos);
+        buf[..n].copy_from_slice(&self.payload[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn read_some_retries_eintr_then_succeeds() {
+    let mut reader = InterruptReader {
+        remaining_interrupts: 5,
+        payload: b"hello".to_vec(),
+        pos: 0,
+    };
+    let mut buf = [0u8; 5];
+    let n = read_some(&mut reader, &mut buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"hello");
+}
+
+#[test]
+fn read_some_fails_after_max_eintr_retries() {
+    let mut reader = InterruptReader {
+        remaining_interrupts: MAX_EINTR_RETRIES + 1,
+        payload: b"data".to_vec(),
+        pos: 0,
+    };
+    let mut buf = [0u8; 4];
+    let err = read_some(&mut reader, &mut buf).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    assert!(
+        err.to_string().contains("exceeded"),
+        "error should mention retry exhaustion: {}",
+        err
+    );
 }
 
 // -- PageCompletionBarrier edge cases --
@@ -912,7 +1023,7 @@ fn scan_connector_streams_items_via_open_and_emits_findings() {
         split_hint_budgets: None,
         ..ConnectorConfig::default()
     };
-    let (_report, metrics) = scan_connector(
+    let (report, metrics) = scan_connector(
         Arc::new(test_engine(6)),
         &mut connector,
         cfg,
@@ -927,6 +1038,8 @@ fn scan_connector_streams_items_via_open_and_emits_findings() {
     assert_eq!(metrics.bytes_scanned, payload.len() as u64);
     assert_eq!(metrics.chunks_scanned, 3);
     assert_eq!(metrics.findings_emitted, 1);
+    assert_eq!(report.enumerate.items_failed_retryable, 0);
+    assert_eq!(report.enumerate.items_failed_permanent, 0);
 
     let encoded = String::from_utf8(sink.bytes()).unwrap();
     assert_eq!(count_jsonl_findings(&encoded), 1);
@@ -965,7 +1078,7 @@ fn scan_connector_uses_range_read_when_capability_advertised() {
         split_hint_budgets: None,
         ..ConnectorConfig::default()
     };
-    let (_report, metrics) = scan_connector(
+    let (report, metrics) = scan_connector(
         Arc::new(test_engine(6)),
         &mut connector,
         cfg,
@@ -979,17 +1092,21 @@ fn scan_connector_uses_range_read_when_capability_advertised() {
     assert_eq!(metrics.io_errors, 0);
     assert_eq!(metrics.bytes_scanned, payload.len() as u64);
     assert_eq!(metrics.findings_emitted, 1);
+    assert_eq!(report.enumerate.items_failed_retryable, 0);
+    assert_eq!(report.enumerate.items_failed_permanent, 0);
 
     let encoded = String::from_utf8(sink.bytes()).unwrap();
     assert_eq!(count_jsonl_findings(&encoded), 1);
 }
 
 #[rstest]
-#[case::retryable(ReadError::retryable("temporary read failure"), "retryable")]
-#[case::permanent(ReadError::permanent("missing object"), "permanent")]
+#[case::retryable(ReadError::retryable("temporary read failure"), "retryable", 1, 0)]
+#[case::permanent(ReadError::permanent("missing object"), "permanent", 0, 1)]
 fn scan_connector_classifies_read_errors_and_continues_page(
     #[case] read_err: ReadError,
     #[case] expected_class: &str,
+    #[case] expected_retryable: u64,
+    #[case] expected_permanent: u64,
 ) {
     let shard = ShardSpec::unbounded();
     let k1 = ItemKey::try_from_slice(b"k1").unwrap();
@@ -1009,7 +1126,7 @@ fn scan_connector_classifies_read_errors_and_continues_page(
         split_hint_budgets: None,
         ..ConnectorConfig::default()
     };
-    let (_report, metrics) = scan_connector(
+    let (report, metrics) = scan_connector(
         Arc::new(test_engine(16)),
         &mut connector,
         cfg,
@@ -1021,6 +1138,8 @@ fn scan_connector_classifies_read_errors_and_continues_page(
     assert_eq!(metrics.io_errors, 1);
     assert_eq!(metrics.bytes_scanned, 0);
     assert_eq!(metrics.findings_emitted, 0);
+    assert_eq!(report.enumerate.items_failed_retryable, expected_retryable);
+    assert_eq!(report.enumerate.items_failed_permanent, expected_permanent);
     assert_eq!(
         progress.calls,
         vec![
@@ -1032,4 +1151,154 @@ fn scan_connector_classifies_read_errors_and_continues_page(
     let encoded = String::from_utf8(sink.bytes()).unwrap();
     assert!(encoded.contains("connector read"));
     assert!(encoded.contains(expected_class));
+}
+
+#[test]
+fn scan_connector_error_on_one_item_does_not_prevent_scanning_remaining_items() {
+    let shard = ShardSpec::unbounded();
+    let k2 = ItemKey::try_from_slice(b"k2").unwrap();
+    // Page with two items: k1 will fail, k2 has a scannable payload.
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1"), item(b"k2", 2, b"v2")],
+            Cursor::with_last_key(k2.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k2.clone())),
+    ];
+    let mut connector = MockConnector::new(pages)
+        .with_item_open_error(b"k1", ReadError::permanent("k1 gone"))
+        .with_item_payload(b"k2", b"payload SECRET tail");
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        chunk_size: 256,
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (report, metrics) = scan_connector(
+        Arc::new(test_engine(6)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    // k1 failed permanently; k2 scanned successfully.
+    assert_eq!(metrics.io_errors, 1);
+    assert_eq!(report.enumerate.items_failed_permanent, 1);
+    assert_eq!(report.enumerate.items_failed_retryable, 0);
+    assert!(
+        metrics.bytes_scanned > 0,
+        "k2 payload should have been scanned"
+    );
+    assert_eq!(metrics.findings_emitted, 1, "SECRET in k2 should be found");
+
+    // Checkpoint and complete should both fire (page completes normally).
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k2.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k2)),
+        ]
+    );
+}
+
+// -- read_range error paths --
+
+#[test]
+fn scan_connector_read_range_error_is_caught_and_page_continues() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector::new(pages)
+        .with_range_read()
+        .with_read_range_error(ReadError::retryable("range read failed"));
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (report, metrics) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(metrics.io_errors, 1);
+    assert_eq!(report.enumerate.items_failed_retryable, 1);
+    assert_eq!(report.enumerate.items_failed_permanent, 0);
+
+    // Diagnostic emitted for the error.
+    let encoded = String::from_utf8(sink.bytes()).unwrap();
+    assert!(encoded.contains("connector read"));
+
+    // Page still completes and checkpoints.
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k1)),
+        ]
+    );
+}
+
+#[test]
+fn scan_connector_read_range_overflow_is_permanent_error() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector::new(pages)
+        .with_range_read()
+        .with_read_range_overflow()
+        .with_item_payload(b"k1", b"some data");
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (report, metrics) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(metrics.io_errors, 1);
+    assert_eq!(report.enumerate.items_failed_permanent, 1);
+    assert_eq!(report.enumerate.items_failed_retryable, 0);
+
+    // Page still checkpoints despite the error.
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k1)),
+        ]
+    );
 }

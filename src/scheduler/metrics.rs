@@ -314,6 +314,10 @@ pub struct WorkerMetricsLocal {
     pub park_count: u64,
     /// I/O errors encountered (file open, read, metadata failures).
     pub io_errors: u64,
+    /// Connector items that failed with a retryable read error (skipped, eligible for retry).
+    pub items_failed_retryable: u64,
+    /// Connector items that failed with a permanent read error (skipped, not retryable).
+    pub items_failed_permanent: u64,
     /// Total findings emitted by this worker.
     pub findings_emitted: u64,
     /// Findings dropped by engine per-chunk caps.
@@ -370,6 +374,8 @@ impl WorkerMetricsLocal {
             idle_spins: 0,
             park_count: 0,
             io_errors: 0,
+            items_failed_retryable: 0,
+            items_failed_permanent: 0,
             findings_emitted: 0,
             findings_dropped: 0,
             persistence_emit_failures: 0,
@@ -477,6 +483,10 @@ pub struct MetricsSnapshot {
     pub yield_count: u64,
     /// Total I/O errors (file open, read, metadata failures).
     pub io_errors: u64,
+    /// Total connector items that failed with a retryable read error.
+    pub items_failed_retryable: u64,
+    /// Total connector items that failed with a permanent read error.
+    pub items_failed_permanent: u64,
     /// Total findings emitted across all workers.
     pub findings_emitted: u64,
     /// Total findings dropped by engine per-chunk caps.
@@ -533,6 +543,8 @@ impl MetricsSnapshot {
             park_count: 0,
             yield_count: 0,
             io_errors: 0,
+            items_failed_retryable: 0,
+            items_failed_permanent: 0,
             findings_emitted: 0,
             findings_dropped: 0,
             persistence_emit_failures: 0,
@@ -568,6 +580,12 @@ impl MetricsSnapshot {
         self.bytes_scanned = self.bytes_scanned.wrapping_add(w.bytes_scanned);
         self.chunks_scanned = self.chunks_scanned.wrapping_add(w.chunks_scanned);
         self.io_errors = self.io_errors.wrapping_add(w.io_errors);
+        self.items_failed_retryable = self
+            .items_failed_retryable
+            .wrapping_add(w.items_failed_retryable);
+        self.items_failed_permanent = self
+            .items_failed_permanent
+            .wrapping_add(w.items_failed_permanent);
         self.findings_emitted = self.findings_emitted.wrapping_add(w.findings_emitted);
         self.findings_dropped = self.findings_dropped.wrapping_add(w.findings_dropped);
         self.persistence_emit_failures = self

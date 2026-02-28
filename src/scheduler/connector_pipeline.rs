@@ -246,6 +246,10 @@ pub struct ConnectorEnumerateStats {
     pub checkpoints_committed: u64,
     /// Split-hint keys persisted via [`ProgressSink::split_hint`].
     pub split_hints_emitted: u64,
+    /// Items that failed with a retryable read error (skipped, eligible for retry).
+    pub items_failed_retryable: u64,
+    /// Items that failed with a permanent read error (skipped, not retryable).
+    pub items_failed_permanent: u64,
 }
 
 /// End-of-run report for a connector scan.
@@ -378,16 +382,24 @@ fn item_display_bytes(item: &ScanItem) -> &[u8] {
         .unwrap_or_else(|| item.item_key().as_bytes())
 }
 
+/// Maximum consecutive EINTR retries before surfacing as an error.
+/// 1024 is generous enough for real signal storms while preventing infinite loops.
+const MAX_EINTR_RETRIES: usize = 1024;
+
 #[inline]
 fn read_some(reader: &mut dyn io::Read, dst: &mut [u8]) -> io::Result<usize> {
     // Treat EINTR as a transient kernel interruption, not connector failure.
-    loop {
+    for _ in 0..MAX_EINTR_RETRIES {
         match reader.read(dst) {
             Ok(n) => return Ok(n),
             Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        format!("exceeded {MAX_EINTR_RETRIES} consecutive EINTR retries"),
+    ))
 }
 
 /// Convert `std::io::Error` into connector contract error classes.
@@ -400,7 +412,8 @@ fn read_error_from_io(err: io::Error) -> ReadError {
         io::ErrorKind::NotFound
         | io::ErrorKind::PermissionDenied
         | io::ErrorKind::InvalidInput
-        | io::ErrorKind::InvalidData => ReadError::permanent(msg),
+        | io::ErrorKind::InvalidData
+        | io::ErrorKind::Unsupported => ReadError::permanent(msg),
         _ => ReadError::retryable(msg),
     }
 }
@@ -447,6 +460,10 @@ where
 
     loop {
         if carry > 0 && have > 0 {
+            debug_assert!(
+                have >= carry,
+                "overlap carry ({carry}) exceeds buffer fill ({have})"
+            );
             // Preserve trailing overlap so cross-chunk matches are still visible.
             buf.copy_within(have - carry..have, 0);
         }
@@ -498,6 +515,10 @@ where
 
     loop {
         if carry > 0 && have > 0 {
+            debug_assert!(
+                have >= carry,
+                "overlap carry ({carry}) exceeds buffer fill ({have})"
+            );
             // Preserve trailing overlap so cross-chunk matches are still visible.
             buf.copy_within(have - carry..have, 0);
         }
@@ -781,7 +802,7 @@ where
     let mut worker_metrics = WorkerMetricsLocal::new();
     let mut next_file_id: u32 = 0;
 
-    let (report, _) = scan_connector_with_page_dispatch(
+    let (mut report, _) = scan_connector_with_page_dispatch(
         engine,
         connector,
         cfg,
@@ -804,6 +825,13 @@ where
                     &mut worker_metrics,
                 ) {
                     worker_metrics.io_errors = worker_metrics.io_errors.saturating_add(1);
+                    if read_err.is_retryable() {
+                        worker_metrics.items_failed_retryable =
+                            worker_metrics.items_failed_retryable.saturating_add(1);
+                    } else {
+                        worker_metrics.items_failed_permanent =
+                            worker_metrics.items_failed_permanent.saturating_add(1);
+                    }
                     emit_read_error_diagnostic(&*dispatch_sink, item, &read_err);
                 }
 
@@ -812,6 +840,9 @@ where
             Ok(())
         },
     )?;
+
+    report.enumerate.items_failed_retryable = worker_metrics.items_failed_retryable;
+    report.enumerate.items_failed_permanent = worker_metrics.items_failed_permanent;
 
     let mut metrics = MetricsSnapshot::new();
     metrics.merge_worker(&worker_metrics);
