@@ -365,13 +365,13 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
         // The copied prefix belongs to the previous chunk. Any finding fully
         // before `new_bytes_start` has already been eligible for emission there.
         let new_bytes_start = base_offset.saturating_add(prefix_len as u64);
-        let before_prefix = self.scratch.pending_findings_len();
-        self.scratch.drop_prefix_findings(new_bytes_start);
-        let after_prefix = self.scratch.pending_findings_len();
+        let before_prefix = scratch.pending_findings_len();
+        scratch.drop_prefix_findings(new_bytes_start);
+        let after_prefix = scratch.pending_findings_len();
 
-        self.pending.clear();
-        self.scratch.drain_findings_into(&mut self.pending);
-        let dedupe_removed = apply_cross_rule_dedupe(&mut self.pending, &*self.engine);
+        pending.clear();
+        scratch.drain_findings_into(pending);
+        let dedupe_removed = apply_cross_rule_dedupe(pending, engine);
         let scheduler_pruned = before_prefix
             .saturating_sub(after_prefix)
             .saturating_add(dedupe_removed);
@@ -379,13 +379,8 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
 
         metrics.findings_emitted = metrics
             .findings_emitted
-            .saturating_add(self.pending.len() as u64);
-        shared_emit_findings(
-            &*self.engine,
-            &*self.event_sink,
-            item_display_bytes(item),
-            &self.pending,
-        );
+            .saturating_add(pending.len() as u64);
+        shared_emit_findings(engine, event_sink, item_display_bytes(item), pending);
 
         let payload = data.len().saturating_sub(prefix_len);
         metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
