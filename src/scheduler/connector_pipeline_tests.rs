@@ -11,7 +11,7 @@ use gossip_contracts::identity::{ObjectVersionId, StableItemId};
 
 use rstest::rstest;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::mpsc;
 use std::thread;
@@ -117,13 +117,33 @@ impl ProgressSink for MockProgress {
 struct MockConnector {
     pages: VecDeque<Result<EnumerationPage, EnumerateError>>,
     split_hints: VecDeque<Result<Option<ItemKey>, EnumerateError>>,
+    caps: ConnectorCapabilities,
+    payloads: HashMap<Vec<u8>, Vec<u8>>,
+    open_error: Option<ReadError>,
+    read_range_error: Option<ReadError>,
+    open_calls: u64,
+    read_range_calls: u64,
 }
 
 impl MockConnector {
     fn new(pages: Vec<EnumerationPage>) -> Self {
+        let mut payloads = HashMap::new();
+        for page in &pages {
+            for item in page.items() {
+                payloads
+                    .entry(item.item_ref().as_bytes().to_vec())
+                    .or_insert_with(Vec::new);
+            }
+        }
         Self {
             pages: pages.into_iter().map(Ok).collect(),
             split_hints: VecDeque::new(),
+            caps: ConnectorCapabilities::default(),
+            payloads,
+            open_error: None,
+            read_range_error: None,
+            open_calls: 0,
+            read_range_calls: 0,
         }
     }
 
@@ -131,11 +151,26 @@ impl MockConnector {
         self.split_hints = hints.into_iter().map(Ok).collect();
         self
     }
+
+    fn with_range_read(mut self) -> Self {
+        self.caps.range_read = true;
+        self
+    }
+
+    fn with_item_payload(mut self, key: &[u8], payload: &[u8]) -> Self {
+        self.payloads.insert(key.to_vec(), payload.to_vec());
+        self
+    }
+
+    fn with_open_error(mut self, err: ReadError) -> Self {
+        self.open_error = Some(err);
+        self
+    }
 }
 
 impl EnumerationConnector for MockConnector {
     fn caps(&self) -> ConnectorCapabilities {
-        ConnectorCapabilities::default()
+        self.caps
     }
 
     fn enumerate_page(
@@ -162,10 +197,46 @@ impl EnumerationConnector for MockConnector {
 impl ReadConnector for MockConnector {
     fn open(
         &mut self,
-        _item_ref: &ItemRef,
+        item_ref: &ItemRef,
         _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
-        Err(ReadError::unsupported("open"))
+        self.open_calls = self.open_calls.saturating_add(1);
+        if let Some(err) = self.open_error.clone() {
+            return Err(err);
+        }
+        let payload = self
+            .payloads
+            .get(item_ref.as_bytes())
+            .cloned()
+            .unwrap_or_default();
+        Ok(Box::new(io::Cursor::new(payload)))
+    }
+
+    fn read_range(
+        &mut self,
+        item_ref: &ItemRef,
+        offset: u64,
+        dst: &mut [u8],
+        _budgets: Budgets,
+    ) -> Result<usize, ReadError> {
+        self.read_range_calls = self.read_range_calls.saturating_add(1);
+        if let Some(err) = self.read_range_error.clone() {
+            return Err(err);
+        }
+        let payload = self
+            .payloads
+            .get(item_ref.as_bytes())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let Ok(start) = usize::try_from(offset) else {
+            return Ok(0);
+        };
+        if start >= payload.len() {
+            return Ok(0);
+        }
+        let n = dst.len().min(payload.len() - start);
+        dst[..n].copy_from_slice(&payload[start..start + n]);
+        Ok(n)
     }
 }
 
@@ -343,7 +414,7 @@ fn scan_connector_waits_for_page_completion_before_checkpoint() {
             ConnectorConfig::default(),
             &mut progress,
             sink,
-            move |page_id, items, tokens| {
+            move |page_id, _connector, items, tokens| {
                 assert_eq!(page_id, 0);
                 assert_eq!(items.len(), tokens.len());
                 assert!(tokens.iter().all(|token| token.barrier.page_id == page_id));
@@ -415,7 +486,7 @@ fn scan_connector_releases_page_barrier_on_terminal_failure() {
             ConnectorConfig::default(),
             &mut progress,
             sink,
-            |_page_id, _items, tokens| {
+            |_page_id, _connector, _items, tokens| {
                 let mut tokens = tokens.into_iter();
                 tokens.next().unwrap().complete();
                 tokens.next().unwrap().complete();
@@ -581,10 +652,8 @@ fn scan_connector_skips_split_hints_when_disabled() {
 #[test]
 fn scan_connector_returns_enumerate_error_on_first_page() {
     let shard = ShardSpec::unbounded();
-    let mut connector = MockConnector {
-        pages: vec![Err(EnumerateError::permanent("simulated failure"))].into(),
-        split_hints: VecDeque::new(),
-    };
+    let mut connector = MockConnector::new(Vec::new());
+    connector.pages = vec![Err(EnumerateError::permanent("simulated failure"))].into();
     let mut progress = MockProgress::new(shard, Cursor::initial());
     let sink = Arc::new(VecEventSink::new());
 
@@ -614,10 +683,8 @@ fn scan_connector_returns_error_on_split_hint_failure() {
         ),
         EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
     ];
-    let mut connector = MockConnector {
-        pages: pages.into_iter().map(Ok).collect(),
-        split_hints: vec![Err(EnumerateError::permanent("split failed"))].into(),
-    };
+    let mut connector = MockConnector::new(pages);
+    connector.split_hints = vec![Err(EnumerateError::permanent("split failed"))].into();
     let mut progress = MockProgress::new(shard, Cursor::initial());
     let sink = Arc::new(VecEventSink::new());
 
@@ -707,7 +774,9 @@ fn scan_connector_dispatch_error_prevents_checkpoint() {
         ConnectorConfig::default(),
         &mut progress,
         sink,
-        |_page_id, _items, _tokens| Err(ConnectorRunError::Dispatch("dispatch failed".into())),
+        |_page_id, _connector, _items, _tokens| {
+            Err(ConnectorRunError::Dispatch("dispatch failed".into()))
+        },
     )
     .unwrap_err();
 
@@ -791,4 +860,150 @@ fn scan_connector_maps_split_hint_persistence_error_to_progress_error() {
         progress.calls,
         vec![ProgressCall::Checkpoint(Cursor::with_last_key(k1))]
     );
+}
+
+fn count_jsonl_findings(encoded: &str) -> usize {
+    encoded.matches("\"type\":\"finding\"").count()
+}
+
+#[test]
+fn scan_connector_streams_items_via_open_and_emits_findings() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let payload = b"prefix SECRET suffix";
+    let mut connector = MockConnector::new(pages).with_item_payload(b"k1", payload);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        chunk_size: 8,
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (_report, metrics) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert!(connector.open_calls > 0);
+    assert_eq!(connector.read_range_calls, 0);
+    assert_eq!(metrics.io_errors, 0);
+    assert_eq!(metrics.bytes_scanned, payload.len() as u64);
+    assert_eq!(metrics.chunks_scanned, 3);
+    assert_eq!(metrics.findings_emitted, 1);
+
+    let encoded = String::from_utf8(sink.bytes()).unwrap();
+    assert_eq!(count_jsonl_findings(&encoded), 1);
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k1)),
+        ]
+    );
+}
+
+#[test]
+fn scan_connector_uses_range_read_when_capability_advertised() {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let payload = b"AAASECRETBBB";
+    let mut connector = MockConnector::new(pages)
+        .with_range_read()
+        .with_item_payload(b"k1", payload);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        chunk_size: 4,
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (_report, metrics) = scan_connector(
+        Arc::new(test_engine(8)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(connector.open_calls, 0);
+    assert!(connector.read_range_calls > 0);
+    assert_eq!(metrics.io_errors, 0);
+    assert_eq!(metrics.bytes_scanned, payload.len() as u64);
+    assert_eq!(metrics.findings_emitted, 1);
+
+    let encoded = String::from_utf8(sink.bytes()).unwrap();
+    assert_eq!(count_jsonl_findings(&encoded), 1);
+}
+
+#[rstest]
+#[case::retryable(ReadError::retryable("temporary read failure"), "retryable")]
+#[case::permanent(ReadError::permanent("missing object"), "permanent")]
+fn scan_connector_classifies_read_errors_and_continues_page(
+    #[case] read_err: ReadError,
+    #[case] expected_class: &str,
+) {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    let mut connector = MockConnector::new(pages).with_open_error(read_err);
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (_report, metrics) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(metrics.io_errors, 1);
+    assert_eq!(metrics.bytes_scanned, 0);
+    assert_eq!(metrics.findings_emitted, 0);
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k1)),
+        ]
+    );
+
+    let encoded = String::from_utf8(sink.bytes()).unwrap();
+    assert!(encoded.contains("connector read"));
+    assert!(encoded.contains(expected_class));
 }

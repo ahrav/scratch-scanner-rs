@@ -8,9 +8,10 @@
 //! gating progress behind a per-page completion barrier, and checkpointing the
 //! cursor only after every item on a page reaches a terminal state.
 //!
-//! Item-level read/chunk/scan execution is intentionally stubbed: the current
-//! [`scan_connector`] immediately completes every item token synchronously.
-//! Future work will hand tokens off to I/O and CPU worker pools.
+//! Item-level execution uses the connector read surface directly:
+//! `open()` as the baseline path and `read_range()` when advertised by
+//! capabilities. Chunk scanning and dedupe reuse the same helpers as the
+//! local/remote scheduler paths to preserve finding semantics.
 //!
 //! # High-level flow
 //!
@@ -33,7 +34,8 @@
 //! ```
 //!
 //! On error at any step, the loop exits immediately. Checkpoints already
-//! persisted are durable; no terminal transition (complete/park) is called.
+//! persisted are durable. If a terminal call itself fails (`complete`), that
+//! terminal method has been attempted and returned an error.
 //!
 //! # Core invariant
 //!
@@ -61,16 +63,22 @@
 //! | [`ConnectorRunError`] | Error taxonomy covering enumeration, validation, and persistence failures |
 
 use super::engine_stub::BUFFER_LEN_MAX;
-use super::engine_trait::ScanEngine;
-use super::metrics::MetricsSnapshot;
-use crate::unified::events::EventSink;
+use super::engine_trait::{EngineScratch as _, ScanEngine};
+use super::local_fs_owner::{
+    account_effective_dropped_findings, apply_cross_rule_dedupe,
+    emit_findings as shared_emit_findings,
+};
+use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
+use crate::api::FileId;
+use crate::unified::events::{DiagnosticEvent, EventSink, ScanEvent};
 
 use gossip_contracts::connector::{
     validate_page, Budgets, ConnectorInstance, Cursor, EnumerateError, ItemKey,
-    PageValidationError, ScanItem,
+    PageValidationError, ReadError, ScanItem,
 };
 use gossip_contracts::coordination::ShardSpec;
 
+use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -166,11 +174,12 @@ impl ConnectorConfig {
 ///    - [`park`](Self::park) — the scan yields ownership (e.g., timeout or
 ///      graceful shutdown) without completing the shard.
 ///
-///    **On error:** If the pipeline returns `Err`, no terminal transition is
-///    called. The progress sink may have received zero or more `checkpoint`
-///    calls before the error. The coordinator must treat the absence of a
-///    terminal transition as an implicit failure and handle accordingly
-///    (e.g., re-assign the shard from the last-checkpointed cursor).
+///    **Current behavior note:** this module currently calls `complete()` on
+///    terminal empty pages and does not call `park()`.
+///
+///    **On error:** the progress sink may have received zero or more
+///    `checkpoint` calls before the error. If the error comes from
+///    `complete()`, that terminal call was attempted and failed.
 /// 4. [`split_hint`](Self::split_hint) — optionally called between checkpoint
 ///    and the next enumerate, suggesting a key at which the coordinator could
 ///    split this shard for parallelism.
@@ -241,8 +250,9 @@ pub struct ConnectorRunReport {
 /// **Partial progress:** When the pipeline returns any of these errors,
 /// zero or more pages may have been successfully checkpointed before the
 /// failure. The [`ProgressSink`] cursor reflects the last successful
-/// checkpoint. No terminal lifecycle transition ([`ProgressSink::complete`]
-/// or [`ProgressSink::park`]) is called on error paths.
+/// checkpoint. If the returned error is [`ConnectorRunError::Progress`], a
+/// terminal lifecycle call such as [`ProgressSink::complete`] may have been
+/// attempted and failed.
 #[derive(Debug)]
 pub enum ConnectorRunError<E> {
     /// Connector enumeration or split-hint selection failed.
@@ -250,8 +260,9 @@ pub enum ConnectorRunError<E> {
     /// A returned page violated shard/cursor invariants.
     /// Boxed because [`PageValidationError`] carries diagnostic context.
     PageValidation(Box<PageValidationError>),
-    /// The [`ProgressSink`] returned an error from checkpoint, complete,
-    /// park, or split_hint.
+    /// The [`ProgressSink`] returned an error from checkpoint, complete, or
+    /// split_hint (`park` is part of the trait surface but is not called by
+    /// the current run loop).
     Progress(E),
     /// The item dispatch strategy failed (e.g., queue full, worker pool rejection).
     /// Contains a human-readable description of the dispatch failure.
@@ -267,6 +278,269 @@ pub enum ConnectorRunError<E> {
     },
     /// The [`ConnectorConfig`] failed validation.
     Config(String),
+    /// Item file ID allocation exceeded `u32::MAX`.
+    FileIdOverflow,
+}
+
+/// Shared CPU-side chunk runner used by both `open()` and `read_range()` paths.
+///
+/// Reuses one engine scratch and one temporary findings buffer across items so
+/// connector I/O paths stay allocation-light and produce identical finding
+/// semantics regardless of how bytes are fetched.
+struct ConnectorCpuRunner<E: ScanEngine> {
+    engine: Arc<E>,
+    event_sink: Arc<dyn EventSink>,
+    scratch: E::Scratch,
+    pending: Vec<<E::Scratch as super::engine_trait::EngineScratch>::Finding>,
+}
+
+impl<E: ScanEngine> ConnectorCpuRunner<E> {
+    fn new(engine: Arc<E>, event_sink: Arc<dyn EventSink>) -> Self {
+        Self {
+            scratch: engine.new_scratch(),
+            pending: Vec::with_capacity(engine.max_findings_per_chunk()),
+            engine,
+            event_sink,
+        }
+    }
+
+    /// Scan one assembled chunk and emit findings/events with connector parity.
+    ///
+    /// # Invariants
+    ///
+    /// - `base_offset` is the absolute offset of `data[0]`.
+    /// - `prefix_len` bytes at the front of `data` are overlap bytes copied from
+    ///   the previous chunk; findings that end before `base_offset + prefix_len`
+    ///   are dropped to avoid duplicate emission across chunk boundaries.
+    /// - Cross-rule dedupe runs after overlap pruning so all connector read paths
+    ///   share the same post-processing semantics as local scheduler scans.
+    fn scan_chunk(
+        &mut self,
+        item: &ScanItem,
+        file_id: FileId,
+        base_offset: u64,
+        prefix_len: usize,
+        data: &[u8],
+        metrics: &mut WorkerMetricsLocal,
+    ) {
+        self.engine
+            .scan_chunk_into(data, file_id, base_offset, &mut self.scratch);
+        let engine_dropped = self.scratch.dropped_findings();
+
+        // The copied prefix belongs to the previous chunk. Any finding fully
+        // before `new_bytes_start` has already been eligible for emission there.
+        let new_bytes_start = base_offset.saturating_add(prefix_len as u64);
+        let before_prefix = self.scratch.pending_findings_len();
+        self.scratch.drop_prefix_findings(new_bytes_start);
+        let after_prefix = self.scratch.pending_findings_len();
+
+        self.pending.clear();
+        self.scratch.drain_findings_into(&mut self.pending);
+        let dedupe_removed = apply_cross_rule_dedupe(&mut self.pending, &*self.engine);
+        let scheduler_pruned = before_prefix
+            .saturating_sub(after_prefix)
+            .saturating_add(dedupe_removed);
+        account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
+
+        metrics.findings_emitted = metrics
+            .findings_emitted
+            .saturating_add(self.pending.len() as u64);
+        shared_emit_findings(
+            &*self.engine,
+            &*self.event_sink,
+            item_display_bytes(item),
+            &self.pending,
+        );
+
+        let payload = data.len().saturating_sub(prefix_len);
+        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
+        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(payload as u64);
+    }
+}
+
+#[inline]
+fn item_display_bytes(item: &ScanItem) -> &[u8] {
+    item.location()
+        .map(|loc| loc.display().as_bytes())
+        .unwrap_or_else(|| item.item_key().as_bytes())
+}
+
+#[inline]
+fn read_some(reader: &mut dyn io::Read, dst: &mut [u8]) -> io::Result<usize> {
+    // Treat EINTR as a transient kernel interruption, not connector failure.
+    loop {
+        match reader.read(dst) {
+            Ok(n) => return Ok(n),
+            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Convert `std::io::Error` into connector contract error classes.
+///
+/// Classifying deterministic input/state failures as permanent prevents useless
+/// retries, while transport/transient kinds remain retryable for higher layers.
+fn read_error_from_io(err: io::Error) -> ReadError {
+    let msg = format!("connector reader failed: {err}");
+    match err.kind() {
+        io::ErrorKind::NotFound
+        | io::ErrorKind::PermissionDenied
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::InvalidData => ReadError::permanent(msg),
+        _ => ReadError::retryable(msg),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Stream bytes through `ConnectorInstance::open` and scan in overlap-aware chunks.
+///
+/// This is the compatibility path for connectors that expose only sequential
+/// readers. Chunk assembly mirrors the `read_range` path so finding boundaries
+/// and dedupe behavior are identical across capability sets.
+fn stream_item_via_open<C, E>(
+    connector: &mut C,
+    item: &ScanItem,
+    file_id: FileId,
+    cfg: ConnectorConfig,
+    overlap: usize,
+    cpu_runner: &mut ConnectorCpuRunner<E>,
+    metrics: &mut WorkerMetricsLocal,
+) -> Result<(), ReadError>
+where
+    C: ConnectorSource + ?Sized,
+    E: ScanEngine,
+{
+    let mut reader = connector.open(item.item_ref(), cfg.page_budgets)?;
+    let mut buf = vec![0_u8; overlap.saturating_add(cfg.chunk_size)];
+    // Absolute payload bytes consumed from this item (excludes overlap carry).
+    let mut offset: u64 = 0;
+    // Bytes copied from the previous iteration into the front of `buf`.
+    let mut carry: usize = 0;
+    // Total bytes present in `buf` on the previous iteration (`carry + read`).
+    let mut have: usize = 0;
+
+    loop {
+        if carry > 0 && have > 0 {
+            // Preserve trailing overlap so cross-chunk matches are still visible.
+            buf.copy_within(have - carry..have, 0);
+        }
+
+        let payload = &mut buf[carry..carry + cfg.chunk_size];
+        let n = read_some(reader.as_mut(), payload).map_err(read_error_from_io)?;
+        if n == 0 {
+            break;
+        }
+
+        let len = carry + n;
+        let base_offset = offset.saturating_sub(carry as u64);
+        cpu_runner.scan_chunk(item, file_id, base_offset, carry, &buf[..len], metrics);
+
+        offset = offset.saturating_add(n as u64);
+        have = len;
+        carry = overlap.min(len);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Stream bytes via random-access `ConnectorInstance::read_range`.
+///
+/// `offset` always advances by newly read payload bytes, while `carry` is local
+/// chunk context only. This keeps connector-visible offsets monotonic and avoids
+/// re-reading overlap from the connector.
+fn stream_item_via_range_read<C, E>(
+    connector: &mut C,
+    item: &ScanItem,
+    file_id: FileId,
+    cfg: ConnectorConfig,
+    overlap: usize,
+    cpu_runner: &mut ConnectorCpuRunner<E>,
+    metrics: &mut WorkerMetricsLocal,
+) -> Result<(), ReadError>
+where
+    C: ConnectorSource + ?Sized,
+    E: ScanEngine,
+{
+    let mut buf = vec![0_u8; overlap.saturating_add(cfg.chunk_size)];
+    // Absolute payload bytes consumed from this item (excludes overlap carry).
+    let mut offset: u64 = 0;
+    // Bytes copied from the previous iteration into the front of `buf`.
+    let mut carry: usize = 0;
+    // Total bytes present in `buf` on the previous iteration (`carry + read`).
+    let mut have: usize = 0;
+
+    loop {
+        if carry > 0 && have > 0 {
+            // Preserve trailing overlap so cross-chunk matches are still visible.
+            buf.copy_within(have - carry..have, 0);
+        }
+
+        let payload = &mut buf[carry..carry + cfg.chunk_size];
+        let n = connector.read_range(item.item_ref(), offset, payload, cfg.page_budgets)?;
+        if n == 0 {
+            break;
+        }
+        if n > payload.len() {
+            // Contract violation: connector must not report bytes beyond requested range.
+            return Err(ReadError::permanent(format!(
+                "connector read_range returned {} bytes for {}-byte buffer",
+                n,
+                payload.len()
+            )));
+        }
+
+        let len = carry + n;
+        let base_offset = offset.saturating_sub(carry as u64);
+        cpu_runner.scan_chunk(item, file_id, base_offset, carry, &buf[..len], metrics);
+
+        offset = offset.saturating_add(n as u64);
+        have = len;
+        carry = overlap.min(len);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Select the connector read path by capability while preserving scan semantics.
+fn stream_item_into_executor<C, E>(
+    connector: &mut C,
+    item: &ScanItem,
+    file_id: FileId,
+    cfg: ConnectorConfig,
+    overlap: usize,
+    cpu_runner: &mut ConnectorCpuRunner<E>,
+    metrics: &mut WorkerMetricsLocal,
+) -> Result<(), ReadError>
+where
+    C: ConnectorSource + ?Sized,
+    E: ScanEngine,
+{
+    if connector.caps().range_read {
+        return stream_item_via_range_read(
+            connector, item, file_id, cfg, overlap, cpu_runner, metrics,
+        );
+    }
+    stream_item_via_open(connector, item, file_id, cfg, overlap, cpu_runner, metrics)
+}
+
+/// Emit one warning diagnostic for an item-level read error.
+///
+/// Includes retry class and stable item key so operators can distinguish noisy
+/// transient failures from deterministic configuration/data problems.
+fn emit_read_error_diagnostic(event_sink: &dyn EventSink, item: &ScanItem, err: &ReadError) {
+    let msg = format!(
+        "connector read {} error for item {}: {}",
+        err.class(),
+        item.item_key(),
+        err.message()
+    );
+    event_sink.emit(ScanEvent::Diagnostic(DiagnosticEvent {
+        level: "warn",
+        message: &msg,
+    }));
 }
 
 /// Monotonically increasing page identifier within a single scan run.
@@ -276,7 +550,7 @@ pub(super) type PageId = u64;
 type PageId = u64;
 
 /// Barrier that blocks checkpoint advancement until every item on a page
-/// reaches a terminal state (success or permanent failure).
+/// reaches a terminal state (success or handled item failure).
 ///
 /// The enumeration loop creates one barrier per non-empty page, seeded with
 /// `outstanding_items == item_count`. Each dispatched item holds a
@@ -419,7 +693,7 @@ impl PageItemToken {
         }
     }
 
-    /// Mark this item as terminally resolved (success or permanent failure).
+    /// Mark this item as terminally resolved (success or handled failure).
     /// Releases the barrier's outstanding count.
     pub(super) fn complete(mut self) {
         self.release();
@@ -454,9 +728,6 @@ impl Drop for PageItemToken {
 /// 6. Optionally emit a split hint.
 /// 7. Repeat until a terminal empty page, then call `complete`.
 ///
-/// This function currently owns **page** lifecycle semantics. Item-level read/chunk
-/// execution is intentionally delegated to follow-up tasks.
-///
 /// # Errors
 ///
 /// - [`ConnectorRunError::Config`] if [`ConnectorConfig::validate`] fails.
@@ -466,6 +737,7 @@ impl Drop for PageItemToken {
 /// - [`ConnectorRunError::Dispatch`] if the item dispatch strategy fails.
 /// - [`ConnectorRunError::Progress`] if checkpoint/complete/split-hint persistence fails.
 /// - [`ConnectorRunError::PageIdOverflow`] if more than `u64::MAX` pages are enumerated.
+/// - [`ConnectorRunError::FileIdOverflow`] if item `FileId` allocation exceeds `u32::MAX`.
 pub fn scan_connector<E, C, P>(
     engine: Arc<E>,
     connector: &mut C,
@@ -478,29 +750,55 @@ where
     C: ConnectorSource + ?Sized,
     P: ProgressSink + ?Sized,
 {
-    scan_connector_with_page_dispatch(
+    let overlap = engine.required_overlap();
+    let dispatch_sink = Arc::clone(&event_sink);
+    let mut cpu_runner = ConnectorCpuRunner::new(Arc::clone(&engine), Arc::clone(&dispatch_sink));
+    let mut worker_metrics = WorkerMetricsLocal::new();
+    let mut next_file_id: u32 = 0;
+
+    let (report, _) = scan_connector_with_page_dispatch(
         engine,
         connector,
         cfg,
         progress,
         event_sink,
-        |_page_id, _items, item_tokens| {
-            // Current page processing is synchronous; future connector read/chunk
-            // work transfers these tokens to async item workers.
-            for token in item_tokens {
+        |_page_id, connector, items, item_tokens| {
+            for (item, token) in items.iter().zip(item_tokens) {
+                let file_id = FileId(next_file_id);
+                next_file_id = next_file_id
+                    .checked_add(1)
+                    .ok_or(ConnectorRunError::FileIdOverflow)?;
+
+                if let Err(read_err) = stream_item_into_executor(
+                    connector,
+                    item,
+                    file_id,
+                    cfg,
+                    overlap,
+                    &mut cpu_runner,
+                    &mut worker_metrics,
+                ) {
+                    worker_metrics.io_errors = worker_metrics.io_errors.saturating_add(1);
+                    emit_read_error_diagnostic(&*dispatch_sink, item, &read_err);
+                }
+
                 token.complete();
             }
             Ok(())
         },
-    )
+    )?;
+
+    let mut metrics = MetricsSnapshot::new();
+    metrics.merge_worker(&worker_metrics);
+    Ok((report, metrics))
 }
 
 /// Inner loop parameterized by a page-dispatch strategy.
 ///
-/// `dispatch_page_items` receives each page's items and their completion
-/// tokens. The public [`scan_connector`] passes a closure that immediately
-/// completes all tokens (synchronous stub). Tests inject custom dispatch
-/// logic to exercise the barrier under concurrent release patterns.
+/// `dispatch_page_items` receives each page's connector handle, items, and
+/// completion tokens. The public [`scan_connector`] uses this hook to execute
+/// connector item reads/chunk scans while tests inject custom dispatch logic
+/// to exercise the barrier under concurrent release patterns.
 ///
 /// The loop body follows the flow documented in the module-level docs:
 /// enumerate -> validate -> dispatch -> barrier -> checkpoint -> split-hint.
@@ -516,7 +814,12 @@ where
     E: ScanEngine,
     C: ConnectorSource + ?Sized,
     P: ProgressSink + ?Sized,
-    D: FnMut(PageId, &[ScanItem], Vec<PageItemToken>) -> Result<(), ConnectorRunError<P::Error>>,
+    D: FnMut(
+        PageId,
+        &mut C,
+        &[ScanItem],
+        Vec<PageItemToken>,
+    ) -> Result<(), ConnectorRunError<P::Error>>,
 {
     cfg.validate(engine.required_overlap())
         .map_err(ConnectorRunError::Config)?;
@@ -563,7 +866,7 @@ where
             // Step 4-5: create barrier + tokens and hand items to the dispatch strategy.
             let (page_barrier, page_tokens) = track_page_items(page_id, items.len());
             record_page_enqueue_and_processing(&items, &mut report);
-            dispatch_page_items(page_id, &items, page_tokens)?;
+            dispatch_page_items(page_id, connector, &items, page_tokens)?;
 
             // Step 6: block until every token is released (the core invariant).
             wait_for_page_completion_barrier(page_barrier.as_ref());
