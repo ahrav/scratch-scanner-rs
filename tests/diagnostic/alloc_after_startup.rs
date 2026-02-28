@@ -7,7 +7,7 @@
 //! IMPORTANT: Use `--test-threads=1` because tests share global allocation
 //! counters and will interfere with each other if run in parallel.
 
-use scanner_rs::scheduler::{scan_local, LocalConfig, LocalFile, VecFileSource};
+use scanner_rs::scheduler::local_fs_owner::{scan_local, LocalConfig, LocalFile, VecFileSource};
 use scanner_rs::{demo_engine, ScannerConfig, ScannerRuntime};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;

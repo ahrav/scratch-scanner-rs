@@ -49,8 +49,7 @@ use crate::git_scan::{
     self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
     StartSetConfig,
 };
-use crate::scheduler::parallel_scan_dir;
-use crate::scheduler::ParallelScanConfig;
+use crate::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
 use crate::store::{RootKind, SqliteStoreConfig, SqliteStoreProducer, StoreKeys, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
@@ -233,7 +232,7 @@ fn run_fs(
     #[cfg(target_os = "linux")]
     let report = {
         use crate::scheduler::local_fs_owner::{LocalReport, LocalStats};
-        use crate::scheduler::{scan_local_fs_uring, LocalFsUringConfig};
+        use crate::scheduler::local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig};
 
         let defaults = LocalFsUringConfig::default();
         let backend = select_fs_backend(

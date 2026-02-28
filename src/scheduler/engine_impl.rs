@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! use scanner_rs::scheduler::engine_impl::*;
-//! use scanner_rs::scheduler::scan_local;
+//! use scanner_rs::scheduler::local_fs_owner::scan_local;
 //! use scanner_rs::engine::Engine;
 //!
 //! let engine = Arc::new(Engine::new(rules, transforms, tuning));

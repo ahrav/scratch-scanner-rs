@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use scanner_rs::scheduler::{scan_local, LocalConfig, LocalFile, VecFileSource};
+use scanner_rs::scheduler::local_fs_owner::{scan_local, LocalConfig, LocalFile, VecFileSource};
 use scanner_rs::unified::events::VecEventSink;
 use scanner_rs::{demo_transforms, demo_tuning, Engine};
 

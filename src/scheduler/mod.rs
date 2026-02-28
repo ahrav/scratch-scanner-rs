@@ -69,10 +69,10 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`local_fs_owner`] | Canonical local filesystem scanning path (chunked I/O + archive expansion) |
-//! | [`parallel_scan`] | High-level directory scanning with gitignore support |
-//! | [`local_fs_uring`] | Linux-only io_uring backend (default on Linux) |
-//! | [`remote`] | HTTP/object-store backend with retry policies |
+//! | [`connector_pipeline`] | Connector-first scheduler entrypoint for enumerate/read/scan workflows |
+//! | [`local_fs_owner`] | Legacy local filesystem scheduler internals (migration compatibility) |
+//! | [`parallel_scan`] | Legacy high-level directory scanner surface |
+//! | [`local_fs_uring`] | Legacy Linux io_uring scheduler surface |
 //!
 //! ## Observability
 //!
@@ -204,7 +204,7 @@
 //! - **Core**: [`Executor`], [`ExecutorConfig`], [`WorkerCtx`], [`ByteBudget`],
 //!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
 //! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`WorkerFindingsBuffer`]
-//! - **Local scanning**: [`scan_local`], [`LocalConfig`], [`scan_local_fs_uring`] (Linux)
+//! - **Connector pipeline**: [`scan_connector`], [`ConnectorConfig`], [`ConnectorSource`]
 //! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
 // Core scheduling
@@ -229,18 +229,18 @@ pub mod ts_chunk;
 pub mod worker_id;
 
 // I/O backends
+pub mod connector_pipeline;
 mod local_fs_archive_ctx;
 mod local_fs_bzip2;
 mod local_fs_extract;
 mod local_fs_gzip;
 pub mod local_fs_owner;
-pub use local_fs_owner as local;
 mod local_fs_tar;
 #[cfg(target_os = "linux")]
 pub mod local_fs_uring;
 mod local_fs_zip;
 pub mod parallel_scan;
-pub mod remote;
+pub(crate) mod remote;
 
 // Observability
 pub mod affinity;
@@ -293,13 +293,10 @@ pub use ts_chunk::TsChunk;
 pub use worker_id::{current_worker_id, set_current_worker_id};
 
 // I/O backends
-pub use local_fs_owner::{
-    scan_local, FileSource, LocalConfig, LocalFile, LocalReport, LocalStats, VecFileSource,
+pub use connector_pipeline::{
+    scan_connector, ConnectorConfig, ConnectorErrorClass, ConnectorObject, ConnectorRetryPolicy,
+    ConnectorRunError, ConnectorRunReport, ConnectorSource,
 };
-#[cfg(target_os = "linux")]
-pub use local_fs_uring::{scan_local_fs_uring, LocalFsUringConfig, UringIoStats};
-pub use parallel_scan::{parallel_scan_dir, ParallelScanConfig, ParallelScanReport};
-pub use remote::{ErrorClass, RemoteBackend, RemoteConfig, RetryPolicy};
 
 // Observability
 pub use affinity::{
