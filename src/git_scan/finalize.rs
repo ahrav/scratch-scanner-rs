@@ -41,7 +41,7 @@ use std::cmp::Ordering;
 use crate::perf_stats;
 
 use super::byte_arena::ByteArena;
-use super::engine_adapter::{FindingKey, FindingSpan, ScannedBlob};
+use super::engine_adapter::{sort_and_dedupe_findings, FindingKey, FindingSpan, ScannedBlob};
 use super::object_id::OidBytes;
 use super::start_set::StartSetId;
 use super::tree_candidate::CandidateContext;
@@ -449,8 +449,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
             blob_findings.extend_from_slice(findings);
         }
         let pre_dedup = blob_findings.len();
-        blob_findings.sort_unstable();
-        blob_findings.dedup();
+        sort_and_dedupe_findings(&mut blob_findings);
         perf_stats::sat_add_u64(
             &mut stats.findings_deduped,
             (pre_dedup - blob_findings.len()) as u64,
@@ -572,6 +571,7 @@ mod tests {
             end,
             rule_id,
             norm_hash: [0xAA; 32],
+            confidence_score: 0,
         }
     }
 
@@ -581,6 +581,7 @@ mod tests {
             end,
             rule_id,
             norm_hash: [hash_byte; 32],
+            confidence_score: 0,
         }
     }
 
@@ -780,6 +781,36 @@ mod tests {
                     findings: span_b,
                 },
             ],
+            finding_arena: &finding_arena,
+            skipped_candidate_oids: vec![],
+            path_arena: &arena,
+        };
+
+        let out = build_finalize_ops(input);
+        assert_perf_u64(out.stats.total_findings, 1);
+        assert_perf_u64(out.stats.findings_deduped, 1);
+    }
+
+    #[test]
+    fn findings_deduped_when_only_confidence_differs() {
+        let mut arena = ByteArena::with_capacity(1024);
+        let mut finding_arena = Vec::new();
+        let path_ref = arena.intern(b"a/file.rs").unwrap();
+        let mut low = finding(0, 15, 1);
+        low.confidence_score = 1;
+        let mut high = finding(0, 15, 1);
+        high.confidence_score = 6;
+        let span = push_findings(&mut finding_arena, &[low, high]);
+        let input = FinalizeInput {
+            repo_id: 1,
+            policy_hash: [0; 32],
+            start_set_id: [0; 32],
+            refs: vec![],
+            scanned_blobs: vec![ScannedBlob {
+                oid: test_oid(0xCE),
+                ctx: ctx(1, path_ref),
+                findings: span,
+            }],
             finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,

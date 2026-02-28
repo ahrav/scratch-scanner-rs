@@ -133,10 +133,10 @@ impl Default for EngineAdapterConfig {
 /// represented only by its `NormHash`, avoiding sensitive data in
 /// long-lived persistence structures.
 ///
-/// Order is total and stable: `(start, end, rule_id, norm_hash)`.
-/// This derived ordering means findings sort by position first, then
-/// by rule, then by secret identity — which makes sort+dedup deterministic
-/// regardless of scan-chunk ordering.
+/// Identity key is `(start, end, rule_id, norm_hash)`.
+/// `confidence_score` is carried for reporting, but does not participate in
+/// dedup identity. When multiple equivalent findings differ only by
+/// confidence, dedupe keeps the highest score.
 ///
 /// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
 /// a *best-effort root match span* in blob coordinates. For transform-derived
@@ -152,6 +152,40 @@ pub struct FindingKey {
     /// Normalized secret hash — the sole representation of the matched
     /// secret, so raw secret bytes never appear in scan output structures.
     pub norm_hash: NormHash,
+    /// Additive confidence score from engine gate evaluation.
+    pub confidence_score: i8,
+}
+
+impl FindingKey {
+    #[inline(always)]
+    fn identity_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start
+            .cmp(&other.start)
+            .then_with(|| self.end.cmp(&other.end))
+            .then_with(|| self.rule_id.cmp(&other.rule_id))
+            .then_with(|| self.norm_hash.cmp(&other.norm_hash))
+    }
+
+    #[inline(always)]
+    fn same_identity(&self, other: &Self) -> bool {
+        self.start == other.start
+            && self.end == other.end
+            && self.rule_id == other.rule_id
+            && self.norm_hash == other.norm_hash
+    }
+}
+
+/// Sort findings by identity and dedupe equal identities in place.
+///
+/// Tie-breaker inside an identity group is descending confidence, so dedupe
+/// keeps the most informative score.
+#[inline]
+pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<FindingKey>) {
+    findings.sort_unstable_by(|a, b| {
+        a.identity_cmp(b)
+            .then_with(|| b.confidence_score.cmp(&a.confidence_score))
+    });
+    findings.dedup_by(|a, b| a.same_identity(b));
 }
 
 /// Range into the adapter findings arena for a single blob.
@@ -523,11 +557,7 @@ impl<'a> EngineAdapter<'a> {
                 rule_name: self.engine.rule_name(f.rule_id),
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
-                // Git adapter does not run gate evaluation — confidence_score is
-                // hardcoded to 0 (indistinguishable from "zero gates fired").
-                // TODO: thread confidence_score through FindingKey when gate
-                // evaluation is wired for Git scans.
-                confidence_score: 0,
+                confidence_score: f.confidence_score,
             }));
         }
     }
@@ -844,8 +874,7 @@ fn scan_blob_chunked_with_chunker(
 
             let ((), _sd_nanos) = perf::time(|| {
                 if !out.is_empty() {
-                    out.sort_unstable();
-                    out.dedup();
+                    sort_and_dedupe_findings(out);
                 }
             });
             perf::record_scan_sort_dedup(_sd_nanos);
@@ -896,8 +925,7 @@ fn scan_blob_chunked_with_chunker(
 
         let ((), _sd_nanos) = perf::time(|| {
             if !out.is_empty() {
-                out.sort_unstable();
-                out.dedup();
+                sort_and_dedupe_findings(out);
             }
         });
         perf::record_scan_sort_dedup(_sd_nanos);
@@ -962,6 +990,7 @@ fn scan_chunk(
             end: end as u32,
             rule_id: rec.rule_id,
             norm_hash: *hash,
+            confidence_score: rec.confidence_score,
         });
     }
 }
@@ -1350,6 +1379,46 @@ mod tests {
         )
     }
 
+    fn test_engine_with_tok_rule_and_keyword_confidence() -> Engine {
+        let rule = RuleSpec {
+            name: "tok-keyword-confidence",
+            anchors: &[b"TOK_"],
+            radius: 16,
+            validator: ValidatorKind::None,
+            two_phase: None,
+            must_contain: None,
+            keywords_any: Some(&[b"TOK_"]),
+            value_suppressors_any: None,
+            entropy: None,
+            char_class: None,
+            local_context: None,
+            secret_group: Some(1),
+            min_confidence: None,
+            offline_validation: None,
+            uuid_format_secret: false,
+            re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
+        };
+
+        let transforms = vec![TransformConfig {
+            id: TransformId::Base64,
+            mode: TransformMode::Always,
+            gate: Gate::AnchorsInDecoded,
+            min_len: 16,
+            max_spans_per_buffer: 4,
+            max_encoded_len: 1024,
+            max_decoded_bytes: 1024,
+            plus_to_space: false,
+            base64_allow_space_ws: false,
+        }];
+
+        Engine::new_with_anchor_policy(
+            vec![rule],
+            transforms,
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        )
+    }
+
     fn make_candidate_with_ctx(commit_id: u32, change_kind: ChangeKind) -> LooseCandidate {
         let ctx = CandidateContext {
             commit_id,
@@ -1479,6 +1548,64 @@ mod tests {
         assert!(
             output.contains("\"source\":\"git\""),
             "git findings must have source:git: {output}"
+        );
+    }
+
+    #[test]
+    fn git_finding_events_propagate_confidence_score() {
+        let engine = test_engine_with_tok_rule_and_keyword_confidence();
+        let sink = Arc::new(VecEventSink::new());
+        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
+
+        let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
+        let blob = b"prefix TOK_ABCDEFGH suffix";
+        adapter
+            .emit_loose(&candidate, b"secret.txt", blob)
+            .expect("scan");
+
+        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
+        assert!(
+            output.contains("\"confidence_score\":2"),
+            "git findings must carry non-zero confidence score from engine: {output}"
+        );
+    }
+
+    #[test]
+    fn sort_and_dedupe_findings_prefers_higher_confidence() {
+        let mut findings = vec![
+            FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 7,
+                norm_hash: [0x11; 32],
+                confidence_score: 1,
+            },
+            FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 7,
+                norm_hash: [0x11; 32],
+                confidence_score: 5,
+            },
+            FindingKey {
+                start: 30,
+                end: 40,
+                rule_id: 7,
+                norm_hash: [0x22; 32],
+                confidence_score: 0,
+            },
+        ];
+
+        sort_and_dedupe_findings(&mut findings);
+
+        assert_eq!(
+            findings.len(),
+            2,
+            "identity-equivalent findings must dedupe"
+        );
+        assert_eq!(
+            findings[0].confidence_score, 5,
+            "dedupe winner should retain highest confidence"
         );
     }
 
