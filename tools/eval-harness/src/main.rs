@@ -597,7 +597,7 @@ fn run_live_scan(
     scan_dir: &Path,
     canonical_root: &str,
 ) -> Result<Vec<NormalizedFinding>, Box<dyn Error>> {
-    use scanner_rs::scheduler::{LocalConfig, LocalFile, VecFileSource, scan_local};
+    use scanner_rs::scheduler::local_fs_owner::{LocalConfig, LocalFile, VecFileSource, scan_local};
     use scanner_rs::unified::events::VecEventSink;
 
     let engine = Arc::new(scanner_rs::demo_engine());
@@ -666,7 +666,7 @@ fn run_live_scan(
 /// The eval harness requires complete scan output. Any I/O errors,
 /// dropped findings, persistence emission failures, or explicit
 /// `persistence_incomplete` signal result in a runtime error.
-fn validate_scan_health(report: &scanner_rs::scheduler::LocalReport) -> Result<(), Box<dyn Error>> {
+fn validate_scan_health(report: &scanner_rs::scheduler::local_fs_owner::LocalReport) -> Result<(), Box<dyn Error>> {
     let stats = &report.stats;
     let mut reasons: Vec<String> = Vec::with_capacity(4);
 
@@ -913,13 +913,13 @@ mod tests {
 
     #[test]
     fn validate_scan_health_accepts_clean_report() {
-        let report = scanner_rs::scheduler::LocalReport::default();
+        let report = scanner_rs::scheduler::local_fs_owner::LocalReport::default();
         assert!(validate_scan_health(&report).is_ok());
     }
 
     #[test]
     fn validate_scan_health_rejects_incomplete_report() {
-        let mut report = scanner_rs::scheduler::LocalReport::default();
+        let mut report = scanner_rs::scheduler::local_fs_owner::LocalReport::default();
         report.stats.io_errors = 1;
         report.stats.dropped_findings = 2;
         report.stats.persistence_emit_failures = 3;
