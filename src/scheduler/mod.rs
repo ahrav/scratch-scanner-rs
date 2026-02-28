@@ -70,9 +70,9 @@
 //! | Module | Purpose |
 //! |--------|---------|
 //! | [`connector_pipeline`] | Connector-first scheduler entrypoint for enumerate/read/scan workflows |
-//! | [`local_fs_owner`] | Legacy local filesystem scheduler internals (migration compatibility) |
-//! | [`parallel_scan`] | Legacy high-level directory scanner surface |
-//! | [`local_fs_uring`] | Legacy Linux io_uring scheduler surface |
+//! | [`local_fs_owner`] | Local filesystem scheduler internals |
+//! | [`parallel_scan`] | High-level directory scanner surface |
+//! | [`local_fs_uring`] | Linux io_uring scheduler surface |
 //!
 //! ## Observability
 //!

@@ -284,12 +284,17 @@ type PageId = u64;
 /// thread calls [`wait_until_complete`](Self::wait_until_complete), which
 /// parks on the condvar until the counter hits zero.
 ///
-/// # Poison propagation
+/// # Poison recovery
 ///
-/// All lock acquisitions use [`lock_or_propagate`](Self::lock_or_propagate),
-/// which panics on mutex poison rather than absorbing it. A poisoned mutex
-/// signals that a prior holder panicked while modifying shared state, so
-/// continuing with potentially inconsistent state is worse than failing fast.
+/// All lock acquisitions use [`lock_or_recover`](Self::lock_or_recover),
+/// which recovers from mutex poison rather than panicking.
+///
+/// **Safety justification**: `PageCompletionState` contains only a `usize`
+/// counter (`outstanding_items`) that is monotonically decremented. There are
+/// no complex invariants a partial update could violate — the worst case is a
+/// stale count, which the barrier will still drain correctly. The alternative
+/// (propagating the panic) would deadlock the enumeration loop, which is
+/// strictly worse than continuing with a recovered counter.
 #[derive(Debug)]
 #[cfg_attr(feature = "bench", allow(dead_code))]
 pub(super) struct PageCompletionBarrier {
@@ -317,9 +322,24 @@ impl PageCompletionBarrier {
         })
     }
 
-    /// Acquire the inner mutex, propagating poison as a panic.
-    fn lock_or_propagate(&self) -> std::sync::MutexGuard<'_, PageCompletionState> {
-        self.state.lock().expect("page barrier mutex poisoned")
+    /// Lock state with poison recovery.
+    ///
+    /// If the mutex was poisoned by a panic in another thread, we recover
+    /// the inner state and continue. `PageCompletionState` holds only a
+    /// `usize` counter — no complex invariants a partial update could
+    /// violate. The alternative (propagating the panic) would deadlock the
+    /// enumeration loop.
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, PageCompletionState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!(
+                    "[connector] page {} barrier mutex poisoned, recovering",
+                    self.page_id
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Block the calling thread until every item token has been released.
@@ -329,12 +349,18 @@ impl PageCompletionBarrier {
     /// within that window, a warning is logged and the wait resumes.
     pub(super) fn wait_until_complete(&self) {
         let timeout = Duration::from_secs(60);
-        let mut state = self.lock_or_propagate();
+        let mut state = self.lock_or_recover();
         while state.outstanding_items > 0 {
-            let (guard, wait_result) = self
-                .cv
-                .wait_timeout(state, timeout)
-                .expect("page barrier condvar poisoned");
+            let (guard, wait_result) = match self.cv.wait_timeout(state, timeout) {
+                Ok(result) => result,
+                Err(poisoned) => {
+                    eprintln!(
+                        "[connector] page {} barrier condvar poisoned, recovering",
+                        self.page_id
+                    );
+                    poisoned.into_inner()
+                }
+            };
             state = guard;
             if wait_result.timed_out() && state.outstanding_items > 0 {
                 eprintln!(
@@ -352,7 +378,7 @@ impl PageCompletionBarrier {
     /// subtraction would also panic on underflow (overflow-checks=true)
     /// but the assertion provides a clearer diagnostic.
     pub(super) fn release_item(&self) {
-        let mut state = self.lock_or_propagate();
+        let mut state = self.lock_or_recover();
         assert!(
             state.outstanding_items > 0,
             "page {} outstanding counter underflow",
@@ -366,7 +392,7 @@ impl PageCompletionBarrier {
 
     #[cfg(test)]
     fn outstanding_items(&self) -> usize {
-        self.lock_or_propagate().outstanding_items
+        self.lock_or_recover().outstanding_items
     }
 }
 
@@ -1099,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn barrier_lock_or_propagate_panics_on_poisoned_mutex() {
+    fn barrier_lock_or_recover_survives_poisoned_mutex() {
         let barrier = PageCompletionBarrier::new(0, 2);
 
         // Poison the mutex by panicking while holding the guard.
@@ -1110,11 +1136,12 @@ mod tests {
         });
         let _ = handle.join();
 
-        // The mutex is now poisoned. lock_or_propagate should panic.
-        let result = std::panic::catch_unwind(|| {
+        // The mutex is now poisoned. lock_or_recover should recover, not panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             barrier.release_item();
-        });
-        assert!(result.is_err(), "expected panic on poisoned mutex");
+        }));
+        assert!(result.is_ok(), "expected recovery from poisoned mutex");
+        assert_eq!(barrier.outstanding_items(), 1);
     }
 
     // -- Integration: empty first page --
