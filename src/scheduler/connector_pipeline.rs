@@ -48,20 +48,21 @@
 //!
 //! | Type | Role |
 //! |------|------|
-//! | [`ConnectorConfig`] | Tuning knobs (workers, chunk size, budgets, timeouts) |
+//! | [`ConnectorConfig`] | Tuning knobs (chunk size, budgets, split hints) |
 //! | [`ProgressSink`] | Persistence contract for cursor checkpointing and shard lifecycle |
 //! | [`ConnectorSource`] | Blanket trait alias for `ConnectorInstance + Send + 'static` |
 //! | [`PageCompletionBarrier`] | Mutex+condvar barrier tracking outstanding items per page |
 //! | [`PageItemToken`] | RAII guard tying one item's lifecycle to its page barrier |
-//! | [`ConnectorRunReport`] | End-of-run statistics (enumeration + I/O counters) |
+//! | [`ConnectorRunReport`] | End-of-run statistics (enumeration counters) |
 //! | [`ConnectorRunError`] | Error taxonomy covering enumeration, validation, and persistence failures |
 
-use super::engine_stub::{MockEngine, BUFFER_LEN_MAX};
+use super::engine_stub::BUFFER_LEN_MAX;
+use super::engine_trait::ScanEngine;
 use super::metrics::MetricsSnapshot;
 use crate::unified::events::EventSink;
 
 use gossip_contracts::connector::{
-    validate_page, Budgets, ConnectorInstance, Cursor, EnumerateError, ErrorClass, ItemKey,
+    validate_page, Budgets, ConnectorInstance, Cursor, EnumerateError, ItemKey,
     PageValidationError, ScanItem,
 };
 use gossip_contracts::coordination::ShardSpec;
@@ -69,15 +70,10 @@ use gossip_contracts::coordination::ShardSpec;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Re-export of [`ErrorClass`] under a scheduler-qualified name so callers
-/// importing from the scheduler module get an unambiguous type name.
-pub type ConnectorErrorClass = ErrorClass;
-
 /// Tuning knobs for a connector pipeline scan.
 ///
-/// Controls thread pool sizes, chunk geometry, backpressure limits, page
-/// enumeration budgets, and optional behaviors (dedup, core pinning, split
-/// hints). All fields have sensible defaults via [`Default`]; callers
+/// Controls chunk geometry, page enumeration budgets, and optional split-hint
+/// behavior. All fields have sensible defaults via [`Default`]; callers
 /// typically override only the fields relevant to their workload profile.
 ///
 /// Call [`validate`](Self::validate) before use to assert scheduler invariants
@@ -86,18 +82,9 @@ pub type ConnectorErrorClass = ErrorClass;
 pub struct ConnectorConfig {
     /// Number of CPU worker threads for scanning.
     pub cpu_workers: usize,
-    /// Number of dedicated I/O threads for connector reads.
-    pub io_threads: usize,
     /// Payload bytes per chunk (excluding overlap region).
     /// The total buffer allocation per chunk is `chunk_size + required_overlap`.
     pub chunk_size: usize,
-    /// Hard cap on discovered-but-not-fully-processed items.
-    /// Acts as backpressure: enumeration stalls when this limit is reached.
-    pub max_in_flight_items: usize,
-    /// Bounded queue depth between enumeration and I/O workers.
-    pub item_queue_cap: usize,
-    /// Total buffers in the global pool.
-    pub pool_buffers: usize,
     /// Page budgets passed to [`EnumerationConnector::enumerate_page`].
     /// Controls max items and max bytes per enumeration call.
     pub page_budgets: Budgets,
@@ -105,34 +92,18 @@ pub struct ConnectorConfig {
     /// When `Some`, a split-hint request is issued after each checkpoint.
     /// When `None`, split-hint logic is skipped entirely.
     pub split_hint_budgets: Option<Budgets>,
-    /// Abort an item if total wall-clock time exceeds this (including retries).
-    pub max_item_time: Option<Duration>,
-    /// Seed for deterministic retry jitter and scheduling behavior.
-    pub seed: u64,
-    /// If true, deduplicate findings within each chunk's overlap window.
-    pub dedupe_within_chunk: bool,
-    /// Pin worker and I/O threads to CPU cores where supported.
-    pub pin_threads: bool,
 }
 
 impl Default for ConnectorConfig {
     fn default() -> Self {
         Self {
             cpu_workers: 8,
-            io_threads: 8,
             chunk_size: 256 * 1024,
-            max_in_flight_items: 512,
-            item_queue_cap: 256,
-            pool_buffers: 64,
             page_budgets: Budgets::try_new(256, 16 * 1024 * 1024, None)
                 .expect("valid default page budgets"),
             split_hint_budgets: Some(
                 Budgets::try_new(32, 1024 * 1024, None).expect("valid default split-hint budgets"),
             ),
-            max_item_time: Some(Duration::from_secs(30)),
-            seed: 1,
-            dedupe_within_chunk: true,
-            pin_threads: super::affinity::default_pin_threads(),
         }
     }
 }
@@ -150,14 +121,7 @@ impl ConnectorConfig {
     /// Panics immediately on the first violated invariant.
     pub fn validate(&self, required_overlap: usize) {
         assert!(self.cpu_workers > 0, "cpu_workers must be > 0");
-        assert!(self.io_threads > 0, "io_threads must be > 0");
         assert!(self.chunk_size > 0, "chunk_size must be > 0");
-        assert!(
-            self.max_in_flight_items > 0,
-            "max_in_flight_items must be > 0"
-        );
-        assert!(self.item_queue_cap > 0, "item_queue_cap must be > 0");
-        assert!(self.pool_buffers > 0, "pool_buffers must be > 0");
         assert!(
             self.page_budgets.max_items() > 0,
             "page_budgets.max_items must be > 0"
@@ -253,43 +217,15 @@ pub struct ConnectorEnumerateStats {
     pub items_enqueued: u64,
     /// Successful [`ProgressSink::checkpoint`] calls.
     pub checkpoints_committed: u64,
-    /// Times the scan parked (yielded shard ownership without completing).
-    pub parks: u64,
     /// Split-hint keys persisted via [`ProgressSink::split_hint`].
     pub split_hints_emitted: u64,
 }
 
-/// I/O-side run statistics for item read/chunk processing.
-///
-/// These counters are currently zero because item-level execution is stubbed.
-/// They will be populated when the I/O worker pool is wired in.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ConnectorIoStats {
-    /// Items whose read was initiated.
-    pub items_started: u64,
-    /// Items that completed successfully (all chunks scanned).
-    pub items_completed: u64,
-    /// Items that reached a terminal failure state.
-    pub items_failed: u64,
-    /// Individual chunk reads performed across all items.
-    pub chunks_read: u64,
-    /// Total payload bytes read (excluding overlap).
-    pub payload_bytes_read: u64,
-    /// Errors classified as [`ErrorClass::Retryable`].
-    pub retryable_errors: u64,
-    /// Errors classified as [`ErrorClass::Permanent`].
-    pub permanent_errors: u64,
-    /// Total retry attempts across all items.
-    pub retries: u64,
-}
-
-/// End-of-run report combining enumeration and I/O statistics.
+/// End-of-run report for a connector scan.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConnectorRunReport {
     /// Page-level enumeration counters.
     pub enumerate: ConnectorEnumerateStats,
-    /// Item-level I/O counters (currently zeroed; see [`ConnectorIoStats`]).
-    pub io: ConnectorIoStats,
 }
 
 /// Errors that can occur during connector-pipeline execution.
@@ -306,6 +242,9 @@ pub enum ConnectorRunError<E> {
     /// The [`ProgressSink`] returned an error from checkpoint, complete,
     /// park, or split_hint.
     Progress(E),
+    /// The item dispatch strategy failed (e.g., queue full, worker pool rejection).
+    /// Contains a human-readable description of the dispatch failure.
+    Dispatch(String),
     /// Page ID counter exceeded `u64::MAX`.
     PageIdOverflow,
     /// A connector returned more items than the configured page budget allows.
@@ -371,13 +310,27 @@ impl PageCompletionBarrier {
 
     /// Block the calling thread until every item token has been released.
     /// Called by the enumeration loop after dispatching a page's items.
+    ///
+    /// Uses a 60-second diagnostic interval: if the barrier hasn't drained
+    /// within that window, a warning is logged and the wait resumes.
     fn wait_until_complete(&self) {
+        let timeout = Duration::from_secs(60);
         let mut state = self.lock_or_recover();
         while state.outstanding_items > 0 {
-            state = match self.cv.wait(state) {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
+            let (guard, wait_result) = match self.cv.wait_timeout(state, timeout) {
+                Ok(tuple) => tuple,
+                Err(poisoned) => {
+                    let (guard, wait_result) = poisoned.into_inner();
+                    (guard, wait_result)
+                }
             };
+            state = guard;
+            if wait_result.timed_out() && state.outstanding_items > 0 {
+                eprintln!(
+                    "page {} barrier: still waiting for {} outstanding items",
+                    self.page_id, state.outstanding_items
+                );
+            }
         }
     }
 
@@ -471,14 +424,15 @@ impl Drop for PageItemToken {
 /// - [`ConnectorRunError::Enumerate`] if enumeration or split-hint selection fails.
 /// - [`ConnectorRunError::PageValidation`] if a connector returns an invalid page.
 /// - [`ConnectorRunError::Progress`] if checkpoint/complete/split-hint persistence fails.
-pub fn scan_connector<C, P>(
-    engine: Arc<MockEngine>,
+pub fn scan_connector<E, C, P>(
+    engine: Arc<E>,
     connector: &mut C,
     cfg: ConnectorConfig,
     progress: &mut P,
     event_sink: Arc<dyn EventSink>,
 ) -> Result<(ConnectorRunReport, MetricsSnapshot), ConnectorRunError<P::Error>>
 where
+    E: ScanEngine,
     C: ConnectorSource + ?Sized,
     P: ProgressSink + ?Sized,
 {
@@ -494,6 +448,7 @@ where
             for token in item_tokens {
                 token.complete();
             }
+            Ok(())
         },
     )
 }
@@ -507,8 +462,8 @@ where
 ///
 /// The loop body follows the flow documented in the module-level docs:
 /// enumerate -> validate -> dispatch -> barrier -> checkpoint -> split-hint.
-fn scan_connector_with_page_dispatch<C, P, D>(
-    engine: Arc<MockEngine>,
+fn scan_connector_with_page_dispatch<E, C, P, D>(
+    engine: Arc<E>,
     connector: &mut C,
     cfg: ConnectorConfig,
     progress: &mut P,
@@ -516,9 +471,10 @@ fn scan_connector_with_page_dispatch<C, P, D>(
     mut dispatch_page_items: D,
 ) -> Result<(ConnectorRunReport, MetricsSnapshot), ConnectorRunError<P::Error>>
 where
+    E: ScanEngine,
     C: ConnectorSource + ?Sized,
     P: ProgressSink + ?Sized,
-    D: FnMut(PageId, &[ScanItem], Vec<PageItemToken>),
+    D: FnMut(PageId, &[ScanItem], Vec<PageItemToken>) -> Result<(), ConnectorRunError<P::Error>>,
 {
     cfg.validate(engine.required_overlap());
 
@@ -564,7 +520,7 @@ where
             // Step 4-5: create barrier + tokens and hand items to the dispatch strategy.
             let (page_barrier, page_tokens) = track_page_items(page_id, items.len());
             record_page_enqueue_and_processing(&items, &mut report);
-            dispatch_page_items(page_id, &items, page_tokens);
+            dispatch_page_items(page_id, &items, page_tokens)?;
 
             // Step 6: block until every token is released (the core invariant).
             wait_for_page_completion_barrier(page_barrier.as_ref());
@@ -636,7 +592,7 @@ fn wait_for_page_completion_barrier(page_barrier: &PageCompletionBarrier) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::engine_stub::MockRule;
+    use crate::scheduler::engine_stub::{MockEngine, MockRule};
     use crate::unified::events::VecEventSink;
 
     use gossip_contracts::connector::{
@@ -973,6 +929,7 @@ mod tests {
                             token.complete();
                         }
                     });
+                    Ok(())
                 },
             )
             .map(|_| progress.calls);
@@ -1035,6 +992,7 @@ mod tests {
                     let mut tokens = tokens.into_iter();
                     tokens.next().unwrap().complete();
                     tokens.next().unwrap().complete();
+                    Ok(())
                 },
             )
             .map(|_| progress.calls);
@@ -1059,21 +1017,13 @@ mod tests {
 
     #[rstest]
     #[case::cpu_workers_zero("cpu_workers")]
-    #[case::io_threads_zero("io_threads")]
     #[case::chunk_size_zero("chunk_size")]
-    #[case::max_in_flight_zero("max_in_flight_items")]
-    #[case::queue_cap_zero("item_queue_cap")]
-    #[case::pool_buffers_zero("pool_buffers")]
     #[should_panic]
     fn validate_rejects_zero_field(#[case] field: &str) {
         let mut cfg = ConnectorConfig::default();
         match field {
             "cpu_workers" => cfg.cpu_workers = 0,
-            "io_threads" => cfg.io_threads = 0,
             "chunk_size" => cfg.chunk_size = 0,
-            "max_in_flight_items" => cfg.max_in_flight_items = 0,
-            "item_queue_cap" => cfg.item_queue_cap = 0,
-            "pool_buffers" => cfg.pool_buffers = 0,
             _ => unreachable!(),
         }
         cfg.validate(16);
@@ -1308,5 +1258,39 @@ mod tests {
             "expected BudgetExceeded, got: {err:?}"
         );
         assert!(progress.calls.is_empty(), "no checkpoint should occur");
+    }
+
+    // -- Error propagation: dispatch failure --
+
+    #[test]
+    fn scan_connector_dispatch_error_prevents_checkpoint() {
+        let shard = ShardSpec::unbounded();
+        let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+        let pages = vec![
+            EnumerationPage::new(vec![item(b"k1", 1, b"v1")], Cursor::with_last_key(k1)),
+            EnumerationPage::new(Vec::new(), Cursor::initial()),
+        ];
+        let mut connector = MockConnector::new(pages);
+        let mut progress = MockProgress::new(shard, Cursor::initial());
+        let sink = Arc::new(VecEventSink::new());
+
+        let err = scan_connector_with_page_dispatch(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            ConnectorConfig::default(),
+            &mut progress,
+            sink,
+            |_page_id, _items, _tokens| Err(ConnectorRunError::Dispatch("dispatch failed".into())),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConnectorRunError::Dispatch(ref msg) if msg == "dispatch failed"),
+            "expected Dispatch error, got: {err:?}"
+        );
+        assert!(
+            progress.calls.is_empty(),
+            "no checkpoint should be committed after dispatch failure"
+        );
     }
 }

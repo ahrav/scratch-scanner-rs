@@ -297,8 +297,8 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 // I/O backends
 #[cfg(feature = "connector-pipeline")]
 pub use connector_pipeline::{
-    scan_connector, ConnectorConfig, ConnectorEnumerateStats, ConnectorErrorClass,
-    ConnectorIoStats, ConnectorRunError, ConnectorRunReport, ConnectorSource, ProgressSink,
+    scan_connector, ConnectorConfig, ConnectorEnumerateStats, ConnectorRunError,
+    ConnectorRunReport, ConnectorSource, ProgressSink,
 };
 
 // Observability
