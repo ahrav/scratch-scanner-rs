@@ -33,7 +33,7 @@ pub enum ContentVerdict {
     /// Content appears to be binary — skip unless `--scan-binary` is set.
     Binary,
     /// Content is a known format from which text can be extracted.
-    BinaryExtractable(ExtractableFormat),
+    Extractable(ExtractableFormat),
 }
 
 /// Formats that have a known text-extraction strategy.
@@ -80,13 +80,13 @@ pub fn is_likely_binary(data: &[u8], check_len: usize) -> bool {
 ///
 /// 1. Check for NUL bytes in the first `check_len` bytes.
 /// 2. If no NUL bytes:
-///    - `.ipynb` is [`ContentVerdict::BinaryExtractable`] so code/markdown
+///    - `.ipynb` is [`ContentVerdict::Extractable`] so code/markdown
 ///      cells can be extracted.
-///    - `.env` / `.env.*` are [`ContentVerdict::BinaryExtractable`] so
+///    - `.env` / `.env.*` are [`ContentVerdict::Extractable`] so
 ///      structured `KEY=VALUE` lines can be extracted.
 ///    - otherwise classify as [`ContentVerdict::Text`].
 /// 3. If NUL bytes are present: check extension for extractable formats →
-///    [`ContentVerdict::BinaryExtractable`]; otherwise → [`ContentVerdict::Binary`].
+///    [`ContentVerdict::Extractable`]; otherwise → [`ContentVerdict::Binary`].
 ///
 /// Empty data returns [`ContentVerdict::Text`] unless the path is `.ipynb`,
 /// `.env`, or `.env.*`.
@@ -102,7 +102,7 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
         // misnamed text file would be silently skipped instead of scanned.
         if let Some(fmt) = match_extractable_format(path) {
             if fmt.extracts_from_text() {
-                return ContentVerdict::BinaryExtractable(fmt);
+                return ContentVerdict::Extractable(fmt);
             }
         }
         return ContentVerdict::Text;
@@ -110,7 +110,7 @@ pub fn classify_content(data: &[u8], path: &[u8], check_len: usize) -> ContentVe
 
     // Binary content — check if we know how to extract text from it.
     match match_extractable_format(path) {
-        Some(fmt) => ContentVerdict::BinaryExtractable(fmt),
+        Some(fmt) => ContentVerdict::Extractable(fmt),
         None => ContentVerdict::Binary,
     }
 }
@@ -270,7 +270,7 @@ mod tests {
         let data = b"{\"cells\": []}";
         assert_eq!(
             classify_content(data, b"notebook.ipynb", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb)
+            ContentVerdict::Extractable(ExtractableFormat::Ipynb)
         );
     }
 
@@ -280,7 +280,7 @@ mod tests {
         data[50] = 0;
         assert_eq!(
             classify_content(&data, b"notebook.ipynb", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::Ipynb)
+            ContentVerdict::Extractable(ExtractableFormat::Ipynb)
         );
     }
 
@@ -289,7 +289,7 @@ mod tests {
         let data = b"API_KEY=abc123";
         assert_eq!(
             classify_content(data, b".env", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+            ContentVerdict::Extractable(ExtractableFormat::DotEnv)
         );
     }
 
@@ -298,7 +298,7 @@ mod tests {
         let data = b"DB_PASSWORD=supersecret";
         assert_eq!(
             classify_content(data, b"config/.env.local", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+            ContentVerdict::Extractable(ExtractableFormat::DotEnv)
         );
     }
 
@@ -400,7 +400,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_content(bin, path, CHECK_LEN),
-                ContentVerdict::BinaryExtractable(expected_fmt),
+                ContentVerdict::Extractable(expected_fmt),
                 "case-insensitive match failed for {:?}",
                 String::from_utf8_lossy(path),
             );
@@ -425,7 +425,7 @@ mod tests {
         let data = b"SECRET_KEY=abc";
         assert_eq!(
             classify_content(data, b"C:\\Users\\dev\\config\\.env", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+            ContentVerdict::Extractable(ExtractableFormat::DotEnv)
         );
     }
 
@@ -434,7 +434,7 @@ mod tests {
         let data = b"DB_PASS=secret";
         assert_eq!(
             classify_content(data, b"projects\\myapp\\.env.production", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::DotEnv)
+            ContentVerdict::Extractable(ExtractableFormat::DotEnv)
         );
     }
 
@@ -443,7 +443,7 @@ mod tests {
         let bin = b"\xCA\xFE\xBA\xBE\x00";
         assert_eq!(
             classify_content(bin, b"lib\\deps\\Foo.class", CHECK_LEN),
-            ContentVerdict::BinaryExtractable(ExtractableFormat::JavaClass)
+            ContentVerdict::Extractable(ExtractableFormat::JavaClass)
         );
     }
 

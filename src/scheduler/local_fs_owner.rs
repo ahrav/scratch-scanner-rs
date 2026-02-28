@@ -807,7 +807,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
     // Extension-based pre-open skip: avoid opening files whose extension
     // marks them as definitely-binary or as a credential-safe lock file.
-    // BinaryExtractable formats (.jar, .class, .pyc, .ipynb) are NOT in the
+    // Extractable formats (.jar, .class, .pyc, .ipynb) are NOT in the
     // skip set — they will fall through to the content classifier below.
     //
     // Ordering: extension check first (cheap u64 binary search on the packed
@@ -934,7 +934,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
                 ctx.metrics.binary_skipped = ctx.metrics.binary_skipped.saturating_add(1);
                 return;
             }
-            crate::content_policy::ContentVerdict::BinaryExtractable(fmt) => {
+            crate::content_policy::ContentVerdict::Extractable(fmt) => {
                 drop(buf); // release buffer before extraction
                 extract_and_scan_file(&task, ctx, &mut file, file_size, path_bytes, fmt);
                 return;

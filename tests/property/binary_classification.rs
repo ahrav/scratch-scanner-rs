@@ -4,7 +4,7 @@
 //! - Classification is deterministic.
 //! - NUL-free data is never classified as `Binary`.
 //! - Empty data is always classified as `Text`.
-//! - Known extractable extensions yield `BinaryExtractable` when data is binary.
+//! - Known extractable extensions yield `Extractable` when data is binary.
 //! - Extraction never panics on arbitrary data.
 
 use proptest::prelude::*;
@@ -44,7 +44,7 @@ proptest! {
             Just(&b"file.pyc"[..]),
         ]
     ) {
-        // Empty data has no NUL bytes, so should be Text (or BinaryExtractable
+        // Empty data has no NUL bytes, so should be Text (or Extractable
         // for known extensions since ipynb/class/pyc match on extension even for text).
         let verdict = classify_content(b"", ext, CHECK_LEN);
         // Empty data is never Binary.
@@ -63,13 +63,13 @@ proptest! {
             Just(&b".env.prod"[..]),
         ]
     ) {
-        // Binary data (contains NUL) with a known extension must be BinaryExtractable.
+        // Binary data (contains NUL) with a known extension must be Extractable.
         let data = b"\x00\x01\x02\x03";
         let verdict = classify_content(data, ext, CHECK_LEN);
         match verdict {
-            ContentVerdict::BinaryExtractable(_) => {} // expected
+            ContentVerdict::Extractable(_) => {} // expected
             other => prop_assert!(false,
-                "binary data + extractable extension should be BinaryExtractable, got {:?}", other),
+                "binary data + extractable extension should be Extractable, got {:?}", other),
         }
     }
 }

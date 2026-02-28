@@ -556,7 +556,7 @@ impl<'a> EngineAdapter<'a> {
                     self.metrics.binary_skipped = self.metrics.binary_skipped.saturating_add(1);
                     return Ok(());
                 }
-                ContentVerdict::BinaryExtractable(fmt) => {
+                ContentVerdict::Extractable(fmt) => {
                     use crate::content_policy::extract::{extract_content, ExtractResult};
                     if extract_content(fmt, bytes, &mut self.extract_buf, &mut self.extract_scratch)
                         == ExtractResult::Ok
