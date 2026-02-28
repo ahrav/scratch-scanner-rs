@@ -740,6 +740,59 @@ fn scan_connector_handles_empty_first_page() {
     );
 }
 
+// -- Integration: empty item payload --
+
+#[rstest]
+#[case::open_path(false)]
+#[case::range_read_path(true)]
+fn scan_connector_handles_empty_item_payload(#[case] use_range_read: bool) {
+    let shard = ShardSpec::unbounded();
+    let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+    let pages = vec![
+        EnumerationPage::new(
+            vec![item(b"k1", 1, b"v1")],
+            Cursor::with_last_key(k1.clone()),
+        ),
+        EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+    ];
+    // MockConnector::new auto-populates empty payloads for items.
+    let mut connector = MockConnector::new(pages);
+    if use_range_read {
+        connector = connector.with_range_read();
+    }
+    let mut progress = MockProgress::new(shard, Cursor::initial());
+    let sink = Arc::new(VecEventSink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let cfg = ConnectorConfig {
+        split_hint_budgets: None,
+        ..ConnectorConfig::default()
+    };
+    let (report, metrics) = scan_connector(
+        Arc::new(test_engine(16)),
+        &mut connector,
+        cfg,
+        &mut progress,
+        sink_dyn,
+    )
+    .unwrap();
+
+    assert_eq!(metrics.bytes_scanned, 0);
+    assert_eq!(metrics.chunks_scanned, 0);
+    assert_eq!(metrics.findings_emitted, 0);
+    assert_eq!(metrics.io_errors, 0);
+    assert_eq!(report.enumerate.items_failed_retryable, 0);
+    assert_eq!(report.enumerate.items_failed_permanent, 0);
+    // Progress lifecycle still runs despite empty payload.
+    assert_eq!(
+        progress.calls,
+        vec![
+            ProgressCall::Checkpoint(Cursor::with_last_key(k1.clone())),
+            ProgressCall::Complete(Cursor::with_last_key(k1)),
+        ]
+    );
+}
+
 // -- Integration: split hints disabled --
 
 #[test]
@@ -1208,8 +1261,15 @@ fn scan_connector_error_on_one_item_does_not_prevent_scanning_remaining_items() 
 
 // -- read_range error paths --
 
-#[test]
-fn scan_connector_read_range_error_is_caught_and_page_continues() {
+#[rstest]
+#[case::retryable(ReadError::retryable("temporary range failure"), "retryable", 1, 0)]
+#[case::permanent(ReadError::permanent("range read denied"), "permanent", 0, 1)]
+fn scan_connector_classifies_range_read_errors_and_continues_page(
+    #[case] read_err: ReadError,
+    #[case] expected_class: &str,
+    #[case] expected_retryable: u64,
+    #[case] expected_permanent: u64,
+) {
     let shard = ShardSpec::unbounded();
     let k1 = ItemKey::try_from_slice(b"k1").unwrap();
     let pages = vec![
@@ -1221,7 +1281,7 @@ fn scan_connector_read_range_error_is_caught_and_page_continues() {
     ];
     let mut connector = MockConnector::new(pages)
         .with_range_read()
-        .with_read_range_error(ReadError::retryable("range read failed"));
+        .with_read_range_error(read_err);
     let mut progress = MockProgress::new(shard, Cursor::initial());
     let sink = Arc::new(VecEventSink::new());
     let sink_dyn: Arc<dyn EventSink> = sink.clone();
@@ -1240,12 +1300,16 @@ fn scan_connector_read_range_error_is_caught_and_page_continues() {
     .unwrap();
 
     assert_eq!(metrics.io_errors, 1);
-    assert_eq!(report.enumerate.items_failed_retryable, 1);
-    assert_eq!(report.enumerate.items_failed_permanent, 0);
+    assert_eq!(metrics.bytes_scanned, 0);
+    assert_eq!(metrics.findings_emitted, 0);
+    assert_eq!(connector.open_calls, 0);
+    assert!(connector.read_range_calls > 0);
+    assert_eq!(report.enumerate.items_failed_retryable, expected_retryable);
+    assert_eq!(report.enumerate.items_failed_permanent, expected_permanent);
 
-    // Diagnostic emitted for the error.
     let encoded = String::from_utf8(sink.bytes()).unwrap();
     assert!(encoded.contains("connector read"));
+    assert!(encoded.contains(expected_class));
 
     // Page still completes and checkpoints.
     assert_eq!(

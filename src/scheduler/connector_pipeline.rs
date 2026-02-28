@@ -64,11 +64,11 @@
 
 use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch as _, ScanEngine};
-use super::local_fs_owner::{
+use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
+use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe,
     emit_findings as shared_emit_findings,
 };
-use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
 use crate::api::FileId;
 use crate::unified::events::{DiagnosticEvent, EventSink, ScanEvent};
 
@@ -301,27 +301,42 @@ pub enum ConnectorRunError<E> {
 
 /// Shared CPU-side chunk runner used by both `open()` and `read_range()` paths.
 ///
-/// Reuses one engine scratch and one temporary findings buffer across items so
-/// connector I/O paths stay allocation-light and produce identical finding
-/// semantics regardless of how bytes are fetched.
+/// Reuses one engine scratch, one temporary findings buffer, and one I/O buffer
+/// across all items so connector I/O paths stay allocation-light and produce
+/// identical finding semantics regardless of how bytes are fetched.
 struct ConnectorCpuRunner<E: ScanEngine> {
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as super::engine_trait::EngineScratch>::Finding>,
+    buf: Vec<u8>,
+    overlap: usize,
+    chunk_size: usize,
 }
 
 impl<E: ScanEngine> ConnectorCpuRunner<E> {
-    fn new(engine: Arc<E>, event_sink: Arc<dyn EventSink>) -> Self {
+    fn new(
+        engine: Arc<E>,
+        event_sink: Arc<dyn EventSink>,
+        overlap: usize,
+        chunk_size: usize,
+    ) -> Self {
         Self {
             scratch: engine.new_scratch(),
             pending: Vec::with_capacity(engine.max_findings_per_chunk()),
+            buf: vec![0u8; overlap.saturating_add(chunk_size)],
             engine,
             event_sink,
+            overlap,
+            chunk_size,
         }
     }
 
     /// Scan one assembled chunk and emit findings/events with connector parity.
+    ///
+    /// Associated function (not `&mut self`) to enable split borrows in
+    /// [`stream_chunks`](Self::stream_chunks), where `self.buf` is borrowed
+    /// mutably for I/O while other fields feed into scan/emit logic.
     ///
     /// # Invariants
     ///
@@ -331,8 +346,12 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
     ///   are dropped to avoid duplicate emission across chunk boundaries.
     /// - Cross-rule dedupe runs after overlap pruning so all connector read paths
     ///   share the same post-processing semantics as local scheduler scans.
-    fn scan_chunk(
-        &mut self,
+    #[allow(clippy::too_many_arguments)] // Split-borrow artifact; private helper only.
+    fn scan_chunk_impl(
+        engine: &E,
+        event_sink: &dyn EventSink,
+        scratch: &mut E::Scratch,
+        pending: &mut Vec<<E::Scratch as super::engine_trait::EngineScratch>::Finding>,
         item: &ScanItem,
         file_id: FileId,
         base_offset: u64,
@@ -340,9 +359,8 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
         data: &[u8],
         metrics: &mut WorkerMetricsLocal,
     ) {
-        self.engine
-            .scan_chunk_into(data, file_id, base_offset, &mut self.scratch);
-        let engine_dropped = self.scratch.dropped_findings();
+        engine.scan_chunk_into(data, file_id, base_offset, scratch);
+        let engine_dropped = scratch.dropped_findings();
 
         // The copied prefix belongs to the previous chunk. Any finding fully
         // before `new_bytes_start` has already been eligible for emission there.
@@ -372,6 +390,100 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
         let payload = data.len().saturating_sub(prefix_len);
         metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
         metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(payload as u64);
+    }
+
+    /// Unified overlap-aware chunking loop, parameterized by an I/O closure.
+    ///
+    /// `read_fn(offset, dst)` fills `dst` with payload bytes starting at
+    /// the given absolute offset and returns the byte count. Returning 0
+    /// signals EOF. The loop preserves `self.overlap` bytes from the tail
+    /// of each chunk as a prefix for the next, so cross-chunk pattern matches
+    /// are visible to the scan engine.
+    fn stream_chunks<F>(
+        &mut self,
+        item: &ScanItem,
+        file_id: FileId,
+        metrics: &mut WorkerMetricsLocal,
+        mut read_fn: F,
+    ) -> Result<(), ReadError>
+    where
+        F: FnMut(u64, &mut [u8]) -> Result<usize, ReadError>,
+    {
+        let overlap = self.overlap;
+        let chunk_size = self.chunk_size;
+        let mut offset: u64 = 0;
+        let mut carry: usize = 0;
+        let mut have: usize = 0;
+
+        loop {
+            if carry > 0 && have > 0 {
+                debug_assert!(
+                    have >= carry,
+                    "overlap carry ({carry}) exceeds buffer fill ({have})"
+                );
+                // Preserve trailing overlap so cross-chunk matches are still visible.
+                self.buf.copy_within(have - carry..have, 0);
+            }
+
+            let n = read_fn(offset, &mut self.buf[carry..carry + chunk_size])?;
+            if n == 0 {
+                break;
+            }
+
+            let len = carry + n;
+            let base_offset = offset.saturating_sub(carry as u64);
+            Self::scan_chunk_impl(
+                &self.engine,
+                &*self.event_sink,
+                &mut self.scratch,
+                &mut self.pending,
+                item,
+                file_id,
+                base_offset,
+                carry,
+                &self.buf[..len],
+                metrics,
+            );
+
+            offset = offset.saturating_add(n as u64);
+            have = len;
+            carry = overlap.min(len);
+        }
+        Ok(())
+    }
+
+    /// Read and scan an item using the connector's advertised capabilities.
+    ///
+    /// Dispatches to `read_range()` when available (random-access path) or
+    /// falls back to `open()` (sequential reader). Both paths share the same
+    /// overlap-aware chunking loop via [`stream_chunks`](Self::stream_chunks).
+    fn stream_item<C: ConnectorSource + ?Sized>(
+        &mut self,
+        connector: &mut C,
+        item: &ScanItem,
+        file_id: FileId,
+        metrics: &mut WorkerMetricsLocal,
+    ) -> Result<(), ReadError> {
+        let budgets = item_read_budgets();
+        if connector.caps().range_read {
+            let item_ref = item.item_ref();
+            self.stream_chunks(item, file_id, metrics, |offset, dst| {
+                let n = connector.read_range(item_ref, offset, dst, budgets)?;
+                if n > dst.len() {
+                    return Err(ReadError::permanent(format!(
+                        "connector read_range returned {} bytes for {}-byte buffer",
+                        n,
+                        dst.len()
+                    )));
+                }
+                Ok(n)
+            })
+        } else {
+            let mut reader = connector.open(item.item_ref(), budgets)?;
+            self.stream_chunks(item, file_id, metrics, |_offset, dst| {
+                read_some(reader.as_mut(), dst).map_err(read_error_from_io)
+            })
+        }
     }
 }
 
@@ -428,148 +540,6 @@ fn read_error_from_io(err: io::Error) -> ReadError {
 /// as a read cap.
 fn item_read_budgets() -> Budgets {
     Budgets::try_new(1, u64::MAX, None).expect("valid item-read budgets")
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Stream bytes through `ConnectorInstance::open` and scan in overlap-aware chunks.
-///
-/// This is the compatibility path for connectors that expose only sequential
-/// readers. Chunk assembly mirrors the `read_range` path so finding boundaries
-/// and dedupe behavior are identical across capability sets.
-fn stream_item_via_open<C, E>(
-    connector: &mut C,
-    item: &ScanItem,
-    file_id: FileId,
-    cfg: ConnectorConfig,
-    overlap: usize,
-    cpu_runner: &mut ConnectorCpuRunner<E>,
-    metrics: &mut WorkerMetricsLocal,
-) -> Result<(), ReadError>
-where
-    C: ConnectorSource + ?Sized,
-    E: ScanEngine,
-{
-    let mut reader = connector.open(item.item_ref(), item_read_budgets())?;
-    let mut buf = vec![0_u8; overlap.saturating_add(cfg.chunk_size)];
-    // Absolute payload bytes consumed from this item (excludes overlap carry).
-    let mut offset: u64 = 0;
-    // Bytes copied from the previous iteration into the front of `buf`.
-    let mut carry: usize = 0;
-    // Total bytes present in `buf` on the previous iteration (`carry + read`).
-    let mut have: usize = 0;
-
-    loop {
-        if carry > 0 && have > 0 {
-            debug_assert!(
-                have >= carry,
-                "overlap carry ({carry}) exceeds buffer fill ({have})"
-            );
-            // Preserve trailing overlap so cross-chunk matches are still visible.
-            buf.copy_within(have - carry..have, 0);
-        }
-
-        let payload = &mut buf[carry..carry + cfg.chunk_size];
-        let n = read_some(reader.as_mut(), payload).map_err(read_error_from_io)?;
-        if n == 0 {
-            break;
-        }
-
-        let len = carry + n;
-        let base_offset = offset.saturating_sub(carry as u64);
-        cpu_runner.scan_chunk(item, file_id, base_offset, carry, &buf[..len], metrics);
-
-        offset = offset.saturating_add(n as u64);
-        have = len;
-        carry = overlap.min(len);
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Stream bytes via random-access `ConnectorInstance::read_range`.
-///
-/// `offset` always advances by newly read payload bytes, while `carry` is local
-/// chunk context only. This keeps connector-visible offsets monotonic and avoids
-/// re-reading overlap from the connector.
-fn stream_item_via_range_read<C, E>(
-    connector: &mut C,
-    item: &ScanItem,
-    file_id: FileId,
-    cfg: ConnectorConfig,
-    overlap: usize,
-    cpu_runner: &mut ConnectorCpuRunner<E>,
-    metrics: &mut WorkerMetricsLocal,
-) -> Result<(), ReadError>
-where
-    C: ConnectorSource + ?Sized,
-    E: ScanEngine,
-{
-    let mut buf = vec![0_u8; overlap.saturating_add(cfg.chunk_size)];
-    // Absolute payload bytes consumed from this item (excludes overlap carry).
-    let mut offset: u64 = 0;
-    // Bytes copied from the previous iteration into the front of `buf`.
-    let mut carry: usize = 0;
-    // Total bytes present in `buf` on the previous iteration (`carry + read`).
-    let mut have: usize = 0;
-
-    loop {
-        if carry > 0 && have > 0 {
-            debug_assert!(
-                have >= carry,
-                "overlap carry ({carry}) exceeds buffer fill ({have})"
-            );
-            // Preserve trailing overlap so cross-chunk matches are still visible.
-            buf.copy_within(have - carry..have, 0);
-        }
-
-        let payload = &mut buf[carry..carry + cfg.chunk_size];
-        let n = connector.read_range(item.item_ref(), offset, payload, item_read_budgets())?;
-        if n == 0 {
-            break;
-        }
-        if n > payload.len() {
-            // Contract violation: connector must not report bytes beyond requested range.
-            return Err(ReadError::permanent(format!(
-                "connector read_range returned {} bytes for {}-byte buffer",
-                n,
-                payload.len()
-            )));
-        }
-
-        let len = carry + n;
-        let base_offset = offset.saturating_sub(carry as u64);
-        cpu_runner.scan_chunk(item, file_id, base_offset, carry, &buf[..len], metrics);
-
-        offset = offset.saturating_add(n as u64);
-        have = len;
-        carry = overlap.min(len);
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Select the connector read path by capability while preserving scan semantics.
-fn stream_item_into_executor<C, E>(
-    connector: &mut C,
-    item: &ScanItem,
-    file_id: FileId,
-    cfg: ConnectorConfig,
-    overlap: usize,
-    cpu_runner: &mut ConnectorCpuRunner<E>,
-    metrics: &mut WorkerMetricsLocal,
-) -> Result<(), ReadError>
-where
-    C: ConnectorSource + ?Sized,
-    E: ScanEngine,
-{
-    if connector.caps().range_read {
-        return stream_item_via_range_read(
-            connector, item, file_id, cfg, overlap, cpu_runner, metrics,
-        );
-    }
-    stream_item_via_open(connector, item, file_id, cfg, overlap, cpu_runner, metrics)
 }
 
 /// Emit one warning diagnostic for an item-level read error.
@@ -798,7 +768,12 @@ where
 {
     let overlap = engine.required_overlap();
     let dispatch_sink = Arc::clone(&event_sink);
-    let mut cpu_runner = ConnectorCpuRunner::new(Arc::clone(&engine), Arc::clone(&dispatch_sink));
+    let mut cpu_runner = ConnectorCpuRunner::new(
+        Arc::clone(&engine),
+        Arc::clone(&dispatch_sink),
+        overlap,
+        cfg.chunk_size,
+    );
     let mut worker_metrics = WorkerMetricsLocal::new();
     let mut next_file_id: u32 = 0;
 
@@ -815,15 +790,9 @@ where
                     .checked_add(1)
                     .ok_or(ConnectorRunError::FileIdOverflow)?;
 
-                if let Err(read_err) = stream_item_into_executor(
-                    connector,
-                    item,
-                    file_id,
-                    cfg,
-                    overlap,
-                    &mut cpu_runner,
-                    &mut worker_metrics,
-                ) {
+                if let Err(read_err) =
+                    cpu_runner.stream_item(connector, item, file_id, &mut worker_metrics)
+                {
                     worker_metrics.io_errors = worker_metrics.io_errors.saturating_add(1);
                     if read_err.is_retryable() {
                         worker_metrics.items_failed_retryable =

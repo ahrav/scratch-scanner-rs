@@ -21,13 +21,13 @@ use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_bzip2::process_bzip2_file;
 use super::local_fs_gzip::process_gzip_file;
-use super::local_fs_owner::{
-    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
-    emit_persistence_batch, FileTask, LocalScratch,
-};
+use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
 use super::local_fs_tar::{process_tar_file, process_tarbz2_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
 use super::metrics::WorkerMetricsLocal;
+use super::scan_helpers::{
+    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
+};
 use super::ts_buffer_pool::TsBufferPool;
 
 /// Allocate a virtual `FileId` for archive entries.

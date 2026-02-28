@@ -43,12 +43,12 @@
 use super::count_budget::{CountBudget, CountPermit};
 use super::engine_trait::{EngineScratch as _, FindingWithHash};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
-use super::local_fs_owner::{
+use super::metrics::MetricsSnapshot;
+use super::rng::XorShift64;
+use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe,
     emit_findings as shared_emit_findings,
 };
-use super::metrics::MetricsSnapshot;
-use super::rng::XorShift64;
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::perf_stats;
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};

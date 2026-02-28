@@ -41,8 +41,8 @@ use super::engine_stub::BUFFER_LEN_MAX;
 use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::file_id_alloc::FileIdAllocator;
-use super::local_fs_owner::{account_effective_dropped_findings, apply_cross_rule_dedupe};
 use super::metrics::MetricsSnapshot;
+use super::scan_helpers::{account_effective_dropped_findings, apply_cross_rule_dedupe};
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
 use crate::archive::scan::{

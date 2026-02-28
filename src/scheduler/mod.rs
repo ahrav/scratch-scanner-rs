@@ -245,6 +245,7 @@ mod local_fs_zip;
 pub mod parallel_scan;
 #[allow(dead_code)]
 pub(crate) mod remote;
+pub(crate) mod scan_helpers;
 
 // Observability
 pub mod affinity;

@@ -8,9 +8,9 @@ use std::fs::File;
 
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
-use super::local_fs_owner::{
+use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
+use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
-    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Read a file with an extractable binary format, extract text, and scan it.

@@ -22,9 +22,9 @@ use super::local_fs_archive_ctx::{
     map_archive_skip_to_partial, scan_compressed_stream_nested, ArchiveEnd, ArchiveScanCtx,
     ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
 };
-use super::local_fs_owner::{
+use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
+use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
-    emit_persistence_batch, FileTask, LocalScratch,
 };
 
 /// Build a child [`ArchiveScanCtx`] from the parent's individually-reborrowed
