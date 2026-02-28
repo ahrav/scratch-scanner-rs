@@ -538,6 +538,28 @@ fn validate_rejects_chunk_plus_overlap_exceeding_max() {
 }
 
 #[test]
+fn validate_rejects_overlap_ge_chunk_size() {
+    let cfg = ConnectorConfig {
+        chunk_size: 64,
+        ..ConnectorConfig::default()
+    };
+    // overlap == chunk_size: must be rejected.
+    let err = cfg.validate(64).unwrap_err();
+    assert!(
+        err.contains("chunk_size") && err.contains("required_overlap"),
+        "expected overlap >= chunk_size rejection, got: {err}"
+    );
+    // overlap > chunk_size: must also be rejected.
+    let err = cfg.validate(128).unwrap_err();
+    assert!(
+        err.contains("chunk_size") && err.contains("required_overlap"),
+        "expected overlap > chunk_size rejection, got: {err}"
+    );
+    // overlap < chunk_size: must pass.
+    cfg.validate(63).unwrap();
+}
+
+#[test]
 fn validate_accepts_default_config() {
     ConnectorConfig::default().validate(16).unwrap();
 }
@@ -883,13 +905,15 @@ fn scan_connector_streams_items_via_open_and_emits_findings() {
     let sink = Arc::new(VecEventSink::new());
     let sink_dyn: Arc<dyn EventSink> = sink.clone();
 
+    // chunk_size must exceed required_overlap for valid cross-chunk scanning.
+    // overlap=6 (enough for 6-byte "SECRET" pattern), chunk_size=8 > 6.
     let cfg = ConnectorConfig {
         chunk_size: 8,
         split_hint_budgets: None,
         ..ConnectorConfig::default()
     };
     let (_report, metrics) = scan_connector(
-        Arc::new(test_engine(16)),
+        Arc::new(test_engine(6)),
         &mut connector,
         cfg,
         &mut progress,
@@ -934,13 +958,15 @@ fn scan_connector_uses_range_read_when_capability_advertised() {
     let sink = Arc::new(VecEventSink::new());
     let sink_dyn: Arc<dyn EventSink> = sink.clone();
 
+    // chunk_size must exceed required_overlap for valid cross-chunk scanning.
+    // overlap=6 (enough for 6-byte "SECRET" pattern), chunk_size=8 > 6.
     let cfg = ConnectorConfig {
-        chunk_size: 4,
+        chunk_size: 8,
         split_hint_budgets: None,
         ..ConnectorConfig::default()
     };
     let (_report, metrics) = scan_connector(
-        Arc::new(test_engine(8)),
+        Arc::new(test_engine(6)),
         &mut connector,
         cfg,
         &mut progress,

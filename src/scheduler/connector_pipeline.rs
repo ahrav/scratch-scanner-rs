@@ -93,6 +93,11 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectorConfig {
     /// Number of CPU worker threads for scanning.
+    ///
+    /// **Not yet wired**: the current pipeline processes items synchronously
+    /// on the calling thread. This field is validated and reserved for the
+    /// upcoming async dispatch implementation. Setting it has no effect on
+    /// runtime behavior today.
     pub cpu_workers: usize,
     /// Payload bytes per chunk (excluding overlap region).
     /// The total buffer allocation per chunk is `chunk_size + required_overlap`.
@@ -123,7 +128,9 @@ impl Default for ConnectorConfig {
 impl ConnectorConfig {
     /// Validate that every field satisfies scheduler invariants.
     ///
-    /// Checks that all counts are positive, budget fields are positive, and
+    /// Checks that all counts are positive, budget fields are positive,
+    /// `chunk_size > required_overlap` (so carry bytes fully satisfy the
+    /// engine's cross-chunk overlap requirement), and
     /// `chunk_size + required_overlap <= BUFFER_LEN_MAX` (the engine's hard
     /// buffer cap). `required_overlap` comes from the engine and represents
     /// the minimum overlap needed for cross-chunk pattern matching.
@@ -133,6 +140,12 @@ impl ConnectorConfig {
         }
         if self.chunk_size == 0 {
             return Err("chunk_size must be > 0".into());
+        }
+        if required_overlap >= self.chunk_size {
+            return Err(format!(
+                "chunk_size ({}) must be > required_overlap ({}) for correct cross-chunk scanning",
+                self.chunk_size, required_overlap
+            ));
         }
         if self.page_budgets.max_items() == 0 {
             return Err("page_budgets.max_items must be > 0".into());
@@ -392,6 +405,18 @@ fn read_error_from_io(err: io::Error) -> ReadError {
     }
 }
 
+/// Permissive budget for item-level reads.
+///
+/// Enumeration budgets (max_items, max_bytes) are semantically bound to
+/// page listing, not individual payload IO. Item reads should be capped
+/// only by the orchestration layer's size-bounded/deadline-aware adapter
+/// (per the ReadConnector trait contract), so we pass the widest advisory
+/// hint to avoid any connector misinterpreting a tight enumeration budget
+/// as a read cap.
+fn item_read_budgets() -> Budgets {
+    Budgets::try_new(1, u64::MAX, None).expect("valid item-read budgets")
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Stream bytes through `ConnectorInstance::open` and scan in overlap-aware chunks.
 ///
@@ -411,7 +436,7 @@ where
     C: ConnectorSource + ?Sized,
     E: ScanEngine,
 {
-    let mut reader = connector.open(item.item_ref(), cfg.page_budgets)?;
+    let mut reader = connector.open(item.item_ref(), item_read_budgets())?;
     let mut buf = vec![0_u8; overlap.saturating_add(cfg.chunk_size)];
     // Absolute payload bytes consumed from this item (excludes overlap carry).
     let mut offset: u64 = 0;
@@ -478,7 +503,7 @@ where
         }
 
         let payload = &mut buf[carry..carry + cfg.chunk_size];
-        let n = connector.read_range(item.item_ref(), offset, payload, cfg.page_budgets)?;
+        let n = connector.read_range(item.item_ref(), offset, payload, item_read_budgets())?;
         if n == 0 {
             break;
         }

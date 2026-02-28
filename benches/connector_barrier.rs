@@ -372,7 +372,12 @@ impl ReadConnector for BenchMockConnector {
         _item_ref: &ItemRef,
         _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
-        Err(ReadError::unsupported("bench mock"))
+        // Return an empty reader so the scan loop completes one zero-byte
+        // read cycle per item without triggering error diagnostics.
+        // This keeps the benchmark measuring page-level orchestration
+        // overhead (enumerate, validate, barrier, checkpoint) rather than
+        // error handling noise.
+        Ok(Box::new(io::empty()))
     }
 }
 
