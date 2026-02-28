@@ -597,7 +597,9 @@ fn run_live_scan(
     scan_dir: &Path,
     canonical_root: &str,
 ) -> Result<Vec<NormalizedFinding>, Box<dyn Error>> {
-    use scanner_rs::scheduler::local_fs_owner::{LocalConfig, LocalFile, VecFileSource, scan_local};
+    use scanner_rs::scheduler::local_fs_owner::{
+        LocalConfig, LocalFile, VecFileSource, scan_local,
+    };
     use scanner_rs::unified::events::VecEventSink;
 
     let engine = Arc::new(scanner_rs::demo_engine());
@@ -666,7 +668,9 @@ fn run_live_scan(
 /// The eval harness requires complete scan output. Any I/O errors,
 /// dropped findings, persistence emission failures, or explicit
 /// `persistence_incomplete` signal result in a runtime error.
-fn validate_scan_health(report: &scanner_rs::scheduler::local_fs_owner::LocalReport) -> Result<(), Box<dyn Error>> {
+fn validate_scan_health(
+    report: &scanner_rs::scheduler::local_fs_owner::LocalReport,
+) -> Result<(), Box<dyn Error>> {
     let stats = &report.stats;
     let mut reasons: Vec<String> = Vec::with_capacity(4);
 
