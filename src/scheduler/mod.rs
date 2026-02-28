@@ -204,7 +204,7 @@
 //! - **Core**: [`Executor`], [`ExecutorConfig`], [`WorkerCtx`], [`ByteBudget`],
 //!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
 //! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`WorkerFindingsBuffer`]
-//! - **Connector pipeline**: [`scan_connector`], [`ConnectorConfig`], [`ConnectorSource`]
+//! - **Connector pipeline**: [`scan_connector`], [`ConnectorScanConfig`], [`ConnectorSource`], [`ProgressSink`]
 //! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
 // Core scheduling
@@ -240,6 +240,7 @@ mod local_fs_tar;
 pub mod local_fs_uring;
 mod local_fs_zip;
 pub mod parallel_scan;
+#[allow(dead_code)]
 pub(crate) mod remote;
 
 // Observability
@@ -294,8 +295,9 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 
 // I/O backends
 pub use connector_pipeline::{
-    scan_connector, ConnectorConfig, ConnectorErrorClass, ConnectorObject, ConnectorRetryPolicy,
-    ConnectorRunError, ConnectorRunReport, ConnectorSource,
+    scan_connector, ConnectorConfig, ConnectorEnumerateStats, ConnectorErrorClass,
+    ConnectorIoStats, ConnectorRunError, ConnectorRunReport, ConnectorScanConfig, ConnectorSource,
+    ProgressSink,
 };
 
 // Observability
