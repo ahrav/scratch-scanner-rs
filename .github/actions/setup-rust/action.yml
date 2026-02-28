@@ -37,6 +37,21 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Stub Gossip-rs path deps
+      shell: bash
+      run: |
+        # Cargo resolves path deps at manifest parse time even when optional.
+        # Create minimal stubs so the connector-pipeline deps resolve in CI
+        # (the feature is never activated, so these are never compiled).
+        for crate in gossip-contracts gossip-connectors; do
+          dir="../Gossip-rs/crates/${crate}"
+          if [ ! -d "${dir}" ]; then
+            mkdir -p "${dir}/src"
+            printf '[package]\nname = "%s"\nversion = "0.0.0"\nedition = "2021"\n' "${crate}" > "${dir}/Cargo.toml"
+            touch "${dir}/src/lib.rs"
+          fi
+        done
+
     - name: Install system deps (Linux)
       if: runner.os == 'Linux'
       shell: bash

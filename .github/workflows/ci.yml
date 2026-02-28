@@ -68,6 +68,20 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
+
+      # Cargo resolves path deps at manifest parse time even when optional.
+      # Stub Gossip-rs so cargo fmt can parse Cargo.toml in CI.
+      - name: Stub Gossip-rs path deps
+        run: |
+          for crate in gossip-contracts gossip-connectors; do
+            dir="../Gossip-rs/crates/${crate}"
+            if [ ! -d "${dir}" ]; then
+              mkdir -p "${dir}/src"
+              printf '[package]\nname = "%s"\nversion = "0.0.0"\nedition = "2021"\n' "${crate}" > "${dir}/Cargo.toml"
+              touch "${dir}/src/lib.rs"
+            fi
+          done
+
       # No cache needed — fmt does not compile
       - run: cargo fmt --all -- --check
 
