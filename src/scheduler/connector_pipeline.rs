@@ -284,12 +284,12 @@ type PageId = u64;
 /// thread calls [`wait_until_complete`](Self::wait_until_complete), which
 /// parks on the condvar until the counter hits zero.
 ///
-/// # Poison recovery
+/// # Poison propagation
 ///
-/// All lock acquisitions use [`lock_or_recover`](Self::lock_or_recover),
-/// which absorbs mutex poison rather than propagating it. This is deliberate:
-/// a panic in one item's processing must not prevent the barrier from draining,
-/// because a stuck barrier would deadlock the entire enumeration loop.
+/// All lock acquisitions use [`lock_or_propagate`](Self::lock_or_propagate),
+/// which panics on mutex poison rather than absorbing it. A poisoned mutex
+/// signals that a prior holder panicked while modifying shared state, so
+/// continuing with potentially inconsistent state is worse than failing fast.
 #[derive(Debug)]
 #[cfg_attr(feature = "bench", allow(dead_code))]
 pub(super) struct PageCompletionBarrier {
@@ -317,12 +317,9 @@ impl PageCompletionBarrier {
         })
     }
 
-    /// Acquire the inner mutex, absorbing poison to avoid cascading panics.
-    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, PageCompletionState> {
-        match self.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    /// Acquire the inner mutex, propagating poison as a panic.
+    fn lock_or_propagate(&self) -> std::sync::MutexGuard<'_, PageCompletionState> {
+        self.state.lock().expect("page barrier mutex poisoned")
     }
 
     /// Block the calling thread until every item token has been released.
@@ -332,15 +329,12 @@ impl PageCompletionBarrier {
     /// within that window, a warning is logged and the wait resumes.
     pub(super) fn wait_until_complete(&self) {
         let timeout = Duration::from_secs(60);
-        let mut state = self.lock_or_recover();
+        let mut state = self.lock_or_propagate();
         while state.outstanding_items > 0 {
-            let (guard, wait_result) = match self.cv.wait_timeout(state, timeout) {
-                Ok(tuple) => tuple,
-                Err(poisoned) => {
-                    let (guard, wait_result) = poisoned.into_inner();
-                    (guard, wait_result)
-                }
-            };
+            let (guard, wait_result) = self
+                .cv
+                .wait_timeout(state, timeout)
+                .expect("page barrier condvar poisoned");
             state = guard;
             if wait_result.timed_out() && state.outstanding_items > 0 {
                 eprintln!(
@@ -354,11 +348,12 @@ impl PageCompletionBarrier {
     /// Decrement the outstanding counter by one. When it reaches zero, wake
     /// the enumeration thread blocked in `wait_until_complete`.
     ///
-    /// The `debug_assert` catches double-release bugs in tests; in release
-    /// builds the subtraction panics on underflow (overflow-checks=true).
+    /// The `assert` catches double-release bugs unconditionally; the
+    /// subtraction would also panic on underflow (overflow-checks=true)
+    /// but the assertion provides a clearer diagnostic.
     pub(super) fn release_item(&self) {
-        let mut state = self.lock_or_recover();
-        debug_assert!(
+        let mut state = self.lock_or_propagate();
+        assert!(
             state.outstanding_items > 0,
             "page {} outstanding counter underflow",
             self.page_id
@@ -371,7 +366,7 @@ impl PageCompletionBarrier {
 
     #[cfg(test)]
     fn outstanding_items(&self) -> usize {
-        self.lock_or_recover().outstanding_items
+        self.lock_or_propagate().outstanding_items
     }
 }
 
@@ -644,6 +639,8 @@ mod tests {
         cursor: Cursor,
         calls: Vec<ProgressCall>,
         fail_checkpoint: bool,
+        fail_complete: bool,
+        fail_split_hint: bool,
         checkpoint_notifier: Option<mpsc::Sender<Cursor>>,
     }
 
@@ -654,12 +651,24 @@ mod tests {
                 cursor,
                 calls: Vec::new(),
                 fail_checkpoint: false,
+                fail_complete: false,
+                fail_split_hint: false,
                 checkpoint_notifier: None,
             }
         }
 
         fn with_checkpoint_failure(mut self) -> Self {
             self.fail_checkpoint = true;
+            self
+        }
+
+        fn with_complete_failure(mut self) -> Self {
+            self.fail_complete = true;
+            self
+        }
+
+        fn with_split_hint_failure(mut self) -> Self {
+            self.fail_split_hint = true;
             self
         }
 
@@ -693,6 +702,9 @@ mod tests {
         }
 
         fn complete(&mut self, final_cursor: &Cursor) -> Result<(), Self::Error> {
+            if self.fail_complete {
+                return Err("complete failed");
+            }
             self.cursor = final_cursor.clone();
             self.calls
                 .push(ProgressCall::Complete(final_cursor.clone()));
@@ -704,6 +716,9 @@ mod tests {
         }
 
         fn split_hint(&mut self, key: &ItemKey) -> Result<(), Self::Error> {
+            if self.fail_split_hint {
+                return Err("split_hint failed");
+            }
             self.calls.push(ProgressCall::SplitHint(key.clone()));
             Ok(())
         }
@@ -1084,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn barrier_lock_or_recover_absorbs_mutex_poison() {
+    fn barrier_lock_or_propagate_panics_on_poisoned_mutex() {
         let barrier = PageCompletionBarrier::new(0, 2);
 
         // Poison the mutex by panicking while holding the guard.
@@ -1095,12 +1110,11 @@ mod tests {
         });
         let _ = handle.join();
 
-        // The mutex is now poisoned. lock_or_recover should absorb it.
-        assert_eq!(barrier.outstanding_items(), 2);
-        barrier.release_item();
-        assert_eq!(barrier.outstanding_items(), 1);
-        barrier.release_item();
-        assert_eq!(barrier.outstanding_items(), 0);
+        // The mutex is now poisoned. lock_or_propagate should panic.
+        let result = std::panic::catch_unwind(|| {
+            barrier.release_item();
+        });
+        assert!(result.is_err(), "expected panic on poisoned mutex");
     }
 
     // -- Integration: empty first page --
@@ -1313,6 +1327,78 @@ mod tests {
         assert!(
             progress.calls.is_empty(),
             "no checkpoint should be committed after dispatch failure"
+        );
+    }
+
+    // -- Error propagation: progress.complete() failure --
+
+    #[test]
+    fn scan_connector_maps_complete_error_to_progress_error() {
+        let shard = ShardSpec::unbounded();
+        // Single empty page triggers `complete()` immediately.
+        let pages = vec![EnumerationPage::new(Vec::new(), Cursor::initial())];
+        let mut connector = MockConnector::new(pages);
+        let mut progress = MockProgress::new(shard, Cursor::initial()).with_complete_failure();
+        let sink = Arc::new(VecEventSink::new());
+
+        let err = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            ConnectorConfig::default(),
+            &mut progress,
+            sink,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConnectorRunError::Progress("complete failed")),
+            "expected Progress(complete failed), got: {err:?}"
+        );
+        assert!(
+            progress.calls.is_empty(),
+            "no calls should be recorded when complete fails"
+        );
+    }
+
+    // -- Error propagation: progress.split_hint() failure --
+
+    #[test]
+    fn scan_connector_maps_split_hint_persistence_error_to_progress_error() {
+        let shard = ShardSpec::unbounded();
+        let k1 = ItemKey::try_from_slice(b"k1").unwrap();
+        let pages = vec![
+            EnumerationPage::new(
+                vec![item(b"k1", 1, b"v1")],
+                Cursor::with_last_key(k1.clone()),
+            ),
+            EnumerationPage::new(Vec::new(), Cursor::with_last_key(k1.clone())),
+        ];
+        // Connector returns a split key so split_hint() is called.
+        let mut connector = MockConnector::new(pages).with_split_hints(vec![Some(k1.clone())]);
+        let mut progress = MockProgress::new(shard, Cursor::initial()).with_split_hint_failure();
+        let sink = Arc::new(VecEventSink::new());
+
+        let cfg = ConnectorConfig {
+            split_hint_budgets: Some(Budgets::try_new(1, 1024, None).unwrap()),
+            ..ConnectorConfig::default()
+        };
+        let err = scan_connector(
+            Arc::new(test_engine(16)),
+            &mut connector,
+            cfg,
+            &mut progress,
+            sink,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConnectorRunError::Progress("split_hint failed")),
+            "expected Progress(split_hint failed), got: {err:?}"
+        );
+        // Checkpoint was committed before the split-hint persistence failure.
+        assert_eq!(
+            progress.calls,
+            vec![ProgressCall::Checkpoint(Cursor::with_last_key(k1))]
         );
     }
 }
