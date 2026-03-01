@@ -144,6 +144,24 @@ jobs:
         if: always()
         run: du -sh target/ || true
 
+  execution-mode-parity:
+    name: Execution Mode Parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes, clippy]
+    env:
+      EXECUTION_MODE_PARITY_ITERS: "5"
+      EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT: "2"
+      EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT: "5"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+      - run: cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+
   eval-harness:
     name: Eval Harness
     runs-on: ubuntu-24.04
