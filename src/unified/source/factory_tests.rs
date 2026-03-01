@@ -122,6 +122,23 @@ fn build_connector_store_returns_explicit_error() {
 }
 
 // ===========================================================================
+// MAX_FS_ENTRIES safety cap
+// ===========================================================================
+
+#[test]
+fn collect_filesystem_entries_succeeds_below_cap() {
+    // A small directory is well below MAX_FS_ENTRIES and must succeed.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("small");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..10 {
+        std::fs::write(root.join(format!("file_{i}.txt")), b"data").unwrap();
+    }
+    let entries = collect_filesystem_entries(&root).unwrap();
+    assert_eq!(entries.len(), 10);
+}
+
+// ===========================================================================
 // rstest: map_io_error — permanent vs retryable classification
 // ===========================================================================
 
@@ -492,6 +509,7 @@ fn version_material_includes_key_bytes() {
 // Property tests — key_for_display invariants over the full input domain
 // ===========================================================================
 
+#[cfg(feature = "stdx-proptest")]
 mod prop {
     use super::*;
     use proptest::prelude::*;

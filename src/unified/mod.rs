@@ -118,6 +118,7 @@ pub enum OutputFormat {
 }
 
 /// Filesystem scan configuration.
+#[derive(Clone)]
 pub struct FsScanConfig {
     /// Directory or file path to scan.
     pub root: PathBuf,

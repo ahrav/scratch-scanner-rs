@@ -3,7 +3,8 @@
 //! Dispatches to the appropriate source driver based on the parsed
 //! CLI configuration:
 //!
-//! - **FS** → connector pipeline (`scan_connector`) with source factory wiring
+//! - **FS** → connector pipeline (`scan_connector`) when `connector-pipeline`
+//!   feature is enabled, otherwise falls back to `parallel_scan_dir`
 //! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
@@ -102,6 +103,11 @@ pub fn run(config: ScanConfig) -> io::Result<()> {
     }
 }
 
+/// In-memory-only progress tracker for local filesystem scans.
+///
+/// Provides no crash-recovery: a failed scan restarts from scratch.
+/// When persistence support is re-added to the connector pipeline,
+/// this will be replaced by a backend-backed implementation.
 #[cfg(feature = "connector-pipeline")]
 #[derive(Debug)]
 struct FsProgressState {
@@ -153,19 +159,6 @@ impl crate::scheduler::ProgressSink for FsProgressState {
     }
 }
 
-#[cfg_attr(not(any(test, feature = "connector-pipeline")), allow(dead_code))]
-fn fs_source_config(cfg: &FsScanConfig) -> SourceConfig {
-    SourceConfig::Fs(FsScanConfig {
-        root: cfg.root.clone(),
-        workers: cfg.workers,
-        decode_depth: cfg.decode_depth,
-        skip_archives: cfg.skip_archives,
-        anchor_mode: cfg.anchor_mode,
-        scan_binary: cfg.scan_binary,
-        persist_findings: cfg.persist_findings,
-    })
-}
-
 #[cfg(feature = "connector-pipeline")]
 fn run_fs_connector(
     engine: Arc<Engine>,
@@ -178,7 +171,7 @@ fn run_fs_connector(
         ));
     }
 
-    let source_cfg = fs_source_config(cfg);
+    let source_cfg = SourceConfig::Fs(cfg.clone());
     let mut connector = super::source::factory::build_connector(&source_cfg)?;
 
     let connector_cfg = crate::scheduler::ConnectorConfig {
@@ -210,21 +203,52 @@ fn run_fs_connector(
     })
 }
 
+/// Fallback when the connector-pipeline feature is not compiled in.
+///
+/// Delegates to [`parallel_scan_dir`](crate::scheduler::parallel_scan::parallel_scan_dir)
+/// which provides the same scanning behaviour through the legacy work-stealing
+/// executor.  This keeps FS scans functional for default builds without
+/// requiring the Gossip-rs path dependencies.
 #[cfg(not(feature = "connector-pipeline"))]
 fn run_fs_connector(
-    _engine: Arc<Engine>,
-    _cfg: &FsScanConfig,
-    _event_sink: Arc<dyn super::events::EventSink>,
+    engine: Arc<Engine>,
+    cfg: &FsScanConfig,
+    event_sink: Arc<dyn super::events::EventSink>,
 ) -> io::Result<LocalReport> {
-    Err(io::Error::other(
-        "filesystem scans require the connector-pipeline feature",
-    ))
+    use crate::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
+
+    let mut scan_cfg = ParallelScanConfig {
+        workers: cfg.workers.max(1),
+        // Match the connector pipeline's discovery defaults:
+        // scan hidden files and ignore .gitignore rules so the
+        // fallback produces the same file set as the connector path.
+        skip_hidden: false,
+        respect_gitignore: false,
+        skip_binary: !cfg.scan_binary,
+        event_sink,
+        ..Default::default()
+    };
+
+    if cfg.skip_archives {
+        scan_cfg.archive.enabled = false;
+    }
+
+    if cfg.persist_findings {
+        return Err(io::Error::other(
+            "filesystem persistence is not yet supported in fallback mode",
+        ));
+    }
+
+    parallel_scan_dir(&cfg.root, engine, scan_cfg)
 }
 
 /// Filesystem scan path.
 ///
-/// Runs through the connector pipeline and emits findings as structured events
-/// to stdout via the [`EventSink`] (format per `--event-format`).
+/// Delegates to [`run_fs_connector`] which uses the connector pipeline when
+/// the `connector-pipeline` feature is enabled, or falls back to
+/// [`parallel_scan_dir`](crate::scheduler::parallel_scan::parallel_scan_dir).
+/// Findings are emitted as structured events to stdout via the
+/// [`EventSink`](super::events::EventSink) (format per `--event-format`).
 /// Summary stats are written to stderr.
 fn run_fs(
     cfg: FsScanConfig,

@@ -202,30 +202,6 @@ fn filter_none_on_empty_input() {
     assert!(result.is_empty());
 }
 
-#[test]
-fn fs_source_config_round_trips_fields() {
-    let cfg = FsScanConfig {
-        root: PathBuf::from("/tmp/x"),
-        workers: 8,
-        decode_depth: Some(2),
-        skip_archives: true,
-        anchor_mode: AnchorMode::Derived,
-        scan_binary: true,
-        persist_findings: false,
-    };
-    let source = fs_source_config(&cfg);
-    let SourceConfig::Fs(fs) = source else {
-        panic!("expected fs source config");
-    };
-    assert_eq!(fs.root, cfg.root);
-    assert_eq!(fs.workers, cfg.workers);
-    assert_eq!(fs.decode_depth, cfg.decode_depth);
-    assert_eq!(fs.skip_archives, cfg.skip_archives);
-    assert_eq!(fs.anchor_mode, cfg.anchor_mode);
-    assert_eq!(fs.scan_binary, cfg.scan_binary);
-    assert_eq!(fs.persist_findings, cfg.persist_findings);
-}
-
 #[cfg(feature = "connector-pipeline")]
 #[test]
 fn run_fs_connector_rejects_persistence_until_wired() {
@@ -270,6 +246,34 @@ fn run_fs_connector_scans_files_through_connector_pipeline() {
         Arc::new(crate::unified::events::NullEventSink),
     )
     .expect("connector scan should succeed");
+    assert_eq!(report.stats.files_enqueued, 2);
+    assert!(report.metrics.bytes_scanned >= 9);
+}
+
+/// Verify that FS scans work regardless of whether the `connector-pipeline`
+/// feature is enabled.  Without the feature the orchestrator must fall back
+/// to `parallel_scan_dir` instead of returning an unconditional error.
+#[cfg(not(feature = "connector-pipeline"))]
+#[test]
+fn run_fs_connector_fallback_scans_files_without_connector_feature() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("a.txt"), b"alpha").unwrap();
+    std::fs::write(temp.path().join("b.txt"), b"beta").unwrap();
+    let cfg = FsScanConfig {
+        root: temp.path().to_path_buf(),
+        workers: 2,
+        decode_depth: None,
+        skip_archives: false,
+        anchor_mode: AnchorMode::Manual,
+        scan_binary: false,
+        persist_findings: false,
+    };
+    let report = run_fs_connector(
+        Arc::new(crate::demo_engine()),
+        &cfg,
+        Arc::new(crate::unified::events::NullEventSink),
+    )
+    .expect("FS scan fallback should succeed without connector-pipeline feature");
     assert_eq!(report.stats.files_enqueued, 2);
     assert!(report.metrics.bytes_scanned >= 9);
 }

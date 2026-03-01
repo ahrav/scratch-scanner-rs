@@ -4,6 +4,7 @@
 //! entrypoint. Source-specific connector construction lives here so scheduler
 //! orchestration stays source-agnostic.
 
+#[cfg(not(unix))]
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,9 @@ use crate::unified::{FsScanConfig, SourceConfig};
 
 const FS_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"localfs");
 
+/// Hard safety cap to prevent OOM on extremely large directory trees.
+const MAX_FS_ENTRIES: usize = 10_000_000;
+
 /// Build a connector instance for a unified source configuration.
 ///
 /// This function is the single source-wiring entrypoint used by unified
@@ -33,7 +37,7 @@ pub fn build_connector(cfg: &SourceConfig) -> io::Result<Box<dyn ConnectorInstan
             Ok(Box::new(connector))
         }
         SourceConfig::Git(_) => Err(io::Error::other(
-            "git source connector is not implemented yet (follow-up: scratch-g7dk.12)",
+            "git source connector is not implemented yet",
         )),
         SourceConfig::Store(_) => Err(io::Error::other(
             "store commands are not connector-backed scan sources",
@@ -57,6 +61,13 @@ struct FilesystemConnector {
 }
 
 impl FilesystemConnector {
+    /// Build a connector by eagerly walking the directory tree into memory.
+    ///
+    /// The full walk happens upfront so that `enumerate_page` can binary-search
+    /// the sorted entry list for O(log N) cursor resume. For very large trees
+    /// (millions of files), the upfront walk creates a memory spike — the
+    /// connector contract supports lazy/streaming enumeration as a future
+    /// optimization path.
     fn new(cfg: &FsScanConfig) -> io::Result<Self> {
         let mut entries = collect_filesystem_entries(&cfg.root)?;
         entries.sort_by(|left, right| left.key.cmp(&right.key));
@@ -82,32 +93,6 @@ impl FilesystemConnector {
         ItemKey::try_from_slice(bound)
             .map(Some)
             .map_err(|err| EnumerateError::permanent(format!("invalid shard {label} bound: {err}")))
-    }
-
-    fn scan_item_for_index(&self, idx: usize) -> Result<ScanItem, EnumerateError> {
-        let entry = self
-            .entries
-            .get(idx)
-            .ok_or_else(|| EnumerateError::permanent("item index out of bounds"))?;
-
-        let idx_u64 = u64::try_from(idx)
-            .map_err(|_| EnumerateError::permanent("item index exceeds u64 capacity"))?;
-        let item_ref = ItemRef::try_from_slice(&idx_u64.to_be_bytes())
-            .map_err(|err| EnumerateError::permanent(format!("invalid item_ref: {err}")))?;
-
-        let mut item = ScanItem::new(
-            entry.key.clone(),
-            item_ref,
-            entry.stable_item_id,
-            entry.version,
-        );
-        if let Some(size_hint) = entry.size_hint {
-            item = item.with_size_hint(size_hint);
-        }
-        if let Some(location) = entry.location.clone() {
-            item = item.with_location(location);
-        }
-        Ok(item)
     }
 
     fn item_index(item_ref: &ItemRef) -> Result<usize, ReadError> {
@@ -164,22 +149,32 @@ impl EnumerationConnector for FilesystemConnector {
         let max_items = budgets.max_items();
         let mut bytes_remaining = budgets.max_bytes();
         while idx < range_end && out.len() < max_items {
-            let entry = self
-                .entries
-                .get(idx)
-                .ok_or_else(|| EnumerateError::permanent("item index out of bounds"))?;
+            let entry = &self.entries[idx];
 
             let hint = entry.size_hint.unwrap_or(0);
             if !out.is_empty() && hint > bytes_remaining {
                 break;
             }
             bytes_remaining = bytes_remaining.saturating_sub(hint);
-            out.push(self.scan_item_for_index(idx)?);
-            idx += 1;
-        }
 
-        if out.is_empty() {
-            return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
+            let idx_u64 = u64::try_from(idx)
+                .map_err(|_| EnumerateError::permanent("item index exceeds u64 capacity"))?;
+            let item_ref = ItemRef::try_from_slice(&idx_u64.to_be_bytes())
+                .map_err(|e| EnumerateError::permanent(format!("invalid item_ref: {e}")))?;
+            let mut item = ScanItem::new(
+                entry.key.clone(),
+                item_ref,
+                entry.stable_item_id,
+                entry.version,
+            );
+            if let Some(sz) = entry.size_hint {
+                item = item.with_size_hint(sz);
+            }
+            if let Some(loc) = entry.location.clone() {
+                item = item.with_location(loc);
+            }
+            out.push(item);
+            idx += 1;
         }
 
         let last_key = out
@@ -209,11 +204,26 @@ impl ReadConnector for FilesystemConnector {
             }
         }
 
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&entry.path)
+                .map_err(map_io_error)?
+        };
+        #[cfg(not(unix))]
         let file = File::open(&entry.path).map_err(map_io_error)?;
         Ok(Box::new(file))
     }
 }
 
+/// Discover every regular file under `root`.
+///
+/// Intentionally scans hidden files and ignores `.gitignore` rules:
+/// a secret scanner must examine files like `.env`, `.aws/credentials`,
+/// and `.npmrc` that are commonly gitignored or hidden.
 fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -243,7 +253,7 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
         let display = display_path(root, &path);
         let key = key_for_display(&display)?;
         let stable_item_id = ItemIdentityKey::new(FS_CONNECTOR_TAG, key.as_bytes()).stable_id();
-        let metadata = std::fs::metadata(&path).ok();
+        let metadata = std::fs::symlink_metadata(&path).ok();
         let version = VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material(
             &key,
             metadata.as_ref(),
@@ -259,6 +269,12 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
             size_hint,
             location,
         });
+        if entries.len() >= MAX_FS_ENTRIES {
+            return Err(io::Error::other(format!(
+                "filesystem entry limit exceeded ({MAX_FS_ENTRIES}); \
+                 narrow the scan root to a smaller directory tree",
+            )));
+        }
     }
 
     Ok(entries)
@@ -299,17 +315,10 @@ fn version_material(key: &ItemKey, metadata: Option<&std::fs::Metadata>) -> Vec<
     material
 }
 
+/// Thin wrapper around the shared classifier in [`crate::scheduler::failure`]
+/// with a filesystem-specific context string.
 fn map_io_error(err: io::Error) -> ReadError {
-    match err.kind() {
-        io::ErrorKind::NotFound
-        | io::ErrorKind::PermissionDenied
-        | io::ErrorKind::InvalidInput
-        | io::ErrorKind::InvalidData
-        | io::ErrorKind::Unsupported => {
-            ReadError::permanent(format!("filesystem read failed: {err}"))
-        }
-        _ => ReadError::retryable(format!("filesystem read failed: {err}")),
-    }
+    crate::scheduler::failure::classify_io_read_error(err, "filesystem read failed")
 }
 
 #[cfg(test)]
