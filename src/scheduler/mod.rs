@@ -1,4 +1,4 @@
-//! Scanner Scheduler: work-stealing runtime for secret scanning.
+//! Scanner Scheduler: work-stealing runtime for parallel secret scanning.
 //!
 //! # Overview
 //!
@@ -6,6 +6,10 @@
 //! It manages work distribution across CPU cores, memory budgets, chunking of large
 //! objects, and metrics collection—all while maintaining deterministic behavior
 //! for reproducible scans.
+//!
+//! The scheduler is backend-agnostic: the same executor and budget primitives
+//! drive three independent I/O frontends (blocking FS, io_uring, connector
+//! pipeline), each tailored to a different deployment scenario.
 //!
 //! # Architecture
 //!
@@ -72,7 +76,8 @@
 //! | [`connector_pipeline`] | Connector-first scheduler entrypoint for enumerate/read/scan workflows |
 //! | [`local_fs_owner`] | Local filesystem scheduler internals |
 //! | [`parallel_scan`] | High-level directory scanner surface |
-//! | [`local_fs_uring`] | Linux io_uring scheduler surface |
+//! | [`local_fs_uring`] | Linux io_uring async I/O scheduler (Linux-only) |
+//! | `shared_core` | Shared chunk scan/post-process pipeline (scan → prefix-prune → dedupe → metrics) used by all I/O backends |
 //!
 //! ## Observability
 //!
@@ -246,6 +251,7 @@ pub mod parallel_scan;
 #[allow(dead_code)]
 pub(crate) mod remote;
 pub(crate) mod scan_helpers;
+pub(crate) mod shared_core;
 
 // Observability
 pub mod affinity;

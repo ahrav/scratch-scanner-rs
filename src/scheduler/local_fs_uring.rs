@@ -2,16 +2,37 @@
 //!
 //! # Architecture
 //!
-//! - I/O threads use io_uring for async reads
-//! - CPU threads run the work-stealing executor for scanning
-//! - Buffer ownership transfers: I/O thread acquires, CPU thread releases
-//! - Overlap bytes are carried in-memory between chunks (payload-only reads)
+//! ```text
+//!  ┌────────────────┐     ┌───────────────────┐     ┌───────────────────────┐
+//!  │   Discovery    │     │  I/O Threads       │     │   CPU Executor        │
+//!  │  (main thread) │     │  (io_uring rings)  │     │  (work-stealing pool) │
+//!  │                │     │                    │     │                       │
+//!  │  walk dirs     │────►│  open / stat       │     │  ┌─────────────────┐  │
+//!  │  route archives│     │  read chunks       │────►│  │ ScanChunk tasks │  │
+//!  │  backpressure  │     │  classify content  │     │  └─────────────────┘  │
+//!  └────────────────┘     │  carry overlap     │     │                       │
+//!         │               └───────────────────┘     └───────────────────────┘
+//!         │                        │                          │
+//!         ▼                        ▼                          ▼
+//!  ┌────────────────┐     ┌───────────────────┐     ┌───────────────────────┐
+//!  │ Archive Workers│     │ Extract Workers    │     │   EventSink           │
+//!  │  (dedicated)   │     │  (dedicated)       │     │   (findings output)   │
+//!  └────────────────┘     └───────────────────┘     └───────────────────────┘
+//! ```
+//!
+//! - **I/O threads** use io_uring for async reads with batched syscalls.
+//! - **CPU threads** run the work-stealing executor for scanning (never block on I/O).
+//! - **Buffer ownership transfers**: I/O thread acquires from [`FixedBufferPool`],
+//!   CPU thread releases on scan completion — no copying between threads.
+//! - **Overlap bytes** are carried in-memory between chunks via `ReadState::overlap_buf`,
+//!   so disk reads are payload-only (no overlap re-reads).
 //!
 //! # Why io_uring?
 //!
 //! - High concurrency on cold storage (NVMe, network mounts)
-//! - Batched syscalls reduce kernel overhead
+//! - Batched syscalls reduce kernel transition overhead
 //! - CPU workers never block on I/O
+//! - Open/stat can be async (when kernel supports `IORING_OP_OPENAT` + `IORING_OP_STATX`)
 //!
 //! # Correctness Guarantees
 //!
@@ -19,18 +40,20 @@
 //! - **Chunk overlap**: `engine.required_overlap()` bytes overlap between chunks
 //! - **Budget bounded**: `max_in_flight_files` limits discovered-but-not-complete files
 //! - **Buffer bounded**: `pool_buffers` limits peak memory
-//! - **Exactly-once per chunk**: No duplicate scans
+//! - **Exactly-once per chunk**: No duplicate scans (single in-flight op per file)
+//! - **Drain-before-return**: All in-flight io_uring ops complete before any thread
+//!   returns, preventing the kernel from writing to freed memory
 //!
 //! # When to Use
 //!
 //! Profile first! io_uring may be slower than blocking reads when:
-//! - Everything is in page cache
-//! - Files are tiny (syscall overhead dominates)
+//! - Everything is in page cache (kernel readahead is already optimal)
+//! - Files are tiny (syscall overhead dominates over I/O latency)
 //!
 //! io_uring tends to win on:
-//! - Cold cache workloads
-//! - High-latency storage (network mounts)
-//! - Many concurrent files
+//! - Cold cache workloads (where I/O latency dominates)
+//! - High-latency storage (network mounts, slow NVMe)
+//! - Many concurrent files (high SQ depth amortizes syscall cost)
 //!
 //! # Platform
 //!
@@ -38,11 +61,12 @@
 
 use super::count_budget::{CountBudget, CountPermit};
 use super::engine_stub::BUFFER_LEN_MAX;
-use super::engine_trait::{EngineScratch, FindingRecord, ScanEngine};
+use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::file_id_alloc::FileIdAllocator;
 use super::metrics::MetricsSnapshot;
-use super::scan_helpers::{account_effective_dropped_findings, apply_cross_rule_dedupe};
+use super::scan_helpers::{apply_cross_rule_dedupe, emit_findings as shared_emit_findings};
+use super::shared_core::scan_chunk_postprocess;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
 use crate::archive::scan::{
@@ -52,8 +76,7 @@ use crate::archive::scan::{
 use crate::archive::{ArchiveConfig, ArchiveKind, ArchiveStats};
 use crate::content_policy::{self, ContentVerdict};
 use crate::perf_stats;
-use crate::unified::events::{EventSink, FindingEvent, ScanEvent};
-use crate::unified::SourceKind;
+use crate::unified::events::EventSink;
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
@@ -250,39 +273,77 @@ impl LocalFsUringConfig {
 // Summary Counters
 // ============================================================================
 
-/// Discovery and I/O counters (no identifiers logged for security).
+/// Discovery and I/O counters for a complete io_uring scan run.
+///
+/// File paths and content are intentionally excluded to avoid leaking
+/// sensitive data through log/metric channels.
+///
+/// Populated by the discovery walker and merged from I/O/archive/extraction
+/// worker stats after join. `open_errors` and `read_errors` are aggregated
+/// across all worker types.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalFsSummary {
+    /// Files observed during directory walking (before any filtering).
     pub files_seen: u64,
+    /// Files accepted and sent to I/O threads or archive workers.
     pub files_enqueued: u64,
+    /// Directory read or entry metadata failures during discovery.
     pub walk_errors: u64,
+    /// Files that failed to open (aggregated from I/O + archive workers).
     pub open_errors: u64,
+    /// Files that failed during read or decompression.
     pub read_errors: u64,
+    /// Files skipped because they exceeded `max_file_size`.
     pub files_skipped_size: u64,
+    /// Files routed to archive workers based on extension detection.
     pub archives_routed: u64,
+    /// Files skipped because they were classified as binary.
     pub binary_skipped: u64,
 }
 
-/// Per-I/O-thread counters.
+/// Per-I/O-thread operational counters, merged across threads after join.
+///
+/// Tracks each phase of the file lifecycle within the I/O worker:
+/// open → stat → read → classify → dispatch. Useful for diagnosing
+/// bottlenecks (e.g., high `open_stat_fallbacks` indicates kernel opcode
+/// gaps, high `short_reads` indicates file truncation or race conditions).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UringIoStats {
+    /// Files received from discovery and entered into the I/O state machine.
     pub files_started: u64,
+    /// Files that could not be opened (open syscall or io_uring CQE error).
     pub files_open_failed: u64,
+    /// io_uring openat/openat2 SQEs submitted.
     pub open_ops_submitted: u64,
+    /// io_uring openat/openat2 CQEs reaped (success or failure).
     pub open_ops_completed: u64,
+    /// io_uring statx SQEs submitted.
     pub stat_ops_submitted: u64,
+    /// io_uring statx CQEs reaped (success or failure).
     pub stat_ops_completed: u64,
+    /// Open ops that completed with an error CQE result.
     pub open_failures: u64,
+    /// Stat ops that completed with an error CQE result.
     pub stat_failures: u64,
+    /// Open/stat ops that fell back to blocking syscalls (unsupported opcode).
     pub open_stat_fallbacks: u64,
+    /// Read SQEs submitted to io_uring.
     pub reads_submitted: u64,
+    /// Read CQEs reaped (success or failure).
     pub reads_completed: u64,
+    /// Read ops that returned a negative result (kernel error).
     pub read_errors: u64,
+    /// Reads that returned fewer bytes than requested (file truncation).
     pub short_reads: u64,
+    /// Files classified as binary and skipped on first-chunk content probe.
     pub binary_skipped: u64,
+    /// Files rerouted to archive workers after magic-byte sniffing.
     pub archives_sniffed: u64,
+    /// Archive sends that failed because the archive channel was closed.
     pub archives_send_failed: u64,
+    /// Files routed to extraction workers (binary-extractable formats).
     pub extractions_routed: u64,
+    /// Total authoritative file bytes (from statx) across all ready files.
     pub bytes_enqueued: u64,
 }
 
@@ -290,15 +351,22 @@ pub struct UringIoStats {
 // Fixed Buffer Pool (io_uring READ_FIXED)
 // ============================================================================
 
-/// Fixed buffer pool backed by a stable buffer table.
+/// Fixed buffer pool backed by a stable `Box<[u8]>` table.
 ///
-/// Buffers are allocated once and never moved, allowing safe registration with
-/// io_uring via `register_buffers`. Address stability is critical: the kernel
-/// retains pointers to these buffers for DMA and will write directly into them
-/// on completion. Moving or reallocating the backing storage while operations
-/// are in-flight would corrupt memory.
+/// Each buffer is individually heap-allocated in a `Box<[u8]>` and stored in
+/// a `Vec<Box<[u8]>>`. The `Vec` stores *pointers*, so growing or shrinking
+/// it would not move the backing allocations — but the pool is never resized
+/// after construction. This address stability is required for safe
+/// `register_buffers` with io_uring: the kernel retains pointers to these
+/// buffers for DMA and writes directly into them on read completion. Moving
+/// or deallocating the backing storage while operations are in-flight would
+/// corrupt memory.
 ///
-/// Handles return buffers to a global free queue on drop.
+/// Concurrency model: a lock-free `ArrayQueue` tracks free buffer indices.
+/// `try_acquire` pops an index (exclusive ownership), and `Drop` on the
+/// returned [`FixedBufferHandle`] pushes the index back. This makes acquire
+/// and release O(1) without locks, which matters because I/O threads acquire
+/// under tight completion-processing loops.
 struct FixedBufferPool {
     buffers: Vec<Box<[u8]>>,
     free: ArrayQueue<usize>,
@@ -539,16 +607,23 @@ struct ExtractWork {
 
 /// Task dispatched from I/O threads to the work-stealing CPU executor.
 ///
-/// Each variant carries all data needed for scanning with no shared mutable
-/// state — the executor can run tasks on any worker thread without locking.
+/// Currently a single-variant enum. The enum wrapper exists for forward
+/// compatibility if additional task types are needed (e.g., finalization
+/// tasks, metadata extraction). Each variant carries all data needed for
+/// scanning with no shared mutable state — the executor can run tasks on
+/// any worker thread without locking.
 enum CpuTask {
     /// Scan a single chunk of a file.
     ///
     /// The buffer contains `prefix_len` bytes of overlap from the previous
-    /// chunk (copied in-memory, not re-read from disk) followed by fresh
-    /// payload bytes. `base_offset` is the file offset of byte 0 in the
-    /// buffer (i.e., `file_offset - prefix_len`). `len` is the total number
-    /// of valid bytes (`prefix_len + payload`).
+    /// chunk (copied in-memory by the I/O thread, not re-read from disk)
+    /// followed by fresh payload bytes. `base_offset` is the file offset
+    /// of byte 0 in the buffer (i.e., `read_offset - prefix_len`). `len`
+    /// is the total number of valid bytes (`prefix_len + payload`).
+    ///
+    /// The `token` keeps the file's `CountPermit` alive. When the last
+    /// `Arc<FileToken>` for a file drops (all chunks scanned), the permit
+    /// is released and discovery can fill the freed slot.
     ScanChunk {
         token: Arc<FileToken>,
         base_offset: u64,
@@ -561,46 +636,16 @@ enum CpuTask {
 /// Per-CPU-worker scratch space, owned by exactly one executor thread.
 ///
 /// Holds the engine scratch buffer, a reusable findings vec, and references
-/// to shared state. The `pending` vec is cleared before each chunk to avoid
-/// cross-chunk finding accumulation (see `drain_findings_into` append semantics).
+/// to shared immutable state. Each executor worker gets its own instance
+/// at startup; nothing is shared across workers.
+///
+/// The `pending` vec is cleared by `scan_chunk_postprocess` before each
+/// chunk's `drain_findings_into` to avoid cross-chunk finding accumulation.
 struct CpuScratch<E: ScanEngine> {
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
-}
-
-// ============================================================================
-// Deduplication Helpers
-// ============================================================================
-
-/// Emit findings as [`FindingEvent`]s through the event sink.
-///
-/// Each finding becomes a `ScanEvent::Finding` with `SourceKind::Fs` and the
-/// display path from the file token. No-op when `recs` is empty.
-fn emit_findings<E: ScanEngine, F: FindingRecord>(
-    engine: &E,
-    event_sink: &dyn EventSink,
-    display: &[u8],
-    recs: &[F],
-) {
-    if recs.is_empty() {
-        return;
-    }
-
-    for rec in recs {
-        event_sink.emit(ScanEvent::Finding(FindingEvent {
-            source: SourceKind::Fs,
-            object_path: display,
-            start: rec.root_hint_start(),
-            end: rec.root_hint_end(),
-            rule_id: rec.rule_id(),
-            rule_name: engine.rule_name(rec.rule_id()),
-            commit_id: None,
-            change_kind: None,
-            confidence_score: rec.confidence_score(),
-        }));
-    }
 }
 
 // ============================================================================
@@ -628,47 +673,23 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
             let len_usize = len as usize;
             let data = &buf.as_slice()[..len_usize];
 
-            engine.scan_chunk_into(data, token.file_id, base_offset, &mut ctx.scratch.scratch);
-            let engine_dropped = ctx.scratch.scratch.dropped_findings();
+            scan_chunk_postprocess(
+                engine,
+                &mut ctx.scratch.scratch,
+                &mut ctx.scratch.pending,
+                token.file_id,
+                base_offset,
+                prefix_len as usize,
+                data,
+                &mut ctx.metrics,
+            );
 
-            // Drop findings fully contained in prefix (overlap region).
-            let new_bytes_start = base_offset + prefix_len as u64;
-            let before_prefix = ctx.scratch.scratch.pending_findings_len();
-            ctx.scratch.scratch.drop_prefix_findings(new_bytes_start);
-            let after_prefix = ctx.scratch.scratch.pending_findings_len();
-
-            // CRITICAL: Clear pending before drain to avoid accumulating findings
-            // across chunks. drain_findings_into uses append(), not replace.
-            ctx.scratch.pending.clear();
-            ctx.scratch
-                .scratch
-                .drain_findings_into(&mut ctx.scratch.pending);
-
-            let _before_mode_pass = ctx.scratch.pending.len();
-            let dedupe_removed =
-                apply_cross_rule_dedupe(&mut ctx.scratch.pending, &*ctx.scratch.engine);
-
-            // Account for dropped findings: engine drops minus scheduler pruning.
-            let scheduler_pruned = before_prefix
-                .saturating_sub(after_prefix)
-                .saturating_add(dedupe_removed);
-            account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
-
-            emit_findings(
+            shared_emit_findings(
                 engine,
                 &*ctx.scratch.event_sink,
                 &token.display,
                 &ctx.scratch.pending,
             );
-
-            // Metrics: payload bytes only (exclude overlap prefix).
-            let payload = (len as u64).saturating_sub(prefix_len as u64);
-            ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
-            ctx.metrics.bytes_scanned = ctx.metrics.bytes_scanned.saturating_add(payload);
-            ctx.metrics.findings_emitted = ctx
-                .metrics
-                .findings_emitted
-                .saturating_add(ctx.scratch.pending.len() as u64);
 
             // Buffer returns to pool on drop (RAII).
             drop(buf);
@@ -734,7 +755,7 @@ impl<E: ScanEngine> ArchiveEntrySink for UringArchiveSink<'_, E> {
         self.findings_dropped = self.findings_dropped.saturating_add(effective_dropped);
 
         self.findings_emitted += self.pending.len() as u64;
-        emit_findings(self.engine, self.event_sink, &self.display, self.pending);
+        shared_emit_findings(self.engine, self.event_sink, &self.display, self.pending);
 
         self.bytes_scanned += chunk.new_bytes_len as u64;
         self.chunks_scanned += 1;
@@ -988,7 +1009,7 @@ fn extract_worker_loop<E: ScanEngine>(
         total_dropped = total_dropped.saturating_add(effective_dropped);
 
         total_findings += pending.len() as u64;
-        emit_findings(engine.as_ref(), &*event_sink, display, &pending);
+        shared_emit_findings(engine.as_ref(), &*event_sink, display, &pending);
 
         total_bytes += output_buf.len() as u64;
         total_chunks += 1;
@@ -2314,14 +2335,27 @@ fn io_worker_loop<E: ScanEngine>(
 
 /// Depth-first recursive directory walk that feeds files to I/O threads.
 ///
-/// Uses a stack-based DFS (not `WalkDir`) to avoid per-entry `stat` calls.
-/// `DirEntry::file_type()` uses `d_type` from `getdents64` on Linux (no
-/// extra syscall on ext4/xfs/btrfs). Size filtering is deferred to the
-/// I/O thread's async `statx`, which is already required for TOCTOU safety.
+/// # Design choices
 ///
-/// Files with recognized archive extensions are routed directly to archive
-/// workers (bypassing I/O threads), since archive scanning opens files itself.
-/// Symlinks are followed or skipped based on `cfg.follow_symlinks`.
+/// - **Stack-based DFS** (not `WalkDir`): avoids per-entry `stat` calls.
+///   `DirEntry::file_type()` uses `d_type` from `getdents64` on Linux (no
+///   extra syscall on ext4/xfs/btrfs). Size filtering is deferred to the
+///   I/O thread's async `statx`, which is already required for TOCTOU safety.
+///
+/// - **Archive short-circuit**: files with recognized archive extensions are
+///   routed directly to archive workers (bypassing I/O threads), since archive
+///   scanning opens files itself and does not benefit from io_uring reads.
+///
+/// - **Backpressure**: uses `CountBudget::acquire` (blocks when
+///   `max_in_flight_files` is reached) and bounded channel send (blocks when
+///   `file_queue_cap` is full). This keeps memory bounded regardless of
+///   directory tree depth or breadth.
+///
+/// # Symlink handling
+///
+/// When `cfg.follow_symlinks` is false, symlinks are skipped during walk.
+/// When true, symlink targets are resolved via `fs::metadata` to determine
+/// if the target is a file or directory.
 fn walk_and_send_files(
     root: &Path,
     cfg: &LocalFsUringConfig,
@@ -2469,20 +2503,43 @@ fn walk_and_send_files(
 
 /// Scan local filesystem using io_uring.
 ///
+/// This is the top-level entry point for the io_uring-based scanner. It
+/// orchestrates the full lifecycle described in the module-level architecture
+/// diagram: discovery → I/O threads → CPU executor → findings.
+///
+/// # Thread structure
+///
+/// The function spawns and joins all threads internally:
+/// - **1 main thread** (the caller): runs `walk_and_send_files` for discovery.
+/// - **`cfg.io_threads` I/O threads**: each owns an `IoUring` instance.
+/// - **`cfg.cpu_workers` CPU threads**: work-stealing executor for chunk scanning.
+/// - **`cpu_workers/4` archive threads** (if archives enabled): dedicated workers
+///   for archive decompression and scanning.
+/// - **`cpu_workers/4` extraction threads** (if `skip_binary`): dedicated workers
+///   for binary-extractable format scanning (`.jar`, `.class`, etc.).
+///
+/// All threads are joined before this function returns; no background work
+/// persists after the call.
+///
 /// # Arguments
 ///
-/// - `engine`: Detection engine implementing [`ScanEngine`]
-/// - `roots`: Root directories to scan
-/// - `cfg`: Configuration
-/// - `event_sink`: Event sink for findings
+/// - `engine`: Detection engine implementing [`ScanEngine`] (shared across all threads).
+/// - `roots`: Root directories to scan (walked depth-first).
+/// - `cfg`: Configuration (validated via [`LocalFsUringConfig::validate`]).
+/// - `event_sink`: Event sink for findings (thread-safe, shared across all threads).
 ///
 /// # Returns
 ///
-/// Tuple of (discovery summary, I/O stats, CPU metrics).
+/// `(LocalFsSummary, UringIoStats, MetricsSnapshot)` where:
+/// - `LocalFsSummary`: discovery-level counters (files seen, enqueued, errors).
+/// - `UringIoStats`: aggregated I/O thread counters (ops submitted/completed).
+/// - `MetricsSnapshot`: CPU-side metrics (bytes scanned, findings emitted),
+///   including merged archive and extraction worker stats.
 ///
 /// # Errors
 ///
-/// Returns `io::Error` if io_uring initialization fails or an I/O thread panics.
+/// Returns `io::Error` if io_uring initialization fails, an I/O thread panics,
+/// or `FileId` allocation overflows.
 pub fn scan_local_fs_uring<E: ScanEngine>(
     engine: Arc<E>,
     roots: &[PathBuf],

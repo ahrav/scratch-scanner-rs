@@ -1,7 +1,51 @@
-//! Shared archive scanning scaffolding.
+//! Shared archive scanning scaffolding for the blocking-I/O local scanner.
 //!
-//! Types and helpers used by all archive format modules (`local_fs_gzip`,
-//! `local_fs_tar`, `local_fs_zip`).
+//! # Purpose
+//!
+//! Provides types, budget-enforcement helpers, and the unified chunk-scan loop
+//! used by all archive format modules (`local_fs_gzip`, `local_fs_bzip2`,
+//! `local_fs_tar`, `local_fs_zip`). These format modules handle
+//! format-specific parsing (headers, central directories, stream framing)
+//! but delegate chunk scanning and budget enforcement back to this module.
+//!
+//! # Archive scanning model
+//!
+//! Archives are scanned as a tree of virtual entries. Each entry gets a
+//! virtual [`FileId`] from the high-bit namespace, a display path built by
+//! [`VirtualPathBuilder`], and a budget allocation tracked by
+//! [`ArchiveBudgets`]. The scanning loop follows the same overlap-carry
+//! pattern as top-level files, using [`ArchiveScanCtx::scan_and_emit_chunk`]
+//! which internally calls [`scan_chunk_postprocess`](super::shared_core::scan_chunk_postprocess).
+//!
+//! # Nesting
+//!
+//! Archives can contain archives (e.g., a `.tar.gz` inside a `.zip`).
+//! Nesting is handled by splitting [`LocalScratch`] buffers into disjoint
+//! per-depth slices via `split_first_mut`. Each nesting level consumes
+//! the head element of depth-indexed vectors (`vpaths`, `path_budget_used`,
+//! `tar_cursors`), passing the tail to the child context. This avoids
+//! aliasing while allowing recursion without heap allocation per level.
+//!
+//! # Budget enforcement
+//!
+//! Decompressed output is metered through `ArchiveBudgets`, which enforces:
+//! - Per-entry output byte caps
+//! - Per-archive output caps
+//! - Root-level (cross-archive) output caps
+//! - Inflation ratio limits (decompressed/compressed)
+//! - Wall-clock deadlines
+//!
+//! Budget violations stop scanning deterministically and produce
+//! [`ArchiveEnd::Partial`] or [`ArchiveEnd::Skipped`] outcomes so the
+//! caller can record the reason in metrics.
+//!
+//! # Key types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`ArchiveScanCtx`] | Borrowed per-depth scanning context (split from [`LocalScratch`]) |
+//! | [`ArchiveEnd`] | Outcome enum: fully scanned, skipped, or partial |
+//! | [`ChunkScanResult`] | Loop-iteration carry state from `scan_and_emit_chunk` |
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -25,9 +69,8 @@ use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
 use super::local_fs_tar::{process_tar_file, process_tarbz2_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
 use super::metrics::WorkerMetricsLocal;
-use super::scan_helpers::{
-    account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
-};
+use super::scan_helpers::emit_findings;
+use super::shared_core::scan_chunk_postprocess;
 use super::ts_buffer_pool::TsBufferPool;
 
 /// Allocate a virtual `FileId` for archive entries.
@@ -253,10 +296,29 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
     /// Scan a buffer chunk, drain/dedupe findings, emit events + persistence,
     /// and update chunk metrics.
     ///
-    /// Shared core used by compressed-stream archive entry scanning loops.
-    /// The caller is responsible for reading bytes, charging budgets, and
-    /// managing the outer loop condition — this method handles everything
-    /// from `scan_chunk_into` through carry/offset bookkeeping.
+    /// Shared core used by all compressed-stream archive entry scanning loops.
+    /// The caller is responsible for reading bytes from the decompressor,
+    /// charging budgets, and managing the outer loop condition — this method
+    /// handles everything from `scan_chunk_into` through finding emission
+    /// and carry/offset bookkeeping.
+    ///
+    /// # Arguments
+    ///
+    /// - `buf`: raw chunk buffer; `buf[..carry]` is overlap from the prior
+    ///   iteration, `buf[carry..carry+allowed]` is fresh decompressed payload.
+    /// - `carry`: overlap prefix byte count from the previous chunk.
+    /// - `offset`: absolute decompressed-stream offset of the first *new* byte.
+    /// - `allowed`: number of budget-approved payload bytes to scan.
+    /// - `overlap`: engine's `required_overlap()`, used to compute next carry.
+    /// - `file_id`: virtual file ID for this archive entry.
+    /// - `display`: display path bytes for finding attribution.
+    /// - `entry_scanned`: set to `true` on first successful scan; prevents
+    ///   double-counting entries in metrics.
+    ///
+    /// # Returns
+    ///
+    /// [`ChunkScanResult`] containing the updated offset, valid-byte count,
+    /// and overlap carry for the next loop iteration.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn scan_and_emit_chunk(
@@ -275,31 +337,21 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
         let base_offset = offset.saturating_sub(carry as u64);
         let data = &buf[..read_len];
 
-        self.engine
-            .scan_chunk_into(data, file_id, base_offset, self.scan_scratch);
-        let engine_dropped = self.scan_scratch.dropped_findings();
-        let before_prefix = self.scan_scratch.pending_findings_len();
+        scan_chunk_postprocess(
+            self.engine.as_ref(),
+            self.scan_scratch,
+            self.pending,
+            file_id,
+            base_offset,
+            carry,
+            data,
+            self.metrics,
+        );
+
         if !*entry_scanned {
             self.metrics.archive.record_entry_scanned();
             *entry_scanned = true;
         }
-
-        self.scan_scratch.drop_prefix_findings(offset);
-        let after_prefix = self.scan_scratch.pending_findings_len();
-
-        self.pending.clear();
-        self.scan_scratch.drain_findings_into(self.pending);
-
-        let dedupe_removed = apply_cross_rule_dedupe(self.pending, self.engine.as_ref());
-        let scheduler_pruned = before_prefix
-            .saturating_sub(after_prefix)
-            .saturating_add(dedupe_removed);
-        account_effective_dropped_findings(self.metrics, engine_dropped, scheduler_pruned);
-
-        self.metrics.findings_emitted = self
-            .metrics
-            .findings_emitted
-            .wrapping_add(self.pending.len() as u64);
 
         emit_persistence_batch(
             self.store_producer,
@@ -310,9 +362,6 @@ impl<'a, E: ScanEngine> ArchiveScanCtx<'a, E> {
             self.metrics,
         );
         emit_findings(self.engine.as_ref(), self.event_sink, display, self.pending);
-
-        self.metrics.chunks_scanned = self.metrics.chunks_scanned.saturating_add(1);
-        self.metrics.bytes_scanned = self.metrics.bytes_scanned.saturating_add(allowed);
 
         ChunkScanResult {
             offset: offset.saturating_add(allowed),
@@ -357,13 +406,25 @@ pub(super) fn charge_discarded_bytes(
 
 /// Apply decompressed-output budgeting for a read of `n` bytes.
 ///
-/// Returns `(allowed, clamped)` where:
-/// - `allowed` is the prefix length to scan/emit.
-/// - `clamped` signals the caller must stop after this iteration.
+/// Called after each decompressor read to enforce per-entry, per-archive, and
+/// root-level output caps plus inflation-ratio limits. The function may reduce
+/// the number of scannable bytes and signal that the caller must stop the loop.
 ///
-/// If the decoder produced more bytes than allowed, the extra bytes are charged
-/// as discarded output so archive/root counters and entry-ratio accounting stay
-/// consistent.
+/// # Returns
+///
+/// `(allowed, clamped)` where:
+/// - `allowed` is the prefix length (in bytes) the caller may scan/emit.
+///   May be less than `n` when a budget caps the output.
+/// - `clamped` is `true` when the caller must break out of the scan loop
+///   after processing this iteration (budget fully exhausted or entry skipped).
+///
+/// # Side effects
+///
+/// - Updates `entry_partial_reason` with the first budget-violation reason.
+/// - Sets `*outcome` to `Partial` and `*stop_archive` to `true` when the
+///   violation is archive-level (not just entry-level).
+/// - Charges excess bytes (`n - allowed`) as discarded output to keep budget
+///   counters consistent with the actual decompressor output.
 #[inline(always)]
 pub(super) fn apply_entry_budget_clamp(
     budgets: &mut ArchiveBudgets,
@@ -446,12 +507,25 @@ pub(super) fn discard_remaining_payload(
 ///
 /// Unified inner loop for nested compressed streams within tar archives.
 /// Both gzip and bzip2 formats use the same sliding-window + budget protocol;
-/// the only difference is the stream type, abstracted via [`CompressedStream`].
+/// the only difference is the decompressor, abstracted via [`CompressedStream`].
+///
+/// The loop reads decompressed bytes, charges them against budgets, scans via
+/// [`ArchiveScanCtx::scan_and_emit_chunk`], and carries overlap forward.
+/// It terminates on any of: EOF, decode error, budget exhaustion, or deadline.
+///
+/// # Arguments
+///
+/// - `stream`: decompressor implementing [`CompressedStream`].
+/// - `display`: display path bytes for finding attribution.
+/// - `corruption_reason`: the `PartialReason` to report if the decompressor
+///   returns an error (e.g., `MalformedGzip`, `MalformedBzip2`).
 ///
 /// # Invariants
-/// - Offsets are decompressed byte offsets.
-/// - Budget clamps stop scanning deterministically.
-/// - Decode failures map to `corruption_reason`.
+///
+/// - All offsets are in the decompressed byte space.
+/// - Budget clamps stop scanning deterministically; no silent data loss.
+/// - Compressed input bytes are tracked via `take_compressed_delta` so
+///   inflation-ratio enforcement uses real I/O counts, not estimates.
 pub(super) fn scan_compressed_stream_nested<E: ScanEngine, C: CompressedStream>(
     scan: &mut ArchiveScanCtx<'_, E>,
     stream: &mut C,

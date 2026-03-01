@@ -65,6 +65,7 @@ use super::executor::{Executor, ExecutorConfig, WorkerCtx};
 use super::local_fs_archive_ctx::{dispatch_archive_scan, ArchiveEnd};
 use super::local_fs_extract::extract_and_scan_file;
 use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
+use super::shared_core::{carry_overlap_prefix, scan_chunk_postprocess};
 use super::ts_buffer_pool::{TsBufferPool, TsBufferPoolConfig};
 use crate::api::FileId;
 use crate::archive::formats::{tar::TAR_BLOCK_LEN, TarCursor, ZipCursor};
@@ -321,12 +322,22 @@ pub(super) struct FileTask {
 
 /// Per-worker scratch state for local scanning.
 ///
+/// Each executor worker owns exactly one `LocalScratch`. It bundles the engine
+/// scratch, all reusable buffers for archive scanning, and configuration
+/// references. Nothing in this struct is shared across threads.
+///
 /// # Invariants
-/// - Buffers are preallocated and reused to avoid per-chunk allocations.
+///
+/// - All buffers are preallocated at worker init and reused to avoid per-chunk
+///   allocations. `pending` and `persist_batch` are sized to
+///   `max_findings_per_chunk` and must not grow.
 /// - Per-depth vectors (`vpaths`, `tar_cursors`, `path_budget_used`) are sized
-///   to `max_archive_depth + 2` and indexed by depth.
-/// - `next_virtual_file_id` stays in the high-bit namespace to avoid collisions
-///   with real file ids.
+///   to `max_archive_depth + 2` and indexed by nesting depth. The `+2`
+///   accommodates the root archive plus one level of format overhead.
+/// - `next_virtual_file_id` stays in the high-bit namespace (`0x8000_0000..`)
+///   to avoid collisions with real file IDs allocated by the discovery loop.
+/// - `budgets` is reset at the start of each archive scan via
+///   `ArchiveBudgets::begin_archive` — it is not per-entry state.
 pub(super) struct LocalScratch<E: ScanEngine> {
     pub(super) engine: Arc<E>,
     pub(super) pool: TsBufferPool,
@@ -429,8 +440,10 @@ pub struct LocalReport {
 
 /// Fixed-capacity stack buffer for diagnostic messages (no heap allocation).
 ///
-/// Implements [`fmt::Write`] so it can be used with `write!()`.  Output
-/// beyond `N` bytes is silently truncated.
+/// Used in error-reporting paths where allocating a `String` could fail or
+/// add unwanted latency. Implements [`fmt::Write`] so it can be used with
+/// `write!()`. Output beyond `N` bytes is silently truncated at a UTF-8
+/// character boundary to guarantee `as_str()` always returns valid UTF-8.
 struct StackMsg<const N: usize> {
     buf: [u8; N],
     len: usize,
@@ -517,9 +530,15 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
 /// Build and emit a persistence batch for one chunk's post-dedupe findings.
 ///
 /// No-ops when `store_producer` is `None` or `findings` is empty.
+///
+/// # Fail-soft design
+///
 /// On emit failure, increments `persistence_emit_failures` and emits a
-/// diagnostic event. The scan continues -- persistence errors are fail-soft
-/// per batch, not per run.
+/// diagnostic event, but does **not** abort the scan. Persistence errors
+/// are treated as recoverable per batch: the scan continues scanning
+/// subsequent chunks/files. At run end, if `persistence_emit_failures > 0`,
+/// the [`LocalStats::persistence_incomplete`] flag is set so callers know
+/// the persisted result set is potentially incomplete.
 #[inline]
 pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     store_producer: Option<&dyn StoreProducer>,
@@ -822,9 +841,7 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
     loop {
         // Move tail overlap bytes to front as next prefix
         // This is a tiny copy (overlap bytes, typically 16-256)
-        if carry > 0 && have > 0 {
-            buf.as_mut_slice().copy_within(have - carry..have, 0);
-        }
+        carry_overlap_prefix(buf.as_mut_slice(), have, carry);
 
         // First iteration reuses the bytes already in the buffer from
         // the probe read above; subsequent iterations read from disk.
@@ -884,47 +901,17 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         // For subsequent: base_offset = offset - carry
         let base_offset = offset.saturating_sub(carry as u64);
 
-        // Scan the chunk
-        #[cfg(all(feature = "perf-stats", debug_assertions))]
-        let scan_start_t = std::time::Instant::now();
-
         let data = &buf.as_slice()[..read_len];
-        engine.scan_chunk_into(data, task.file_id, base_offset, &mut scratch.scan_scratch);
-        let engine_dropped = scratch.scan_scratch.dropped_findings();
-        let before_prefix = scratch.scan_scratch.pending_findings_len();
-
-        #[cfg(all(feature = "perf-stats", debug_assertions))]
-        {
-            ctx.metrics.scan_ns = ctx
-                .metrics
-                .scan_ns
-                .saturating_add(scan_start_t.elapsed().as_nanos() as u64);
-        }
-
-        // Drop findings whose root_hint_end is in the prefix region.
-        // These will be (or were) found by the chunk that "owns" those bytes.
-        // new_bytes_start == offset (the first truly new byte in this scan)
-        let new_bytes_start = offset;
-        scratch.scan_scratch.drop_prefix_findings(new_bytes_start);
-        let after_prefix = scratch.scan_scratch.pending_findings_len();
-
-        // Extract findings
-        scratch.pending.clear();
-        scratch
-            .scan_scratch
-            .drain_findings_into(&mut scratch.pending);
-
-        let dedupe_removed = apply_cross_rule_dedupe(&mut scratch.pending, engine.as_ref());
-        let scheduler_pruned = before_prefix
-            .saturating_sub(after_prefix)
-            .saturating_add(dedupe_removed);
-        account_effective_dropped_findings(&mut ctx.metrics, engine_dropped, scheduler_pruned);
-
-        // Count findings before emitting (pending.len() is the count for this chunk)
-        ctx.metrics.findings_emitted = ctx
-            .metrics
-            .findings_emitted
-            .saturating_add(scratch.pending.len() as u64);
+        scan_chunk_postprocess(
+            engine.as_ref(),
+            &mut scratch.scan_scratch,
+            &mut scratch.pending,
+            task.file_id,
+            base_offset,
+            carry,
+            data,
+            &mut ctx.metrics,
+        );
 
         emit_persistence_batch(
             scratch.store_producer.as_deref(),
@@ -942,16 +929,8 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             &scratch.pending,
         );
 
-        // Update metrics with ACTUAL bytes scanned (not planned)
-        let actual_payload = n; // New bytes read this iteration
-        ctx.metrics.chunks_scanned = ctx.metrics.chunks_scanned.saturating_add(1);
-        ctx.metrics.bytes_scanned = ctx
-            .metrics
-            .bytes_scanned
-            .saturating_add(actual_payload as u64);
-
         // Advance offset by actual payload read
-        offset = offset.saturating_add(actual_payload as u64);
+        offset = offset.saturating_add(n as u64);
         have = read_len;
         carry = overlap.min(read_len);
 
@@ -967,8 +946,11 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
 
 /// Advise the kernel that this file will be read sequentially.
 ///
-/// On Linux this doubles the default readahead window and avoids
-/// random-access penalties. Advisory and non-blocking; errors ignored.
+/// On Linux this doubles the default readahead window (from ~128 KiB to
+/// ~256 KiB on typical configs) and tells the VM not to expect random
+/// access, improving prefetch hit rates for the sequential chunk reads
+/// that follow. Advisory and non-blocking; errors are ignored because
+/// `posix_fadvise` never modifies file state.
 #[cfg(target_os = "linux")]
 fn hint_sequential(file: &File, len: u64) {
     use std::os::unix::io::AsRawFd;
