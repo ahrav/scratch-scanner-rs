@@ -512,6 +512,38 @@ fn finding_key_derived_eq_and_hash_cover_all_fields() {
     );
 }
 
+/// Derived `Ord` on `FindingKey` orders by field declaration order:
+/// `(start, end, rule_id, norm_hash)`. This test documents that expectation
+/// so field reordering doesn't silently change dedup semantics.
+#[test]
+fn finding_key_ord_follows_field_declaration_order() {
+    let base = FindingKey {
+        start: 0,
+        end: 10,
+        rule_id: 1,
+        norm_hash: [0x00; 32],
+    };
+
+    // Differs only in `start`.
+    let higher_start = FindingKey { start: 1, ..base };
+    assert!(base < higher_start, "start is the primary sort key");
+
+    // Same start, differs in `end`.
+    let higher_end = FindingKey { end: 11, ..base };
+    assert!(base < higher_end, "end breaks ties after start");
+
+    // Same start+end, differs in `rule_id`.
+    let higher_rule = FindingKey { rule_id: 2, ..base };
+    assert!(base < higher_rule, "rule_id breaks ties after end");
+
+    // Same start+end+rule_id, differs in `norm_hash`.
+    let higher_hash = FindingKey {
+        norm_hash: [0x01; 32],
+        ..base
+    };
+    assert!(base < higher_hash, "norm_hash breaks ties after rule_id");
+}
+
 // -- sort_and_dedupe_findings edge cases ------------------------------------
 
 #[test]
