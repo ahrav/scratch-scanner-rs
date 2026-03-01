@@ -740,32 +740,6 @@ impl IoErrorClassifier {
 }
 
 // ============================================================================
-// Connector-level IO → ReadError classifier
-// ============================================================================
-
-/// Classify a [`std::io::Error`] into a [`ReadError`] for connector read paths.
-///
-/// Permanent kinds (NotFound, PermissionDenied, InvalidInput, InvalidData,
-/// Unsupported) produce a non-retryable error; everything else is retryable.
-#[cfg(feature = "connector-pipeline")]
-pub(crate) fn classify_io_read_error(
-    err: std::io::Error,
-    context: &str,
-) -> gossip_contracts::connector::ReadError {
-    use gossip_contracts::connector::ReadError;
-
-    let msg = format!("{context}: {err}");
-    match err.kind() {
-        std::io::ErrorKind::NotFound
-        | std::io::ErrorKind::PermissionDenied
-        | std::io::ErrorKind::InvalidInput
-        | std::io::ErrorKind::InvalidData
-        | std::io::ErrorKind::Unsupported => ReadError::permanent(msg),
-        _ => ReadError::retryable(msg),
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 

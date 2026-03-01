@@ -183,7 +183,7 @@ pub struct NamespaceCounts {
 
 /// Returns the finding slice for a span produced by the engine adapter.
 ///
-/// The span must be in-bounds for `arena`; this is enforced by debug asserts.
+/// The span must be in-bounds for `arena`; this is enforced by an assertion.
 fn finding_slice(span: FindingSpan, arena: &[ScoredFinding]) -> &[ScoredFinding] {
     let start = span.start as usize;
     let end = start.saturating_add(span.len as usize);
