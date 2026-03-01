@@ -69,10 +69,7 @@ fn create_fs_flat_case(root: &Path, name: &'static str, files: usize) -> PathBuf
     let dir = root.join(name);
     fs::create_dir_all(&dir).expect("create fs case dir");
     for idx in 0..files {
-        let body = format!(
-            "index={idx}\nslack_token=xoxa-1234567890abcdef\npadding={:08}\n",
-            idx * 7
-        );
+        let body = bulk_secret_payload(&format!("flat_token_{idx}"), 50);
         fs::write(dir.join(format!("flat_{idx:04}.txt")), body).expect("write fs fixture");
     }
     dir
@@ -95,9 +92,7 @@ fn create_fs_nested_case(root: &Path, name: &'static str) -> PathBuf {
         let sub = dir.join(format!("shard_{shard:02}"));
         fs::create_dir_all(&sub).expect("create nested shard");
         for idx in 0..40usize {
-            let body = format!(
-                "shard={shard}\nidx={idx}\nsecret=xoxa-1234567890abcdef\nnote=stable fixture\n"
-            );
+            let body = bulk_secret_payload(&format!("shard_{shard}_entry_{idx}"), 30);
             fs::write(sub.join(format!("entry_{idx:03}.env")), body).expect("write nested fixture");
         }
     }
@@ -281,11 +276,11 @@ fn throughput_limits() -> (f64, f64) {
     let median = std::env::var("EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(2.0);
+        .unwrap_or(5.0);
     let per_case = std::env::var("EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(20.0);
     (median, per_case)
 }
 

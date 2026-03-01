@@ -149,6 +149,11 @@ is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
 Throughput sampling enforces a minimum of 5 iterations per case (with warmup)
 to reduce startup jitter before threshold evaluation.
 
+Phase-6 defaulting decisions additionally require sustained-green policy
+evaluation across CI windows; see
+`docs/migration-defaulting-closeout.md` and
+`tools/migration-parity/sustained_green_gate.py`.
+
 ### Commands
 
 ```bash
