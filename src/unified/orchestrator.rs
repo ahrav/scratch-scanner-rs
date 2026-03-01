@@ -52,6 +52,7 @@ use crate::git_scan::{
 use crate::scheduler::local_fs_owner::LocalReport;
 #[cfg(feature = "connector-pipeline")]
 use crate::scheduler::local_fs_owner::LocalStats;
+use crate::store::StoreProducer as _;
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::cli::TransformFilter;
@@ -224,6 +225,9 @@ fn run_fs_connector(
 /// which provides the same scanning behaviour through the work-stealing
 /// executor.  This keeps FS scans functional for default builds without
 /// requiring the Gossip-rs path dependencies.
+///
+/// When `persist_findings` is enabled, wires a [`SqliteStoreProducer`] into
+/// the scan config and finalizes the run after scanning completes.
 #[cfg(not(feature = "connector-pipeline"))]
 fn run_fs_connector(
     engine: Arc<Engine>,
@@ -231,6 +235,12 @@ fn run_fs_connector(
     event_sink: Arc<dyn super::events::EventSink>,
 ) -> io::Result<LocalReport> {
     use crate::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
+
+    let producer = if cfg.persist_findings {
+        Some(open_fs_store_producer(&cfg.root)?)
+    } else {
+        None
+    };
 
     let mut scan_cfg = ParallelScanConfig {
         workers: cfg.workers.max(1),
@@ -241,6 +251,9 @@ fn run_fs_connector(
         respect_gitignore: false,
         skip_binary: !cfg.scan_binary,
         event_sink,
+        store_producer: producer
+            .clone()
+            .map(|p| p as Arc<dyn crate::store::StoreProducer>),
         ..Default::default()
     };
 
@@ -248,13 +261,58 @@ fn run_fs_connector(
         scan_cfg.archive.enabled = false;
     }
 
-    if cfg.persist_findings {
-        return Err(io::Error::other(
-            "filesystem persistence is not yet supported in fallback mode",
-        ));
+    let report = parallel_scan_dir(&cfg.root, engine, scan_cfg)?;
+
+    if let Some(ref p) = producer {
+        let had_limits =
+            report.stats.dropped_findings > 0 || report.stats.persistence_emit_failures > 0;
+        if let Err(e) = p.end_run(had_limits) {
+            eprintln!("warn: persistence finalization failed: {}", e.detail());
+        }
     }
 
-    parallel_scan_dir(&cfg.root, engine, scan_cfg)
+    Ok(report)
+}
+
+/// Create a [`SqliteStoreProducer`] rooted at `<scan_root>/.scanner-store/findings.db`.
+///
+/// Derives a deterministic root identity from the scan root's canonical path
+/// so that repeat scans of the same directory share identity records.
+fn open_fs_store_producer(
+    scan_root: &Path,
+) -> io::Result<Arc<crate::store::db::writer::SqliteStoreProducer>> {
+    use crate::store::db::writer::{SqliteStoreConfig, SqliteStoreProducer};
+    use crate::store::keys::StoreKeys;
+    use crate::store::root_id::{self, RootIdInput, RootKind};
+
+    let keys = StoreKeys::bootstrap_from_env();
+    let canonical = scan_root
+        .canonicalize()
+        .unwrap_or_else(|_| scan_root.to_path_buf());
+    let root_id = root_id::root_id(
+        &RootIdInput {
+            kind: RootKind::Fs,
+            identity_scheme: "fs_path_v1",
+            canonical_identity: canonical.as_os_str().as_encoded_bytes(),
+        },
+        &keys,
+    );
+
+    let db_path = scan_root.join(".scanner-store").join("findings.db");
+    let config = SqliteStoreConfig {
+        db_path,
+        root_id,
+        root_kind: RootKind::Fs,
+        identity_scheme: "fs_path_v1".to_string(),
+        canonical_identity: canonical.as_os_str().as_encoded_bytes().to_vec(),
+        display_name: Some(canonical.display().to_string()),
+        id_hash_mode: keys.id_hash_mode(),
+        scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    };
+
+    SqliteStoreProducer::open(config)
+        .map(Arc::new)
+        .map_err(|e| io::Error::other(format!("cannot open persistence store: {}", e.detail())))
 }
 
 /// Filesystem scan path.
