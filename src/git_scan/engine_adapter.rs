@@ -134,9 +134,8 @@ impl Default for EngineAdapterConfig {
 /// long-lived persistence structures.
 ///
 /// Identity key is `(start, end, rule_id, norm_hash)`.
-/// `PartialEq`, `Eq`, and `Hash` are implemented manually over the identity
-/// key only; `Ord`/`PartialOrd` are deliberately absent to force callers
-/// through `sort_and_dedupe_findings`.
+/// All identity traits (`PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd`)
+/// are derived over the full field tuple.
 ///
 /// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
 /// a *best-effort root match span* in blob coordinates. For transform-derived
@@ -160,7 +159,7 @@ pub struct FindingKey {
 /// confidence when multiple scans produce the same identity key.
 /// `confidence_score` does not participate in persistence keying (see
 /// `build_finding_key` in `finalize.rs`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScoredFinding {
     pub key: FindingKey,
     pub confidence_score: i8,
