@@ -273,7 +273,8 @@ fn parity_iterations() -> usize {
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|iters| *iters > 0)
-        .unwrap_or(5)
+        .unwrap_or(9)
+        .max(5)
 }
 
 fn throughput_limits() -> (f64, f64) {
@@ -284,7 +285,7 @@ fn throughput_limits() -> (f64, f64) {
     let per_case = std::env::var("EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(10.0);
+        .unwrap_or(5.0);
     (median, per_case)
 }
 
@@ -309,11 +310,8 @@ fn execution_mode_parity_matrix_and_thresholds() {
         );
     }
 
-    // Phase 2: Throughput parity — informational.
-    // Small test fixtures complete in milliseconds, so throughput measurements
-    // are dominated by process startup and OS scheduling jitter. On shared CI
-    // runners, per-case variance of 20-50% is routine. We still collect and
-    // print the data (useful for local profiling), but do not fail the test.
+    // Phase 2: Throughput parity — hard gate.
+    // Median absolute delta must stay <= 2% and per-case absolute delta <= 5%.
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
         // Warmup: absorb cold-cache / process-startup costs.
@@ -363,17 +361,17 @@ fn execution_mode_parity_matrix_and_thresholds() {
         .collect::<Vec<_>>()
         .join(", ");
     let deltas: Vec<f64> = results.iter().map(|result| result.delta_pct).collect();
-    match enforce_throughput_thresholds(&deltas, median_limit_pct, per_case_limit_pct) {
-        Ok(_) => {
-            eprintln!("throughput parity OK: [{details}]");
-        }
-        Err(err) => {
-            eprintln!(
-                "throughput parity WARNING (median_limit={}%, per_case_limit={}%): [{details}]: {err}",
-                median_limit_pct, per_case_limit_pct
-            );
-        }
-    }
+    let median_abs = enforce_throughput_thresholds(&deltas, median_limit_pct, per_case_limit_pct)
+        .unwrap_or_else(|err| {
+            panic!(
+                "throughput parity failed (iters={}, median_limit={}%, per_case_limit={}%): [{}]: {}",
+                iterations, median_limit_pct, per_case_limit_pct, details, err
+            )
+        });
+    eprintln!(
+        "throughput parity OK (iters={}, median_abs={:.4}%): [{}]",
+        iterations, median_abs, details
+    );
 }
 
 #[test]

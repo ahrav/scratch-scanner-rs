@@ -127,7 +127,7 @@ flowchart TD
 Mode 3 is a migration gate that validates parity between execution modes:
 - CLI execution mode selector: `--execution-mode=direct|connector`
 - Exact finding parity after canonical normalization
-- Throughput drift thresholds:
+- Throughput drift thresholds (hard gate):
 - median absolute delta across matrix cases <= 2%
 - per-case absolute delta <= 5%
 
@@ -146,14 +146,17 @@ is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
 - Git linear history fixture
 - Git branch-and-merge fixture
 
+Throughput sampling enforces a minimum of 5 iterations per case (with warmup)
+to reduce startup jitter before threshold evaluation.
+
 ### Commands
 
 ```bash
-# Run the parity gate locally (uses defaults: 5 iterations, 2%/5% thresholds)
+# Run the parity gate locally (uses defaults: 9 iterations, 2%/5% thresholds)
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
 # Optional tuning knobs for local stress/debug
-EXECUTION_MODE_PARITY_ITERS=5 \
+EXECUTION_MODE_PARITY_ITERS=9 \
 EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
 EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
@@ -169,9 +172,9 @@ The matrix validates:
 
 | Axis | Fixture row | Expected |
 |---|---|---|
-| Hidden files | `.hidden.txt` | Included by both |
+| Hidden files and dirs | `.hidden.txt`, `.hidden_dir/inside.txt` | Included by both |
 | Gitignore handling | `.gitignore` + `ignored.txt` | Included by both (gitignore not enforced) |
-| Symlink policy | `link_file.txt`, `link_dir` | Skipped by both |
+| Symlink policy | `link_file.txt`, `link_dir`, `link_dir/included.txt` | Skipped by both (no symlink traversal) |
 | Binary-like paths | `blob.bin` | Included by both |
 | Archive-like paths | `bundle.zip` | Included by both |
 | Non-UTF8 path bytes | raw bytes file name | Byte-identical inclusion when filesystem supports creation |
