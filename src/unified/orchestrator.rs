@@ -152,15 +152,17 @@ fn run_fs(
     use super::SourceKind;
 
     let t0 = Instant::now();
+    let workers = cfg.workers.max(1);
     let rules = load_rules_for_scan(rules_file.as_deref());
     let store_producer: Option<Arc<dyn StoreProducer>> = if cfg.persist_findings {
         let store_dir = cfg.root.join(".scanner-store");
         let keys = StoreKeys::bootstrap_from_env();
+        let canonical = cfg.root.canonicalize().unwrap_or_else(|_| cfg.root.clone());
         let root_id = crate::store::root_id::root_id(
             &crate::store::RootIdInput {
                 kind: RootKind::Fs,
                 identity_scheme: "fs_path_v1",
-                canonical_identity: cfg.root.to_string_lossy().as_bytes(),
+                canonical_identity: canonical.as_os_str().as_encoded_bytes(),
             },
             &keys,
         );
@@ -169,8 +171,8 @@ fn run_fs(
             root_id,
             root_kind: RootKind::Fs,
             identity_scheme: "fs_path_v1".to_string(),
-            canonical_identity: cfg.root.to_string_lossy().as_bytes().to_vec(),
-            display_name: Some(cfg.root.display().to_string()),
+            canonical_identity: canonical.as_os_str().as_encoded_bytes().to_vec(),
+            display_name: Some(canonical.display().to_string()),
             id_hash_mode: keys.id_hash_mode(),
             scanner_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
@@ -214,7 +216,7 @@ fn run_fs(
     };
 
     let mut ps_config = ParallelScanConfig {
-        workers: cfg.workers,
+        workers,
         skip_hidden: false,
         respect_gitignore: false,
         event_sink: Arc::clone(&event_sink),
@@ -243,7 +245,7 @@ fn run_fs(
 
         match backend {
             FsBackend::Uring => {
-                let io_threads = (cfg.workers / 4).max(2);
+                let io_threads = (workers / 4).max(2);
                 let io_depth = defaults.io_depth;
                 // pool_buffers must be >= io_threads * io_depth (assertion floor), but
                 // the real requirement is headroom ABOVE that so completed I/O can sit
@@ -251,11 +253,11 @@ fn run_fs(
                 // headroom every buffer is in-flight and try_acquire() fails, stalling
                 // both I/O submission and the CPU pipeline.
                 let io_pool = io_threads * io_depth;
-                let cpu_headroom = cfg.workers * 4;
+                let cpu_headroom = workers * 4;
                 let pool_buffers = io_pool + cpu_headroom;
 
                 let uring_cfg = LocalFsUringConfig {
-                    cpu_workers: cfg.workers,
+                    cpu_workers: workers,
                     io_threads,
                     io_depth,
                     chunk_size: ps_config.chunk_size,
@@ -365,7 +367,7 @@ fn run_fs(
         report.metrics.persist_ns / 1_000_000,
         total_elapsed.as_millis(),
         throughput_mib,
-        cfg.workers,
+        workers,
     );
 
     Ok(())
