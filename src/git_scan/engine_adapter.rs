@@ -133,10 +133,9 @@ impl Default for EngineAdapterConfig {
 /// represented only by its `NormHash`, avoiding sensitive data in
 /// long-lived persistence structures.
 ///
-/// Order is total and stable: `(start, end, rule_id, norm_hash)`.
-/// This derived ordering means findings sort by position first, then
-/// by rule, then by secret identity — which makes sort+dedup deterministic
-/// regardless of scan-chunk ordering.
+/// Identity key is `(start, end, rule_id, norm_hash)`.
+/// All identity traits (`PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd`)
+/// are derived over the full field tuple.
 ///
 /// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
 /// a *best-effort root match span* in blob coordinates. For transform-derived
@@ -152,6 +151,40 @@ pub struct FindingKey {
     /// Normalized secret hash — the sole representation of the matched
     /// secret, so raw secret bytes never appear in scan output structures.
     pub norm_hash: NormHash,
+}
+
+/// A finding paired with its confidence score from gate evaluation.
+///
+/// The arena stores `ScoredFinding` so that dedup can prefer the highest
+/// confidence when multiple scans produce the same identity key.
+/// `confidence_score` does not participate in persistence keying (see
+/// `build_finding_key` in `finalize.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScoredFinding {
+    pub key: FindingKey,
+    pub confidence_score: i8,
+}
+
+/// Sort findings by identity and dedupe equal identities in place.
+///
+/// Tie-breaker inside an identity group is descending confidence, so dedupe
+/// keeps the most informative score. The first (highest-confidence) entry
+/// in each identity group survives.
+#[inline]
+pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<ScoredFinding>) {
+    findings.sort_unstable_by(|a, b| {
+        a.key
+            .cmp(&b.key)
+            .then_with(|| b.confidence_score.cmp(&a.confidence_score))
+    });
+    findings.dedup_by(|a, b| {
+        let same = a.key == b.key;
+        debug_assert!(
+            !same || b.confidence_score >= a.confidence_score,
+            "sort must place highest confidence first within identity group"
+        );
+        same
+    });
 }
 
 /// Range into the adapter findings arena for a single blob.
@@ -188,7 +221,7 @@ pub struct ScannedBlobs {
     /// Blobs scanned in candidate order.
     pub blobs: Vec<ScannedBlob>,
     /// Shared findings arena referenced by `ScannedBlob.findings`.
-    pub finding_arena: Vec<FindingKey>,
+    pub finding_arena: Vec<ScoredFinding>,
 }
 
 /// Always-on Git scan counters for user-facing summaries.
@@ -288,7 +321,7 @@ impl From<EngineAdapterError> for PackExecError {
 /// - **Event stream** — structured [`ScanEvent::Finding`] events emitted
 ///   to the configured `EventSink` for real-time consumption (dashboards,
 ///   progress reporting, CI integrations).
-/// - **Arena accumulation** — `FindingKey` values appended to a shared
+/// - **Arena accumulation** — `ScoredFinding` values appended to a shared
 ///   arena for batch persistence after the scan completes.
 ///
 /// The adapter is `Send` so it can be pooled across scoped-thread
@@ -300,11 +333,11 @@ pub struct EngineAdapter<'a> {
     results: Vec<ScannedBlob>,
     /// Accumulated findings across all blobs; each `ScannedBlob.findings`
     /// indexes a contiguous span here.
-    findings_arena: Vec<FindingKey>,
+    findings_arena: Vec<ScoredFinding>,
     /// Per-blob scratch: populated by `scan_blob_into_buf`, read by
     /// `stream_findings`, drained into the arena by `record_findings`,
     /// then cleared at the start of the next `scan_blob_into_buf` call.
-    findings_buf: Vec<FindingKey>,
+    findings_buf: Vec<ScoredFinding>,
     chunker: RingChunker,
     // Monotone ID for this adapter instance; wraps on overflow.
     next_file_id: u32,
@@ -383,7 +416,7 @@ impl<'a> EngineAdapter<'a> {
     ///
     /// Each `ScannedBlob.findings` references a span in this arena.
     #[must_use]
-    pub fn findings_arena(&self) -> &[FindingKey] {
+    pub fn findings_arena(&self) -> &[ScoredFinding] {
         &self.findings_arena
     }
 
@@ -517,17 +550,13 @@ impl<'a> EngineAdapter<'a> {
             self.event_sink.emit(ScanEvent::Finding(FindingEvent {
                 source: SourceKind::Git,
                 object_path: path,
-                start: u64::from(f.start),
-                end: u64::from(f.end),
-                rule_id: f.rule_id,
-                rule_name: self.engine.rule_name(f.rule_id),
+                start: u64::from(f.key.start),
+                end: u64::from(f.key.end),
+                rule_id: f.key.rule_id,
+                rule_name: self.engine.rule_name(f.key.rule_id),
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
-                // Git adapter does not run gate evaluation — confidence_score is
-                // hardcoded to 0 (indistinguishable from "zero gates fired").
-                // TODO: thread confidence_score through FindingKey when gate
-                // evaluation is wired for Git scans.
-                confidence_score: 0,
+                confidence_score: f.confidence_score,
             }));
         }
     }
@@ -718,7 +747,7 @@ pub fn scan_blob_chunked(
     engine: &Engine,
     blob: &[u8],
     chunk_bytes: usize,
-) -> Result<Vec<FindingKey>, EngineAdapterError> {
+) -> Result<Vec<ScoredFinding>, EngineAdapterError> {
     let overlap = engine.required_overlap();
     let chunk_bytes = effective_chunk_bytes(chunk_bytes, overlap);
     let mut scratch = engine.new_scratch();
@@ -779,7 +808,7 @@ fn scan_blob_chunked_into(
     blob: &[u8],
     chunk_bytes: usize,
     overlap: usize,
-    out: &mut Vec<FindingKey>,
+    out: &mut Vec<ScoredFinding>,
 ) -> Result<(), EngineAdapterError> {
     let mut chunker = RingChunker::new(chunk_bytes, overlap);
     scan_blob_chunked_with_chunker(engine, scratch, file_id, blob, overlap, &mut chunker, out)
@@ -811,7 +840,7 @@ fn scan_blob_chunked_with_chunker(
     blob: &[u8],
     overlap: usize,
     chunker: &mut RingChunker,
-    out: &mut Vec<FindingKey>,
+    out: &mut Vec<ScoredFinding>,
 ) -> Result<(), EngineAdapterError> {
     perf::record_scan_blob();
 
@@ -844,8 +873,7 @@ fn scan_blob_chunked_with_chunker(
 
             let ((), _sd_nanos) = perf::time(|| {
                 if !out.is_empty() {
-                    out.sort_unstable();
-                    out.dedup();
+                    sort_and_dedupe_findings(out);
                 }
             });
             perf::record_scan_sort_dedup(_sd_nanos);
@@ -896,8 +924,7 @@ fn scan_blob_chunked_with_chunker(
 
         let ((), _sd_nanos) = perf::time(|| {
             if !out.is_empty() {
-                out.sort_unstable();
-                out.dedup();
+                sort_and_dedupe_findings(out);
             }
         });
         perf::record_scan_sort_dedup(_sd_nanos);
@@ -932,7 +959,7 @@ fn scan_chunk(
     file_id: FileId,
     overlap: usize,
     view: ChunkView<'_>,
-    out: &mut Vec<FindingKey>,
+    out: &mut Vec<ScoredFinding>,
     err: &mut Option<EngineAdapterError>,
 ) {
     perf::record_scan_chunk();
@@ -957,11 +984,14 @@ fn scan_chunk(
             *err = Some(EngineAdapterError::FindingOffsetOverflow { start, end });
             return;
         }
-        out.push(FindingKey {
-            start: start as u32,
-            end: end as u32,
-            rule_id: rec.rule_id,
-            norm_hash: *hash,
+        out.push(ScoredFinding {
+            key: FindingKey {
+                start: start as u32,
+                end: end as u32,
+                rule_id: rec.rule_id,
+                norm_hash: *hash,
+            },
+            confidence_score: rec.confidence_score,
         });
     }
 }
@@ -1132,843 +1162,5 @@ const _: () = {
 };
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::git_scan::alloc_guard;
-    use crate::git_scan::pack_candidates::LooseCandidate;
-    use crate::git_scan::tree_candidate::{CandidateContext, ChangeKind};
-    use crate::git_scan::ByteRef;
-    use crate::{demo_engine_with_anchor_mode, AnchorMode};
-
-    /// Verify that the scan hot path allocates nothing after warmup.
-    ///
-    /// The alloc guard uses **global** counters, so allocations from any
-    /// thread are visible. Run with:
-    ///
-    /// ```sh
-    /// SCANNER_RS_ALLOC_GUARD=1 cargo test --lib scan_alloc_guard_no_alloc_after_warmup \
-    ///     -- --test-threads=1
-    /// ```
-    #[test]
-    fn scan_alloc_guard_no_alloc_after_warmup() {
-        if std::env::var("SCANNER_RS_ALLOC_GUARD").ok().as_deref() != Some("1") {
-            eprintln!(
-                "alloc guard test skipped; set SCANNER_RS_ALLOC_GUARD=1 and \
-                 run with --test-threads=1 to enable"
-            );
-            return;
-        }
-
-        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
-
-        let ctx = CandidateContext {
-            commit_id: 0,
-            parent_idx: 0,
-            change_kind: ChangeKind::Add,
-            ctx_flags: 0,
-            cand_flags: 0,
-            path_ref: ByteRef::new(0, 0),
-        };
-        let candidate = LooseCandidate {
-            oid: OidBytes::from_slice(&[0u8; 20]),
-            ctx,
-        };
-        let path = b"test.txt";
-        let blob = b"no findings here";
-
-        alloc_guard::set_enabled(false);
-        adapter
-            .emit_loose(&candidate, path, blob)
-            .expect("warmup scan");
-
-        alloc_guard::set_enabled(true);
-        adapter
-            .emit_loose(&candidate, path, blob)
-            .expect("guarded scan");
-        alloc_guard::set_enabled(false);
-    }
-
-    fn make_candidate() -> LooseCandidate {
-        make_candidate_with_ctx(0, ChangeKind::Add)
-    }
-
-    /// Blob of exactly chunk_bytes takes the bypass path (single chunk).
-    #[test]
-    fn chunker_bypass_exact_chunk_size() {
-        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-        let config = EngineAdapterConfig::default();
-        let mut adapter = EngineAdapter::new(&engine, config);
-        let candidate = make_candidate();
-
-        // Blob exactly chunk_bytes long — should take bypass (one chunk).
-        let blob = vec![b'a'; config.chunk_bytes];
-        adapter
-            .emit_loose(&candidate, b"test.txt", &blob)
-            .expect("exact chunk_bytes scan");
-        assert_eq!(adapter.results().len(), 1);
-    }
-
-    /// Blob of chunk_bytes + 1 takes the slow path (two chunks).
-    #[test]
-    fn chunker_slow_path_chunk_size_plus_one() {
-        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-        let config = EngineAdapterConfig::default();
-        let mut adapter = EngineAdapter::new(&engine, config);
-        let candidate = make_candidate();
-
-        // Blob one byte over chunk_bytes — must use the ring chunker.
-        let blob = vec![b'a'; config.chunk_bytes + 1];
-        adapter
-            .emit_loose(&candidate, b"test.txt", &blob)
-            .expect("chunk_bytes+1 scan");
-        assert_eq!(adapter.results().len(), 1);
-    }
-
-    /// Binary blob (contains NUL byte) is skipped entirely.
-    #[test]
-    fn binary_blob_skipped() {
-        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
-        let candidate = make_candidate();
-
-        let mut blob = vec![b'a'; 1024];
-        blob[512] = 0; // NUL byte at offset 512
-        adapter
-            .emit_loose(&candidate, b"image.png", &blob)
-            .expect("binary scan");
-        // Should have a result entry with zero findings.
-        assert_eq!(adapter.results().len(), 1);
-        assert_eq!(adapter.results()[0].findings.len, 0);
-    }
-
-    /// Pure-text blob is not skipped.
-    #[test]
-    fn text_blob_not_skipped() {
-        let engine = demo_engine_with_anchor_mode(AnchorMode::Manual);
-        let mut adapter = EngineAdapter::new(&engine, EngineAdapterConfig::default());
-        let candidate = make_candidate();
-
-        let blob = b"this is plain text with no NUL bytes";
-        adapter
-            .emit_loose(&candidate, b"readme.txt", blob)
-            .expect("text scan");
-        assert_eq!(adapter.results().len(), 1);
-    }
-
-    /// is_likely_binary edge cases (delegated to content_policy).
-    #[test]
-    fn is_likely_binary_edge_cases() {
-        use crate::content_policy::is_likely_binary;
-        // Empty blob is not binary.
-        assert!(!is_likely_binary(b"", 8192));
-        // All-text is not binary.
-        assert!(!is_likely_binary(b"hello world", 8192));
-        // NUL at first byte.
-        assert!(is_likely_binary(b"\0hello", 8192));
-        // NUL beyond check_len is not detected.
-        let mut data = vec![b'a'; 100];
-        data.push(0);
-        assert!(!is_likely_binary(&data, 100));
-        // NUL at exact boundary.
-        let mut data2 = vec![b'a'; 99];
-        data2.push(0);
-        assert!(is_likely_binary(&data2, 100));
-    }
-
-    // -- Attribution event tests ------------------------------------------------
-
-    use crate::git_scan::commit_graph::CommitGraphIndex;
-    use crate::stdx::AtomicBitSet;
-    use crate::unified::events::{EventSink, ScanEvent, VecEventSink};
-    use std::sync::{Condvar, Mutex};
-    use std::time::{Duration, Instant};
-
-    /// Build a test adapter with event sink and dummy commit-graph / bitset.
-    ///
-    /// The dummy graph is empty and the bitset has a single bit; this means
-    /// `stream_findings` will skip commit-meta emission (commit_id out of
-    /// range), which is fine for tests that only verify finding events.
-    fn test_adapter_with_sink<'a>(
-        engine: &'a Engine,
-        sink: Arc<VecEventSink>,
-    ) -> EngineAdapter<'a> {
-        EngineAdapter::new_with_event_sink(
-            engine,
-            EngineAdapterConfig::default(),
-            CommitMetaContext {
-                event_sink: sink,
-                commit_graph_index: Arc::new(CommitGraphIndex::empty()),
-                commit_meta_seen: Arc::new(AtomicBitSet::empty(1)),
-                identity_interner: None,
-            },
-        )
-    }
-    use crate::{
-        demo_tuning, AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode,
-        ValidatorKind,
-    };
-    use regex::bytes::Regex;
-
-    fn test_engine_with_tok_rule() -> Engine {
-        let rule = RuleSpec {
-            name: "tok",
-            anchors: &[b"TOK_"],
-            radius: 16,
-            validator: ValidatorKind::None,
-            two_phase: None,
-            must_contain: None,
-            keywords_any: None,
-            value_suppressors_any: None,
-            entropy: None,
-            char_class: None,
-            local_context: None,
-            secret_group: Some(1),
-            min_confidence: None,
-            offline_validation: None,
-            uuid_format_secret: false,
-            re: Regex::new(r"TOK_([A-Z0-9]{8})").unwrap(),
-        };
-
-        let transforms = vec![TransformConfig {
-            id: TransformId::Base64,
-            mode: TransformMode::Always,
-            gate: Gate::AnchorsInDecoded,
-            min_len: 16,
-            max_spans_per_buffer: 4,
-            max_encoded_len: 1024,
-            max_decoded_bytes: 1024,
-            plus_to_space: false,
-            base64_allow_space_ws: false,
-        }];
-
-        Engine::new_with_anchor_policy(
-            vec![rule],
-            transforms,
-            demo_tuning(),
-            AnchorPolicy::ManualOnly,
-        )
-    }
-
-    fn make_candidate_with_ctx(commit_id: u32, change_kind: ChangeKind) -> LooseCandidate {
-        let ctx = CandidateContext {
-            commit_id,
-            parent_idx: 0,
-            change_kind,
-            ctx_flags: 0,
-            cand_flags: 0,
-            path_ref: ByteRef::new(0, 0),
-        };
-        LooseCandidate {
-            oid: OidBytes::from_slice(&[0u8; 20]),
-            ctx,
-        }
-    }
-
-    #[test]
-    fn git_finding_event_carries_add_attribution() {
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
-
-        let candidate = make_candidate_with_ctx(42, ChangeKind::Add);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"secret.txt", blob)
-            .expect("scan with Add attribution");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        assert!(
-            output.contains("\"commit_id\":42"),
-            "expected commit_id:42 in: {output}"
-        );
-        assert!(
-            output.contains("\"change_kind\":\"add\""),
-            "expected change_kind:add in: {output}"
-        );
-    }
-
-    #[test]
-    fn git_finding_event_carries_modify_attribution() {
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
-
-        let candidate = make_candidate_with_ctx(99, ChangeKind::Modify);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"secret.txt", blob)
-            .expect("scan with Modify attribution");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        assert!(
-            output.contains("\"commit_id\":99"),
-            "expected commit_id:99 in: {output}"
-        );
-        assert!(
-            output.contains("\"change_kind\":\"modify\""),
-            "expected change_kind:modify in: {output}"
-        );
-    }
-
-    #[test]
-    fn no_finding_blob_emits_no_events() {
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
-
-        let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
-        let blob = b"nothing suspicious here";
-        adapter
-            .emit_loose(&candidate, b"clean.txt", blob)
-            .expect("scan clean blob");
-
-        let output = sink.take();
-        assert!(output.is_empty(), "expected no events for clean blob");
-    }
-
-    #[test]
-    fn pack_object_sink_carries_attribution() {
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
-
-        let ctx = CandidateContext {
-            commit_id: 77,
-            parent_idx: 0,
-            change_kind: ChangeKind::Modify,
-            ctx_flags: 0,
-            cand_flags: 0,
-            path_ref: ByteRef::new(0, 0),
-        };
-        let candidate = PackCandidate {
-            oid: OidBytes::from_slice(&[0u8; 20]),
-            ctx,
-            pack_id: 0,
-            offset: 0,
-        };
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-
-        PackObjectSink::emit(&mut adapter, &candidate, b"packed.txt", blob)
-            .expect("pack path scan");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        assert!(
-            output.contains("\"commit_id\":77"),
-            "pack path must carry commit_id: {output}"
-        );
-        assert!(
-            output.contains("\"change_kind\":\"modify\""),
-            "pack path must carry change_kind: {output}"
-        );
-    }
-
-    #[test]
-    fn git_finding_events_carry_source_git() {
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
-
-        let candidate = make_candidate_with_ctx(1, ChangeKind::Add);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"secret.txt", blob)
-            .expect("scan");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        assert!(
-            output.contains("\"source\":\"git\""),
-            "git findings must have source:git: {output}"
-        );
-    }
-
-    #[test]
-    fn commit_id_zero_roundtrips_as_some() {
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_sink(&engine, sink.clone());
-
-        // commit_id 0 is a valid graph position (root commit).
-        let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"root.txt", blob)
-            .expect("scan with commit_id 0");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        assert!(
-            output.contains("\"commit_id\":0"),
-            "commit_id:0 must appear in JSONL (not be treated as None): {output}"
-        );
-        assert!(
-            output.contains("\"change_kind\":\"add\""),
-            "change_kind must still appear with commit_id 0: {output}"
-        );
-    }
-
-    // -- CommitMeta emission tests ----------------------------------------------
-
-    use crate::git_scan::commit_walk::{CommitGraph, ParentScratch};
-    use crate::git_scan::errors::CommitPlanError;
-    use gix_commitgraph::Position;
-
-    /// Tiny commit-graph stub with known OIDs and timestamps.
-    struct SmallTestGraph {
-        oids: Vec<OidBytes>,
-        timestamps: Vec<u64>,
-    }
-
-    impl SmallTestGraph {
-        fn new(entries: &[(OidBytes, u64)]) -> Self {
-            let (oids, timestamps) = entries.iter().cloned().unzip();
-            Self { oids, timestamps }
-        }
-    }
-
-    impl CommitGraph for SmallTestGraph {
-        fn num_commits(&self) -> u32 {
-            self.oids.len() as u32
-        }
-        fn lookup(&self, _oid: &OidBytes) -> Result<Option<Position>, CommitPlanError> {
-            Ok(None)
-        }
-        fn generation(&self, _pos: Position) -> u32 {
-            0
-        }
-        fn collect_parents(
-            &self,
-            _pos: Position,
-            _max: u32,
-            scratch: &mut ParentScratch,
-        ) -> Result<(), CommitPlanError> {
-            scratch.clear();
-            Ok(())
-        }
-        fn root_tree_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
-            Ok(self.oids[pos.0 as usize])
-        }
-        fn commit_oid(&self, pos: Position) -> Result<OidBytes, CommitPlanError> {
-            Ok(self.oids[pos.0 as usize])
-        }
-        fn committer_timestamp(&self, pos: Position) -> u64 {
-            self.timestamps[pos.0 as usize]
-        }
-    }
-
-    /// Build an adapter wired to a real `CommitGraphIndex` + fresh `AtomicBitSet`.
-    fn test_adapter_with_graph<'a>(
-        engine: &'a Engine,
-        sink: Arc<VecEventSink>,
-        entries: &[(OidBytes, u64)],
-    ) -> EngineAdapter<'a> {
-        let graph = SmallTestGraph::new(entries);
-        let cg = Arc::new(CommitGraphIndex::build(&graph).expect("build test graph"));
-        let seen = Arc::new(AtomicBitSet::empty(cg.len().max(1)));
-        EngineAdapter::new_with_event_sink(
-            engine,
-            EngineAdapterConfig::default(),
-            CommitMetaContext {
-                event_sink: sink,
-                commit_graph_index: cg,
-                commit_meta_seen: seen,
-                identity_interner: None,
-            },
-        )
-    }
-
-    fn test_oid(n: u8) -> OidBytes {
-        let mut bytes = [0u8; 20];
-        bytes[0] = n;
-        OidBytes::sha1(bytes)
-    }
-
-    fn parse_jsonl_types(output: &str) -> Vec<(&str, Option<u64>)> {
-        output
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| {
-                let ty = if l.contains("\"type\":\"commit_meta\"") {
-                    "commit_meta"
-                } else if l.contains("\"type\":\"finding\"") {
-                    "finding"
-                } else {
-                    "other"
-                };
-                // Extract commit_id value.
-                let cid = l.find("\"commit_id\":").map(|start| {
-                    let rest = &l[start + "\"commit_id\":".len()..];
-                    let end = rest
-                        .find(|c: char| !c.is_ascii_digit())
-                        .unwrap_or(rest.len());
-                    rest[..end].parse::<u64>().unwrap()
-                });
-                (ty, cid)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn single_adapter_commit_meta_precedes_its_findings() {
-        let entries = vec![(test_oid(0xab), 1_700_000_000)];
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_graph(&engine, sink.clone(), &entries);
-
-        let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"secret.txt", blob)
-            .expect("scan");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        let events = parse_jsonl_types(&output);
-
-        assert!(
-            events.len() >= 2,
-            "expected commit_meta + finding, got: {output}"
-        );
-        assert_eq!(
-            events[0].0, "commit_meta",
-            "first event must be commit_meta: {output}"
-        );
-        assert_eq!(events[0].1, Some(0));
-        assert_eq!(
-            events[1].0, "finding",
-            "second event must be finding: {output}"
-        );
-        // Verify OID hex and timestamp are present.
-        assert!(
-            output.contains("\"oid\":\"ab"),
-            "commit_meta must contain OID hex: {output}"
-        );
-        assert!(
-            output.contains("\"timestamp\":1700000000"),
-            "commit_meta must contain timestamp: {output}"
-        );
-    }
-
-    #[derive(Default)]
-    struct ReorderGateState {
-        meta_waiting: bool,
-        allow_meta_emit: bool,
-    }
-
-    /// Event sink that blocks the first `CommitMeta` until another worker emits
-    /// a `Finding`. This makes cross-worker ordering inversions deterministic.
-    struct BlockingCommitMetaSink {
-        events: Mutex<Vec<&'static str>>,
-        state: Mutex<ReorderGateState>,
-        cv: Condvar,
-    }
-
-    impl BlockingCommitMetaSink {
-        fn new() -> Self {
-            Self {
-                events: Mutex::new(Vec::new()),
-                state: Mutex::new(ReorderGateState::default()),
-                cv: Condvar::new(),
-            }
-        }
-
-        fn wait_until_meta_waiting(&self, timeout: Duration) -> bool {
-            let start = Instant::now();
-            let mut state = self
-                .state
-                .lock()
-                .expect("blocking sink state mutex poisoned");
-            while !state.meta_waiting {
-                let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    return false;
-                }
-                let wait_for = timeout.saturating_sub(elapsed);
-                let (next_state, timed_out) = self
-                    .cv
-                    .wait_timeout(state, wait_for)
-                    .expect("blocking sink condvar wait poisoned");
-                state = next_state;
-                if timed_out.timed_out() && !state.meta_waiting {
-                    return false;
-                }
-            }
-            true
-        }
-
-        fn events(&self) -> Vec<&'static str> {
-            self.events
-                .lock()
-                .expect("blocking sink events mutex poisoned")
-                .clone()
-        }
-    }
-
-    impl EventSink for BlockingCommitMetaSink {
-        fn emit(&self, event: ScanEvent<'_>) {
-            match event {
-                ScanEvent::CommitMeta(_) => {
-                    let mut state = self
-                        .state
-                        .lock()
-                        .expect("blocking sink state mutex poisoned");
-                    state.meta_waiting = true;
-                    self.cv.notify_all();
-                    while !state.allow_meta_emit {
-                        state = self
-                            .cv
-                            .wait(state)
-                            .expect("blocking sink condvar wait poisoned");
-                    }
-                    drop(state);
-
-                    self.events
-                        .lock()
-                        .expect("blocking sink events mutex poisoned")
-                        .push("commit_meta");
-                }
-                ScanEvent::Finding(_) => {
-                    self.events
-                        .lock()
-                        .expect("blocking sink events mutex poisoned")
-                        .push("finding");
-                    let mut state = self
-                        .state
-                        .lock()
-                        .expect("blocking sink state mutex poisoned");
-                    if state.meta_waiting {
-                        state.allow_meta_emit = true;
-                        self.cv.notify_all();
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn flush(&self) {}
-    }
-
-    #[test]
-    fn parallel_adapters_can_emit_finding_before_commit_meta_for_same_commit() {
-        let entries = vec![(test_oid(0xdd), 4_000)];
-        let engine = Arc::new(test_engine_with_tok_rule());
-        let sink = Arc::new(BlockingCommitMetaSink::new());
-
-        let graph = SmallTestGraph::new(&entries);
-        let commit_graph_index = Arc::new(CommitGraphIndex::build(&graph).expect("build graph"));
-        let commit_meta_seen = Arc::new(AtomicBitSet::empty(commit_graph_index.len().max(1)));
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-
-        let worker_a = {
-            let engine = Arc::clone(&engine);
-            let sink = Arc::clone(&sink);
-            let commit_graph_index = Arc::clone(&commit_graph_index);
-            let commit_meta_seen = Arc::clone(&commit_meta_seen);
-            std::thread::spawn(move || {
-                let event_sink: Arc<dyn EventSink> = sink;
-                let mut adapter = EngineAdapter::new_with_event_sink(
-                    engine.as_ref(),
-                    EngineAdapterConfig::default(),
-                    CommitMetaContext {
-                        event_sink,
-                        commit_graph_index,
-                        commit_meta_seen,
-                        identity_interner: None,
-                    },
-                );
-                let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
-                adapter
-                    .emit_loose(&candidate, b"a.txt", blob)
-                    .expect("worker A scan");
-            })
-        };
-
-        assert!(
-            sink.wait_until_meta_waiting(Duration::from_secs(2)),
-            "timed out waiting for worker A to block in commit_meta emit"
-        );
-
-        let worker_b = {
-            let engine = Arc::clone(&engine);
-            let sink = Arc::clone(&sink);
-            let commit_graph_index = Arc::clone(&commit_graph_index);
-            let commit_meta_seen = Arc::clone(&commit_meta_seen);
-            std::thread::spawn(move || {
-                let event_sink: Arc<dyn EventSink> = sink;
-                let mut adapter = EngineAdapter::new_with_event_sink(
-                    engine.as_ref(),
-                    EngineAdapterConfig::default(),
-                    CommitMetaContext {
-                        event_sink,
-                        commit_graph_index,
-                        commit_meta_seen,
-                        identity_interner: None,
-                    },
-                );
-                let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
-                adapter
-                    .emit_loose(&candidate, b"b.txt", blob)
-                    .expect("worker B scan");
-            })
-        };
-
-        worker_b.join().expect("worker B join");
-        worker_a.join().expect("worker A join");
-
-        let events = sink.events();
-        let first_finding = events
-            .iter()
-            .position(|ty| *ty == "finding")
-            .expect("expected at least one finding event");
-        let first_meta = events
-            .iter()
-            .position(|ty| *ty == "commit_meta")
-            .expect("expected commit_meta event");
-        assert!(
-            first_finding < first_meta,
-            "expected a finding before commit_meta for the same commit: {events:?}"
-        );
-    }
-
-    #[test]
-    fn commit_meta_emitted_once_per_commit() {
-        let entries = vec![(test_oid(0xaa), 1000), (test_oid(0xbb), 2000)];
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_graph(&engine, sink.clone(), &entries);
-
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-
-        // Two scans with the same commit_id=0.
-        let c0 = make_candidate_with_ctx(0, ChangeKind::Add);
-        adapter.emit_loose(&c0, b"a.txt", blob).expect("scan 1");
-        adapter.emit_loose(&c0, b"b.txt", blob).expect("scan 2");
-
-        // One scan with commit_id=1.
-        let c1 = make_candidate_with_ctx(1, ChangeKind::Add);
-        adapter.emit_loose(&c1, b"c.txt", blob).expect("scan 3");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        let events = parse_jsonl_types(&output);
-
-        let meta_count = events.iter().filter(|(t, _)| *t == "commit_meta").count();
-        assert_eq!(
-            meta_count, 2,
-            "expected exactly 2 commit_meta events (one per unique commit_id), got {meta_count}: {output}"
-        );
-
-        // Verify each commit_id has exactly one commit_meta.
-        let meta_ids: Vec<u64> = events
-            .iter()
-            .filter(|(t, _)| *t == "commit_meta")
-            .map(|(_, id)| id.unwrap())
-            .collect();
-        assert!(meta_ids.contains(&0), "missing commit_meta for id=0");
-        assert!(meta_ids.contains(&1), "missing commit_meta for id=1");
-    }
-
-    #[test]
-    fn no_commit_meta_without_findings() {
-        let entries = vec![(test_oid(0xcc), 3000)];
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_graph(&engine, sink.clone(), &entries);
-
-        let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
-        let blob = b"nothing suspicious here";
-        adapter
-            .emit_loose(&candidate, b"clean.txt", blob)
-            .expect("scan clean blob");
-
-        let output = sink.take();
-        assert!(
-            output.is_empty(),
-            "no events should be emitted for blobs without findings"
-        );
-    }
-
-    #[test]
-    fn out_of_range_commit_id_emits_diagnostic() {
-        // Graph has 1 entry (positions 0..1); commit_id=5 is out of range.
-        let entries = vec![(test_oid(0xaa), 1000)];
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_graph(&engine, sink.clone(), &entries);
-
-        let candidate = make_candidate_with_ctx(5, ChangeKind::Add);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"secret.txt", blob)
-            .expect("scan with out-of-range commit_id");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        // Findings should still be emitted.
-        assert!(
-            output.contains("\"type\":\"finding\""),
-            "findings must still be emitted for out-of-range commit_id: {output}"
-        );
-        // No commit_meta should be emitted (commit_id is out of range).
-        assert!(
-            !output.contains("\"type\":\"commit_meta\""),
-            "commit_meta must not be emitted for out-of-range commit_id: {output}"
-        );
-        // A diagnostic warning should be emitted so the skip is visible.
-        assert!(
-            output.contains("\"type\":\"diagnostic\""),
-            "expected a diagnostic event for out-of-range commit_id, got: {output}"
-        );
-    }
-
-    #[test]
-    fn commit_meta_carries_correct_oid_and_timestamp() {
-        let oid = OidBytes::sha1([
-            0xde, 0xad, 0xbe, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc,
-            0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
-        ]);
-        let entries = vec![(oid, 1_234_567_890)];
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let mut adapter = test_adapter_with_graph(&engine, sink.clone(), &entries);
-
-        let candidate = make_candidate_with_ctx(0, ChangeKind::Add);
-        let blob = b"prefix TOK_ABCDEFGH suffix";
-        adapter
-            .emit_loose(&candidate, b"s.txt", blob)
-            .expect("scan");
-
-        let output = String::from_utf8(sink.take()).expect("valid UTF-8");
-        assert!(
-            output.contains("\"oid\":\"deadbeef0123456789abcdeffedcba9876543210\""),
-            "OID hex must match: {output}"
-        );
-        assert!(
-            output.contains("\"timestamp\":1234567890"),
-            "timestamp must match: {output}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "AtomicBitSet bit_length")]
-    fn mismatched_bitset_and_graph_panics_in_debug() {
-        // Graph has 3 entries but bitset only has 1 bit — mismatch.
-        let entries = vec![
-            (test_oid(0xaa), 1000),
-            (test_oid(0xbb), 2000),
-            (test_oid(0xcc), 3000),
-        ];
-        let engine = test_engine_with_tok_rule();
-        let sink = Arc::new(VecEventSink::new());
-        let graph = SmallTestGraph::new(&entries);
-        let cg = Arc::new(CommitGraphIndex::build(&graph).expect("build test graph"));
-        // Deliberately create a bitset smaller than the graph.
-        let seen = Arc::new(AtomicBitSet::empty(1));
-        let _adapter = EngineAdapter::new_with_event_sink(
-            &engine,
-            EngineAdapterConfig::default(),
-            CommitMetaContext {
-                event_sink: sink,
-                commit_graph_index: cg,
-                commit_meta_seen: seen,
-                identity_interner: None,
-            },
-        );
-    }
-}
+#[path = "engine_adapter_tests.rs"]
+mod tests;

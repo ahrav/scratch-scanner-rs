@@ -41,7 +41,9 @@ use std::cmp::Ordering;
 use crate::perf_stats;
 
 use super::byte_arena::ByteArena;
-use super::engine_adapter::{FindingKey, FindingSpan, ScannedBlob};
+use super::engine_adapter::{
+    sort_and_dedupe_findings, FindingKey, FindingSpan, ScannedBlob, ScoredFinding,
+};
 use super::object_id::OidBytes;
 use super::start_set::StartSetId;
 use super::tree_candidate::CandidateContext;
@@ -91,7 +93,7 @@ pub struct FinalizeInput<'a> {
     /// Will be sorted by OID.
     pub scanned_blobs: Vec<ScannedBlob>,
     /// Shared findings arena referenced by `scanned_blobs`.
-    pub finding_arena: &'a [FindingKey],
+    pub finding_arena: &'a [ScoredFinding],
     /// OIDs that were skipped during decode (budget exceeded, corrupt, etc.).
     /// If non-empty, watermarks will NOT be advanced.
     pub skipped_candidate_oids: Vec<OidBytes>,
@@ -182,7 +184,7 @@ pub struct NamespaceCounts {
 /// Returns the finding slice for a span produced by the engine adapter.
 ///
 /// The span must be in-bounds for `arena`; this is enforced by debug asserts.
-fn finding_slice(span: FindingSpan, arena: &[FindingKey]) -> &[FindingKey] {
+fn finding_slice(span: FindingSpan, arena: &[ScoredFinding]) -> &[ScoredFinding] {
     let start = span.start as usize;
     let end = start.saturating_add(span.len as usize);
     debug_assert!(end <= arena.len(), "finding span out of bounds");
@@ -241,6 +243,10 @@ pub(crate) fn build_seen_blob_key(repo_id: u64, policy_hash: &[u8; 32], oid: &Oi
 }
 
 /// Builds a finding key for a specific blob OID and finding tuple.
+///
+/// `confidence_score` is intentionally excluded: the persistence layer tracks
+/// finding identity for dedup, not scoring metadata. The score is carried
+/// in the real-time `FindingEvent` stream only.
 fn build_finding_key(
     repo_id: u64,
     policy_hash: &[u8; 32],
@@ -408,7 +414,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
 
     // Reusable scratch buffers to avoid per-blob allocations.
     let mut ctx_val: Vec<u8> = Vec::with_capacity(128);
-    let mut blob_findings: Vec<FindingKey> = Vec::with_capacity(64);
+    let mut blob_findings: Vec<ScoredFinding> = Vec::with_capacity(64);
 
     let mut stats = FinalizeStats::default();
 
@@ -449,8 +455,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
             blob_findings.extend_from_slice(findings);
         }
         let pre_dedup = blob_findings.len();
-        blob_findings.sort_unstable();
-        blob_findings.dedup();
+        sort_and_dedupe_findings(&mut blob_findings);
         perf_stats::sat_add_u64(
             &mut stats.findings_deduped,
             (pre_dedup - blob_findings.len()) as u64,
@@ -458,7 +463,7 @@ pub fn build_finalize_ops(mut input: FinalizeInput<'_>) -> FinalizeOutput {
 
         for f in &blob_findings {
             ops_finding.push(WriteOp {
-                key: build_finding_key(input.repo_id, &input.policy_hash, &oid, f),
+                key: build_finding_key(input.repo_id, &input.policy_hash, &oid, &f.key),
                 value: marker_value(),
             });
         }
@@ -566,25 +571,31 @@ mod tests {
         }
     }
 
-    fn finding(start: u32, end: u32, rule_id: u32) -> FindingKey {
-        FindingKey {
-            start,
-            end,
-            rule_id,
-            norm_hash: [0xAA; 32],
+    fn finding(start: u32, end: u32, rule_id: u32) -> ScoredFinding {
+        ScoredFinding {
+            key: FindingKey {
+                start,
+                end,
+                rule_id,
+                norm_hash: [0xAA; 32],
+            },
+            confidence_score: 0,
         }
     }
 
-    fn finding_with_hash(start: u32, end: u32, rule_id: u32, hash_byte: u8) -> FindingKey {
-        FindingKey {
-            start,
-            end,
-            rule_id,
-            norm_hash: [hash_byte; 32],
+    fn finding_with_hash(start: u32, end: u32, rule_id: u32, hash_byte: u8) -> ScoredFinding {
+        ScoredFinding {
+            key: FindingKey {
+                start,
+                end,
+                rule_id,
+                norm_hash: [hash_byte; 32],
+            },
+            confidence_score: 0,
         }
     }
 
-    fn push_findings(arena: &mut Vec<FindingKey>, findings: &[FindingKey]) -> FindingSpan {
+    fn push_findings(arena: &mut Vec<ScoredFinding>, findings: &[ScoredFinding]) -> FindingSpan {
         let start = arena.len();
         arena.extend_from_slice(findings);
         FindingSpan {
@@ -595,7 +606,7 @@ mod tests {
 
     fn basic_input<'a>(
         arena: &'a mut ByteArena,
-        finding_arena: &'a mut Vec<FindingKey>,
+        finding_arena: &'a mut Vec<ScoredFinding>,
     ) -> FinalizeInput<'a> {
         let path_ref = arena.intern(b"src/main.rs").unwrap();
         let span_a = push_findings(finding_arena, &[finding(0, 15, 1)]);
@@ -780,6 +791,46 @@ mod tests {
                     findings: span_b,
                 },
             ],
+            finding_arena: &finding_arena,
+            skipped_candidate_oids: vec![],
+            path_arena: &arena,
+        };
+
+        let out = build_finalize_ops(input);
+        assert_perf_u64(out.stats.total_findings, 1);
+        assert_perf_u64(out.stats.findings_deduped, 1);
+    }
+
+    #[test]
+    fn findings_deduped_when_only_confidence_differs() {
+        let mut arena = ByteArena::with_capacity(1024);
+        let mut finding_arena = Vec::new();
+        let path_ref = arena.intern(b"a/file.rs").unwrap();
+        let mut low = finding(0, 15, 1);
+        low.confidence_score = 1;
+        let mut high = finding(0, 15, 1);
+        high.confidence_score = 6;
+        let span = push_findings(&mut finding_arena, &[low, high]);
+
+        // Verify that sort_and_dedupe keeps the highest confidence winner.
+        let mut dedup_check = finding_arena.clone();
+        sort_and_dedupe_findings(&mut dedup_check);
+        assert_eq!(dedup_check.len(), 1, "identity-equal findings must dedup");
+        assert_eq!(
+            dedup_check[0].confidence_score, 6,
+            "highest confidence must survive dedup"
+        );
+
+        let input = FinalizeInput {
+            repo_id: 1,
+            policy_hash: [0; 32],
+            start_set_id: [0; 32],
+            refs: vec![],
+            scanned_blobs: vec![ScannedBlob {
+                oid: test_oid(0xCE),
+                ctx: ctx(1, path_ref),
+                findings: span,
+            }],
             finding_arena: &finding_arena,
             skipped_candidate_oids: vec![],
             path_arena: &arena,
