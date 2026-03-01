@@ -31,7 +31,7 @@ python3 tools/migration-parity/capture_baseline.py \
 # Override via environment variables
 MIGRATION_REPOS="../linux,../scratch-scanner-rs" \
 MIGRATION_SCANNER_BIN=./target/release/scanner-rs \
-MIGRATION_ARTIFACT_ROOT=artifacts/baseline \
+MIGRATION_ARTIFACT_ROOT=../baseline-artifacts \
 python3 tools/migration-parity/capture_baseline.py
 ```
 
@@ -42,14 +42,15 @@ python3 tools/migration-parity/capture_baseline.py
 - `MIGRATION_ARTIFACT_ROOT`: artifact output root
 - `MIGRATION_DECODE_DEPTH`: decode depth passed to scans (default `2`)
 - `MIGRATION_TRANSFORMS`: transforms value passed to scans (default `all`)
+- `MIGRATION_TIMEOUT`: per-scan timeout in seconds (default `3600`)
 
 ## Output Layout
 
 The script writes:
 
-- `artifacts/baseline/findings/<repo>/<mode>.jsonl`
-- `artifacts/baseline/perf/<timestamp>.csv`
-- `artifacts/baseline/summary.md`
+- `../baseline-artifacts/findings/<repo>/<mode>.jsonl`
+- `../baseline-artifacts/perf/<timestamp>.csv`
+- `../baseline-artifacts/summary.md`
 
 `summary.md` includes:
 

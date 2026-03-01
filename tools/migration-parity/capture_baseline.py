@@ -68,24 +68,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scanner-bin",
-        default=os.environ.get("MIGRATION_SCANNER_BIN", "target/release/scanner-rs"),
+        default=os.environ.get("MIGRATION_SCANNER_BIN") or "target/release/scanner-rs",
         help="Path to scanner-rs binary (default: MIGRATION_SCANNER_BIN or target/release/scanner-rs)",
     )
     parser.add_argument(
         "--artifact-root",
-        default=os.environ.get("MIGRATION_ARTIFACT_ROOT", "artifacts/baseline"),
-        help="Artifact root (default: MIGRATION_ARTIFACT_ROOT or artifacts/baseline)",
+        default=os.environ.get("MIGRATION_ARTIFACT_ROOT") or "../baseline-artifacts",
+        help="Artifact root (default: MIGRATION_ARTIFACT_ROOT or ../baseline-artifacts)",
     )
     parser.add_argument(
         "--decode-depth",
         type=int,
-        default=int(os.environ.get("MIGRATION_DECODE_DEPTH", "2")),
+        default=int(os.environ.get("MIGRATION_DECODE_DEPTH") or "2"),
         help="Value passed to --decode-depth (default: MIGRATION_DECODE_DEPTH or 2)",
     )
     parser.add_argument(
         "--transforms",
-        default=os.environ.get("MIGRATION_TRANSFORMS", "all"),
+        default=os.environ.get("MIGRATION_TRANSFORMS") or "all",
         help="Value passed to --transforms (default: MIGRATION_TRANSFORMS or all)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("MIGRATION_TIMEOUT") or "3600"),
+        help="Per-scan timeout in seconds (default: MIGRATION_TIMEOUT or 3600)",
     )
     parser.add_argument(
         "--fail-fast",
@@ -121,7 +127,13 @@ def resolve_repos(args: argparse.Namespace, root: Path) -> list[Path]:
             raw_repos = parse_repo_env(env_value)
         else:
             raw_repos = list(DEFAULT_REPOS)
-    repos = [resolve_path(root, raw) for raw in raw_repos]
+    repos: list[Path] = []
+    seen: set[Path] = set()
+    for raw in raw_repos:
+        resolved = resolve_path(root, raw)
+        if resolved not in seen:
+            seen.add(resolved)
+            repos.append(resolved)
     return repos
 
 
@@ -509,9 +521,30 @@ def main() -> int:
                 print(f"[{run_index}/{total_runs}] {repo_slug} {mode}")
 
                 start = time.perf_counter()
+                timed_out = False
                 with events_path.open("wb") as events_handle, stderr_path.open("wb") as err_handle:
-                    proc = subprocess.run(command, stdout=events_handle, stderr=err_handle)
+                    try:
+                        proc = subprocess.run(
+                            command, stdout=events_handle, stderr=err_handle,
+                            timeout=args.timeout,
+                        )
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
                 wall_time = time.perf_counter() - start
+
+                if timed_out:
+                    print(f"  TIMEOUT after {wall_time:.0f}s (limit: {args.timeout}s)")
+                    result = RunResult(
+                        repo_path=repo, repo_slug=repo_slug, mode=mode,
+                        exit_code=-1, wall_time_s=wall_time, bytes_scanned=0,
+                        throughput_mib_s=0.0, findings_count=0, malformed_lines=0,
+                        non_finding_lines=0, command=command_str,
+                        findings_path=findings_path, stderr_path=stderr_path,
+                    )
+                    results.append(result)
+                    if args.fail_fast:
+                        break
+                    continue
 
                 findings_count, malformed, non_finding, summary_event = extract_findings(
                     events_path, findings_path
@@ -519,6 +552,8 @@ def main() -> int:
                 bytes_scanned = summary_int(summary_event, "bytes_scanned", "bytes")
                 if bytes_scanned is None:
                     bytes_scanned = fs_bytes(repo) if mode == "fs" else git_pack_bytes(repo)
+                    approx = "du" if mode == "fs" else "git pack size"
+                    print(f"  (bytes_scanned estimated from {approx}; may differ from actual scan)")
 
                 throughput_mib = summary_float(summary_event, "throughput_mib_s")
                 if throughput_mib is None:
