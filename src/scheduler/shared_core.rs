@@ -78,6 +78,8 @@ pub(super) fn carry_overlap_prefix(buf: &mut [u8], have: usize, carry: usize) {
 ///
 /// Only payload bytes (`data.len() - prefix_len`) are counted toward
 /// `bytes_scanned` and `chunks_scanned` to avoid double-counting overlap.
+/// When `perf-stats` + `debug_assertions` are enabled, `scan_ns` is recorded
+/// around the engine scan only (excluding post-processing).
 #[inline(always)]
 #[allow(clippy::too_many_arguments)] // Hot-path helper; split parameters avoid temporary structs.
 pub(super) fn scan_chunk_postprocess<E: ScanEngine>(
@@ -90,7 +92,20 @@ pub(super) fn scan_chunk_postprocess<E: ScanEngine>(
     data: &[u8],
     metrics: &mut WorkerMetricsLocal,
 ) {
+    // Time only the engine scan for `scan_ns` — post-processing (prefix prune,
+    // dedupe, accounting) is scheduler work and must not inflate this counter.
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    let scan_start_t = std::time::Instant::now();
+
     engine.scan_chunk_into(data, file_id, base_offset, scratch);
+
+    #[cfg(all(feature = "perf-stats", debug_assertions))]
+    {
+        metrics.scan_ns = metrics
+            .scan_ns
+            .saturating_add(scan_start_t.elapsed().as_nanos() as u64);
+    }
+
     let engine_dropped = scratch.dropped_findings();
 
     // Prefix bytes are owned by the previous chunk.
@@ -99,6 +114,8 @@ pub(super) fn scan_chunk_postprocess<E: ScanEngine>(
     scratch.drop_prefix_findings(new_bytes_start);
     let after_prefix = scratch.pending_findings_len();
 
+    // drain_findings_into uses append semantics — clear first to avoid
+    // accumulating findings across chunks.
     pending.clear();
     scratch.drain_findings_into(pending);
 

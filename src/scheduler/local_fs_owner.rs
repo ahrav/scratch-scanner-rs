@@ -901,10 +901,6 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
         // For subsequent: base_offset = offset - carry
         let base_offset = offset.saturating_sub(carry as u64);
 
-        // Scan the chunk
-        #[cfg(all(feature = "perf-stats", debug_assertions))]
-        let scan_start_t = std::time::Instant::now();
-
         let data = &buf.as_slice()[..read_len];
         scan_chunk_postprocess(
             engine.as_ref(),
@@ -916,14 +912,6 @@ fn process_file<E: ScanEngine>(task: FileTask, ctx: &mut WorkerCtx<FileTask, Loc
             data,
             &mut ctx.metrics,
         );
-
-        #[cfg(all(feature = "perf-stats", debug_assertions))]
-        {
-            ctx.metrics.scan_ns = ctx
-                .metrics
-                .scan_ns
-                .saturating_add(scan_start_t.elapsed().as_nanos() as u64);
-        }
 
         emit_persistence_batch(
             scratch.store_producer.as_deref(),
