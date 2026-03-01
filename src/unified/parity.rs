@@ -116,6 +116,10 @@ pub enum ThroughputError {
     NonPositiveBaseline {
         baseline: f64,
     },
+    NonPositiveLimit {
+        label: &'static str,
+        value: f64,
+    },
     ThresholdExceeded {
         scope: &'static str,
         observed_abs_pct: f64,
@@ -133,6 +137,9 @@ impl fmt::Display for ThroughputError {
             }
             Self::NonPositiveBaseline { baseline } => {
                 write!(f, "baseline throughput must be > 0, got {}", baseline)
+            }
+            Self::NonPositiveLimit { label, value } => {
+                write!(f, "threshold limit '{}' must be > 0, got {}", label, value)
             }
             Self::ThresholdExceeded {
                 scope,
@@ -290,10 +297,17 @@ pub fn canonicalize_jsonl_events(bytes: &[u8]) -> Result<CanonicalRun, Canonical
                 });
             }
             "summary" => {
-                let Some(tp) = value.get("throughput_mib_s").and_then(|v| v.as_f64()) else {
+                let Some(raw) = value.get("throughput_mib_s") else {
                     return Err(CanonicalizeError::MissingField {
                         line: line_no,
                         field: "throughput_mib_s",
+                    });
+                };
+                let Some(tp) = raw.as_f64() else {
+                    return Err(CanonicalizeError::InvalidFieldType {
+                        line: line_no,
+                        field: "throughput_mib_s",
+                        expected: "f64",
                     });
                 };
                 throughput_mib_s = Some(tp);
@@ -405,8 +419,20 @@ pub fn enforce_throughput_thresholds(
             value: median_limit_abs_pct,
         });
     }
+    if median_limit_abs_pct <= 0.0 {
+        return Err(ThroughputError::NonPositiveLimit {
+            label: "median_limit_abs_pct",
+            value: median_limit_abs_pct,
+        });
+    }
     if !per_case_limit_abs_pct.is_finite() {
         return Err(ThroughputError::NonFinite {
+            label: "per_case_limit_abs_pct",
+            value: per_case_limit_abs_pct,
+        });
+    }
+    if per_case_limit_abs_pct <= 0.0 {
+        return Err(ThroughputError::NonPositiveLimit {
             label: "per_case_limit_abs_pct",
             value: per_case_limit_abs_pct,
         });
@@ -514,5 +540,41 @@ mod tests {
     fn throughput_delta_allows_both_zero() {
         let delta = throughput_delta_pct(0.0, 0.0).expect("zero-vs-zero should be stable");
         assert_eq!(delta, 0.0);
+    }
+
+    // Verify-first test for claim: malformed summary throughput returns wrong error variant.
+    // When summary event is present but throughput_mib_s is a string (not f64),
+    // the error should be InvalidFieldType, not MissingField.
+    #[test]
+    fn canonicalize_returns_invalid_field_type_for_non_f64_throughput() {
+        let jsonl = br#"{"type":"summary","source":"fs","status":"complete","elapsed_ms":1,"bytes":1,"findings":0,"errors":0,"throughput_mib_s":"not_a_number"}
+"#;
+        let err = canonicalize_jsonl_events(jsonl).expect_err("non-f64 throughput must error");
+        match &err {
+            CanonicalizeError::InvalidFieldType { field, .. } => {
+                assert_eq!(*field, "throughput_mib_s");
+            }
+            other => panic!("expected InvalidFieldType for non-f64 throughput, got: {other}"),
+        }
+    }
+
+    // Verify-first test for claim: negative threshold limits not rejected.
+    // A negative limit should be rejected with a clear error, not silently
+    // cause every case to fail.
+    #[test]
+    fn enforce_thresholds_rejects_negative_limits() {
+        let result = enforce_throughput_thresholds(&[0.0], -2.0, 5.0);
+        assert!(
+            !matches!(result, Err(ThroughputError::ThresholdExceeded { .. })),
+            "negative median limit should be rejected as invalid input, \
+             not reported as a threshold exceedance"
+        );
+
+        let result2 = enforce_throughput_thresholds(&[0.0], 2.0, -5.0);
+        assert!(
+            !matches!(result2, Err(ThroughputError::ThresholdExceeded { .. })),
+            "negative per-case limit should be rejected as invalid input, \
+             not reported as a threshold exceedance"
+        );
     }
 }
