@@ -490,6 +490,39 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_distinguishes_commit_attribution_for_same_span() {
+        let jsonl = br#"{"type":"finding","source":"git","path":"a.txt","start":1,"end":3,"rule":"tok","rule_id":0,"commit_id":1,"change_kind":"add","confidence_score":0}
+{"type":"finding","source":"git","path":"a.txt","start":1,"end":3,"rule":"tok","rule_id":0,"commit_id":2,"change_kind":"add","confidence_score":0}
+{"type":"commit_meta","commit_id":1,"oid":"0001","timestamp":100}
+{"type":"commit_meta","commit_id":2,"oid":"0002","timestamp":200}
+{"type":"summary","source":"git","status":"complete","elapsed_ms":1,"bytes":1,"findings":2,"errors":0,"throughput_mib_s":2.50}
+"#;
+
+        let run = canonicalize_jsonl_events(jsonl).expect("canonicalize");
+        assert_eq!(run.findings.len(), 2);
+        assert_eq!(run.findings[0].commit_oid.as_deref(), Some("0001"));
+        assert_eq!(run.findings[1].commit_oid.as_deref(), Some("0002"));
+        assert_eq!(run.findings[0].commit_timestamp, Some(100));
+        assert_eq!(run.findings[1].commit_timestamp, Some(200));
+    }
+
+    #[test]
+    fn canonicalize_keeps_change_kind_in_identity() {
+        let jsonl = br#"{"type":"finding","source":"git","path":"a.txt","start":1,"end":3,"rule":"tok","rule_id":0,"commit_id":7,"change_kind":"add","confidence_score":0}
+{"type":"finding","source":"git","path":"a.txt","start":1,"end":3,"rule":"tok","rule_id":0,"commit_id":7,"change_kind":"modify","confidence_score":0}
+{"type":"commit_meta","commit_id":7,"oid":"0123","timestamp":100}
+{"type":"summary","source":"git","status":"complete","elapsed_ms":1,"bytes":1,"findings":2,"errors":0,"throughput_mib_s":2.50}
+"#;
+
+        let run = canonicalize_jsonl_events(jsonl).expect("canonicalize");
+        assert_eq!(run.findings.len(), 2);
+        assert_ne!(
+            run.findings[0].change_kind, run.findings[1].change_kind,
+            "change_kind must remain part of canonical identity"
+        );
+    }
+
+    #[test]
     fn canonicalize_requires_commit_meta_for_git_findings() {
         let jsonl = br#"{"type":"finding","source":"git","path":"a.txt","start":1,"end":3,"rule":"tok","rule_id":0,"commit_id":9,"change_kind":"add","confidence_score":0}
 {"type":"summary","source":"git","status":"complete","elapsed_ms":1,"bytes":1,"findings":1,"errors":0,"throughput_mib_s":2.50}

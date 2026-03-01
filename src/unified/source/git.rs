@@ -1,13 +1,18 @@
 //! Git source driver and CLI helper types.
 //!
-//! Contains the `GitCliResolver` and `EmptyWatermarkStore` used by
-//! the unified CLI for git scanning.
+//! Contains the `GitCliResolver`, `EmptyWatermarkStore`, and execution-mode
+//! dispatcher used by the unified CLI for git scanning.
 //!
 //! ## Current state
 //!
-//! The git source delegates to [`crate::git_scan::run_git_scan()`]
-//! and pack execution is dispatched through `scheduler::Executor`
-//! via `runner_exec::execute_pack_plans_with_scheduler`. An
+//! The git source delegates to [`crate::git_scan::run_git_scan()`].
+//! `run_git_scan_with_execution_mode()` provides the migration seam:
+//! - `direct` mode calls the direct runner;
+//! - `connector` mode calls a dedicated adapter path that currently
+//!   reuses the same shared-core runner for strict parity.
+//!
+//! Pack execution is dispatched through `scheduler::Executor` via
+//! `runner_exec::execute_pack_plans_with_scheduler`. An
 //! `Arc<dyn EventSink>` is threaded through to `EngineAdapter` so
 //! findings are streamed as structured `ScanEvent::Finding` events
 //! during pack and loose scanning.
@@ -17,8 +22,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::git_scan::{
-    OidBytes, RefWatermarkStore, RepoOpenError, StartSetConfig, StartSetResolver,
+    run_git_scan, GitScanConfig, GitScanError, GitScanResult, OidBytes, RefWatermarkStore,
+    RepoOpenError, SeenBlobStore, StartSetConfig, StartSetResolver,
 };
+use crate::unified::events::EventSink;
+use crate::unified::ExecutionMode;
+use crate::Engine;
 
 /// Resolves the start set by invoking `git` in the target repository.
 ///
@@ -67,6 +76,91 @@ impl RefWatermarkStore for EmptyWatermarkStore {
         ref_names: &[&[u8]],
     ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
+    }
+}
+
+/// Run the Git scanner via the selected execution mode.
+///
+/// `ExecutionMode::Direct` uses the current direct scanner path.
+/// `ExecutionMode::Connector` uses a dedicated adapter seam that currently
+/// delegates to the same shared-core runner to preserve parity while exposing
+/// a distinct orchestration path.
+#[allow(clippy::too_many_arguments)]
+pub fn run_git_scan_with_execution_mode(
+    execution_mode: ExecutionMode,
+    repo_root: &std::path::Path,
+    engine: std::sync::Arc<Engine>,
+    resolver: &dyn StartSetResolver,
+    seen_store: &dyn SeenBlobStore,
+    watermark_store: &dyn RefWatermarkStore,
+    persist_store: Option<&dyn crate::git_scan::PersistenceStore>,
+    config: &GitScanConfig,
+    event_sink: std::sync::Arc<dyn EventSink>,
+) -> Result<GitScanResult, GitScanError> {
+    dispatch_by_execution_mode(
+        execution_mode,
+        || {
+            run_git_scan(
+                repo_root,
+                std::sync::Arc::clone(&engine),
+                resolver,
+                seen_store,
+                watermark_store,
+                persist_store,
+                config,
+                std::sync::Arc::clone(&event_sink),
+            )
+        },
+        || {
+            run_git_scan_via_connector_adapter(
+                repo_root,
+                std::sync::Arc::clone(&engine),
+                resolver,
+                seen_store,
+                watermark_store,
+                persist_store,
+                config,
+                std::sync::Arc::clone(&event_sink),
+            )
+        },
+    )
+}
+
+/// Connector-mode adapter seam for Git scanning.
+///
+/// This adapter currently reuses `run_git_scan` so direct and connector modes
+/// stay behavior-identical while migration parity gates remain strict.
+#[allow(clippy::too_many_arguments)]
+fn run_git_scan_via_connector_adapter(
+    repo_root: &std::path::Path,
+    engine: std::sync::Arc<Engine>,
+    resolver: &dyn StartSetResolver,
+    seen_store: &dyn SeenBlobStore,
+    watermark_store: &dyn RefWatermarkStore,
+    persist_store: Option<&dyn crate::git_scan::PersistenceStore>,
+    config: &GitScanConfig,
+    event_sink: std::sync::Arc<dyn EventSink>,
+) -> Result<GitScanResult, GitScanError> {
+    run_git_scan(
+        repo_root,
+        engine,
+        resolver,
+        seen_store,
+        watermark_store,
+        persist_store,
+        config,
+        event_sink,
+    )
+}
+
+fn dispatch_by_execution_mode<T>(
+    execution_mode: ExecutionMode,
+    run_direct: impl FnOnce() -> T,
+    run_connector: impl FnOnce() -> T,
+) -> T {
+    match execution_mode {
+        ExecutionMode::Direct => run_direct(),
+        ExecutionMode::Connector => run_connector(),
     }
 }
 
@@ -145,4 +239,23 @@ fn oid_from_hex(hex: &str) -> Result<OidBytes, RepoOpenError> {
         i += 2;
     }
     Ok(OidBytes::from_slice(&out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_mode_dispatch_prefers_direct_runner() {
+        let selected =
+            dispatch_by_execution_mode(ExecutionMode::Direct, || "direct", || "connector");
+        assert_eq!(selected, "direct");
+    }
+
+    #[test]
+    fn execution_mode_dispatch_prefers_connector_runner() {
+        let selected =
+            dispatch_by_execution_mode(ExecutionMode::Connector, || "direct", || "connector");
+        assert_eq!(selected, "connector");
+    }
 }

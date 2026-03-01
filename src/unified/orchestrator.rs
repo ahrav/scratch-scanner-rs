@@ -5,7 +5,7 @@
 //!
 //! - **FS** → `scan_local_fs_uring` on Linux when available and persistence is off;
 //!   otherwise `parallel_scan_dir`
-//! - **Git** → [`run_git_scan`] (pack execution, tree diffs, loose scan)
+//! - **Git** → mode-selected Git scan driver (direct or connector adapter)
 //!
 //! Both paths share a common [`EventSink`](super::events::EventSink) for
 //! structured output to stdout (format selected via `--event-format`),
@@ -46,15 +46,14 @@ use std::time::Instant;
 
 use crate::api::RuleSpec;
 use crate::git_scan::{
-    self, run_git_scan, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore,
-    StartSetConfig,
+    self, GitScanConfig, GitScanResult, InMemoryPersistenceStore, NeverSeenStore, StartSetConfig,
 };
 use crate::scheduler::parallel_scan::{parallel_scan_dir, ParallelScanConfig};
 use crate::store::{RootKind, SqliteStoreConfig, SqliteStoreProducer, StoreKeys, StoreProducer};
 use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, Engine};
 
 use super::cli::TransformFilter;
-use super::source::git::{EmptyWatermarkStore, GitCliResolver};
+use super::source::git::{run_git_scan_with_execution_mode, EmptyWatermarkStore, GitCliResolver};
 use super::{
     EventFormat, ExecutionMode, FsScanConfig, GitSourceConfig, OutputFormat, ScanConfig,
     SourceConfig, StoreCommand,
@@ -420,10 +419,13 @@ fn probe_in_pack_object_count(repo_root: &Path) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("missing in-pack entry in git count-objects output"))
 }
 
-/// Git scan path — delegates to [`run_git_scan`].
+/// Git scan path — delegates to mode-selected Git scan driver.
 ///
 /// Builds the engine, configures persistence stores (in-memory for CLI),
 /// resolves the start set via `git` CLI commands, and runs the scan.
+/// `--execution-mode=direct|connector` dispatches through
+/// `run_git_scan_with_execution_mode` so connector mode uses a dedicated
+/// adapter seam while remaining parity-compatible.
 /// Findings stream through the [`EventSink`](super::events::EventSink);
 /// summary + optional debug/perf output goes to stderr.
 ///
@@ -442,13 +444,8 @@ fn run_git(
     rules_file: Option<PathBuf>,
     transform_filter: &TransformFilter,
 ) -> io::Result<()> {
-    match cfg.execution_mode {
-        ExecutionMode::Direct => {}
-        ExecutionMode::Connector => {
-            eprintln!(
-                "info: --execution-mode=connector currently runs the direct path (phase-1 parity mode)"
-            );
-        }
+    if matches!(cfg.execution_mode, ExecutionMode::Connector) {
+        eprintln!("info: using git connector adapter execution path");
     }
 
     let t0 = Instant::now();
@@ -528,7 +525,8 @@ fn run_git(
     config.enrich_identities = cfg.enrich_identities;
 
     let scan_start = Instant::now();
-    match run_git_scan(
+    match run_git_scan_with_execution_mode(
+        cfg.execution_mode,
         &cfg.repo_root,
         Arc::clone(&engine),
         &resolver,
