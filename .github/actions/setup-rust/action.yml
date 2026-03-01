@@ -57,7 +57,7 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y libboost-dev mold ${{ inputs.extra-apt }}
+        sudo apt-get install -y libboost-dev mold clang ${{ inputs.extra-apt }}
 
     - name: Configure mold linker (Linux)
       if: runner.os == 'Linux'
