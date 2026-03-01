@@ -169,9 +169,9 @@ The matrix validates:
 
 | Axis | Fixture row | Expected |
 |---|---|---|
-| Hidden files | `.hidden.txt` | Included by both |
+| Hidden files and dirs | `.hidden.txt`, `.hidden_dir/inside.txt` | Included by both |
 | Gitignore handling | `.gitignore` + `ignored.txt` | Included by both (gitignore not enforced) |
-| Symlink policy | `link_file.txt`, `link_dir` | Skipped by both |
+| Symlink policy | `link_file.txt`, `link_dir`, `link_dir/included.txt` | Skipped by both (no symlink traversal) |
 | Binary-like paths | `blob.bin` | Included by both |
 | Archive-like paths | `bundle.zip` | Included by both |
 | Non-UTF8 path bytes | raw bytes file name | Byte-identical inclusion when filesystem supports creation |

@@ -988,9 +988,12 @@ mod tests {
     fn filesystem_enumeration_conformance_matrix_matches_connector() {
         let dir = TempDir::new().expect("temp dir");
         fs::create_dir_all(dir.path().join("nested/deeper")).expect("create nested dirs");
+        fs::create_dir_all(dir.path().join(".hidden_dir")).expect("create hidden dir");
         fs::write(dir.path().join("visible.txt"), b"visible").expect("write visible file");
         fs::write(dir.path().join("nested/included.txt"), b"nested").expect("write nested file");
         fs::write(dir.path().join(".hidden.txt"), b"hidden").expect("write hidden file");
+        fs::write(dir.path().join(".hidden_dir/inside.txt"), b"hidden dir")
+            .expect("write hidden dir file");
         fs::write(dir.path().join(".gitignore"), b"ignored.txt\n").expect("write .gitignore");
         fs::write(dir.path().join("ignored.txt"), b"still scanned").expect("write ignored file");
         fs::write(dir.path().join("blob.bin"), [0, 1, 2, 3, 0]).expect("write binary-like file");
@@ -1010,12 +1013,18 @@ mod tests {
             ("nested", b"nested/included.txt".to_vec(), true),
             ("deep", b"nested/deeper/leaf.txt".to_vec(), true),
             ("hidden", b".hidden.txt".to_vec(), true),
+            ("hidden_dir_child", b".hidden_dir/inside.txt".to_vec(), true),
             ("gitignore_file", b".gitignore".to_vec(), true),
             ("gitignored_target", b"ignored.txt".to_vec(), true),
             ("binary_like", b"blob.bin".to_vec(), true),
             ("archive_like", b"bundle.zip".to_vec(), true),
             ("file_symlink", b"link_file.txt".to_vec(), false),
             ("dir_symlink", b"link_dir".to_vec(), false),
+            (
+                "dir_symlink_target_child",
+                b"link_dir/included.txt".to_vec(),
+                false,
+            ),
         ];
 
         // APFS may reject invalid UTF-8 names; include this row only when the
