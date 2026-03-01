@@ -405,25 +405,31 @@ fn git_finding_events_propagate_confidence_score() {
 #[test]
 fn sort_and_dedupe_findings_prefers_higher_confidence() {
     let mut findings = vec![
-        FindingKey {
-            start: 10,
-            end: 20,
-            rule_id: 7,
-            norm_hash: [0x11; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 7,
+                norm_hash: [0x11; 32],
+            },
             confidence_score: 1,
         },
-        FindingKey {
-            start: 10,
-            end: 20,
-            rule_id: 7,
-            norm_hash: [0x11; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 7,
+                norm_hash: [0x11; 32],
+            },
             confidence_score: 5,
         },
-        FindingKey {
-            start: 30,
-            end: 40,
-            rule_id: 7,
-            norm_hash: [0x22; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 30,
+                end: 40,
+                rule_id: 7,
+                norm_hash: [0x22; 32],
+            },
             confidence_score: 0,
         },
     ];
@@ -444,18 +450,22 @@ fn sort_and_dedupe_findings_prefers_higher_confidence() {
 #[test]
 fn sort_and_dedupe_findings_prefers_higher_confidence_reverse_input() {
     let mut findings = vec![
-        FindingKey {
-            start: 10,
-            end: 20,
-            rule_id: 7,
-            norm_hash: [0x11; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 7,
+                norm_hash: [0x11; 32],
+            },
             confidence_score: 5,
         },
-        FindingKey {
-            start: 10,
-            end: 20,
-            rule_id: 7,
-            norm_hash: [0x11; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 7,
+                norm_hash: [0x11; 32],
+            },
             confidence_score: 1,
         },
     ];
@@ -467,12 +477,11 @@ fn sort_and_dedupe_findings_prefers_higher_confidence_reverse_input() {
     );
 }
 
-/// `confidence_score` is metadata, not identity. Two `FindingKey` values
-/// that differ only in confidence must compare equal and hash identically.
-/// `Ord`/`PartialOrd` are deliberately absent to force callers through
-/// `sort_and_dedupe_findings`.
+/// `FindingKey` is pure identity — `Eq`, `Hash`, and `Ord` are derived
+/// and cover all fields. `ScoredFinding` carries confidence as metadata
+/// outside the identity key.
 #[test]
-fn finding_key_identity_ignores_confidence_score() {
+fn finding_key_derived_eq_and_hash_cover_all_fields() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -481,20 +490,16 @@ fn finding_key_identity_ignores_confidence_score() {
         end: 20,
         rule_id: 7,
         norm_hash: [0x11; 32],
-        confidence_score: 1,
     };
     let b = FindingKey {
         start: 10,
         end: 20,
         rule_id: 7,
         norm_hash: [0x11; 32],
-        confidence_score: 5,
     };
 
-    // PartialEq / Eq: identity equality must ignore confidence.
-    assert_eq!(a, b, "FindingKey equality must ignore confidence_score");
+    assert_eq!(a, b, "identical FindingKey values must be equal");
 
-    // Hash: equal values must hash identically.
     let hash = |k: &FindingKey| {
         let mut h = DefaultHasher::new();
         k.hash(&mut h);
@@ -503,7 +508,7 @@ fn finding_key_identity_ignores_confidence_score() {
     assert_eq!(
         hash(&a),
         hash(&b),
-        "FindingKey hash must ignore confidence_score"
+        "identical FindingKey values must hash identically"
     );
 }
 
@@ -511,18 +516,20 @@ fn finding_key_identity_ignores_confidence_score() {
 
 #[test]
 fn sort_and_dedupe_empty_vec() {
-    let mut findings: Vec<FindingKey> = vec![];
+    let mut findings: Vec<ScoredFinding> = vec![];
     sort_and_dedupe_findings(&mut findings);
     assert!(findings.is_empty());
 }
 
 #[test]
 fn sort_and_dedupe_single_element() {
-    let original = FindingKey {
-        start: 5,
-        end: 15,
-        rule_id: 1,
-        norm_hash: [0xaa; 32],
+    let original = ScoredFinding {
+        key: FindingKey {
+            start: 5,
+            end: 15,
+            rule_id: 1,
+            norm_hash: [0xaa; 32],
+        },
         confidence_score: 3,
     };
     let mut findings = vec![original];
@@ -534,18 +541,22 @@ fn sort_and_dedupe_single_element() {
 #[test]
 fn sort_and_dedupe_negative_confidence_keeps_higher() {
     let mut findings = vec![
-        FindingKey {
-            start: 0,
-            end: 10,
-            rule_id: 2,
-            norm_hash: [0xbb; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 0,
+                end: 10,
+                rule_id: 2,
+                norm_hash: [0xbb; 32],
+            },
             confidence_score: -10,
         },
-        FindingKey {
-            start: 0,
-            end: 10,
-            rule_id: 2,
-            norm_hash: [0xbb; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 0,
+                end: 10,
+                rule_id: 2,
+                norm_hash: [0xbb; 32],
+            },
             confidence_score: -5,
         },
     ];
@@ -564,25 +575,31 @@ fn sort_and_dedupe_negative_confidence_keeps_higher() {
 #[test]
 fn sort_and_dedupe_three_duplicates_keeps_highest() {
     let mut findings = vec![
-        FindingKey {
-            start: 0,
-            end: 8,
-            rule_id: 4,
-            norm_hash: [0xcc; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 0,
+                end: 8,
+                rule_id: 4,
+                norm_hash: [0xcc; 32],
+            },
             confidence_score: 2,
         },
-        FindingKey {
-            start: 0,
-            end: 8,
-            rule_id: 4,
-            norm_hash: [0xcc; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 0,
+                end: 8,
+                rule_id: 4,
+                norm_hash: [0xcc; 32],
+            },
             confidence_score: 7,
         },
-        FindingKey {
-            start: 0,
-            end: 8,
-            rule_id: 4,
-            norm_hash: [0xcc; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 0,
+                end: 8,
+                rule_id: 4,
+                norm_hash: [0xcc; 32],
+            },
             confidence_score: 3,
         },
     ];
@@ -597,11 +614,13 @@ fn sort_and_dedupe_three_duplicates_keeps_highest() {
 
 #[test]
 fn sort_and_dedupe_all_identical_including_confidence() {
-    let f = FindingKey {
-        start: 1,
-        end: 2,
-        rule_id: 9,
-        norm_hash: [0xdd; 32],
+    let f = ScoredFinding {
+        key: FindingKey {
+            start: 1,
+            end: 2,
+            rule_id: 9,
+            norm_hash: [0xdd; 32],
+        },
         confidence_score: 4,
     };
     let mut findings = vec![f, f, f];
@@ -618,59 +637,71 @@ fn sort_and_dedupe_all_identical_including_confidence() {
 fn sort_and_dedupe_mixed_duplicates_and_unique() {
     let mut findings = vec![
         // Group A: two duplicates with different confidence.
-        FindingKey {
-            start: 10,
-            end: 20,
-            rule_id: 1,
-            norm_hash: [0x11; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 1,
+                norm_hash: [0x11; 32],
+            },
             confidence_score: 2,
         },
-        FindingKey {
-            start: 10,
-            end: 20,
-            rule_id: 1,
-            norm_hash: [0x11; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 10,
+                end: 20,
+                rule_id: 1,
+                norm_hash: [0x11; 32],
+            },
             confidence_score: 8,
         },
         // Group B: unique finding.
-        FindingKey {
-            start: 30,
-            end: 40,
-            rule_id: 2,
-            norm_hash: [0x22; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 30,
+                end: 40,
+                rule_id: 2,
+                norm_hash: [0x22; 32],
+            },
             confidence_score: 0,
         },
         // Group C: three duplicates.
-        FindingKey {
-            start: 50,
-            end: 60,
-            rule_id: 3,
-            norm_hash: [0x33; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 50,
+                end: 60,
+                rule_id: 3,
+                norm_hash: [0x33; 32],
+            },
             confidence_score: 1,
         },
-        FindingKey {
-            start: 50,
-            end: 60,
-            rule_id: 3,
-            norm_hash: [0x33; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 50,
+                end: 60,
+                rule_id: 3,
+                norm_hash: [0x33; 32],
+            },
             confidence_score: 6,
         },
-        FindingKey {
-            start: 50,
-            end: 60,
-            rule_id: 3,
-            norm_hash: [0x33; 32],
+        ScoredFinding {
+            key: FindingKey {
+                start: 50,
+                end: 60,
+                rule_id: 3,
+                norm_hash: [0x33; 32],
+            },
             confidence_score: 3,
         },
     ];
     sort_and_dedupe_findings(&mut findings);
     assert_eq!(findings.len(), 3, "expected 3 unique identity groups");
     // Results are sorted by identity, so group A < B < C by start offset.
-    assert_eq!(findings[0].start, 10);
+    assert_eq!(findings[0].key.start, 10);
     assert_eq!(findings[0].confidence_score, 8, "group A winner");
-    assert_eq!(findings[1].start, 30);
+    assert_eq!(findings[1].key.start, 30);
     assert_eq!(findings[1].confidence_score, 0, "group B sole entry");
-    assert_eq!(findings[2].start, 50);
+    assert_eq!(findings[2].key.start, 50);
     assert_eq!(findings[2].confidence_score, 6, "group C winner");
 }
 

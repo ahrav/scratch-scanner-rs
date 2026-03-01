@@ -141,7 +141,7 @@ impl Default for EngineAdapterConfig {
 /// `start`/`end` are derived from `FindingRec.root_hint_*`, which provide
 /// a *best-effort root match span* in blob coordinates. For transform-derived
 /// findings, these spans map back to the encoded bytes that produced the match.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FindingKey {
     /// Inclusive start offset within the blob.
     pub start: u32,
@@ -152,63 +152,40 @@ pub struct FindingKey {
     /// Normalized secret hash — the sole representation of the matched
     /// secret, so raw secret bytes never appear in scan output structures.
     pub norm_hash: NormHash,
-    /// Additive confidence score from engine gate evaluation.
-    ///
-    /// **Not part of identity.** This field is excluded from `PartialEq`,
-    /// `Hash`, and `Ord` so that findings differing only in confidence are
-    /// treated as duplicates by standard collections and sort/dedup.
+}
+
+/// A finding paired with its confidence score from gate evaluation.
+///
+/// The arena stores `ScoredFinding` so that dedup can prefer the highest
+/// confidence when multiple scans produce the same identity key.
+/// `confidence_score` does not participate in persistence keying (see
+/// `build_finding_key` in `finalize.rs`).
+#[derive(Clone, Copy, Debug)]
+pub struct ScoredFinding {
+    pub key: FindingKey,
     pub confidence_score: i8,
-}
-
-impl PartialEq for FindingKey {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.start == other.start
-            && self.end == other.end
-            && self.rule_id == other.rule_id
-            && self.norm_hash == other.norm_hash
-    }
-}
-
-impl Eq for FindingKey {}
-
-impl std::hash::Hash for FindingKey {
-    #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.start.hash(state);
-        self.end.hash(state);
-        self.rule_id.hash(state);
-        self.norm_hash.hash(state);
-    }
-}
-
-impl FindingKey {
-    /// Compare two keys by identity fields only (start, end, rule_id,
-    /// norm_hash). Confidence is excluded so that callers must go through
-    /// [`sort_and_dedupe_findings`] to get the correct confidence tie-breaker.
-    #[inline]
-    fn identity_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.start
-            .cmp(&other.start)
-            .then_with(|| self.end.cmp(&other.end))
-            .then_with(|| self.rule_id.cmp(&other.rule_id))
-            .then_with(|| self.norm_hash.cmp(&other.norm_hash))
-    }
 }
 
 /// Sort findings by identity and dedupe equal identities in place.
 ///
 /// Tie-breaker inside an identity group is descending confidence, so dedupe
-/// keeps the most informative score. `dedup()` uses the manual `Eq` impl
-/// which excludes `confidence_score`, so the first (highest-confidence)
-/// entry in each group survives.
+/// keeps the most informative score. The first (highest-confidence) entry
+/// in each identity group survives.
 #[inline]
-pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<FindingKey>) {
+pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<ScoredFinding>) {
     findings.sort_unstable_by(|a, b| {
-        a.identity_cmp(b)
+        a.key
+            .cmp(&b.key)
             .then_with(|| b.confidence_score.cmp(&a.confidence_score))
     });
-    findings.dedup();
+    findings.dedup_by(|a, b| {
+        let same = a.key == b.key;
+        debug_assert!(
+            !same || b.confidence_score >= a.confidence_score,
+            "sort must place highest confidence first within identity group"
+        );
+        same
+    });
 }
 
 /// Range into the adapter findings arena for a single blob.
@@ -245,7 +222,7 @@ pub struct ScannedBlobs {
     /// Blobs scanned in candidate order.
     pub blobs: Vec<ScannedBlob>,
     /// Shared findings arena referenced by `ScannedBlob.findings`.
-    pub finding_arena: Vec<FindingKey>,
+    pub finding_arena: Vec<ScoredFinding>,
 }
 
 /// Always-on Git scan counters for user-facing summaries.
@@ -345,7 +322,7 @@ impl From<EngineAdapterError> for PackExecError {
 /// - **Event stream** — structured [`ScanEvent::Finding`] events emitted
 ///   to the configured `EventSink` for real-time consumption (dashboards,
 ///   progress reporting, CI integrations).
-/// - **Arena accumulation** — `FindingKey` values appended to a shared
+/// - **Arena accumulation** — `ScoredFinding` values appended to a shared
 ///   arena for batch persistence after the scan completes.
 ///
 /// The adapter is `Send` so it can be pooled across scoped-thread
@@ -357,11 +334,11 @@ pub struct EngineAdapter<'a> {
     results: Vec<ScannedBlob>,
     /// Accumulated findings across all blobs; each `ScannedBlob.findings`
     /// indexes a contiguous span here.
-    findings_arena: Vec<FindingKey>,
+    findings_arena: Vec<ScoredFinding>,
     /// Per-blob scratch: populated by `scan_blob_into_buf`, read by
     /// `stream_findings`, drained into the arena by `record_findings`,
     /// then cleared at the start of the next `scan_blob_into_buf` call.
-    findings_buf: Vec<FindingKey>,
+    findings_buf: Vec<ScoredFinding>,
     chunker: RingChunker,
     // Monotone ID for this adapter instance; wraps on overflow.
     next_file_id: u32,
@@ -440,7 +417,7 @@ impl<'a> EngineAdapter<'a> {
     ///
     /// Each `ScannedBlob.findings` references a span in this arena.
     #[must_use]
-    pub fn findings_arena(&self) -> &[FindingKey] {
+    pub fn findings_arena(&self) -> &[ScoredFinding] {
         &self.findings_arena
     }
 
@@ -574,10 +551,10 @@ impl<'a> EngineAdapter<'a> {
             self.event_sink.emit(ScanEvent::Finding(FindingEvent {
                 source: SourceKind::Git,
                 object_path: path,
-                start: u64::from(f.start),
-                end: u64::from(f.end),
-                rule_id: f.rule_id,
-                rule_name: self.engine.rule_name(f.rule_id),
+                start: u64::from(f.key.start),
+                end: u64::from(f.key.end),
+                rule_id: f.key.rule_id,
+                rule_name: self.engine.rule_name(f.key.rule_id),
                 commit_id: Some(commit_id),
                 change_kind: Some(change_kind),
                 confidence_score: f.confidence_score,
@@ -771,7 +748,7 @@ pub fn scan_blob_chunked(
     engine: &Engine,
     blob: &[u8],
     chunk_bytes: usize,
-) -> Result<Vec<FindingKey>, EngineAdapterError> {
+) -> Result<Vec<ScoredFinding>, EngineAdapterError> {
     let overlap = engine.required_overlap();
     let chunk_bytes = effective_chunk_bytes(chunk_bytes, overlap);
     let mut scratch = engine.new_scratch();
@@ -832,7 +809,7 @@ fn scan_blob_chunked_into(
     blob: &[u8],
     chunk_bytes: usize,
     overlap: usize,
-    out: &mut Vec<FindingKey>,
+    out: &mut Vec<ScoredFinding>,
 ) -> Result<(), EngineAdapterError> {
     let mut chunker = RingChunker::new(chunk_bytes, overlap);
     scan_blob_chunked_with_chunker(engine, scratch, file_id, blob, overlap, &mut chunker, out)
@@ -864,7 +841,7 @@ fn scan_blob_chunked_with_chunker(
     blob: &[u8],
     overlap: usize,
     chunker: &mut RingChunker,
-    out: &mut Vec<FindingKey>,
+    out: &mut Vec<ScoredFinding>,
 ) -> Result<(), EngineAdapterError> {
     perf::record_scan_blob();
 
@@ -983,7 +960,7 @@ fn scan_chunk(
     file_id: FileId,
     overlap: usize,
     view: ChunkView<'_>,
-    out: &mut Vec<FindingKey>,
+    out: &mut Vec<ScoredFinding>,
     err: &mut Option<EngineAdapterError>,
 ) {
     perf::record_scan_chunk();
@@ -1008,11 +985,13 @@ fn scan_chunk(
             *err = Some(EngineAdapterError::FindingOffsetOverflow { start, end });
             return;
         }
-        out.push(FindingKey {
-            start: start as u32,
-            end: end as u32,
-            rule_id: rec.rule_id,
-            norm_hash: *hash,
+        out.push(ScoredFinding {
+            key: FindingKey {
+                start: start as u32,
+                end: end as u32,
+                rule_id: rec.rule_id,
+                norm_hash: *hash,
+            },
             confidence_score: rec.confidence_score,
         });
     }
