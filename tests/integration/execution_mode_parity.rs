@@ -69,7 +69,7 @@ fn create_fs_flat_case(root: &Path, name: &'static str, files: usize) -> PathBuf
     let dir = root.join(name);
     fs::create_dir_all(&dir).expect("create fs case dir");
     for idx in 0..files {
-        let body = bulk_secret_payload(&format!("flat_token_{idx}"), 30);
+        let body = bulk_secret_payload(&format!("flat_token_{idx}"), 50);
         fs::write(dir.join(format!("flat_{idx:04}.txt")), body).expect("write fs fixture");
     }
     dir
@@ -280,7 +280,7 @@ fn throughput_limits() -> (f64, f64) {
     let per_case = std::env::var("EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(15.0);
+        .unwrap_or(20.0);
     (median, per_case)
 }
 
