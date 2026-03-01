@@ -25,6 +25,7 @@ pub mod harness_api;
 pub mod json_sink;
 pub mod json_write;
 pub mod orchestrator;
+pub mod parity;
 pub mod sarif_sink;
 #[cfg(test)]
 mod sink_stress_tests;
@@ -117,6 +118,28 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Execution path selector for scan orchestration.
+///
+/// `Direct` is the current default scanner path. `Connector` reserves the
+/// connector-oriented execution path used by migration parity gates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Run the current direct scanner path (default).
+    #[default]
+    Direct,
+    /// Run the connector-oriented scanner path.
+    Connector,
+}
+
+impl std::fmt::Display for ExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct => f.write_str("direct"),
+            Self::Connector => f.write_str("connector"),
+        }
+    }
+}
+
 /// Filesystem scan configuration.
 pub struct FsScanConfig {
     /// Directory or file path to scan.
@@ -140,6 +163,8 @@ pub struct FsScanConfig {
     /// backend. The default backend writes to a SQLite database under the
     /// configured store root.
     pub persist_findings: bool,
+    /// Execution mode selector (`direct` default, `connector` for parity runs).
+    pub execution_mode: ExecutionMode,
 }
 
 /// Controls which debug output is emitted to stderr after a git scan.
@@ -186,6 +211,8 @@ pub struct GitSourceConfig {
     pub scan_binary: bool,
     /// When `true`, extract and emit author/committer identity data.
     pub enrich_identities: bool,
+    /// Execution mode selector (`direct` default, `connector` for parity runs).
+    pub execution_mode: ExecutionMode,
 }
 
 /// Output event format selection.

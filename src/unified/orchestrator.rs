@@ -56,8 +56,8 @@ use crate::{demo_rules, demo_transforms, demo_tuning, AnchorMode, AnchorPolicy, 
 use super::cli::TransformFilter;
 use super::source::git::{EmptyWatermarkStore, GitCliResolver};
 use super::{
-    EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, ScanConfig, SourceConfig,
-    StoreCommand,
+    EventFormat, ExecutionMode, FsScanConfig, GitSourceConfig, OutputFormat, ScanConfig,
+    SourceConfig, StoreCommand,
 };
 
 /// Run a scan using the unified configuration.
@@ -150,6 +150,15 @@ fn run_fs(
 ) -> io::Result<()> {
     use super::events::{ScanEvent, SummaryEvent};
     use super::SourceKind;
+
+    match cfg.execution_mode {
+        ExecutionMode::Direct => {}
+        ExecutionMode::Connector => {
+            eprintln!(
+                "info: --execution-mode=connector currently runs the direct path (phase-1 parity mode)"
+            );
+        }
+    }
 
     let t0 = Instant::now();
     let workers = cfg.workers.max(1);
@@ -433,6 +442,15 @@ fn run_git(
     rules_file: Option<PathBuf>,
     transform_filter: &TransformFilter,
 ) -> io::Result<()> {
+    match cfg.execution_mode {
+        ExecutionMode::Direct => {}
+        ExecutionMode::Connector => {
+            eprintln!(
+                "info: --execution-mode=connector currently runs the direct path (phase-1 parity mode)"
+            );
+        }
+    }
+
     let t0 = Instant::now();
     let rules = load_rules_for_scan(rules_file.as_deref());
     let transforms = apply_transform_filter(demo_transforms(), transform_filter);

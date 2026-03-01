@@ -120,8 +120,47 @@ flowchart TD
     D --> E[Golden baseline compare]
 ```
 
+## Mode 3: Direct-vs-Connector Parity Gate (Phase 1)
+
+### What it tests
+
+Mode 3 is a migration gate that validates parity between execution modes:
+- CLI execution mode selector: `--execution-mode=direct|connector`
+- Exact finding parity after canonical normalization
+- Throughput drift thresholds:
+- median absolute delta across matrix cases <= 2%
+- per-case absolute delta <= 5%
+
+The canonical identity tuple is:
+- path (JSON path field)
+- rule identity (`rule`)
+- span (`start`, `end`)
+- git commit metadata (`oid`, `timestamp`) joined from `commit_meta`
+
+### Reduced matrix and CI gate
+
+The integration gate lives in `tests/integration/execution_mode_parity.rs` and
+is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
+- FS flat fixture
+- FS nested fixture
+- Git linear history fixture
+- Git branch-and-merge fixture
+
+### Commands
+
+```bash
+# Run the parity gate locally (uses defaults: 5 iterations, 2%/5% thresholds)
+cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+
+# Optional tuning knobs for local stress/debug
+EXECUTION_MODE_PARITY_ITERS=5 \
+EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT=2 \
+EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
+cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
+```
+
 ## Recommendation
 
 Keep synthetic stress testing as the primary engine-correctness gate, and use
-the real-rules harness as a separate ruleset regression gate. The two modes
-should not share oracles or failure criteria.
+the real-rules harness plus execution-mode parity gate as separate regression
+gates. The modes should not share oracles or failure criteria.

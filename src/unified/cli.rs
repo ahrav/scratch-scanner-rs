@@ -20,8 +20,8 @@ use crate::git_scan::{GitScanMode, MergeDiffMode};
 use crate::AnchorMode;
 
 use super::{
-    DebugLevel, EventFormat, FsScanConfig, GitSourceConfig, OutputFormat, SourceConfig,
-    StoreCommand,
+    DebugLevel, EventFormat, ExecutionMode, FsScanConfig, GitSourceConfig, OutputFormat,
+    SourceConfig, StoreCommand,
 };
 
 /// Controls which transform decoders are active during a scan.
@@ -173,6 +173,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
     let mut null_sink = false;
     let mut scan_binary = false;
     let mut persist_findings = false;
+    let mut execution_mode = ExecutionMode::Direct;
     let mut verbose = false;
     let mut anchor_mode = AnchorMode::Manual;
     let mut event_format = EventFormat::Jsonl;
@@ -225,6 +226,10 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             }
             if let Some(rest) = flag.strip_prefix("--event-format=") {
                 event_format = parse_event_format(rest);
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--execution-mode=") {
+                execution_mode = parse_execution_mode(rest);
                 continue;
             }
             match flag {
@@ -292,6 +297,7 @@ fn parse_fs_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<S
             anchor_mode,
             scan_binary,
             persist_findings,
+            execution_mode,
         }),
         event_format,
         verbose,
@@ -321,6 +327,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
     let mut debug_level = DebugLevel::Off;
     let mut scan_binary = false;
     let mut enrich_identities = false;
+    let mut execution_mode = ExecutionMode::Direct;
     let mut null_sink = false;
     let mut verbose = false;
     let mut event_format = EventFormat::Jsonl;
@@ -375,6 +382,10 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
             }
             if let Some(rest) = flag.strip_prefix("--event-format=") {
                 event_format = parse_event_format(rest);
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("--execution-mode=") {
+                execution_mode = parse_execution_mode(rest);
                 continue;
             }
             // --- Hidden flags (--x-* prefix) -----------------------------------
@@ -517,6 +528,7 @@ fn parse_git_args(args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<
             debug: debug_level,
             scan_binary,
             enrich_identities,
+            execution_mode,
         }),
         event_format,
         verbose,
@@ -562,6 +574,22 @@ fn parse_event_format(s: &str) -> EventFormat {
         _ => {
             eprintln!(
                 "invalid --event-format value: {} (expected jsonl|text|json|sarif)",
+                s
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Map a CLI string (`"direct"` | `"connector"`) to [`ExecutionMode`].
+/// Exits with code 2 on unrecognised values.
+fn parse_execution_mode(s: &str) -> ExecutionMode {
+    match s {
+        "direct" => ExecutionMode::Direct,
+        "connector" => ExecutionMode::Connector,
+        _ => {
+            eprintln!(
+                "invalid --execution-mode value: {} (expected direct|connector)",
                 s
             );
             std::process::exit(2);
@@ -690,6 +718,7 @@ OPTIONS:
     --decode-depth=<N>      Max decode depth (default: 3)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                             Comma-separated: base64, url (case-insensitive)
+    --execution-mode=direct|connector  Execution path (default: direct)
     --null-sink             Drop all findings (measure scan overhead only)
     --persist-findings      Persist FS findings to append-log segment files
 
@@ -717,6 +746,7 @@ OPTIONS:
     --decode-depth=<N>        Max decode depth (default: 3)
     --transforms=all|none|<list>  Transforms to enable (default: all)
                               Comma-separated: base64, url (case-insensitive)
+    --execution-mode=direct|connector  Execution path (default: direct)
     --anchors=manual|derived  Anchor mode (default: manual)
     --debug                   Verbose stage stats to stderr
     --debug=perf              Stage stats + pack execution timing breakdown
@@ -1197,6 +1227,32 @@ mod tests {
         let git_args = vec![OsString::from("--repo=/r")];
         let git_config = parse_git_args(git_args.into_iter()).unwrap();
         assert!(!git_config.null_sink);
+    }
+
+    // -- Execution mode -------------------------------------------------------
+
+    #[test]
+    fn fs_execution_mode_defaults_direct() {
+        let cfg = fs_config(&["--path=/d"]);
+        assert_eq!(cfg.execution_mode, super::super::ExecutionMode::Direct);
+    }
+
+    #[test]
+    fn fs_execution_mode_connector_parsed() {
+        let cfg = fs_config(&["--path=/d", "--execution-mode=connector"]);
+        assert_eq!(cfg.execution_mode, super::super::ExecutionMode::Connector);
+    }
+
+    #[test]
+    fn git_execution_mode_defaults_direct() {
+        let cfg = git_config(&["--repo=/r"]);
+        assert_eq!(cfg.execution_mode, super::super::ExecutionMode::Direct);
+    }
+
+    #[test]
+    fn git_execution_mode_connector_parsed() {
+        let cfg = git_config(&["--repo=/r", "--execution-mode=connector"]);
+        assert_eq!(cfg.execution_mode, super::super::ExecutionMode::Connector);
     }
 
     // -- DebugLevel / --debug / --debug=perf --------------------------------
