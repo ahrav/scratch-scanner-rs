@@ -204,6 +204,13 @@ impl ReadConnector for FilesystemConnector {
             }
         }
 
+        // Re-check file type to guard against TOCTOU races where the path
+        // was replaced between enumerate and open.
+        let meta = std::fs::symlink_metadata(&entry.path).map_err(map_io_error)?;
+        if !meta.file_type().is_file() {
+            return Err(ReadError::permanent("path is no longer a regular file"));
+        }
+
         #[cfg(unix)]
         let file = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -234,11 +241,12 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
         .git_exclude(false);
 
     let mut entries = Vec::new();
+    let mut version_buf = Vec::with_capacity(128);
     for entry in builder.build() {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(err) => {
-                eprintln!("warn: filesystem connector discovery error: {err}");
+            Err(_) => {
+                eprintln!("warn: filesystem connector: skipped entry during discovery");
                 continue;
             }
         };
@@ -254,10 +262,8 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
         let key = key_for_display(&display)?;
         let stable_item_id = ItemIdentityKey::new(FS_CONNECTOR_TAG, key.as_bytes()).stable_id();
         let metadata = std::fs::symlink_metadata(&path).ok();
-        let version = VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material(
-            &key,
-            metadata.as_ref(),
-        )));
+        version_material(&mut version_buf, &key, metadata.as_ref());
+        let version = VersionId::Weak(ObjectVersionId::from_version_bytes(&version_buf));
         let size_hint = metadata.as_ref().map(std::fs::Metadata::len);
         let location = Location::try_new(display, None).ok();
 
@@ -301,18 +307,17 @@ fn display_path(root: &Path, path: &Path) -> String {
     preferred.to_string_lossy().replace('\\', "/")
 }
 
-fn version_material(key: &ItemKey, metadata: Option<&std::fs::Metadata>) -> Vec<u8> {
-    let mut material = Vec::with_capacity(64);
-    material.extend_from_slice(key.as_bytes());
+fn version_material(buf: &mut Vec<u8>, key: &ItemKey, metadata: Option<&std::fs::Metadata>) {
+    buf.clear();
+    buf.extend_from_slice(key.as_bytes());
     if let Some(metadata) = metadata {
-        material.extend_from_slice(&metadata.len().to_le_bytes());
+        buf.extend_from_slice(&metadata.len().to_le_bytes());
         if let Ok(modified) = metadata.modified() {
             if let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH) {
-                material.extend_from_slice(&since_epoch.as_nanos().to_le_bytes());
+                buf.extend_from_slice(&since_epoch.as_nanos().to_le_bytes());
             }
         }
     }
-    material
 }
 
 /// Thin wrapper around the shared classifier in [`crate::scheduler::failure`]

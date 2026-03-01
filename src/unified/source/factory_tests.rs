@@ -490,19 +490,110 @@ fn open_invalid_item_ref_returns_permanent_error() {
 #[test]
 fn version_material_deterministic_without_metadata() {
     let key = ItemKey::try_from_slice(b"test/path.rs").unwrap();
-    let v1 = version_material(&key, None);
-    let v2 = version_material(&key, None);
+    let mut v1 = Vec::new();
+    let mut v2 = Vec::new();
+    version_material(&mut v1, &key, None);
+    version_material(&mut v2, &key, None);
     assert_eq!(v1, v2, "version_material must be deterministic");
 }
 
 #[test]
 fn version_material_includes_key_bytes() {
     let key = ItemKey::try_from_slice(b"my/file.txt").unwrap();
-    let mat = version_material(&key, None);
+    let mut mat = Vec::new();
+    version_material(&mut mat, &key, None);
     assert!(
         mat.starts_with(b"my/file.txt"),
         "version material should start with the key bytes",
     );
+}
+
+// ===========================================================================
+// Property tests — key_for_display invariants over the full input domain
+// ===========================================================================
+
+// ===========================================================================
+// Unix edge cases — symlinks and permission-denied directories
+// ===========================================================================
+
+#[cfg(unix)]
+mod unix_edge_cases {
+    use super::*;
+
+    #[test]
+    fn symlink_to_regular_file_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.txt"), b"data").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let entries = collect_filesystem_entries(&root).unwrap();
+        // follow_links(false) means symlinks are not followed; only the real
+        // file should appear.
+        assert_eq!(entries.len(), 1, "symlink should be skipped");
+        assert!(
+            entries[0]
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("real"),
+            "only the real file should be enumerated",
+        );
+    }
+
+    #[test]
+    fn broken_symlink_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.txt"), b"data").unwrap();
+        std::os::unix::fs::symlink("/nonexistent/target", root.join("broken.txt")).unwrap();
+
+        let entries = collect_filesystem_entries(&root).unwrap();
+        assert_eq!(entries.len(), 1, "broken symlink should be skipped");
+    }
+
+    #[test]
+    fn permission_denied_directory_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let denied = root.join("denied");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(root.join("visible.txt"), b"ok").unwrap();
+        std::fs::write(denied.join("secret.txt"), b"hidden").unwrap();
+
+        // Remove read+execute permission on the subdirectory.
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // RAII guard to restore permissions even if the test panics.
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _guard = RestorePerms(denied.clone());
+
+        let entries = collect_filesystem_entries(&root).unwrap();
+        // The inaccessible directory should be skipped (warned), not fail.
+        let paths: Vec<_> = entries
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            paths.contains(&"visible.txt".to_owned()),
+            "visible file must be present: {paths:?}",
+        );
+        assert!(
+            !paths.contains(&"secret.txt".to_owned()),
+            "file in inaccessible dir must not be present: {paths:?}",
+        );
+    }
 }
 
 // ===========================================================================
@@ -550,12 +641,25 @@ mod prop {
             );
         }
 
+        /// key_for_display handles unicode and special characters correctly.
+        #[test]
+        fn key_for_display_handles_unicode(
+            display in "[\\w\\s\\p{L}!@#$%^&()+=;',~`-]{1,8200}"
+                .prop_filter("non-empty after trim", |s| !s.trim().is_empty())
+        ) {
+            let key = key_for_display(&display).unwrap();
+            prop_assert!(!key.as_bytes().is_empty());
+            prop_assert!(key.as_bytes().len() <= MAX_ITEM_KEY_SIZE);
+        }
+
         /// version_material is deterministic for a given key (without metadata).
         #[test]
         fn version_material_deterministic(key_str in "[a-zA-Z0-9/_.-]{1,200}") {
             let key = ItemKey::try_from_slice(key_str.as_bytes()).unwrap();
-            let v1 = version_material(&key, None);
-            let v2 = version_material(&key, None);
+            let mut v1 = Vec::new();
+            let mut v2 = Vec::new();
+            version_material(&mut v1, &key, None);
+            version_material(&mut v2, &key, None);
             prop_assert_eq!(v1, v2);
         }
 
@@ -563,7 +667,8 @@ mod prop {
         #[test]
         fn version_material_starts_with_key(key_str in "[a-zA-Z0-9/_.-]{1,200}") {
             let key = ItemKey::try_from_slice(key_str.as_bytes()).unwrap();
-            let mat = version_material(&key, None);
+            let mut mat = Vec::new();
+            version_material(&mut mat, &key, None);
             prop_assert!(
                 mat.starts_with(key.as_bytes()),
                 "material should start with key bytes",
