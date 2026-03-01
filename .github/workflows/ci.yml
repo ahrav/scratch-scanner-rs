@@ -166,8 +166,8 @@ jobs:
     name: Sustained Green Report
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: [execution-mode-parity, test, test-aarch64]
+    if: ${{ always() && !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    needs: [execution-mode-parity, test, test-aarch64, clippy]
     permissions:
       actions: read
       contents: read
