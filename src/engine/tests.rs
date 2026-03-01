@@ -3103,6 +3103,26 @@ fn anchor_policy_prefers_derived_over_manual() {
 }
 
 #[test]
+fn regression_slack_webhook_raw_match_not_suppressed() {
+    let buf: Vec<u8> = vec![
+        57, 221, 123, 82, 133, 169, 165, 91, 183, 11, 248, 153, 63, 172, 98, 240, 220, 91, 10, 75,
+        10, 135, 150, 106, 232, 156, 76, 162, 159, 190, 148, 46, 221, 19, 120, 19, 13, 5, 133, 104,
+        116, 116, 112, 115, 58, 47, 47, 104, 111, 111, 107, 115, 46, 115, 108, 97, 99, 107, 46, 99,
+        111, 109, 47, 115, 101, 114, 118, 105, 99, 101, 115, 47, 65, 65, 86, 68, 81, 66, 87, 81,
+        65, 98, 97, 105, 68, 67, 122, 57, 110, 103, 115, 85, 122, 72, 113, 48, 109, 48, 78, 82,
+        113, 84, 90, 116, 48, 50, 69, 83, 71, 114, 56, 75, 107, 57, 70, 120, 37, 192, 134, 34, 52,
+        202, 133, 250, 48, 156, 25, 0, 23, 244, 138, 247, 112, 101, 3, 36, 32, 205, 201, 250, 108,
+        185, 208, 176, 133, 248, 42, 88, 101, 99, 109, 225, 208, 74, 34, 251, 14,
+    ];
+    let engine = demo_engine();
+    let findings = scan_chunk_findings(&engine, &buf);
+    let has_raw = findings
+        .iter()
+        .any(|f| f.rule == "slack-webhook-url" && f.span == (39..116) && f.decode_steps.is_empty());
+    assert!(has_raw, "raw slack-webhook-url match missing at 39..116");
+}
+
+#[test]
 fn anchor_policy_falls_back_to_manual_on_unfilterable() {
     const MANUAL: &[&[u8]] = &[b"Z"];
     let rule = RuleSpec {
@@ -4868,6 +4888,68 @@ fn tiger_regressions_replay() {
 }
 
 #[test]
+fn tiger_boundary_url_percent_adjacent_secret() {
+    // Regression guard for the oracle itself: the VS prefilter fires at two
+    // adjacent match-end offsets for a slack-webhook-url embedded next to a
+    // trailing `%` byte. Both windows (after clamping) cover the same decoded
+    // region and yield identical regex matches, staging two FindingRecs that
+    // cause `replace_same_scan_duplicate` to overwrite the raw finding.
+    //
+    // The tiger harness didn't catch this because `check_oracle_covered`
+    // compares oracle vs chunked — but the oracle itself was wrong (the raw
+    // finding was also lost in single-chunk mode). This test validates the
+    // oracle contains the raw finding AND that chunking doesn't regress it.
+    let engine = correctness_engine();
+
+    let buf: Vec<u8> = vec![
+        57, 221, 123, 82, 133, 169, 165, 91, 183, 11, 248, 153, 63, 172, 98, 240, 220, 91, 10, 75,
+        10, 135, 150, 106, 232, 156, 76, 162, 159, 190, 148, 46, 221, 19, 120, 19, 13, 5, 133, 104,
+        116, 116, 112, 115, 58, 47, 47, 104, 111, 111, 107, 115, 46, 115, 108, 97, 99, 107, 46, 99,
+        111, 109, 47, 115, 101, 114, 118, 105, 99, 101, 115, 47, 65, 65, 86, 68, 81, 66, 87, 81,
+        65, 98, 97, 105, 68, 67, 122, 57, 110, 103, 115, 85, 122, 72, 113, 48, 109, 48, 78, 82,
+        113, 84, 90, 116, 48, 50, 69, 83, 71, 114, 56, 75, 107, 57, 70, 120, 37, 192, 134, 34, 52,
+        202, 133, 250, 48, 156, 25, 0, 23, 244, 138, 247, 112, 101, 3, 36, 32, 205, 201, 250, 108,
+        185, 208, 176, 133, 248, 42, 88, 101, 99, 109, 225, 208, 74, 34, 251, 14,
+    ];
+
+    // The oracle itself must contain the raw finding.
+    let oracle = scan_one_chunk_records(&engine, &buf);
+    let has_raw_oracle = oracle
+        .iter()
+        .any(|f| engine.rule_name(f.rule_id) == "slack-webhook-url" && f.step_id == STEP_ROOT);
+    assert!(
+        has_raw_oracle,
+        "oracle must contain raw slack-webhook-url finding; got: {:?}",
+        oracle
+    );
+
+    // Exercise multiple chunk plans to ensure no plan reintroduces the bug.
+    let plans = [
+        ("fixed-32", ChunkPlan::fixed(32)),
+        ("fixed-48", ChunkPlan::fixed(48)),
+        ("alternating-24-64", ChunkPlan::alternating(24, 64)),
+    ];
+    for (label, plan) in &plans {
+        let chunked = scan_chunked_records(&engine, &buf, plan.clone());
+        if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+            panic!(
+                "tiger_boundary_url_percent_adjacent_secret [{}] failed: {}",
+                label, msg
+            );
+        }
+        // Chunked output must also preserve the raw finding.
+        let has_raw_chunked = chunked
+            .iter()
+            .any(|f| engine.rule_name(f.rule_id) == "slack-webhook-url" && f.step_id == STEP_ROOT);
+        assert!(
+            has_raw_chunked,
+            "[{}] chunked scan lost raw slack-webhook-url finding; got: {:?}",
+            label, chunked
+        );
+    }
+}
+
+#[test]
 fn tiger_boundary_percent_triplet_split() {
     // Explicitly split a `%AB` percent triplet so '%' ends a chunk and the
     // two hex digits begin the next chunk. This exercises URL-percent decoding
@@ -5140,6 +5222,195 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
         chunked
     );
 }
+
+// -- Tests for streaming-decode duplicate-finding bug (raw overwrite) ----------
+
+#[test]
+fn raw_and_url_percent_transform_findings_coexist() {
+    // When a plaintext secret sits adjacent to `%XX` bytes, the URL span
+    // finder merges them into one URLISH run.  After decoding, the secret
+    // is still present (it passes through URL decoding unchanged), so BOTH
+    // a raw finding and a transform finding should be produced.
+    //
+    // Before the dedup fix in `run_rule_on_raw_window_into`, the VS
+    // prefilter could fire at adjacent offsets, staging two identical
+    // transform findings.  `replace_same_scan_duplicate` then overwrote the
+    // raw finding with the duplicate, losing it.
+    let rule = RuleSpec {
+        radius: 64,
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let token = b"TOK0_ABCDEFGH";
+    // Space breaks the URLISH run, isolating the span.
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(token);
+    buf.extend_from_slice(&url_percent_encode_all(b"ABCD"));
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let recs = scan_one_chunk_records(&engine, &buf);
+
+    let has_raw = recs.iter().any(|r| r.step_id == STEP_ROOT);
+    let has_transform = recs.iter().any(|r| r.step_id != STEP_ROOT);
+
+    assert!(has_raw, "raw finding missing; got: {:?}", recs);
+    assert!(has_transform, "transform finding missing; got: {:?}", recs);
+
+    // No duplicate findings: every (rule_id, span, root_hint) tuple is unique.
+    let keys = recs_to_full_keys(&recs);
+    assert_eq!(
+        recs.len(),
+        keys.len(),
+        "duplicate findings detected: {:?}",
+        recs
+    );
+}
+
+#[test]
+fn chunked_scan_preserves_raw_and_transform_for_percent_adjacent_secret() {
+    // Same setup as `raw_and_url_percent_transform_findings_coexist`, but
+    // compares oracle (single-chunk) vs chunked output. Both must contain
+    // raw + transform findings AND oracle == chunked.
+    let rule = RuleSpec {
+        radius: 64,
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    tuning.max_findings_per_chunk = tuning.max_findings_per_chunk.max(65_535);
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let token = b"TOK0_ABCDEFGH";
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(token);
+    buf.extend_from_slice(&url_percent_encode_all(b"ABCD"));
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let reference = scan_one_chunk_records(&engine, &buf);
+    let chunked = scan_in_chunks_with_overlap(&engine, &buf, 32, engine.required_overlap());
+
+    let reference_keys = recs_to_full_keys(&reference);
+    let chunked_keys = recs_to_full_keys(&chunked);
+
+    assert_eq!(
+        reference_keys, chunked_keys,
+        "oracle vs chunked mismatch:\n  oracle: {:?}\n  chunked: {:?}",
+        reference_keys, chunked_keys
+    );
+
+    // Both must have raw + transform.
+    let has_raw = reference.iter().any(|r| r.step_id == STEP_ROOT);
+    let has_transform = reference.iter().any(|r| r.step_id != STEP_ROOT);
+    assert!(has_raw, "oracle missing raw finding");
+    assert!(has_transform, "oracle missing transform finding");
+}
+
+#[test]
+fn percent_spans_both_sides_of_secret_no_extra_findings() {
+    // `%XX` bytes on BOTH sides of the secret create a wider URLISH span
+    // and more VS match offsets, increasing the likelihood of adjacent
+    // prefilter fires that trigger the duplicate staging bug.
+    let rule = RuleSpec {
+        radius: 64,
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let token = b"TOK0_ABCDEFGH";
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(&url_percent_encode_all(b"AB"));
+    buf.extend_from_slice(token);
+    buf.extend_from_slice(&url_percent_encode_all(b"CDE"));
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let recs = scan_one_chunk_records(&engine, &buf);
+
+    // No duplicate findings.
+    let keys = recs_to_full_keys(&recs);
+    assert_eq!(
+        recs.len(),
+        keys.len(),
+        "duplicate findings detected: {:?}",
+        recs
+    );
+
+    // At most 1 raw + at most 1 transform.
+    let raw_count = recs.iter().filter(|r| r.step_id == STEP_ROOT).count();
+    let transform_count = recs.iter().filter(|r| r.step_id != STEP_ROOT).count();
+    assert!(
+        raw_count <= 1,
+        "expected at most 1 raw finding, got {}: {:?}",
+        raw_count,
+        recs
+    );
+    assert!(
+        transform_count <= 1,
+        "expected at most 1 transform finding, got {}: {:?}",
+        transform_count,
+        recs
+    );
+}
+
+// -- End streaming-decode duplicate-finding tests -----------------------------
 
 #[test]
 fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
