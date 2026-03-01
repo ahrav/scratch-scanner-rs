@@ -3103,6 +3103,11 @@ fn anchor_policy_prefers_derived_over_manual() {
 
 #[test]
 fn regression_slack_webhook_raw_match_not_suppressed() {
+    // Byte layout:
+    //   [0..39)   random non-ASCII prefix
+    //   [39..116) "https://hooks.slack.com/services/AAVDQBWQAbaiDCz9ngsUzHq0m0NRqTZt02ESGr8Kk9Fx"
+    //   [116]     0x25 ('%') — adjacent percent that triggers duplicate VS prefilter windows
+    //   [117..156) random non-ASCII suffix
     let buf: Vec<u8> = vec![
         57, 221, 123, 82, 133, 169, 165, 91, 183, 11, 248, 153, 63, 172, 98, 240, 220, 91, 10, 75,
         10, 135, 150, 106, 232, 156, 76, 162, 159, 190, 148, 46, 221, 19, 120, 19, 13, 5, 133, 104,
@@ -4044,20 +4049,23 @@ fn apply_encoding(token: &[u8], base: BaseEncoding, chain: TransformChain) -> Ve
 
     match chain {
         TransformChain::None => bytes,
-        TransformChain::Url => url_percent_encode_all(&bytes),
+        TransformChain::Url => percent_encode_all(&bytes),
         TransformChain::Base64 => b64_encode(&bytes).into_bytes(),
         TransformChain::UrlThenBase64 => {
-            let url = url_percent_encode_all(&bytes);
+            let url = percent_encode_all(&bytes);
             b64_encode(&url).into_bytes()
         }
         TransformChain::Base64ThenUrl => {
             let b64 = b64_encode(&bytes);
-            url_percent_encode_all(b64.as_bytes())
+            percent_encode_all(b64.as_bytes())
         }
     }
 }
 
-fn url_percent_encode_all(input: &[u8]) -> Vec<u8> {
+/// Percent-encode every byte as `%XX` with uppercase hex — equivalent to
+/// [`crate::sim::mutation::percent_encode_all`] but kept local so that tests
+/// compile without the `sim-harness` feature.
+fn percent_encode_all(input: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = Vec::with_capacity(input.len().saturating_mul(3));
     for &b in input {
@@ -4900,6 +4908,11 @@ fn tiger_boundary_url_percent_adjacent_secret() {
     // oracle contains the raw finding AND that chunking doesn't regress it.
     let engine = correctness_engine();
 
+    // Byte layout (same buffer as regression_slack_webhook_raw_match_not_suppressed):
+    //   [0..39)   random non-ASCII prefix
+    //   [39..116) "https://hooks.slack.com/services/AAVDQBWQAbaiDCz9ngsUzHq0m0NRqTZt02ESGr8Kk9Fx"
+    //   [116]     0x25 ('%') — adjacent percent that triggers duplicate VS prefilter windows
+    //   [117..156) random non-ASCII suffix
     let buf: Vec<u8> = vec![
         57, 221, 123, 82, 133, 169, 165, 91, 183, 11, 248, 153, 63, 172, 98, 240, 220, 91, 10, 75,
         10, 135, 150, 106, 232, 156, 76, 162, 159, 190, 148, 46, 221, 19, 120, 19, 13, 5, 133, 104,
@@ -4957,7 +4970,7 @@ fn tiger_boundary_percent_triplet_split() {
     let overlap = engine.required_overlap();
 
     let token = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
-    let encoded = url_percent_encode_all(token);
+    let encoded = percent_encode_all(token);
     assert_eq!(encoded.first(), Some(&b'%'));
 
     let chunk_size = overlap.saturating_add(1);
@@ -5021,7 +5034,7 @@ fn chunked_transform_root_hint_matches_reference() {
 
     let token = b"TOK0_ABCDEFGH";
     let encoded_b64 = b64_encode(token).into_bytes();
-    let encoded_url = url_percent_encode_all(token);
+    let encoded_url = percent_encode_all(token);
 
     let mut buf = Vec::new();
     buf.extend_from_slice(b"start ");
@@ -5133,7 +5146,7 @@ fn chunked_url_percent_prefix_trigger_kept() {
     let mut buf = Vec::new();
     buf.extend_from_slice(token);
     buf.extend(std::iter::repeat_n(b'x', 24));
-    buf.extend_from_slice(&url_percent_encode_all(b"WXYZ"));
+    buf.extend_from_slice(&percent_encode_all(b"WXYZ"));
 
     let reference = scan_one_chunk_records(&engine, &buf);
     let chunked = scan_in_chunks_with_overlap(&engine, &buf, 32, engine.required_overlap());
@@ -5275,7 +5288,7 @@ fn raw_and_url_percent_transform_findings_coexist() {
     let mut buf = Vec::new();
     buf.extend(std::iter::repeat_n(b' ', 32));
     buf.extend_from_slice(token);
-    buf.extend_from_slice(&url_percent_encode_all(b"ABCD"));
+    buf.extend_from_slice(&percent_encode_all(b"ABCD"));
     buf.extend(std::iter::repeat_n(b' ', 32));
 
     let recs = scan_one_chunk_records(&engine, &buf);
@@ -5311,7 +5324,7 @@ fn chunked_scan_preserves_raw_and_transform_for_percent_adjacent_secret() {
     let mut buf = Vec::new();
     buf.extend(std::iter::repeat_n(b' ', 32));
     buf.extend_from_slice(token);
-    buf.extend_from_slice(&url_percent_encode_all(b"ABCD"));
+    buf.extend_from_slice(&percent_encode_all(b"ABCD"));
     buf.extend(std::iter::repeat_n(b' ', 32));
 
     let reference = scan_one_chunk_records(&engine, &buf);
@@ -5345,9 +5358,9 @@ fn percent_spans_both_sides_of_secret_no_extra_findings() {
     let token = b"TOK0_ABCDEFGH";
     let mut buf = Vec::new();
     buf.extend(std::iter::repeat_n(b' ', 32));
-    buf.extend_from_slice(&url_percent_encode_all(b"AB"));
+    buf.extend_from_slice(&percent_encode_all(b"AB"));
     buf.extend_from_slice(token);
-    buf.extend_from_slice(&url_percent_encode_all(b"CDE"));
+    buf.extend_from_slice(&percent_encode_all(b"CDE"));
     buf.extend(std::iter::repeat_n(b' ', 32));
 
     let recs = scan_one_chunk_records(&engine, &buf);
@@ -5459,7 +5472,7 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
     }
 
     let token = b"TOK0_ABCDEFGH";
-    let encoded = url_percent_encode_all(token);
+    let encoded = percent_encode_all(token);
 
     let mut buf = Vec::new();
     buf.extend(std::iter::repeat_n(b'x', 64));
@@ -5545,7 +5558,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
     decoded.extend_from_slice(b"--");
     decoded.extend_from_slice(tok_b);
 
-    let url_encoded = url_percent_encode_all(&decoded);
+    let url_encoded = percent_encode_all(&decoded);
     let b64_encoded = b64_encode(&url_encoded).into_bytes();
 
     let mut buf = Vec::new();
