@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '.beads/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '.beads/**'
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
   schedule:
     - cron: "0 2 * * *" # nightly at 02:00 UTC
   workflow_dispatch:
@@ -18,8 +28,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -54,7 +65,7 @@ jobs:
               - 'src/**'
 
   # ---------------------------------------------------------------------------
-  # fmt → clippy → test  (serial chain, shared cache)
+  # fmt, clippy, test  (parallel — each depends only on path filtering)
   # ---------------------------------------------------------------------------
   fmt:
     name: Format
@@ -89,7 +100,8 @@ jobs:
     name: Clippy
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    needs: [fmt]
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
@@ -105,11 +117,16 @@ jobs:
           --features stdx-proptest,kgram-gate,perf-stats,stats,b64-stats,bench,tiger-harness,sim-harness,kani,scheduler-sim,integration-tests,property-tests,smoke-tests,diagnostic-tests,rocksdb,aegis-pure-rust,git-perf,real-rules-harness
           -- -D warnings
 
+      - name: Show cache stats
+        if: always()
+        run: du -sh target/ || true
+
   test:
     name: Test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    needs: [clippy]
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes]
     env:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
@@ -119,9 +136,13 @@ jobs:
         with:
           toolchain: stable
           shared-key: stable-linux
-          save-cache: "false"
 
-      - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
+      - run: cargo nextest run --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
+      - run: cargo test --doc
+
+      - name: Show cache stats
+        if: always()
+        run: du -sh target/ || true
 
   eval-harness:
     name: Eval Harness
@@ -130,7 +151,6 @@ jobs:
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes, clippy]
     env:
-      RUSTC_WRAPPER: ""
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -171,7 +191,8 @@ jobs:
     name: Test (aarch64)
     runs-on: macos-15
     timeout-minutes: 30
-    needs: [clippy-aarch64]
+    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    needs: [changes]
     env:
       PROPTEST_CASES: ${{ (github.event_name == 'schedule') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule') && '2' || '1' }}
@@ -181,8 +202,9 @@ jobs:
         with:
           toolchain: stable
           shared-key: stable-macos
-          save-cache: "false"
-      - run: cargo test --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
+
+      - run: cargo nextest run --features stdx-proptest,integration-tests,property-tests,diagnostic-tests,smoke-tests
+      - run: cargo test --doc
 
   # ---------------------------------------------------------------------------
   # Scheduled: full harness (runs after clippy for cache reuse)
@@ -208,7 +230,8 @@ jobs:
           shared-key: stable-linux
           save-cache: "false"
 
-      - run: cargo test --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests,perf-stats
+      - run: cargo nextest run --lib --bins --tests --examples --features stdx-proptest,tiger-harness,scheduler-sim,integration-tests,property-tests,diagnostic-tests,smoke-tests,perf-stats
+      - run: cargo test --doc
 
   loom:
     name: Loom Concurrency Tests
@@ -216,8 +239,6 @@ jobs:
     timeout-minutes: 30
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
@@ -240,8 +261,6 @@ jobs:
       checks: write
       contents: read
       issues: write
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
@@ -259,7 +278,6 @@ jobs:
     needs: [changes]
     env:
       FUZZ_SECONDS: 20
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
@@ -298,7 +316,6 @@ jobs:
     timeout-minutes: 60
     env:
       FUZZ_RUNS: 10000
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
@@ -352,7 +369,6 @@ jobs:
     timeout-minutes: 60
     env:
       FUZZ_RUNS: 10000
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
@@ -406,7 +422,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      RUSTC_WRAPPER: ""
       MIRIFLAGS: >-
         -Zmiri-strict-provenance
         -Zmiri-symbolic-alignment-check
@@ -453,7 +468,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      RUSTC_WRAPPER: ""
       RUSTFLAGS: "-Zsanitizer=address"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -476,8 +490,6 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/setup-rust
