@@ -811,6 +811,16 @@ mod tests {
         let mut high = finding(0, 15, 1);
         high.confidence_score = 6;
         let span = push_findings(&mut finding_arena, &[low, high]);
+
+        // Verify that sort_and_dedupe keeps the highest confidence winner.
+        let mut dedup_check = finding_arena.clone();
+        sort_and_dedupe_findings(&mut dedup_check);
+        assert_eq!(dedup_check.len(), 1, "identity-equal findings must dedup");
+        assert_eq!(
+            dedup_check[0].confidence_score, 6,
+            "highest confidence must survive dedup"
+        );
+
         let input = FinalizeInput {
             repo_id: 1,
             policy_hash: [0; 32],
