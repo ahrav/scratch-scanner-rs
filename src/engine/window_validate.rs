@@ -600,6 +600,35 @@ fn compute_confidence_score(
     s.clamp(0, 10)
 }
 
+/// Returns `true` when `staged` already contains a finding with the same
+/// rule, span, and root-hint coordinates — i.e. the candidate is a duplicate
+/// produced by overlapping VS prefilter windows that decode to the same region.
+///
+/// `step_id` is intentionally excluded from the comparison: raw and transform
+/// findings at identical coordinates must both be staged because downstream
+/// `replace_same_scan_duplicate` resolves raw-vs-transform priority.
+///
+/// This is staging-local dedup only. Global cross-window dedup happens in
+/// `push_finding_with_drop_hint` → `replace_same_scan_duplicate`.
+///
+/// O(n) scan over `staged`, bounded by `max_findings_per_chunk`.
+fn is_staging_duplicate(
+    staged: &[FindingRec],
+    rule_id: u32,
+    span_start: u32,
+    span_end: u32,
+    root_hint_start: u64,
+    root_hint_end: u64,
+) -> bool {
+    staged.iter().any(|f| {
+        f.rule_id == rule_id
+            && f.span_start == span_start
+            && f.span_end == span_end
+            && f.root_hint_start == root_hint_start
+            && f.root_hint_end == root_hint_end
+    })
+}
+
 impl Engine {
     /// Runs a compiled rule against one window and appends findings into `scratch`.
     ///
@@ -1293,6 +1322,23 @@ impl Engine {
                     crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
                     return;
                 }
+                // Streaming decode can produce overlapping windows for the
+                // same (rule, variant) when the VS prefilter fires at adjacent
+                // match-end offsets. After clamping, these windows cover the
+                // same decoded region and yield identical regex matches. Skip
+                // the duplicate to avoid pushing two findings with the same
+                // coordinates into the staging buffer.
+                if is_staging_duplicate(
+                    scratch.tmp_findings.as_slice(),
+                    rule_id,
+                    span_in_buf.start as u32,
+                    span_in_buf.end as u32,
+                    root_hint_start,
+                    root_hint_end,
+                ) {
+                    return;
+                }
+
                 // Set found_any only for findings that are actually staged.
                 // Suppressed findings (emit-time policy or confidence threshold)
                 // must not prevent IfNoFindingsInThisBuffer transforms from running.
@@ -1553,6 +1599,19 @@ impl Engine {
                 let confidence_score = compute_confidence_score(&evidence, rule, &outcome);
                 if !gates.passes_threshold(confidence_score) {
                     crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
+                    return;
+                }
+                // Same dedup guard as the raw staging path: overlapping VS
+                // prefilter windows can decode to the same UTF-16 region and
+                // yield identical regex matches.
+                if is_staging_duplicate(
+                    scratch.tmp_findings.as_slice(),
+                    rule_id,
+                    secret_start as u32,
+                    secret_end as u32,
+                    root_hint_start,
+                    root_hint_end,
+                ) {
                     return;
                 }
                 // Set found_any only for findings that are actually staged

@@ -32,7 +32,6 @@ use super::vectorscan_prefilter::{
 use crate::api::confidence;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::api::OfflineVerdict;
-#[cfg(feature = "stdx-proptest")]
 use crate::api::Tuning;
 use crate::api::{
     AnchorPolicy, CharClassSpec, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate,
@@ -3103,6 +3102,31 @@ fn anchor_policy_prefers_derived_over_manual() {
 }
 
 #[test]
+fn regression_slack_webhook_raw_match_not_suppressed() {
+    // Byte layout:
+    //   [0..39)   random non-ASCII prefix
+    //   [39..116) "https://hooks.slack.com/services/AAVDQBWQAbaiDCz9ngsUzHq0m0NRqTZt02ESGr8Kk9Fx"
+    //   [116]     0x25 ('%') — adjacent percent that triggers duplicate VS prefilter windows
+    //   [117..156) random non-ASCII suffix
+    let buf: Vec<u8> = vec![
+        57, 221, 123, 82, 133, 169, 165, 91, 183, 11, 248, 153, 63, 172, 98, 240, 220, 91, 10, 75,
+        10, 135, 150, 106, 232, 156, 76, 162, 159, 190, 148, 46, 221, 19, 120, 19, 13, 5, 133, 104,
+        116, 116, 112, 115, 58, 47, 47, 104, 111, 111, 107, 115, 46, 115, 108, 97, 99, 107, 46, 99,
+        111, 109, 47, 115, 101, 114, 118, 105, 99, 101, 115, 47, 65, 65, 86, 68, 81, 66, 87, 81,
+        65, 98, 97, 105, 68, 67, 122, 57, 110, 103, 115, 85, 122, 72, 113, 48, 109, 48, 78, 82,
+        113, 84, 90, 116, 48, 50, 69, 83, 71, 114, 56, 75, 107, 57, 70, 120, 37, 192, 134, 34, 52,
+        202, 133, 250, 48, 156, 25, 0, 23, 244, 138, 247, 112, 101, 3, 36, 32, 205, 201, 250, 108,
+        185, 208, 176, 133, 248, 42, 88, 101, 99, 109, 225, 208, 74, 34, 251, 14,
+    ];
+    let engine = demo_engine();
+    let findings = scan_chunk_findings(&engine, &buf);
+    let has_raw = findings
+        .iter()
+        .any(|f| f.rule == "slack-webhook-url" && f.span == (39..116) && f.decode_steps.is_empty());
+    assert!(has_raw, "raw slack-webhook-url match missing at 39..116");
+}
+
+#[test]
 fn anchor_policy_falls_back_to_manual_on_unfilterable() {
     const MANUAL: &[&[u8]] = &[b"Z"];
     let rule = RuleSpec {
@@ -4025,20 +4049,23 @@ fn apply_encoding(token: &[u8], base: BaseEncoding, chain: TransformChain) -> Ve
 
     match chain {
         TransformChain::None => bytes,
-        TransformChain::Url => url_percent_encode_all(&bytes),
+        TransformChain::Url => percent_encode_all(&bytes),
         TransformChain::Base64 => b64_encode(&bytes).into_bytes(),
         TransformChain::UrlThenBase64 => {
-            let url = url_percent_encode_all(&bytes);
+            let url = percent_encode_all(&bytes);
             b64_encode(&url).into_bytes()
         }
         TransformChain::Base64ThenUrl => {
             let b64 = b64_encode(&bytes);
-            url_percent_encode_all(b64.as_bytes())
+            percent_encode_all(b64.as_bytes())
         }
     }
 }
 
-fn url_percent_encode_all(input: &[u8]) -> Vec<u8> {
+/// Percent-encode every byte as `%XX` with uppercase hex — equivalent to
+/// [`crate::sim::mutation::percent_encode_all`] but kept local so that tests
+/// compile without the `sim-harness` feature.
+fn percent_encode_all(input: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = Vec::with_capacity(input.len().saturating_mul(3));
     for &b in input {
@@ -4868,6 +4895,73 @@ fn tiger_regressions_replay() {
 }
 
 #[test]
+fn tiger_boundary_url_percent_adjacent_secret() {
+    // Regression guard for the oracle itself: the VS prefilter fires at two
+    // adjacent match-end offsets for a slack-webhook-url embedded next to a
+    // trailing `%` byte. Both windows (after clamping) cover the same decoded
+    // region and yield identical regex matches, staging two FindingRecs that
+    // cause `replace_same_scan_duplicate` to overwrite the raw finding.
+    //
+    // The tiger harness didn't catch this because `check_oracle_covered`
+    // compares oracle vs chunked — but the oracle itself was wrong (the raw
+    // finding was also lost in single-chunk mode). This test validates the
+    // oracle contains the raw finding AND that chunking doesn't regress it.
+    let engine = correctness_engine();
+
+    // Byte layout (same buffer as regression_slack_webhook_raw_match_not_suppressed):
+    //   [0..39)   random non-ASCII prefix
+    //   [39..116) "https://hooks.slack.com/services/AAVDQBWQAbaiDCz9ngsUzHq0m0NRqTZt02ESGr8Kk9Fx"
+    //   [116]     0x25 ('%') — adjacent percent that triggers duplicate VS prefilter windows
+    //   [117..156) random non-ASCII suffix
+    let buf: Vec<u8> = vec![
+        57, 221, 123, 82, 133, 169, 165, 91, 183, 11, 248, 153, 63, 172, 98, 240, 220, 91, 10, 75,
+        10, 135, 150, 106, 232, 156, 76, 162, 159, 190, 148, 46, 221, 19, 120, 19, 13, 5, 133, 104,
+        116, 116, 112, 115, 58, 47, 47, 104, 111, 111, 107, 115, 46, 115, 108, 97, 99, 107, 46, 99,
+        111, 109, 47, 115, 101, 114, 118, 105, 99, 101, 115, 47, 65, 65, 86, 68, 81, 66, 87, 81,
+        65, 98, 97, 105, 68, 67, 122, 57, 110, 103, 115, 85, 122, 72, 113, 48, 109, 48, 78, 82,
+        113, 84, 90, 116, 48, 50, 69, 83, 71, 114, 56, 75, 107, 57, 70, 120, 37, 192, 134, 34, 52,
+        202, 133, 250, 48, 156, 25, 0, 23, 244, 138, 247, 112, 101, 3, 36, 32, 205, 201, 250, 108,
+        185, 208, 176, 133, 248, 42, 88, 101, 99, 109, 225, 208, 74, 34, 251, 14,
+    ];
+
+    // The oracle itself must contain the raw finding.
+    let oracle = scan_one_chunk_records(&engine, &buf);
+    let has_raw_oracle = oracle
+        .iter()
+        .any(|f| engine.rule_name(f.rule_id) == "slack-webhook-url" && f.step_id == STEP_ROOT);
+    assert!(
+        has_raw_oracle,
+        "oracle must contain raw slack-webhook-url finding; got: {:?}",
+        oracle
+    );
+
+    // Exercise multiple chunk plans to ensure no plan reintroduces the bug.
+    let plans = [
+        ("fixed-32", ChunkPlan::fixed(32)),
+        ("fixed-48", ChunkPlan::fixed(48)),
+        ("alternating-24-64", ChunkPlan::alternating(24, 64)),
+    ];
+    for (label, plan) in &plans {
+        let chunked = scan_chunked_records(&engine, &buf, plan.clone());
+        if let Err(msg) = check_oracle_covered(&engine, &oracle, &chunked) {
+            panic!(
+                "tiger_boundary_url_percent_adjacent_secret [{}] failed: {}",
+                label, msg
+            );
+        }
+        // Chunked output must also preserve the raw finding.
+        let has_raw_chunked = chunked
+            .iter()
+            .any(|f| engine.rule_name(f.rule_id) == "slack-webhook-url" && f.step_id == STEP_ROOT);
+        assert!(
+            has_raw_chunked,
+            "[{}] chunked scan lost raw slack-webhook-url finding; got: {:?}",
+            label, chunked
+        );
+    }
+}
+
+#[test]
 fn tiger_boundary_percent_triplet_split() {
     // Explicitly split a `%AB` percent triplet so '%' ends a chunk and the
     // two hex digits begin the next chunk. This exercises URL-percent decoding
@@ -4876,7 +4970,7 @@ fn tiger_boundary_percent_triplet_split() {
     let overlap = engine.required_overlap();
 
     let token = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
-    let encoded = url_percent_encode_all(token);
+    let encoded = percent_encode_all(token);
     assert_eq!(encoded.first(), Some(&b'%'));
 
     let chunk_size = overlap.saturating_add(1);
@@ -4940,7 +5034,7 @@ fn chunked_transform_root_hint_matches_reference() {
 
     let token = b"TOK0_ABCDEFGH";
     let encoded_b64 = b64_encode(token).into_bytes();
-    let encoded_url = url_percent_encode_all(token);
+    let encoded_url = percent_encode_all(token);
 
     let mut buf = Vec::new();
     buf.extend_from_slice(b"start ");
@@ -5052,7 +5146,7 @@ fn chunked_url_percent_prefix_trigger_kept() {
     let mut buf = Vec::new();
     buf.extend_from_slice(token);
     buf.extend(std::iter::repeat_n(b'x', 24));
-    buf.extend_from_slice(&url_percent_encode_all(b"WXYZ"));
+    buf.extend_from_slice(&percent_encode_all(b"WXYZ"));
 
     let reference = scan_one_chunk_records(&engine, &buf);
     let chunked = scan_in_chunks_with_overlap(&engine, &buf, 32, engine.required_overlap());
@@ -5141,6 +5235,215 @@ fn chunked_url_percent_no_duplicate_when_trigger_before_and_after() {
     );
 }
 
+// -- Tests for streaming-decode duplicate-finding bug (raw overwrite) ----------
+
+/// Build an engine with a single `TOK0_[A-Z0-9]{8}` rule, a URL-percent
+/// transform, and UTF-16 scanning disabled. The `customize` closure receives
+/// a mutable `Tuning` for per-test tweaks. Returns `None` when the
+/// vectorscan prefilter is unavailable (the tests are only meaningful with
+/// the VS streaming path).
+fn percent_dedup_test_engine(customize: impl FnOnce(&mut Tuning)) -> Option<Engine> {
+    let rule = RuleSpec {
+        radius: 64,
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::UrlPercent,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = false;
+    customize(&mut tuning);
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    engine.vs_stream.is_some().then_some(engine)
+}
+
+#[test]
+fn raw_and_url_percent_transform_findings_coexist() {
+    // When a plaintext secret sits adjacent to `%XX` bytes, the URL span
+    // finder merges them into one URLISH run.  After decoding, the secret
+    // is still present (it passes through URL decoding unchanged), so BOTH
+    // a raw finding and a transform finding should be produced.
+    //
+    // Before the dedup fix in `run_rule_on_raw_window_into`, the VS
+    // prefilter could fire at adjacent offsets, staging two identical
+    // transform findings.  `replace_same_scan_duplicate` then overwrote the
+    // raw finding with the duplicate, losing it.
+    let Some(engine) = percent_dedup_test_engine(|_| {}) else {
+        return;
+    };
+
+    let token = b"TOK0_ABCDEFGH";
+    // Space breaks the URLISH run, isolating the span.
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(token);
+    buf.extend_from_slice(&percent_encode_all(b"ABCD"));
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let recs = scan_one_chunk_records(&engine, &buf);
+
+    let has_raw = recs.iter().any(|r| r.step_id == STEP_ROOT);
+    let has_transform = recs.iter().any(|r| r.step_id != STEP_ROOT);
+
+    assert!(has_raw, "raw finding missing; got: {:?}", recs);
+    assert!(has_transform, "transform finding missing; got: {:?}", recs);
+
+    // No duplicate findings: every (rule_id, span, root_hint) tuple is unique.
+    let keys = recs_to_full_keys(&recs);
+    assert_eq!(
+        recs.len(),
+        keys.len(),
+        "duplicate findings detected: {:?}",
+        recs
+    );
+}
+
+#[test]
+fn chunked_scan_preserves_raw_and_transform_for_percent_adjacent_secret() {
+    // Same setup as `raw_and_url_percent_transform_findings_coexist`, but
+    // compares oracle (single-chunk) vs chunked output. Both must contain
+    // raw + transform findings AND oracle == chunked.
+    let Some(engine) = percent_dedup_test_engine(|t| {
+        t.max_findings_per_chunk = t.max_findings_per_chunk.max(65_535);
+    }) else {
+        return;
+    };
+
+    let token = b"TOK0_ABCDEFGH";
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(token);
+    buf.extend_from_slice(&percent_encode_all(b"ABCD"));
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let reference = scan_one_chunk_records(&engine, &buf);
+    let chunked = scan_in_chunks_with_overlap(&engine, &buf, 32, engine.required_overlap());
+
+    let reference_keys = recs_to_full_keys(&reference);
+    let chunked_keys = recs_to_full_keys(&chunked);
+
+    assert_eq!(
+        reference_keys, chunked_keys,
+        "oracle vs chunked mismatch:\n  oracle: {:?}\n  chunked: {:?}",
+        reference_keys, chunked_keys
+    );
+
+    // Both must have raw + transform.
+    let has_raw = reference.iter().any(|r| r.step_id == STEP_ROOT);
+    let has_transform = reference.iter().any(|r| r.step_id != STEP_ROOT);
+    assert!(has_raw, "oracle missing raw finding");
+    assert!(has_transform, "oracle missing transform finding");
+}
+
+#[test]
+fn percent_spans_both_sides_of_secret_no_extra_findings() {
+    // `%XX` bytes on BOTH sides of the secret create a wider URLISH span
+    // and more VS match offsets, increasing the likelihood of adjacent
+    // prefilter fires that trigger the duplicate staging bug.
+    let Some(engine) = percent_dedup_test_engine(|_| {}) else {
+        return;
+    };
+
+    let token = b"TOK0_ABCDEFGH";
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(&percent_encode_all(b"AB"));
+    buf.extend_from_slice(token);
+    buf.extend_from_slice(&percent_encode_all(b"CDE"));
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let recs = scan_one_chunk_records(&engine, &buf);
+
+    // No duplicate findings.
+    let keys = recs_to_full_keys(&recs);
+    assert_eq!(
+        recs.len(),
+        keys.len(),
+        "duplicate findings detected: {:?}",
+        recs
+    );
+
+    // At most 1 raw + at most 1 transform.
+    let raw_count = recs.iter().filter(|r| r.step_id == STEP_ROOT).count();
+    let transform_count = recs.iter().filter(|r| r.step_id != STEP_ROOT).count();
+    assert!(
+        raw_count <= 1,
+        "expected at most 1 raw finding, got {}: {:?}",
+        raw_count,
+        recs
+    );
+    assert!(
+        transform_count <= 1,
+        "expected at most 1 transform finding, got {}: {:?}",
+        transform_count,
+        recs
+    );
+}
+
+#[test]
+fn utf16_staging_path_no_duplicate_findings() {
+    // Regression test for the UTF-16 staging path: the same VS prefilter
+    // overlap that caused duplicate findings on the raw path can also occur
+    // when a secret is encoded as UTF-16LE and then base64-wrapped.
+    let rule = RuleSpec {
+        radius: 64,
+        ..base_rule("tok0", &[b"TOK0_"], Regex::new("TOK0_[A-Z0-9]{8}").unwrap())
+    };
+
+    let transforms = vec![TransformConfig {
+        id: TransformId::Base64,
+        mode: TransformMode::Always,
+        gate: Gate::AnchorsInDecoded,
+        min_len: 4,
+        max_spans_per_buffer: 16,
+        max_encoded_len: 64 * 1024,
+        max_decoded_bytes: 64 * 1024,
+        plus_to_space: false,
+        base64_allow_space_ws: false,
+    }];
+
+    let mut tuning = demo_tuning();
+    tuning.scan_utf16_variants = true;
+    let engine =
+        Engine::new_with_anchor_policy(vec![rule], transforms, tuning, AnchorPolicy::ManualOnly);
+    if engine.vs_stream.is_none() {
+        return;
+    }
+
+    let secret = b"TOK0_ABCDEFGH";
+    let utf16le = utf16le_bytes(secret);
+    let b64 = b64_encode(&utf16le);
+
+    let mut buf = Vec::new();
+    buf.extend(std::iter::repeat_n(b' ', 32));
+    buf.extend_from_slice(b64.as_bytes());
+    buf.extend(std::iter::repeat_n(b' ', 32));
+
+    let recs = scan_one_chunk_records(&engine, &buf);
+
+    // No duplicate (rule_id, span, root_hint) tuples.
+    let keys = recs_to_full_keys(&recs);
+    assert_eq!(
+        recs.len(),
+        keys.len(),
+        "duplicate findings in UTF-16 staging path: {:?}",
+        recs
+    );
+}
+
+// -- End streaming-decode duplicate-finding tests -----------------------------
+
 #[test]
 fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
     let rule = RuleSpec {
@@ -5169,7 +5472,7 @@ fn chunked_overlap_gt_chunk_dedupes_transform_findings() {
     }
 
     let token = b"TOK0_ABCDEFGH";
-    let encoded = url_percent_encode_all(token);
+    let encoded = percent_encode_all(token);
 
     let mut buf = Vec::new();
     buf.extend(std::iter::repeat_n(b'x', 64));
@@ -5255,7 +5558,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
     decoded.extend_from_slice(b"--");
     decoded.extend_from_slice(tok_b);
 
-    let url_encoded = url_percent_encode_all(&decoded);
+    let url_encoded = percent_encode_all(&decoded);
     let b64_encoded = b64_encode(&url_encoded).into_bytes();
 
     let mut buf = Vec::new();
