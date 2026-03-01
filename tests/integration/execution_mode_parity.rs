@@ -311,8 +311,7 @@ fn execution_mode_parity_matrix_and_thresholds() {
     }
 
     // Phase 2: Throughput parity — hard gate.
-    // We enforce migration thresholds from scratch-0g6a:
-    // median absolute delta <= 2% and per-case absolute delta <= 5%.
+    // Median absolute delta must stay <= 2% and per-case absolute delta <= 5%.
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
         // Warmup: absorb cold-cache / process-startup costs.
