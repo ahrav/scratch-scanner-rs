@@ -108,3 +108,123 @@ def test_evaluate_policy_fails_when_required_job_is_missing_or_failed() -> None:
     assert run["passes_policy"] is False
     assert "Clippy" in run["failed_required_jobs"]
     assert "Test" in run["missing_required_jobs"]
+
+
+def test_evaluate_policy_empty_runs_list() -> None:
+    report = gate.evaluate_policy(
+        runs=[],
+        jobs_by_run_id={},
+        required_jobs=["Execution Mode Parity", "Clippy"],
+        min_consecutive=1,
+        min_day_span=0.0,
+    )
+
+    summary = report["summary"]
+    assert summary["gate_pass"] is False
+    assert summary["consecutive_green_runs"] == 0
+    assert summary["consecutive_day_span"] == 0.0
+    assert summary["evaluated_runs"] == 0
+    assert summary["blocking_run_id"] is None
+
+
+def test_evaluate_policy_single_green_run_day_span_zero() -> None:
+    runs = [make_run(601, created_at="2026-02-28T12:00:00Z")]
+    jobs_by_run = {601: make_jobs()}
+
+    report = gate.evaluate_policy(
+        runs=runs,
+        jobs_by_run_id=jobs_by_run,
+        required_jobs=["Execution Mode Parity", "Clippy"],
+        min_consecutive=1,
+        min_day_span=0.0,
+    )
+
+    summary = report["summary"]
+    assert summary["gate_pass"] is True
+    assert summary["consecutive_green_runs"] == 1
+    assert summary["consecutive_day_span"] == 0.0
+
+
+def test_evaluate_policy_single_run_fails_when_day_span_required() -> None:
+    runs = [make_run(701, created_at="2026-02-28T12:00:00Z")]
+    jobs_by_run = {701: make_jobs()}
+
+    report = gate.evaluate_policy(
+        runs=runs,
+        jobs_by_run_id=jobs_by_run,
+        required_jobs=["Execution Mode Parity", "Clippy"],
+        min_consecutive=1,
+        min_day_span=1.0,
+    )
+
+    summary = report["summary"]
+    assert summary["gate_pass"] is False
+    assert summary["consecutive_green_runs"] == 1
+    assert summary["consecutive_day_span"] == 0.0
+
+
+def test_evaluate_policy_enough_runs_but_insufficient_day_span() -> None:
+    # 3 consecutive green runs but all within the same hour.
+    runs = [
+        make_run(803, created_at="2026-02-28T12:30:00Z"),
+        make_run(802, created_at="2026-02-28T12:15:00Z"),
+        make_run(801, created_at="2026-02-28T12:00:00Z"),
+    ]
+    jobs_by_run = {803: make_jobs(), 802: make_jobs(), 801: make_jobs()}
+
+    report = gate.evaluate_policy(
+        runs=runs,
+        jobs_by_run_id=jobs_by_run,
+        required_jobs=["Execution Mode Parity", "Clippy"],
+        min_consecutive=3,
+        min_day_span=1.0,
+    )
+
+    summary = report["summary"]
+    assert summary["gate_pass"] is False
+    assert summary["consecutive_green_runs"] == 3
+    assert summary["consecutive_day_span"] < 1.0
+
+
+def test_evaluate_policy_enough_day_span_but_insufficient_consecutive() -> None:
+    # 2 green runs over 5 days, but policy requires 3 consecutive.
+    runs = [
+        make_run(902, created_at="2026-02-28T12:00:00Z"),
+        make_run(901, created_at="2026-02-23T12:00:00Z"),
+    ]
+    jobs_by_run = {902: make_jobs(), 901: make_jobs()}
+
+    report = gate.evaluate_policy(
+        runs=runs,
+        jobs_by_run_id=jobs_by_run,
+        required_jobs=["Execution Mode Parity", "Clippy"],
+        min_consecutive=3,
+        min_day_span=3.0,
+    )
+
+    summary = report["summary"]
+    assert summary["gate_pass"] is False
+    assert summary["consecutive_green_runs"] == 2
+    assert summary["consecutive_day_span"] == 5.0
+
+
+def test_evaluate_policy_exact_boundary_consecutive_and_day_span() -> None:
+    # Exactly min_consecutive=2 and day_span exactly 1.0 — should pass (>=).
+    runs = [
+        make_run(1002, created_at="2026-02-28T12:00:00Z"),
+        make_run(1001, created_at="2026-02-27T12:00:00Z"),
+    ]
+    jobs_by_run = {1002: make_jobs(), 1001: make_jobs()}
+
+    report = gate.evaluate_policy(
+        runs=runs,
+        jobs_by_run_id=jobs_by_run,
+        required_jobs=["Execution Mode Parity", "Clippy"],
+        min_consecutive=2,
+        min_day_span=1.0,
+    )
+
+    summary = report["summary"]
+    assert summary["gate_pass"] is True
+    assert summary["consecutive_green_runs"] == 2
+    assert summary["consecutive_day_span"] == 1.0
