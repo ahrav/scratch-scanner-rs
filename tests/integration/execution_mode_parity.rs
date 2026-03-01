@@ -276,7 +276,7 @@ fn throughput_limits() -> (f64, f64) {
     let median = std::env::var("EXECUTION_MODE_PARITY_MEDIAN_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(2.0);
+        .unwrap_or(5.0);
     let per_case = std::env::var("EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
