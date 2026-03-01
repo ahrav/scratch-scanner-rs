@@ -3,6 +3,11 @@
 //! The orchestrator calls [`build_connector`] as the single source wiring
 //! entrypoint. Source-specific connector construction lives here so scheduler
 //! orchestration stays source-agnostic.
+//!
+//! The filesystem connector eagerly walks the directory tree into a sorted
+//! in-memory entry list, then serves `enumerate_page` via binary search for
+//! O(log N) cursor resume. Each entry carries a weak version derived from
+//! `(key, size, mtime)` and a stable item ID keyed by connector tag + item key.
 
 #[cfg(not(unix))]
 use std::fs::File;
@@ -29,7 +34,7 @@ const MAX_FS_ENTRIES: usize = 10_000_000;
 ///
 /// This function is the single source-wiring entrypoint used by unified
 /// orchestration. Unsupported source variants return explicit actionable
-/// errors rather than falling back to legacy scheduler-specific paths.
+/// errors rather than falling back to scheduler-specific paths.
 pub fn build_connector(cfg: &SourceConfig) -> io::Result<Box<dyn ConnectorInstance>> {
     match cfg {
         SourceConfig::Fs(fs_cfg) => {
@@ -57,7 +62,7 @@ struct FsEntry {
 
 #[derive(Debug)]
 struct FilesystemConnector {
-    entries: Vec<FsEntry>,
+    entries: Box<[FsEntry]>,
 }
 
 impl FilesystemConnector {
@@ -71,7 +76,9 @@ impl FilesystemConnector {
     fn new(cfg: &FsScanConfig) -> io::Result<Self> {
         let mut entries = collect_filesystem_entries(&cfg.root)?;
         entries.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(Self { entries })
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+        })
     }
 
     #[inline]
@@ -122,6 +129,7 @@ impl EnumerationConnector for FilesystemConnector {
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
         if budgets.is_expired_at(std::time::Instant::now()) {
+            eprintln!("warn: filesystem connector: budget expired, returning empty page");
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
         }
 
@@ -242,11 +250,13 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
 
     let mut entries = Vec::new();
     let mut version_buf = Vec::with_capacity(128);
+    let mut walk_errors: u64 = 0;
     for entry in builder.build() {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => {
-                eprintln!("warn: filesystem connector: skipped entry during discovery");
+            Err(err) => {
+                walk_errors += 1;
+                eprintln!("warn: filesystem connector: skipped entry during discovery: {err}");
                 continue;
             }
         };
@@ -261,11 +271,29 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
         let display = display_path(root, &path);
         let key = key_for_display(&display)?;
         let stable_item_id = ItemIdentityKey::new(FS_CONNECTOR_TAG, key.as_bytes()).stable_id();
-        let metadata = std::fs::symlink_metadata(&path).ok();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(m) => Some(m),
+            Err(err) => {
+                eprintln!(
+                    "warn: filesystem connector: metadata failed for {}: {err}",
+                    path.display()
+                );
+                None
+            }
+        };
         version_material(&mut version_buf, &key, metadata.as_ref());
         let version = VersionId::Weak(ObjectVersionId::from_version_bytes(&version_buf));
         let size_hint = metadata.as_ref().map(std::fs::Metadata::len);
-        let location = Location::try_new(display, None).ok();
+        let location = match Location::try_new(display, None) {
+            Ok(loc) => Some(loc),
+            Err(err) => {
+                eprintln!(
+                    "warn: filesystem connector: location construction failed for {}: {err}",
+                    path.display()
+                );
+                None
+            }
+        };
 
         entries.push(FsEntry {
             path,
@@ -281,6 +309,10 @@ fn collect_filesystem_entries(root: &Path) -> io::Result<Vec<FsEntry>> {
                  narrow the scan root to a smaller directory tree",
             )));
         }
+    }
+
+    if walk_errors > 0 {
+        eprintln!("warn: filesystem connector: {walk_errors} entries skipped due to walk errors");
     }
 
     Ok(entries)
@@ -307,6 +339,12 @@ fn display_path(root: &Path, path: &Path) -> String {
     preferred.to_string_lossy().replace('\\', "/")
 }
 
+/// Compose a weak version fingerprint from `(key, size, mtime)`.
+///
+/// The resulting bytes are hashed by [`ObjectVersionId::from_version_bytes`] to
+/// produce a deterministic version token. When metadata is unavailable the
+/// fingerprint degrades to key-only, so the item is still trackable but
+/// version changes won't be detected until metadata becomes readable.
 fn version_material(buf: &mut Vec<u8>, key: &ItemKey, metadata: Option<&std::fs::Metadata>) {
     buf.clear();
     buf.extend_from_slice(key.as_bytes());

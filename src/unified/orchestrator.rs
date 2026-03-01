@@ -147,10 +147,12 @@ impl crate::scheduler::ProgressSink for FsProgressState {
         Ok(())
     }
 
+    /// No-op: local filesystem scans have no durable state to park.
     fn park(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 
+    /// No-op: single-shard local scans do not use split hints.
     fn split_hint(
         &mut self,
         _key: &gossip_contracts::connector::ItemKey,
@@ -188,7 +190,20 @@ fn run_fs_connector(
         &mut progress,
         event_sink,
     )
-    .map_err(|err| io::Error::other(format!("filesystem connector pipeline failed: {err}")))?;
+    .map_err(|err| {
+        use crate::scheduler::ConnectorRunError;
+        let category = match &err {
+            ConnectorRunError::Config(_) => "configuration",
+            ConnectorRunError::Enumerate(_) => "enumeration",
+            ConnectorRunError::PageValidation(_) => "page validation",
+            ConnectorRunError::Progress(_) => "progress",
+            ConnectorRunError::Dispatch(_) => "dispatch",
+            ConnectorRunError::PageIdOverflow => "runtime",
+            ConnectorRunError::BudgetExceeded { .. } => "budget",
+            ConnectorRunError::FileIdOverflow => "runtime",
+        };
+        io::Error::other(format!("filesystem connector {category} error: {err}"))
+    })?;
 
     Ok(LocalReport {
         stats: LocalStats {
@@ -206,7 +221,7 @@ fn run_fs_connector(
 /// Fallback when the connector-pipeline feature is not compiled in.
 ///
 /// Delegates to [`parallel_scan_dir`](crate::scheduler::parallel_scan::parallel_scan_dir)
-/// which provides the same scanning behaviour through the legacy work-stealing
+/// which provides the same scanning behaviour through the work-stealing
 /// executor.  This keeps FS scans functional for default builds without
 /// requiring the Gossip-rs path dependencies.
 #[cfg(not(feature = "connector-pipeline"))]
