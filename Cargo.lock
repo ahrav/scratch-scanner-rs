@@ -708,14 +708,13 @@ name = "gossip-connectors"
 version = "0.1.0"
 dependencies = [
  "gossip-contracts",
- "gossip-stdx",
- "libc",
 ]
 
 [[package]]
 name = "gossip-contracts"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "blake3",
  "gossip-stdx",
  "subtle",
