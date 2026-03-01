@@ -159,6 +159,36 @@ EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT=5 \
 cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 ```
 
+## Mode 4: FS Enumeration Conformance Matrix (Phase 4)
+
+### What it tests
+
+Mode 4 compares direct filesystem discovery semantics against the real
+`gossip_connectors::filesystem::FilesystemConnector` on the same fixture tree.
+The matrix validates:
+
+| Axis | Fixture row | Expected |
+|---|---|---|
+| Hidden files | `.hidden.txt` | Included by both |
+| Gitignore handling | `.gitignore` + `ignored.txt` | Included by both (gitignore not enforced) |
+| Symlink policy | `link_file.txt`, `link_dir` | Skipped by both |
+| Binary-like paths | `blob.bin` | Included by both |
+| Archive-like paths | `bundle.zip` | Included by both |
+| Non-UTF8 path bytes | raw bytes file name | Byte-identical inclusion when filesystem supports creation |
+| Ordering | full connector listing | Deterministic key-sorted order |
+
+The implementation lives in
+`src/scheduler/parallel_scan.rs` as
+`filesystem_enumeration_conformance_matrix_matches_connector` and is gated
+behind `connector-pipeline` because it exercises the real connector crate.
+
+### Commands
+
+```bash
+# Run only the FS enumeration conformance test
+cargo test --features connector-pipeline filesystem_enumeration_conformance_matrix_matches_connector
+```
+
 ## Recommendation
 
 Keep synthetic stress testing as the primary engine-correctness gate, and use
