@@ -65,10 +65,7 @@ use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::{Executor, ExecutorConfig, ExecutorHandle, WorkerCtx};
 use super::file_id_alloc::FileIdAllocator;
 use super::metrics::MetricsSnapshot;
-use super::scan_helpers::{
-    account_effective_dropped_findings, apply_cross_rule_dedupe,
-    emit_findings as shared_emit_findings,
-};
+use super::scan_helpers::{apply_cross_rule_dedupe, emit_findings as shared_emit_findings};
 use super::shared_core::scan_chunk_postprocess;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
@@ -79,7 +76,7 @@ use crate::archive::scan::{
 use crate::archive::{ArchiveConfig, ArchiveKind, ArchiveStats};
 use crate::content_policy::{self, ContentVerdict};
 use crate::perf_stats;
-use crate::unified::events::{EventSink, ScanEvent};
+use crate::unified::events::EventSink;
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
