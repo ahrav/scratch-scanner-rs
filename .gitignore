@@ -21,6 +21,10 @@ fuzz/artifacts
 fuzz/corpus
 fuzz/Cargo.lock
 
+# Python bytecode caches
+__pycache__/
+*.pyc
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
