@@ -1,3 +1,6 @@
+//! Tests for the engine adapter: chunking, binary detection, attribution events,
+//! commit-meta emission, and finding dedup semantics.
+
 use super::*;
 use crate::git_scan::alloc_guard;
 use crate::git_scan::pack_candidates::LooseCandidate;
