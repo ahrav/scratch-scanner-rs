@@ -64,12 +64,10 @@
 //! | [`ConnectorRunError`] | Error taxonomy covering enumeration, validation, and persistence failures |
 
 use super::engine_stub::BUFFER_LEN_MAX;
-use super::engine_trait::{EngineScratch as _, ScanEngine};
+use super::engine_trait::ScanEngine;
 use super::metrics::{MetricsSnapshot, WorkerMetricsLocal};
-use super::scan_helpers::{
-    account_effective_dropped_findings, apply_cross_rule_dedupe,
-    emit_findings as shared_emit_findings,
-};
+use super::scan_helpers::emit_findings as shared_emit_findings;
+use super::shared_core::{carry_overlap_prefix, scan_chunk_postprocess};
 use crate::api::FileId;
 use crate::unified::events::{DiagnosticEvent, EventSink, ScanEvent};
 
@@ -346,6 +344,14 @@ impl<E: fmt::Debug + Send + Sync + 'static> std::error::Error for ConnectorRunEr
 /// Reuses one engine scratch, one temporary findings buffer, and one I/O buffer
 /// across all items so connector I/O paths stay allocation-light and produce
 /// identical finding semantics regardless of how bytes are fetched.
+///
+/// # Design choice: single buffer per runner
+///
+/// The runner holds one `buf` of size `overlap + chunk_size`. Items are scanned
+/// serially on the calling thread, so only one buffer is active at a time.
+/// The buffer is reused across items without reallocation. The connector
+/// pipeline currently processes items synchronously; if parallel dispatch is
+/// added, each worker would need its own `ConnectorCpuRunner` instance.
 struct ConnectorCpuRunner<E: ScanEngine> {
     engine: Arc<E>,
     event_sink: Arc<dyn EventSink>,
@@ -404,32 +410,17 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
         data: &[u8],
         metrics: &mut WorkerMetricsLocal,
     ) {
-        engine.scan_chunk_into(data, file_id, base_offset, scratch);
-        let engine_dropped = scratch.dropped_findings();
-
-        // The copied prefix belongs to the previous chunk. Any finding fully
-        // before `new_bytes_start` has already been eligible for emission there.
-        let new_bytes_start = base_offset.saturating_add(prefix_len as u64);
-        let before_prefix = scratch.pending_findings_len();
-        scratch.drop_prefix_findings(new_bytes_start);
-        let after_prefix = scratch.pending_findings_len();
-
-        pending.clear();
-        scratch.drain_findings_into(pending);
-        let dedupe_removed = apply_cross_rule_dedupe(pending, engine);
-        let scheduler_pruned = before_prefix
-            .saturating_sub(after_prefix)
-            .saturating_add(dedupe_removed);
-        account_effective_dropped_findings(metrics, engine_dropped, scheduler_pruned);
-
-        metrics.findings_emitted = metrics
-            .findings_emitted
-            .saturating_add(pending.len() as u64);
+        scan_chunk_postprocess(
+            engine,
+            scratch,
+            pending,
+            file_id,
+            base_offset,
+            prefix_len,
+            data,
+            metrics,
+        );
         shared_emit_findings(engine, event_sink, item_display_bytes(item), pending);
-
-        let payload = data.len().saturating_sub(prefix_len);
-        metrics.chunks_scanned = metrics.chunks_scanned.saturating_add(1);
-        metrics.bytes_scanned = metrics.bytes_scanned.saturating_add(payload as u64);
     }
 
     /// Unified overlap-aware chunking loop, parameterized by an I/O closure.
@@ -457,14 +448,8 @@ impl<E: ScanEngine> ConnectorCpuRunner<E> {
         let mut have: usize = 0;
 
         loop {
-            if carry > 0 && have > 0 {
-                debug_assert!(
-                    have >= carry,
-                    "overlap carry ({carry}) exceeds buffer fill ({have})"
-                );
-                // Preserve trailing overlap so cross-chunk matches are still visible.
-                self.buf.copy_within(have - carry..have, 0);
-            }
+            // Preserve trailing overlap so cross-chunk matches are still visible.
+            carry_overlap_prefix(&mut self.buf, have, carry);
 
             let n = read_fn(offset, &mut self.buf[carry..carry + chunk_size])?;
             if n == 0 {
@@ -903,13 +888,22 @@ where
 
 /// Inner loop parameterized by a page-dispatch strategy.
 ///
-/// `dispatch_page_items` receives each page's connector handle, items, and
-/// completion tokens. The public [`scan_connector`] uses this hook to execute
-/// connector item reads/chunk scans while tests inject custom dispatch logic
-/// to exercise the barrier under concurrent release patterns.
+/// Separated from [`scan_connector`] to allow test injection of custom dispatch
+/// logic without duplicating the enumeration/validation/checkpoint orchestration.
+/// Tests inject dispatch closures that exercise the barrier under concurrent
+/// release patterns, simulated failures, and partial-page processing.
+///
+/// `dispatch_page_items` receives the page ID, a mutable reference to the
+/// connector (for item reads), the page's items, and one [`PageItemToken`] per
+/// item. The closure must call `token.complete()` (or drop the token) for every
+/// item to unblock the barrier.
 ///
 /// The loop body follows the flow documented in the module-level docs:
-/// enumerate -> validate -> dispatch -> barrier -> checkpoint -> split-hint.
+/// enumerate → validate → dispatch → barrier → checkpoint → split-hint.
+///
+/// **Event sink flush:** `event_sink.flush()` is called unconditionally after
+/// the loop exits (success or error) so that events from completed pages are
+/// never silently buffered when the run terminates early.
 fn scan_connector_with_page_dispatch<E, C, P, D>(
     engine: Arc<E>,
     connector: &mut C,
