@@ -1293,6 +1293,23 @@ impl Engine {
                     crate::perf_stats::sat_add_usize(&mut scratch.confidence_suppressed, 1);
                     return;
                 }
+                // Streaming decode can produce overlapping windows for the
+                // same (rule, variant) when the VS prefilter fires at adjacent
+                // match-end offsets. After clamping, these windows cover the
+                // same decoded region and yield identical regex matches. Skip
+                // the duplicate to avoid pushing two findings with the same
+                // coordinates into the staging buffer.
+                let dominated = scratch.tmp_findings.as_slice().iter().any(|f| {
+                    f.rule_id == rule_id
+                        && f.span_start == span_in_buf.start as u32
+                        && f.span_end == span_in_buf.end as u32
+                        && f.root_hint_start == root_hint_start
+                        && f.root_hint_end == root_hint_end
+                });
+                if dominated {
+                    return;
+                }
+
                 // Set found_any only for findings that are actually staged.
                 // Suppressed findings (emit-time policy or confidence threshold)
                 // must not prevent IfNoFindingsInThisBuffer transforms from running.
