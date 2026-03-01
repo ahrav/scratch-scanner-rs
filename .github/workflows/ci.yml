@@ -162,6 +162,30 @@ jobs:
           shared-key: stable-linux
       - run: cargo test --features integration-tests --test integration execution_mode_parity_ -- --nocapture
 
+  sustained-green-report:
+    name: Sustained Green Report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [execution-mode-parity, test, test-aarch64]
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Generate sustained-green policy report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p tools/migration-parity/results
+          python3 tools/migration-parity/sustained_green_gate.py \
+            --repo "${{ github.repository }}" \
+            --workflow ci.yml \
+            --branch main \
+            --output-json tools/migration-parity/results/sustained_green_report.json \
+            --output-markdown tools/migration-parity/results/sustained_green_report.md
+          cat tools/migration-parity/results/sustained_green_report.md
+
   eval-harness:
     name: Eval Harness
     runs-on: ubuntu-24.04

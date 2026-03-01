@@ -63,3 +63,52 @@ The script writes:
 
 - Findings JSONL files are canonicalized and sorted for stable diffs.
 - Non-zero scanner exit codes are recorded in CSV/summary; script exits non-zero if any run fails.
+
+## Sustained-Green Policy Gate
+
+`sustained_green_gate.py` evaluates recent CI runs to determine whether the
+execution-mode migration is eligible for default-mode cutover.
+
+Policy defaults:
+
+- minimum consecutive green runs: `7`
+- minimum time span covered by those runs: `3` days
+
+Required jobs per run:
+
+- `Execution Mode Parity`
+- `Clippy`
+- `Test`
+- `Test (aarch64)`
+
+### Usage
+
+```bash
+# Report-only mode (always exits 0 unless API/config errors occur)
+python3 tools/migration-parity/sustained_green_gate.py \
+  --repo owner/repo \
+  --workflow ci.yml \
+  --branch main \
+  --output-json tools/migration-parity/results/sustained_green_report.json \
+  --output-markdown tools/migration-parity/results/sustained_green_report.md
+
+# Enforcing mode (exit 1 when policy is not yet satisfied)
+python3 tools/migration-parity/sustained_green_gate.py \
+  --repo owner/repo \
+  --workflow ci.yml \
+  --branch main \
+  --require-pass
+```
+
+### Offline / Fixture Mode
+
+```bash
+python3 tools/migration-parity/sustained_green_gate.py \
+  --input-runs-json /tmp/workflow_runs.json \
+  --input-jobs-dir /tmp/jobs_payloads
+```
+
+Each jobs payload file is named `<run_id>.json` and can be either:
+
+- `{ "jobs": [...] }`
+- or a raw JSON array `[...]`
