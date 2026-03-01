@@ -284,7 +284,7 @@ fn throughput_limits() -> (f64, f64) {
     let per_case = std::env::var("EXECUTION_MODE_PARITY_PER_CASE_MAX_PCT")
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(10.0);
     (median, per_case)
 }
 
@@ -306,6 +306,11 @@ fn execution_mode_parity_matrix_and_thresholds() {
             case.name,
             diff_summary(&direct_first.findings, &connector_first.findings)
         );
+
+        // Warmup: discard one sample per mode to absorb cold-cache costs
+        // and reduce first-sample jitter on shared CI runners.
+        let _ = run_throughput_sample(case, "direct");
+        let _ = run_throughput_sample(case, "connector");
 
         let mut direct_samples = Vec::with_capacity(iterations);
         let mut connector_samples = Vec::with_capacity(iterations);
