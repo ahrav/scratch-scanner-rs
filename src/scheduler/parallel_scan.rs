@@ -1039,6 +1039,18 @@ mod tests {
         let connector_set: std::collections::BTreeSet<Vec<u8>> =
             connector_paths.iter().cloned().collect();
 
+        // Catch duplicate emissions that BTreeSet conversion would silently hide.
+        assert_eq!(
+            direct_paths.len(),
+            direct_set.len(),
+            "direct enumerator emitted duplicate paths"
+        );
+        assert_eq!(
+            connector_paths.len(),
+            connector_set.len(),
+            "connector enumerator emitted duplicate paths"
+        );
+
         assert_eq!(
             direct_set, connector_set,
             "direct and connector file membership diverged"
