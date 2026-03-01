@@ -187,13 +187,7 @@ pub struct NamespaceCounts {
 fn finding_slice(span: FindingSpan, arena: &[ScoredFinding]) -> &[ScoredFinding] {
     let start = span.start as usize;
     let end = start.saturating_add(span.len as usize);
-    assert!(
-        end <= arena.len(),
-        "finding span out of bounds: start={}, len={}, arena_len={}",
-        span.start,
-        span.len,
-        arena.len(),
-    );
+    debug_assert!(end <= arena.len(), "finding span out of bounds");
     &arena[start..end]
 }
 

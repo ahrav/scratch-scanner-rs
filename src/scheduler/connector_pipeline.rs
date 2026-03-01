@@ -243,7 +243,7 @@ pub trait ProgressSink: Send {
 /// Automatically implemented for any type satisfying the bounds.
 pub trait ConnectorSource: ConnectorInstance + Send + 'static {}
 
-impl<T: ?Sized> ConnectorSource for T where T: ConnectorInstance + Send + 'static {}
+impl<T> ConnectorSource for T where T: ConnectorInstance + Send + 'static {}
 
 /// Enumeration-side run statistics accumulated during page-level orchestration.
 #[derive(Clone, Copy, Debug, Default)]

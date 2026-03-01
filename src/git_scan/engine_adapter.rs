@@ -159,26 +159,10 @@ pub struct FindingKey {
 /// confidence when multiple scans produce the same identity key.
 /// `confidence_score` does not participate in persistence keying (see
 /// `build_finding_key` in `finalize.rs`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScoredFinding {
     pub key: FindingKey,
     pub confidence_score: i8,
-}
-
-impl Ord for ScoredFinding {
-    /// Primary: identity key ascending. Secondary: confidence descending.
-    /// Matches dedup contract: sort_unstable() + dedup_by key keeps highest confidence.
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key
-            .cmp(&other.key)
-            .then_with(|| other.confidence_score.cmp(&self.confidence_score))
-    }
-}
-
-impl PartialOrd for ScoredFinding {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// Sort findings by identity and dedupe equal identities in place.
@@ -188,7 +172,11 @@ impl PartialOrd for ScoredFinding {
 /// in each identity group survives.
 #[inline]
 pub(crate) fn sort_and_dedupe_findings(findings: &mut Vec<ScoredFinding>) {
-    findings.sort_unstable();
+    findings.sort_unstable_by(|a, b| {
+        a.key
+            .cmp(&b.key)
+            .then_with(|| b.confidence_score.cmp(&a.confidence_score))
+    });
     findings.dedup_by(|a, b| {
         let same = a.key == b.key;
         debug_assert!(
