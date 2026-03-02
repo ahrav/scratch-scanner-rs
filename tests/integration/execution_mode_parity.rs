@@ -123,24 +123,28 @@ fn create_git_branch_merge_case(root: &Path, name: &'static str) -> PathBuf {
     let repo = root.join(name);
     fs::create_dir_all(&repo).expect("create git merge repo");
     initialize_repo(&repo);
+    // Larger blobs (3× previous) so the scanning phase dominates over
+    // fixed git overhead (repo open, commit-graph parse, merge tree-diff).
+    // With small payloads the throughput denominator is tiny and jitter
+    // from OS scheduling easily causes >20 % deltas between modes.
     write_and_commit(
         &repo,
         "root.txt",
-        &bulk_secret_payload("ROOT", 4200),
+        &bulk_secret_payload("ROOT", 12_600),
         "root commit",
     );
     run_git(&repo, &["checkout", "-b", "feature/parity"]);
     write_and_commit(
         &repo,
         "feature.txt",
-        &bulk_secret_payload("FEATURE", 4000),
+        &bulk_secret_payload("FEATURE", 12_000),
         "feature secret",
     );
     run_git(&repo, &["checkout", "main"]);
     write_and_commit(
         &repo,
         "main.txt",
-        &bulk_secret_payload("MAIN", 4100),
+        &bulk_secret_payload("MAIN", 12_300),
         "mainline secret",
     );
     run_git(
@@ -309,9 +313,13 @@ fn execution_mode_parity_matrix_and_thresholds() {
     // Median absolute delta must stay <= 2% and per-case absolute delta <= 5%.
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
-        // Warmup: absorb cold-cache / process-startup costs.
-        let _ = run_throughput_sample(case, "direct");
-        let _ = run_throughput_sample(case, "connector");
+        // Warmup: two passes per mode to absorb cold-cache / process-startup /
+        // page-cache priming costs. A single pass can still leave OS caches
+        // partially warm, amplifying the first real sample's variance.
+        for _ in 0..2 {
+            let _ = run_throughput_sample(case, "direct");
+            let _ = run_throughput_sample(case, "connector");
+        }
 
         let mut direct_samples = Vec::with_capacity(iterations);
         let mut connector_samples = Vec::with_capacity(iterations);
