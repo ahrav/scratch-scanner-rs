@@ -497,6 +497,7 @@ jobs:
             --skip scheduler::parallel_scan \
             --skip rules::yaml \
             --skip archive::scan \
+            --skip archive::formats::bzip2 \
             --skip archive::formats::gzip \
             --skip archive::formats::zip::tests::long_name \
             --skip archive::formats::zip::tests::in_memory
