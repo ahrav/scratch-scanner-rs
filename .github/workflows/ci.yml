@@ -497,7 +497,8 @@ jobs:
             --skip scheduler::parallel_scan \
             --skip rules::yaml \
             --skip archive::scan \
-            --skip archive::formats::gzip \
+            --skip archive::formats::bzip2 \  # FFI: C libbzip2 backend
+            --skip archive::formats::gzip \   # FFI: C libz backend
             --skip archive::formats::zip::tests::long_name \
             --skip archive::formats::zip::tests::in_memory
 
