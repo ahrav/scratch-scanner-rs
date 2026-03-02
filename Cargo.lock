@@ -699,6 +699,9 @@ dependencies = [
 [[package]]
 name = "gossip-stdx"
 version = "0.1.0"
+dependencies = [
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "half"
